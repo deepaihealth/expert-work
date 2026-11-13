@@ -108,6 +108,37 @@ async def is_user_side_protected(item: MemoryItem, load: MemberLoader) -> bool:
     return bool(frontier)
 
 
+#: 汇总成员查不完时按这个置信度算(保守方向:等于用户更正,任何提炼出的候选都低于它)。
+FAIL_CLOSED_CONFIDENCE = 1.0
+
+
+async def user_side_confidence(item: MemoryItem, load: MemberLoader) -> float | None:
+    """B-300 用户 11-14(审查 11-14)—— 第二条拦截规则拿来与候选比的置信度;``None`` = 目标
+    不是用户一方的(与 :func:`is_user_side_protected` 同一个判定)。
+
+    * 不是汇总行:用户一方的就是它自己的置信度;
+    * 汇总行:它自己(若是用户一方的)与成员里一层层往下所有用户一方记忆的置信度取**最高**——
+      不用汇总行自己那一行(成员最小值),否则一条用户更正(1.0)和来源未记录的成员汇在一起,
+      就会被置信度一般的用户候选取代;
+    * 遍历同 :func:`is_user_side_protected`(``visited`` 防环、``MAX_SUMMARY_DEPTH`` 层);
+      查到上限还有没查的成员 → :data:`FAIL_CLOSED_CONFIDENCE`。"""
+    found = [item.confidence] if effective_origin(item) in USER_SIDE_ORIGINS else []
+    visited = {item.id}
+    frontier = [sid for sid in item.consolidated_from if sid not in visited]
+    for _depth in range(MAX_SUMMARY_DEPTH):
+        if not frontier:
+            break
+        visited.update(frontier)
+        members = await load(frontier)
+        found.extend(m.confidence for m in members if effective_origin(m) in USER_SIDE_ORIGINS)
+        frontier = list(
+            dict.fromkeys(sid for m in members for sid in m.consolidated_from if sid not in visited)
+        )
+    if frontier:
+        return FAIL_CLOSED_CONFIDENCE
+    return max(found) if found else None
+
+
 class UserSideTargetError(RuntimeError):
     """B-300 审查 MEDIUM-1 —— 带保护的 ``supersede`` / ``expire``(``refuse_user_side``)
     在锁里重读目标,发现它(或它汇总的成员)是用户一方的:什么都没改。
@@ -128,16 +159,19 @@ async def refuse_if_user_side(
     """两个存储实现在行锁里共用的重判(行已由调用方锁住 / 重读,成员只读):
 
     * ``refuse``(来自助手的候选):目标是用户一方的 → :class:`UserSideTargetError`;
-    * ``above``(用户消息里说的候选的置信度):目标是用户一方的、且置信度高于它 →
-      :class:`UserSideHigherConfidenceError`。汇总行按它自己这一行的置信度比。"""
-    stricter = above is not None and row.confidence > above
-    if not (refuse or stricter) or not await is_user_side_protected(row, load):
-        return
+    * ``above``(用户消息里说的候选的置信度)::func:`user_side_confidence` 高于它 →
+      :class:`UserSideHigherConfidenceError`(汇总行按成员里最高的用户一方置信度比)。"""
     if refuse:
-        msg = f"memory item {row.id} is on the user's side; not changing it"
-        raise UserSideTargetError(msg)
-    msg = f"memory item {row.id} is on the user's side and more certain; not changing it"
-    raise UserSideHigherConfidenceError(msg)
+        if await is_user_side_protected(row, load):
+            msg = f"memory item {row.id} is on the user's side; not changing it"
+            raise UserSideTargetError(msg)
+        return
+    if above is None:
+        return
+    confidence = await user_side_confidence(row, load)
+    if confidence is not None and confidence > above:
+        msg = f"memory item {row.id} is on the user's side and more certain; not changing it"
+        raise UserSideHigherConfidenceError(msg)
 
 
 @dataclass(frozen=True)
@@ -455,6 +489,13 @@ class MemoryStore(abc.ABC):
     async def user_side_protected(self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID) -> bool:
         """B-300 review MEDIUM-3 — :func:`is_user_side_protected` for one row, its
         summary members read whatever their current validity. Unknown id → False."""
+
+    @abc.abstractmethod
+    async def user_side_confidence(
+        self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID
+    ) -> float | None:
+        """B-300 user 11-14 — :func:`user_side_confidence` for one row (members read
+        the same way as :meth:`user_side_protected`). Unknown id → None."""
 
     @abc.abstractmethod
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:

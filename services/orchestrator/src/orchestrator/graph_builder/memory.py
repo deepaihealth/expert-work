@@ -1168,6 +1168,46 @@ def _blocked_by_user_side(
     return None
 
 
+async def _user_side_confidence(
+    memory_store: MemoryStore, target: MemoryItem, token: CancellationToken, log_label: str
+) -> float | None:
+    """用户 11-14 第二条拦截规则的预判口径(审查 11-14):不是汇总行 → 用户一方的就是它自己的
+    置信度;汇总行 → 成员里最高的用户一方置信度(存储里查,查不完按 1.0)。查失败按「不受保护」
+    放过,由 ``supersede`` / ``expire`` 锁里那道兜底(同 :func:`_protects_user_side`)。"""
+    if not target.consolidated_from:
+        return target.confidence if effective_origin(target) in USER_SIDE_ORIGINS else None
+    try:
+        return await token.run_cancellable(
+            memory_store.user_side_confidence(
+                tenant_id=target.tenant_id, user_id=target.user_id, memory_id=target.id
+            )
+        )
+    except RunCancelledError:
+        raise
+    except Exception:
+        logger.warning("%s_confidence_lookup_failed id=%s", log_label, target.id, exc_info=True)
+        return None
+
+
+async def _refused_before_apply(
+    memory_store: MemoryStore,
+    target: MemoryItem,
+    *,
+    guarded: bool,
+    above: float | None,
+    token: CancellationToken,
+    log_label: str,
+) -> bool:
+    """去重合并改库前的预判:来自助手的候选碰用户一方的(第一条);用户消息里说的候选碰比它更确定的
+    用户一方的(第二条)。"""
+    if guarded:
+        return await _protects_user_side(memory_store, target, token, log_label)
+    if above is None:
+        return False
+    confidence = await _user_side_confidence(memory_store, target, token, log_label)
+    return confidence is not None and confidence > above
+
+
 def _lower_confidence_guard(item: MemoryItem) -> float | None:
     """用户 11-14 —— 「用户消息里说的」候选只能改置信度不高于它的用户一方记忆:返回要交给
     ``supersede`` / ``expire`` 的 ``refuse_user_side_above``(候选的置信度);别的候选 ``None``。"""
@@ -1333,17 +1373,20 @@ async def _reconcile_and_apply(
         target_item = valid.get(target_raw) if target_raw is not None else None
         target = target_item.id if target_item is not None else None
         # B-300 §6.2 拦截规则:来自助手的候选不得更新 / 删除用户一方的记忆;用户 11-14 加一条:
-        # 「用户消息里说的」候选,置信度低于目标时同样不得(汇总行按它自己的置信度比)。
+        # 「用户消息里说的」候选,置信度低于目标时同样不得(汇总行按成员里最高的用户一方置信度比)。
         guarded = item.origin == "assistant_derived"
         above = _lower_confidence_guard(item)
-        less_certain = (
-            above is not None and target_item is not None and target_item.confidence > above
-        )
         if (
             op in ("UPDATE", "DELETE")
             and target_item is not None
-            and (guarded or less_certain)
-            and await _protects_user_side(memory_store, target_item, token, log_label)
+            and await _refused_before_apply(
+                memory_store,
+                target_item,
+                guarded=guarded,
+                above=above,
+                token=token,
+                log_label=log_label,
+            )
         ):
             kept = _blocked_by_user_side(
                 op, item, is_correction=is_corr, lower_confidence=not guarded
@@ -1728,7 +1771,8 @@ async def flush_messages_with_outcome(
     白名单标记。
 
     B-300 D12 —— 返回的条数是实际落库的条数(与库里已有同内容的、被拦的都不算;去重合并里
-    「更新」由 ``supersede`` 取代出来的新行要算,「删除」只作废旧行、不算)。
+    「更新」由 ``supersede`` 取代出来的新行要算,「删除」只作废旧行、不算)。出错走失败分支时
+    条数一律是 0、``failed`` 为真 —— 即使去重合并里已有取代落了库、之后的 ``write`` 才抛错。
     """
     extracted: list[ExtractedMemory] = []
     blocked: list[_BlockedWrite] = []

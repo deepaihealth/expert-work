@@ -4,7 +4,8 @@
 * ① 第一次提炼的指令:只有一个值、没说是什么的那句,永远不是更正,也不是对旧记忆的更新;
   ``is_correction`` 只在同一句话自己说清改的是什么、新值是什么时才为真。
 * ② 程序的拦截:「用户消息里说的」候选,置信度**低于**目标(用户一方的记忆,含成员里有用户一方的
-  汇总行;汇总行按它自己的置信度比)时,不得更新 / 删除它 —— 与来自助手的拦截同一套处理:
+  汇总行;汇总行按成员里最高的用户一方置信度比,查不完按 1.0)时,不得更新 / 删除它 ——
+  与来自助手的拦截同一套处理:
   被拦的删除什么都不做;被拦的更新带 ``is_correction`` 按新增存下,不带就丢弃。预判一次,
   ``supersede`` / ``expire`` 的行锁里按此刻的行再判一次。计数用单独的标签。
 * ③ 去重合并的指令补上另一个方向:来自助手的候选对上用户说的 / 用户更正的已有记忆 → NOOP。
@@ -270,7 +271,7 @@ async def test_lower_confidence_user_candidate_may_change_an_unrecorded_memory()
 
 
 async def _seed_summary(
-    store: InMemoryMemoryStore, origins: Sequence[MemoryOrigin | None]
+    store: InMemoryMemoryStore, members_spec: Sequence[tuple[MemoryOrigin | None, float]]
 ) -> MemoryItem:
     members = [
         MemoryItem(
@@ -281,9 +282,9 @@ async def _seed_summary(
             content=f"member {i}",
             embedding=_NORTH,
             origin=o,
-            confidence=0.6,
+            confidence=c,
         )
-        for i, o in enumerate(origins)
+        for i, (o, c) in enumerate(members_spec)
     ]
     _ = await store.write(members)
     stored = {r.id: r for r in store._rows}
@@ -297,16 +298,37 @@ async def _seed_summary(
     )
 
 
-@pytest.mark.parametrize(("candidate", "changed"), [(0.5, False), (0.6, True)])
-async def test_summary_target_is_compared_by_its_own_confidence(
-    candidate: float, changed: bool
+_STATED_06 = (("user_stated", 0.6), (None, 0.6), (None, 0.6))
+#: 一条用户更正(1.0)+ 两条来源未记录(0.5):汇总行自己的置信度是成员最小值 0.5。
+_CORRECTED_AND_UNRECORDED = ((None, 1.0), (None, 0.5), (None, 0.5))
+
+
+@pytest.mark.parametrize(
+    ("members", "summary_confidence", "candidate", "changed"),
+    [
+        (_STATED_06, 0.6, 0.5, False),
+        (_STATED_06, 0.6, 0.6, True),
+        (_CORRECTED_AND_UNRECORDED, 0.5, 0.6, False),
+        (_CORRECTED_AND_UNRECORDED, 0.5, 0.99, False),
+    ],
+    ids=["stated-lower", "stated-equal", "correction-vs-0.6", "correction-vs-0.99"],
+)
+async def test_summary_target_is_compared_by_its_most_certain_user_side_member(
+    members: Sequence[tuple[MemoryOrigin | None, float]],
+    summary_confidence: float,
+    candidate: float,
+    changed: bool,
 ) -> None:
-    store = InMemoryMemoryStore()
-    summary = await _seed_summary(store, ["user_stated", None, None])
-    assert (summary.origin, summary.confidence) == (None, 0.6)
+    """审查(11-14)—— 汇总行按它成员里**最高**的用户一方置信度比,不按自己那一行(成员最小值):
+    否则 {用户更正 1.0, 未记录 0.5} 汇成的 0.5 汇总行会被 0.6 的用户候选取代,更正就没了。"""
+    store = _CountingStore()
+    summary = await _seed_summary(store, members)
+    assert (summary.origin, summary.confidence) == (None, summary_confidence)
     llm = _LLM(user_reply=_stated(candidate), ops_reply=_ops("UPDATE", summary.id))
     _ = await _flush(llm, store)
     assert set(await _live(store)) == ({"cand"} if changed else {"summary"})
+    # 拦下的那几条在预判就拦了,没走到改库(锁里那道另由存储测试覆盖)。
+    assert store.writes_to_targets == (1 if changed else 0)
 
 
 def _raise_confidence_while_deciding(

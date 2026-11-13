@@ -33,6 +33,7 @@ from expert_work.persistence.memory.base import (
     scan_memory_content,
     split_blocked,
     summary_fields,
+    user_side_confidence,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.persistence.models import (
@@ -716,6 +717,25 @@ class SqlMemoryStore(MemoryStore):
             if row is None:
                 return False
             return await is_user_side_protected(
+                _row_to_item(row), _member_loader(session, tenant_id, user_id)
+            )
+
+    async def user_side_confidence(
+        self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID
+    ) -> float | None:
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(MemoryItemRow).where(
+                        MemoryItemRow.id == memory_id,
+                        MemoryItemRow.tenant_id == tenant_id,
+                        MemoryItemRow.user_id == user_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return await user_side_confidence(
                 _row_to_item(row), _member_loader(session, tenant_id, user_id)
             )
 

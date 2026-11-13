@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -31,10 +31,12 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.memory.base import (
+    MAX_SUMMARY_DEPTH,
     ConsolidationSourcesChangedError,
     MemoryStore,
     UserSideHigherConfidenceError,
     UserSideTargetError,
+    user_side_confidence,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
@@ -438,14 +440,15 @@ async def test_lower_confidence_guard_refuses_a_more_certain_user_side_target(
     stated = _item(t, u, "stated", origin="user_stated", confidence=0.9)
     _ = await store.write([stated])
     await _refuse_both(store, t, u, stated, above=0.5)
-    # 同一个错误也是 ``UserSideTargetError`` —— 现有的处理路径照样接得住。
-    assert issubclass(UserSideHigherConfidenceError, UserSideTargetError)
 
 
 @pytest.mark.asyncio
-async def test_lower_confidence_guard_rereads_the_locked_row(store: MemoryStore) -> None:
-    """读邻居时目标是 0.5(候选 0.6 放得过),判的那几秒里用户「更正」成 1.0:锁里按此刻的
-    置信度重判,拒。"""
+async def test_lower_confidence_guard_judges_the_targets_current_confidence(
+    store: MemoryStore,
+) -> None:
+    """存储按目标**此刻**的置信度判(这里写入时 0.5、调用前已被更正成 1.0),不按调用方早先
+    读到的值;「判的那几秒里被更正」的竞争由 orchestrator 的
+    ``test_target_made_more_certain_while_deciding_is_rechecked_under_the_lock`` 覆盖。"""
     t, u = uuid4(), uuid4()
     target = _item(t, u, "stated", origin="user_stated", confidence=0.5)
     _ = await store.write([target])
@@ -477,10 +480,10 @@ async def test_lower_confidence_guard_lets_equal_and_non_user_targets_through(
 
 
 @pytest.mark.asyncio
-async def test_lower_confidence_guard_on_a_summary_uses_its_row_confidence(
+async def test_lower_confidence_guard_on_a_summary_uses_its_user_side_members(
     store: MemoryStore,
 ) -> None:
-    """成员里有用户说的汇总行算用户一方;比的是汇总行自己的置信度(成员最小值,这里 0.5)。"""
+    """成员里有用户说的汇总行算用户一方;比的是成员里最高的用户一方置信度(这里 0.5)。"""
     t, u = uuid4(), uuid4()
     summary = await _summary(store, t, u, ["user_stated", None, None])
     assert summary.confidence == 0.5
@@ -488,6 +491,40 @@ async def test_lower_confidence_guard_on_a_summary_uses_its_row_confidence(
     assert await store.expire(
         tenant_id=t, user_id=u, memory_id=summary.id, refuse_user_side_above=0.5
     )
+
+
+@pytest.mark.asyncio
+async def test_lower_confidence_guard_keeps_a_correction_folded_into_a_summary(
+    store: MemoryStore,
+) -> None:
+    """审查(11-14)—— {用户更正 1.0, 未记录 0.5, 未记录 0.5} 汇成的汇总行自己是 0.5;按成员里最高的
+    用户一方置信度(1.0)比,0.6 乃至 0.99 的用户候选都改不动它,更正不会被抹掉。"""
+    t, u = uuid4(), uuid4()
+    summary = await _summary(store, t, u, ["corrected", None, None])
+    assert summary.confidence == 0.5
+    # 写回预判用的同一个口径(存储方法,读邻居之后、改库之前)。
+    assert await store.user_side_confidence(tenant_id=t, user_id=u, memory_id=summary.id) == 1.0
+    await _refuse_both(store, t, u, summary, above=0.6)
+    await _refuse_both(store, t, u, summary, above=0.99)
+
+
+@pytest.mark.asyncio
+async def test_user_side_confidence_fails_closed_past_the_depth_bound() -> None:
+    """嵌套汇总查到 ``MAX_SUMMARY_DEPTH`` 层还有没查的成员 → 按 1.0(与受保护判断同一个上限)。"""
+    t, u = uuid4(), uuid4()
+    chain = [_item(t, u, f"level {i}") for i in range(MAX_SUMMARY_DEPTH + 2)]
+    rows = {
+        row.id: row.model_copy(update={"consolidated_from": [chain[i + 1].id]})
+        for i, row in enumerate(chain[:-1])
+    }
+    rows[chain[-1].id] = chain[-1].model_copy(update={"origin": "user_stated"})
+
+    async def load(ids: Sequence[UUID]) -> list[MemoryItem]:
+        return [rows[i] for i in ids if i in rows]
+
+    top = rows[chain[0].id]
+    assert await user_side_confidence(top, load) == 1.0
+    assert await user_side_confidence(chain[-1].model_copy(update={"origin": None}), load) is None
 
 
 @pytest.mark.asyncio

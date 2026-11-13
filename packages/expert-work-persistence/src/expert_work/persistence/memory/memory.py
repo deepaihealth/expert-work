@@ -28,6 +28,7 @@ from expert_work.persistence.memory.base import (
     scan_memory_content,
     split_blocked,
     summary_fields,
+    user_side_confidence,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
@@ -478,6 +479,21 @@ class InMemoryMemoryStore(MemoryStore):
         if row is None:
             return False
         return await is_user_side_protected(row, self._member_loader(tenant_id, user_id))
+
+    async def user_side_confidence(
+        self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID
+    ) -> float | None:
+        row = next(
+            (
+                r
+                for r in self._rows
+                if r.id == memory_id and r.tenant_id == tenant_id and r.user_id == user_id
+            ),
+            None,
+        )
+        if row is None:
+            return None
+        return await user_side_confidence(row, self._member_loader(tenant_id, user_id))
 
     def _member_loader(self, tenant_id: UUID, user_id: UUID) -> MemberLoader:
         async def load(ids: Sequence[UUID]) -> list[MemoryItem]:
