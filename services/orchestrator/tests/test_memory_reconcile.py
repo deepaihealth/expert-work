@@ -119,7 +119,9 @@ async def test_update_supersedes_existing_memory() -> None:
     old = await _seed(store, tenant, user, "likes light roast")
     llm = _RecordingLLM(responses=[_extraction("likes dark roast"), _ops("UPDATE", old.id)])
     written = await _flush(store, llm, _MapEmbedder({"likes dark roast": _NEAR_EAST}), tenant, user)
-    assert written == 0  # nothing direct-written — applied via store.supersede
+    # B-300 D12 — applied via store.supersede (no direct write), and the row it
+    # wrote counts: "written" is the rows that actually landed.
+    assert written == 1
     assert len(llm.calls) == 2
     # The ops prompt carried the existing memory for the decision.
     assert str(old.id) in str(llm.calls[1][1].content)

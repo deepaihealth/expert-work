@@ -554,3 +554,84 @@ async def _seed_in(store: InMemoryMemoryStore, content: str, *, origin: MemoryOr
     )
     store._rows.append(item)
     return item
+
+
+# ---------------------------------------------------------------------------
+# D12 —— 「写了几条」含去重合并里取代出来的新行(真栈验收 §117.9:库里多了 3 行、计数报 1)
+# ---------------------------------------------------------------------------
+
+
+class _GoneTargetStore(InMemoryMemoryStore):
+    """``supersede`` 找不到目标(已被删 / 已被取代)时返回 ``None``、什么都不写。"""
+
+    async def supersede(self, **kwargs: Any) -> MemoryItem | None:
+        del kwargs
+        return None
+
+
+async def test_written_counts_reconciled_adds() -> None:
+    store = InMemoryMemoryStore()
+    await _seed(store, "old", origin=None)
+    llm = _LLM(user_reply=_reply({"kind": "fact", "content": "cand"}), ops_reply=_ops("ADD"))
+    written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
+    assert written == 1
+    assert set(await _live(store)) == {"old", "cand"}
+
+
+async def test_written_counts_the_row_a_supersede_wrote() -> None:
+    store = InMemoryMemoryStore()
+    target = await _seed(store, "old", origin=None)
+    llm = _LLM(
+        user_reply=_reply({"kind": "fact", "content": "cand"}), ops_reply=_ops("UPDATE", target.id)
+    )
+    written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
+    assert written == 1
+    rows = await _live(store)
+    assert set(rows) == {"cand"}
+    assert rows["cand"].supersedes == target.id
+
+
+async def test_supersede_that_wrote_nothing_counts_only_the_fallback_write() -> None:
+    store = _GoneTargetStore()
+    target = await _seed(store, "old", origin=None)
+    llm = _LLM(
+        user_reply=_reply({"kind": "fact", "content": "cand"}), ops_reply=_ops("UPDATE", target.id)
+    )
+    written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
+    # 取代没写成 → 候选退回直接写入,只算那一行。
+    assert written == 1
+    assert len(store._rows) == 2
+    rows = await _live(store)
+    assert set(rows) == {"old", "cand"}
+    assert rows["cand"].supersedes is None
+
+
+async def test_written_counts_superseded_and_added_rows_but_not_retractions() -> None:
+    store = InMemoryMemoryStore()
+    old1 = await _seed(store, "old1", origin=None)
+    old2 = await _seed(store, "old2", origin=None)
+    llm = _LLM(
+        user_reply=_reply(
+            {"kind": "fact", "content": "replaces old1"},
+            {"kind": "fact", "content": "retracts old2"},
+            {"kind": "fact", "content": "unrelated"},
+        ),
+        ops_reply=json.dumps(
+            {
+                "ops": [
+                    {"index": 0, "op": "UPDATE", "target_id": str(old1.id)},
+                    {"index": 1, "op": "DELETE", "target_id": str(old2.id)},
+                ]
+            }
+        ),
+    )
+    rows_before = len(store._rows)
+    written, _ = await _flush(
+        llm,
+        store,
+        _ReportingEmbedder({"replaces old1": _NEAR_EAST, "retracts old2": _NEAR_EAST}),
+        reconcile=True,
+    )
+    assert set(await _live(store)) == {"replaces old1", "unrelated"}
+    # 新增的行 = 取代出来的一行 + 直接写入的一行;作废(DELETE)不新增行。
+    assert written == len(store._rows) - rows_before == 2

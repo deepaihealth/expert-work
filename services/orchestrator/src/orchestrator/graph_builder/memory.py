@@ -1208,6 +1208,8 @@ class _BlockedWrite:
 class _Reconciled(NamedTuple):
     direct: list[MemoryItem]
     blocked: list[_BlockedWrite]
+    #: B-300 D12 —— 「更新」时 ``supersede`` 已经落库的新行数(不经 ``write``,要另算)。
+    superseded: int = 0
 
 
 async def _reconcile_and_apply(
@@ -1304,6 +1306,7 @@ async def _reconcile_and_apply(
 
     position = {item.id: idx for idx, item in enumerate(items)}
     blocked: list[_BlockedWrite] = []
+    superseded = 0
     for idx, (item, similar, is_corr) in enumerate(pending):
         op, target_raw = ops.get(idx, ("", None))
         valid = {str(n.id): n for n in similar}
@@ -1351,7 +1354,9 @@ async def _reconcile_and_apply(
                 direct.append(item)
                 continue
             record_memory_reconcile(op="update" if updated else "degraded")
-            if not updated:
+            if updated:
+                superseded += 1
+            else:
                 direct.append(item)
         elif op == "DELETE" and target is not None:
             try:
@@ -1375,7 +1380,7 @@ async def _reconcile_and_apply(
             # Missing / malformed decision — never lose the memory.
             record_memory_reconcile(op="degraded")
             direct.append(item)
-    return _Reconciled(direct, blocked)
+    return _Reconciled(direct, blocked, superseded)
 
 
 async def _apply_update(
@@ -1676,7 +1681,8 @@ async def flush_messages_with_outcome(
     调用方(评测脚本)显式声明「这几条消息整条都是用户文字」,不经 ``_build_human_message`` 的
     白名单标记。
 
-    B-300 D12 —— 返回的条数是实际落库的条数(与库里已有同内容的、被拦的都不算)。
+    B-300 D12 —— 返回的条数是实际落库的条数(与库里已有同内容的、被拦的都不算;去重合并里
+    「更新」由 ``supersede`` 取代出来的新行要算,「删除」只作废旧行、不算)。
     """
     extracted: list[ExtractedMemory] = []
     blocked: list[_BlockedWrite] = []
@@ -1739,7 +1745,7 @@ async def flush_messages_with_outcome(
         ]
         position = {item.id: idx for idx, item in enumerate(items)}
         if reconcile:
-            items, blocked = await _reconcile_and_apply(
+            items, blocked, written = await _reconcile_and_apply(
                 items,
                 corrections=[m.is_correction for m in extracted],
                 memory_store=memory_store,
@@ -1758,7 +1764,7 @@ async def flush_messages_with_outcome(
             blocked.extend(
                 _BlockedWrite(b, "writeback", position[b.item_id]) for b in result.blocked
             )
-            written = result.written
+            written += result.written
     except RunCancelledError:
         raise
     except Exception as exc:
