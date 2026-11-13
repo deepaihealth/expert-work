@@ -129,6 +129,20 @@ class MemoryStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def get_live(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        memory_id: UUID,
+    ) -> MemoryItem | None:
+        """B-300 D8 — one live memory by id, scoped like :meth:`update_content`.
+
+        Returns ``None`` for unknown id / wrong tenant / wrong user / already
+        soft-deleted — exactly the rows :meth:`update_content` would refuse, so
+        the console's write endpoints can 404 before they scan or re-embed."""
+
+    @abc.abstractmethod
     async def update_content(
         self,
         *,

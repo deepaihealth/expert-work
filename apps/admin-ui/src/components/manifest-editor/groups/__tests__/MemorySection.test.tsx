@@ -81,7 +81,7 @@ describe("MemorySection", () => {
     expect(rowFor("memory.long_term.write_back")).not.toBeInTheDocument();
   });
 
-  it("budget tab: no injection FieldRows while memory is off, consolidation FieldRow still there", () => {
+  it("budget tab: no injection FieldRows while memory is off", () => {
     renderSection(OFF_SEED);
     expect(
       rowFor("memory.long_term.injection_token_budget"),
@@ -89,9 +89,36 @@ describe("MemorySection", () => {
     expect(
       rowFor("memory.long_term.correction_token_budget"),
     ).not.toBeInTheDocument();
-    expect(
-      rowFor("policies.memory_consolidation.enabled"),
-    ).toBeInTheDocument();
+  });
+
+  // B-300 D9 — nothing reads the per-agent consolidation switch (the
+  // deployment setting alone decides), so the form must not offer it, nor
+  // name a model for it.
+  it.each([
+    ["on", ON_SEED],
+    ["off", OFF_SEED],
+  ])("offers no consolidation switch and names no model (memory %s)", (_, seed) => {
+    const { container } = renderSection(seed);
+    expect(rowFor("policies.memory_consolidation.enabled")).toBeNull();
+    expect(container.textContent ?? "").not.toMatch(/consolidation|memory_consolidation/i);
+    expect(container.textContent ?? "").not.toMatch(/claude-sonnet/i);
+  });
+
+  it("B-300 D9: a stored memory_consolidation block survives an unrelated edit", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const stored = { enabled: false, aux_model: { provider: "glm", name: "glm-4-flash" } };
+    renderSection(
+      {
+        spec: { memory: { long_term: {} }, policies: { memory_consolidation: stored } },
+      } as AgentManifest,
+      onChange,
+    );
+    await user.click(screen.getByRole("switch", { name: "Learn (remember new info)" }));
+    const last = onChange.mock.calls.at(-1)?.[0] as {
+      spec: { policies: Record<string, unknown> };
+    };
+    expect(last.spec.policies.memory_consolidation).toEqual(stored);
   });
 
   it("budget tab: injection FieldRows render once memory is on", () => {

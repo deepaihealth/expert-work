@@ -893,19 +893,22 @@ class Settings(BaseSettings):
     #: happens on hours-to-days, not weeks.
     memory_consolidator_interval_s: int = Field(default=14_400, gt=0)
 
-    #: Capability Uplift Sprint #7 (Mini-ADR U-39) — default aux model
-    #: name used when an agent's manifest leaves
-    #: ``policies.memory_consolidation.aux_model`` unset. Sonnet rather
-    #: than Haiku because the anti-mislearn classification benefits from
-    #: a stronger model; this is a cold path so the cost premium is
-    #: bounded.
+    #: Capability Uplift Sprint #7 (Mini-ADR U-39) — the model the memory
+    #: consolidator uses, for every agent. This deployment setting is the
+    #: only source: an agent manifest's ``policies.memory_consolidation``
+    #: (``enabled`` / ``aux_model``) is deprecated and has no effect (B-300
+    #: D9). Deployments set it via
+    #: ``EXPERT_WORK_MEMORY_CONSOLIDATOR_DEFAULT_AUX_MODEL``; the code default
+    #: only applies when that is unset. A stronger model because the anti-mislearn
+    #: classification benefits from it; this is a cold path so the cost
+    #: premium is bounded.
     memory_consolidator_default_aux_model: str = "claude-sonnet-4-6"
 
-    #: Stream O — default provider for the consolidator's aux model when
-    #: the manifest leaves ``policies.memory_consolidation.aux_model``
-    #: unset. The :class:`LLMRouterAuxModelAdapter` uses this to build
-    #: a single-provider :class:`LLMRouter` with the appropriate
-    #: credential resolved via :class:`CredentialsResolver`.
+    #: Stream O — provider for the consolidator's model above (same rule: the
+    #: deployment setting only, never the agent manifest). The
+    #: :class:`LLMRouterAuxModelAdapter` uses this to build a single-provider
+    #: :class:`LLMRouter` with the appropriate credential resolved via
+    #: :class:`CredentialsResolver`.
     memory_consolidator_default_aux_provider: Provider = "anthropic"
 
     # ----------------------------------------------- credentials catalog (Stream O)

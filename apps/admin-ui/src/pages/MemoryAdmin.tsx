@@ -156,6 +156,16 @@ export function MemoryAdmin() {
     [editing, editBuf],
   );
 
+  // B-300 D8 — writes name the row's owner (and, off the home scope, the
+  // row's tenant) so an admin edits / forgets that person's memory instead of
+  // missing on their own. "Correct" is the owner's own assertion
+  // (confidence 1.0), so it is offered on the caller's own rows only.
+  const rowTenant = useCallback(
+    (item: MemoryItem) => (apiTenantScope === undefined ? undefined : item.tenant_id),
+    [apiTenantScope],
+  );
+  const callerUserId = data?.caller_user_id ?? null;
+
   const onSave = useCallback(async () => {
     if (editing === null) return;
     if (editBuf.trim().length === 0) {
@@ -168,7 +178,12 @@ export function MemoryAdmin() {
         await correctMemory(editing.id, { action: "rewrite", content: editBuf });
         message.success(t("memory.corrected"));
       } else {
-        await updateMemory(editing.id, { content: editBuf });
+        await updateMemory(
+          editing.id,
+          { content: editBuf },
+          editing.user_id,
+          rowTenant(editing),
+        );
         message.success(t("memory.updated"));
       }
       setEditing(null);
@@ -181,17 +196,17 @@ export function MemoryAdmin() {
     } finally {
       setSubmitting(false);
     }
-  }, [editing, editBuf, mode, message, refresh, t]);
+  }, [editing, editBuf, mode, message, refresh, rowTenant, t]);
 
-  const onDelete = useCallback(async (id: string) => {
+  const onDelete = useCallback(async (item: MemoryItem) => {
     try {
-      await deleteMemory(id);
+      await deleteMemory(item.id, item.user_id, rowTenant(item));
       message.success(t("memory.deleted"));
       refresh();
     } catch (err) {
       message.error(err instanceof Error ? err.message : "failed");
     }
-  }, [message, refresh, t]);
+  }, [message, refresh, rowTenant, t]);
 
   const filteredItems = useMemo(() => {
     const all = data?.items ?? [];
@@ -266,20 +281,22 @@ export function MemoryAdmin() {
           <Button size="small" onClick={() => openEdit(record)} data-testid={`memory-edit-${record.id}`}>
             {t("common.edit")}
           </Button>
-          <Button
-            size="small"
-            onClick={() => openCorrect(record)}
-            data-testid={`memory-correct-${record.id}`}
-          >
-            {t("memory.correct")}
-          </Button>
+          {callerUserId !== null && record.user_id === callerUserId && (
+            <Button
+              size="small"
+              onClick={() => openCorrect(record)}
+              data-testid={`memory-correct-${record.id}`}
+            >
+              {t("memory.correct")}
+            </Button>
+          )}
           <Popconfirm
             title={t("memory.delete_confirm_title")}
             description={t("memory.delete_confirm_body")}
             okType="danger"
             okText={t("common.delete")}
             cancelText={t("common.cancel")}
-            onConfirm={() => onDelete(record.id)}
+            onConfirm={() => onDelete(record)}
           >
             <Button size="small" danger icon={<Trash2 size={12} strokeWidth={1.75} />} data-testid={`memory-delete-${record.id}`}>
               {t("common.delete")}
@@ -288,7 +305,7 @@ export function MemoryAdmin() {
         </Space>
       ),
     },
-  ], [t, openEdit, openCorrect, onDelete]);
+  ], [t, openEdit, openCorrect, onDelete, callerUserId]);
 
   const isCrossTenant = data?.cross_tenant ?? false;
 

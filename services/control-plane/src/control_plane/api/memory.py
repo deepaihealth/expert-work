@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NamedTuple
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -41,8 +41,10 @@ from control_plane.audit import emit
 from control_plane.auth.rbac import is_admin
 from control_plane.tenant_scope import (
     CrossTenant,
+    SingleTenant,
     applied_scope,
     cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
     ensure_tenant_scope,
 )
 from control_plane.uplift.threat_metrics import (
@@ -172,21 +174,30 @@ async def _require_caller_user(request: Request, users: TenantUserStore) -> tupl
     return principal.tenant_id, user_id
 
 
+class _TargetUser(NamedTuple):
+    """Who a memory call acts on, and who is asking (both in the caller's
+    home tenant's user registry)."""
+
+    user_id: UUID
+    caller_user_id: UUID
+    #: True when an admin acts on a different user — drives the audit
+    #: ``target_user_id`` so the governance action is attributable.
+    cross_user: bool
+
+
 async def _resolve_target_user(
     request: Request, users: TenantUserStore, *, requested: UUID | None
-) -> tuple[UUID, UUID, bool]:
-    """Resolve ``(tenant_id, target_user_id, is_cross_user)`` for a mutating call.
+) -> _TargetUser:
+    """Resolve the target user for a per-user call.
 
     Phase 2 — the user-detail Memory tab lets a tenant admin edit / forget
     another member's memory. Machine principal → 403 (memory is per-user);
     ``requested`` None or the caller's own id → the caller; a tenant admin may
     target another member; anyone else asking for someone else is 403.
-    ``is_cross_user`` is True when an admin acts on a different user — it drives
-    the audit ``target_user_id`` so the governance action is attributable.
     """
-    tenant_id, caller_user_id = await _require_caller_user(request, users)
+    _, caller_user_id = await _require_caller_user(request, users)
     if requested is None or requested == caller_user_id:
-        return tenant_id, caller_user_id, False
+        return _TargetUser(caller_user_id, caller_user_id, False)
     if not is_admin(request.state.principal):
         raise HTTPException(
             status_code=403,
@@ -195,7 +206,64 @@ async def _resolve_target_user(
                 "message": "only tenant admins may act on another user's memories",
             },
         )
-    return tenant_id, requested, True
+    return _TargetUser(requested, caller_user_id, True)
+
+
+async def _resolve_write_target(
+    request: Request,
+    users: TenantUserStore,
+    audit: AuditLogger,
+    *,
+    requested_user: UUID | None,
+    requested_tenant: UUID | None,
+    endpoint: str,
+) -> tuple[SingleTenant, _TargetUser]:
+    """B-300 D8 — the tenant + user an edit / forget acts on.
+
+    The console's non-home views show rows from other tenants, so a write may
+    name the row's tenant. It resolves like ``GET`` does, through
+    ``ensure_single_tenant_scope`` (``allowed_tenants``, the tenant-switch
+    audit, the deployment's cross-tenant switch; ``*`` is a read aggregate and
+    is refused for a write). On top of that, writing into a tenant other than
+    the caller's home one needs a platform admin: the caller's admin role
+    belongs to their home tenant, and ``allowed_tenants`` only grants reading
+    elsewhere. Naming another tenant requires naming the user too: the
+    caller's own user lives in their home tenant. Omitting the tenant keeps
+    today's meaning — the caller's home tenant.
+    """
+    principal: Principal = request.state.principal
+    if (
+        requested_tenant is not None
+        and requested_tenant != principal.tenant_id
+        and requested_user is None
+    ):
+        # Before resolution: no tenant-switch audit for a request that can
+        # never succeed.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "TARGET_USER_REQUIRED",
+                "message": "a write into another tenant must name the target user_id",
+            },
+        )
+    scope = await ensure_single_tenant_scope(
+        principal,
+        requested_tenant,
+        audit,
+        trace_id=current_trace_id_hex(),
+        endpoint=endpoint,
+        cross_tenant_enabled=cross_tenant_query_enabled(request),
+    )
+    if scope.tenant_id != principal.tenant_id and not principal.is_system_admin:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "PLATFORM_ADMIN_REQUIRED",
+                "message": "only a platform admin may change memories in another tenant",
+            },
+        )
+    target = await _resolve_target_user(request, users, requested=requested_user)
+    return scope, target
 
 
 def build_memory_router() -> APIRouter:
@@ -228,6 +296,11 @@ def build_memory_router() -> APIRouter:
             endpoint="GET /v1/memory",
             cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
+        # B-300 D8 — the list page offers "correct" only on the caller's own
+        # rows, and the console identity is the login subject, not the memory
+        # user id. None where the caller can have no rows: the cross-tenant
+        # aggregate, or a tenant other than their home one.
+        caller_user_id: UUID | None = None
         async with applied_scope(scope):
             if isinstance(scope, CrossTenant):
                 # Platform-admin view aggregates every user's memories
@@ -238,9 +311,10 @@ def build_memory_router() -> APIRouter:
                 # Single-tenant: keep the per-user enforcement. A tenant admin
                 # may read another member's memory (the user-detail Memory tab);
                 # anyone else asking for someone else is a 403.
-                _, target_user_id, cross_user = await _resolve_target_user(
-                    request, users, requested=user_id
-                )
+                target = await _resolve_target_user(request, users, requested=user_id)
+                target_user_id, cross_user = target.user_id, target.cross_user
+                if scope.tenant_id == principal.tenant_id:
+                    caller_user_id = target.caller_user_id
                 items = await store.list_for_user(
                     tenant_id=scope.tenant_id,
                     user_id=target_user_id,
@@ -266,6 +340,7 @@ def build_memory_router() -> APIRouter:
                 "items": [_serialise(i) for i in items],
                 "total": len(items),
                 "cross_tenant": isinstance(scope, CrossTenant),
+                "caller_user_id": None if caller_user_id is None else str(caller_user_id),
             },
             "error": None,
         }
@@ -282,64 +357,82 @@ def build_memory_router() -> APIRouter:
         # Phase 2 — a tenant admin edits another member's memory (user-detail
         # Memory tab). Omitted / own id → the caller; non-admin → 403.
         user_id: Annotated[UUID | None, Query()] = None,
+        # B-300 D8 — the row's tenant, from the list page's cross-tenant view.
+        # Omitted → the caller's home tenant.
+        tenant_id: Annotated[UUID | None, Query()] = None,
     ) -> dict[str, Any]:
-        tenant_id, target_user_id, cross_user = await _resolve_target_user(
-            request, users, requested=user_id
-        )
-        # Capability Uplift Sprint #2 — strict scan BEFORE embedder so
-        # poisoned content doesn't cost an OpenAI call.
-        await _scan_memory_strict(
-            content=payload.content,
-            memory_id=memory_id,
-            tenant_id=tenant_id,
-            actor_id=principal.subject_id,
-            audit=audit,
-        )
-        # Stream T (PR B) — the embedder is always a ``DynamicResolvingEmbedder``
-        # object now; it resolves the live platform embedding config at call time
-        # and raises ``AgentFactoryError`` when embedding is unconfigured.
-        # Re-embedding is required to keep recall ranking honest; without it the
-        # row would carry a vector for the old content and silently mis-rank.
-        # Catch the unconfigured failure and surface the same typed 503 as before.
-        embedder = request.app.state.embedder
-        try:
-            vectors = await embedder.embed([payload.content], tenant_id=tenant_id)
-        except AgentFactoryError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "code": "EMBEDDER_UNCONFIGURED",
-                    "message": (
-                        "memory PATCH requires an embedder — set "
-                        "EXPERT_WORK_EMBEDDING_API_KEY_REF + "
-                        "EXPERT_WORK_EMBEDDING_MODEL"
-                    ),
-                },
-            ) from exc
-
-        updated = await store.update_content(
-            tenant_id=tenant_id,
-            user_id=target_user_id,
-            memory_id=memory_id,
-            content=payload.content,
-            embedding=vectors[0],
-            kind=payload.kind,
-        )
-        if updated is None:
-            raise HTTPException(status_code=404, detail="memory not found")
-        details: dict[str, Any] = {"kind": updated.kind, "content_len": len(payload.content)}
-        if cross_user:
-            details["target_user_id"] = str(target_user_id)
-        await emit(
+        scope, target = await _resolve_write_target(
+            request,
+            users,
             audit,
-            tenant_id=tenant_id,
-            actor_id=principal.subject_id,
-            action=AuditAction.MEMORY_UPDATE,
-            resource_type="memory_item",
-            resource_id=str(memory_id),
-            trace_id=current_trace_id_hex(),
-            details=details,
+            requested_user=user_id,
+            requested_tenant=tenant_id,
+            endpoint="PATCH /v1/memory/{memory_id}",
         )
+        target_tenant_id = scope.tenant_id
+        async with applied_scope(scope):
+            # B-300 D8 — find the row first: a 404 must not cost a strict-scan
+            # audit row or an embedding call for content that is never stored.
+            existing = await store.get_live(
+                tenant_id=target_tenant_id, user_id=target.user_id, memory_id=memory_id
+            )
+            if existing is None:
+                raise HTTPException(status_code=404, detail="memory not found")
+            # Capability Uplift Sprint #2 — strict scan BEFORE embedder so
+            # poisoned content doesn't cost an OpenAI call.
+            await _scan_memory_strict(
+                content=payload.content,
+                memory_id=memory_id,
+                tenant_id=target_tenant_id,
+                actor_id=principal.subject_id,
+                audit=audit,
+            )
+            # Stream T (PR B) — the embedder is always a ``DynamicResolvingEmbedder``
+            # object now; it resolves the live platform embedding config at call time
+            # and raises ``AgentFactoryError`` when embedding is unconfigured.
+            # Re-embedding is required to keep recall ranking honest; without it the
+            # row would carry a vector for the old content and silently mis-rank.
+            # Catch the unconfigured failure and surface the same typed 503 as before.
+            embedder = request.app.state.embedder
+            try:
+                vectors = await embedder.embed([payload.content], tenant_id=target_tenant_id)
+            except AgentFactoryError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "EMBEDDER_UNCONFIGURED",
+                        "message": (
+                            "memory PATCH requires an embedder — set "
+                            "EXPERT_WORK_EMBEDDING_API_KEY_REF + "
+                            "EXPERT_WORK_EMBEDDING_MODEL"
+                        ),
+                    },
+                ) from exc
+
+            updated = await store.update_content(
+                tenant_id=target_tenant_id,
+                user_id=target.user_id,
+                memory_id=memory_id,
+                content=payload.content,
+                embedding=vectors[0],
+                kind=payload.kind,
+            )
+            # Still possible: forgotten between the lookup and the write.
+            if updated is None:
+                raise HTTPException(status_code=404, detail="memory not found")
+            details: dict[str, Any] = {"kind": updated.kind, "content_len": len(payload.content)}
+            if target.cross_user:
+                details["target_user_id"] = str(target.user_id)
+            await emit(
+                audit,
+                tenant_id=target_tenant_id,
+                actor_id=principal.subject_id,
+                action=AuditAction.MEMORY_UPDATE,
+                resource_type="memory_item",
+                resource_id=str(memory_id),
+                trace_id=current_trace_id_hex(),
+                details=details,
+            )
         return {"success": True, "data": _serialise(updated), "error": None}
 
     @router.delete("/{memory_id}", status_code=204)
@@ -353,25 +446,34 @@ def build_memory_router() -> APIRouter:
         # Phase 2 — a tenant admin forgets another member's memory (user-detail
         # Memory tab). Omitted / own id → the caller; non-admin → 403.
         user_id: Annotated[UUID | None, Query()] = None,
+        # B-300 D8 — the row's tenant, from the list page's cross-tenant view.
+        # Omitted → the caller's home tenant.
+        tenant_id: Annotated[UUID | None, Query()] = None,
     ) -> None:
-        tenant_id, target_user_id, cross_user = await _resolve_target_user(
-            request, users, requested=user_id
-        )
-        ok = await store.soft_delete(
-            tenant_id=tenant_id, user_id=target_user_id, memory_id=memory_id
-        )
-        if not ok:
-            raise HTTPException(status_code=404, detail="memory not found")
-        await emit(
+        scope, target = await _resolve_write_target(
+            request,
+            users,
             audit,
-            tenant_id=tenant_id,
-            actor_id=principal.subject_id,
-            action=AuditAction.MEMORY_FORGET,
-            resource_type="memory_item",
-            resource_id=str(memory_id),
-            trace_id=current_trace_id_hex(),
-            details={"target_user_id": str(target_user_id)} if cross_user else None,
+            requested_user=user_id,
+            requested_tenant=tenant_id,
+            endpoint="DELETE /v1/memory/{memory_id}",
         )
+        async with applied_scope(scope):
+            ok = await store.soft_delete(
+                tenant_id=scope.tenant_id, user_id=target.user_id, memory_id=memory_id
+            )
+            if not ok:
+                raise HTTPException(status_code=404, detail="memory not found")
+            await emit(
+                audit,
+                tenant_id=scope.tenant_id,
+                actor_id=principal.subject_id,
+                action=AuditAction.MEMORY_FORGET,
+                resource_type="memory_item",
+                resource_id=str(memory_id),
+                trace_id=current_trace_id_hex(),
+                details={"target_user_id": str(target.user_id)} if target.cross_user else None,
+            )
 
     @router.post("/{memory_id}/correct")
     async def correct_memory(
@@ -418,6 +520,10 @@ def build_memory_router() -> APIRouter:
                     "message": "rewrite corrections require non-empty content",
                 },
             )
+        # B-300 D8 — find the row first (same reason as PATCH). Corrections stay
+        # self-only: a ``user_id`` / ``tenant_id`` on the query is not read here.
+        if await store.get_live(tenant_id=tenant_id, user_id=user_id, memory_id=memory_id) is None:
+            raise HTTPException(status_code=404, detail="memory not found")
         await _scan_memory_strict(
             content=content,
             memory_id=memory_id,

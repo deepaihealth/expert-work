@@ -8,10 +8,10 @@
  * Monaco is stubbed (same approach as ApprovalCard + EvalDatasetsPanel)
  * so JSON edits flow through ``onChange`` synchronously.
  */
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "antd";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "../../i18n";
 
@@ -223,7 +223,13 @@ describe("MemoryAdmin", () => {
         match: (u, m) => u.startsWith("/v1/memory") && m === "get",
         respond: () => ({
           success: true,
-          data: { items: [memRow], total: 1, cross_tenant: false },
+          data: {
+            items: [memRow],
+            total: 1,
+            cross_tenant: false,
+            // The caller's own row — "correct" is only offered there (B-300 D8).
+            caller_user_id: memRow.user_id,
+          },
           error: null,
         }),
       },
@@ -254,6 +260,162 @@ describe("MemoryAdmin", () => {
     await waitFor(() =>
       expect(correctBody).toEqual({ action: "rewrite", content: "fixed" }),
     );
+  });
+});
+
+// ─── B-300 D8 写别人那一行 ───────────────────────────────────────────
+
+interface SentWrite {
+  method: string;
+  url: string;
+  params: Record<string, unknown>;
+}
+
+/** Answers the list (and ``/v1/me``) and records every write's query params.
+ *  With ``me`` given (the system_admin case) only the ``tenant_id=*`` list
+ *  answers ``listData``; the interim home-scope list is empty, so the page is
+ *  settled once the cross-tenant banner shows. */
+function installWriteRecorder(
+  listData: Record<string, unknown>,
+  me?: Record<string, unknown>,
+): SentWrite[] {
+  const sent: SentWrite[] = [];
+  apiClient.defaults.adapter = (config) => {
+    const url = config.url ?? "";
+    const method = (config.method ?? "get").toLowerCase();
+    let data: unknown = {};
+    if (url === "/v1/me" && me !== undefined) {
+      data = { success: true, data: me, error: null };
+    } else if (url.startsWith("/v1/memory") && method === "get") {
+      const allTenants = (config.params ?? {}).tenant_id === "*";
+      data =
+        me !== undefined && !allTenants
+          ? {
+              success: true,
+              data: { items: [], total: 0, cross_tenant: false, caller_user_id: null },
+              error: null,
+            }
+          : { success: true, data: listData, error: null };
+    } else if (url.startsWith("/v1/memory/")) {
+      sent.push({ method, url, params: { ...(config.params ?? {}) } });
+      data = { success: true, data: { ...memRow, content: "edited" }, error: null };
+    }
+    return Promise.resolve({
+      data,
+      status: 200,
+      statusText: "OK",
+      headers: {},
+      config,
+      request: {},
+    });
+  };
+  return sent;
+}
+
+const ownRow = { ...memRow, id: "m-own", user_id: "user-admin-self-uuid" };
+
+async function editAndSave(user: ReturnType<typeof userEvent.setup>, id: string) {
+  await user.click(screen.getByTestId(`memory-edit-${id}`));
+  fireEvent.change(await screen.findByTestId("memory-content-editor"), {
+    target: { value: "edited" },
+  });
+  await user.click(screen.getByTestId("memory-save-btn"));
+}
+
+async function deleteRow(user: ReturnType<typeof userEvent.setup>, id: string) {
+  await user.click(screen.getByTestId(`memory-delete-${id}`));
+  const confirm = await screen.findByRole("tooltip");
+  await user.click(within(confirm).getByRole("button", { name: "Delete" }));
+}
+
+describe("MemoryAdmin — writes on another user's row (B-300 D8)", () => {
+  afterEach(() => {
+    window.sessionStorage.clear();
+  });
+
+  it("edit sends the row's user id (home view, no tenant id)", async () => {
+    const sent = installWriteRecorder({
+      items: [memRow],
+      total: 1,
+      cross_tenant: false,
+      caller_user_id: ownRow.user_id,
+    });
+    const user = userEvent.setup();
+    renderMemory();
+    await screen.findByText(/User prefers/);
+    await editAndSave(user, memRow.id);
+    await waitFor(() => expect(sent).toHaveLength(1));
+    expect(sent[0]).toEqual({
+      method: "patch",
+      url: "/v1/memory/m1",
+      params: { user_id: memRow.user_id },
+    });
+  });
+
+  it("delete sends the row's user id (home view, no tenant id)", async () => {
+    const sent = installWriteRecorder({
+      items: [memRow],
+      total: 1,
+      cross_tenant: false,
+      caller_user_id: ownRow.user_id,
+    });
+    const user = userEvent.setup();
+    renderMemory();
+    await screen.findByText(/User prefers/);
+    await deleteRow(user, memRow.id);
+    await waitFor(() => expect(sent).toHaveLength(1));
+    expect(sent[0].method).toBe("delete");
+    expect(sent[0].params.user_id).toBe(memRow.user_id);
+    expect(sent[0].params.tenant_id).toBeUndefined();
+  });
+
+  it("offers Correct only on the caller's own row", async () => {
+    installWriteRecorder({
+      items: [memRow, ownRow],
+      total: 2,
+      cross_tenant: false,
+      caller_user_id: ownRow.user_id,
+    });
+    renderMemory();
+    await waitFor(() =>
+      expect(screen.getByTestId(`memory-edit-${ownRow.id}`)).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId(`memory-correct-${ownRow.id}`)).toBeInTheDocument();
+    expect(screen.queryByTestId(`memory-correct-${memRow.id}`)).toBeNull();
+    // Edit / delete stay available on someone else's row.
+    expect(screen.getByTestId(`memory-edit-${memRow.id}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`memory-delete-${memRow.id}`)).toBeInTheDocument();
+  });
+
+  it("cross-tenant view: edit and delete carry the row's tenant and user; no Correct", async () => {
+    window.sessionStorage.setItem("expert_work.admin.tenantScope", "*");
+    const otherTenantRow = { ...memRow, tenant_id: "t-other" };
+    const sent = installWriteRecorder(
+      { items: [otherTenantRow], total: 1, cross_tenant: true, caller_user_id: null },
+      {
+        subject_id: "u1",
+        subject_type: "user",
+        tenant_id: "t1",
+        email: null,
+        auth_method: "jwt",
+        roles: ["system_admin"],
+        scopes: [],
+        is_system_admin: true,
+        home_is_platform: false,
+      },
+    );
+    const user = userEvent.setup();
+    renderMemoryAsSystemAdmin();
+    await screen.findByTestId("memory-cross-banner");
+    expect(screen.queryByTestId(`memory-correct-${memRow.id}`)).toBeNull();
+    await editAndSave(user, memRow.id);
+    await waitFor(() => expect(sent).toHaveLength(1));
+    await deleteRow(user, memRow.id);
+    await waitFor(() => expect(sent).toHaveLength(2));
+    for (const write of sent) {
+      expect(write.params).toEqual({ user_id: memRow.user_id, tenant_id: "t-other" });
+    }
+    expect(sent.map((w) => w.method)).toEqual(["patch", "delete"]);
   });
 });
 

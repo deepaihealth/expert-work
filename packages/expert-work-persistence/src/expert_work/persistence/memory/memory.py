@@ -272,6 +272,25 @@ class InMemoryMemoryStore(MemoryStore):
         )
         return candidates[:limit]
 
+    async def get_live(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        memory_id: UUID,
+    ) -> MemoryItem | None:
+        return next(
+            (
+                row
+                for row in self._rows
+                if row.id == memory_id
+                and row.tenant_id == tenant_id
+                and row.user_id == user_id
+                and row.deleted_at is None
+            ),
+            None,
+        )
+
     async def update_content(
         self,
         *,

@@ -19,12 +19,12 @@
  *   the "basic" tab, so there's no path to these controls while memory is
  *   off in the first place; disabling the tab nav (rather than hiding each
  *   row) is enough.
- * - **budget** — the two curated panels from before (injection budgets,
- *   background consolidation), unchanged: injection budgets only render
- *   while memory is on (a budget over an absent ``long_term`` block is
- *   meaningless — same reasoning as ``top_k``/``write_back`` below);
- *   consolidation is a control-plane job independent of memory on/off, so it
- *   (and its aux-model note) always renders.
+ * - **budget** — the injection budgets panel. It only renders while memory
+ *   is on (a budget over an absent ``long_term`` block is meaningless — same
+ *   reasoning as ``top_k``/``write_back`` below), so the tab is disabled while
+ *   memory is off. The background-consolidation switch that used to sit here
+ *   is gone (B-300 D9): nothing read it — the deployment setting alone
+ *   decides — so it was a control with no effect.
  *
  * Every tab's ``children`` is ``forceRender: true`` so all three panes stay
  * mounted regardless of which is active — tests can query any tab's fields
@@ -49,10 +49,8 @@ import { ModelSelect } from "../widgets/ModelSelect";
 import { PolicyFieldList, type FieldDef } from "./field_defs";
 import {
   defaultMemoryModel,
-  patchConsolidation,
   patchMemoryBudgets,
   readAbstainThreshold,
-  readConsolidation,
   readMemoryBudgets,
   readMemoryModel,
   readMemoryOn,
@@ -74,7 +72,6 @@ import {
   setVerifyReads,
   setWriteBack,
   setWriteMinImportance,
-  type ConsolidationFields,
   type MemoryBudgetFields,
 } from "../form_model";
 
@@ -113,17 +110,10 @@ const BUDGET_DEFS: readonly FieldDef[] = [
   },
 ];
 
-// ② policies.memory_consolidation.enabled — the background consolidator's
-// per-agent master switch. Unchanged by Task 2.
-const CONSOLIDATION_DEFS: readonly FieldDef[] = [
-  {
-    fieldId: "policies.memory_consolidation.enabled",
-    i18nKey: "memory_group.consolidation",
-    valueKey: "consolidationEnabled",
-    kind: "switch",
-    effectiveDefault: true,
-  },
-];
+// B-300 D9 — no per-agent consolidation switch here: nothing reads
+// ``policies.memory_consolidation`` (the deployment setting alone decides),
+// so offering it would be a control with no effect. Stored values are left
+// untouched in the manifest.
 
 export function MemorySection({
   formData,
@@ -176,18 +166,9 @@ export function MemorySection({
     string,
     number | undefined
   >;
-  const consolidationValues = readConsolidation(formData) as Record<
-    string,
-    boolean | undefined
-  >;
 
   const handleBudgetPatch = (patch: Partial<MemoryBudgetFields>): void => {
     onChange(patchMemoryBudgets(formData, patch));
-  };
-  const handleConsolidationPatch = (
-    patch: Partial<ConsolidationFields>,
-  ): void => {
-    onChange(patchConsolidation(formData, patch));
   };
 
   const topK = readTopK(formData) ?? 5;
@@ -453,13 +434,16 @@ export function MemorySection({
           {
             key: "budget",
             label: t("memory_group.tab_budget"),
+            // Only the injection budgets live here now (B-300 D9), and they
+            // need memory on — same gating as the retrieval tab.
+            disabled: !memoryOn,
             forceRender: true,
             children: (
               <div data-testid="memory-tab-budget">
                 <Collapse
                   defaultActiveKey={[]}
-                  items={[
-                    ...(memoryOn
+                  items={
+                    memoryOn
                       ? [
                           {
                             key: "injection",
@@ -474,28 +458,8 @@ export function MemorySection({
                             ),
                           },
                         ]
-                      : []),
-                    {
-                      key: "consolidation",
-                      label: t("memory_group.panel_consolidation"),
-                      forceRender: true,
-                      children: (
-                        <>
-                          <PolicyFieldList
-                            defs={CONSOLIDATION_DEFS}
-                            values={consolidationValues}
-                            onPatch={handleConsolidationPatch}
-                          />
-                          <Text
-                            type="secondary"
-                            style={{ display: "block", marginTop: 8 }}
-                          >
-                            {t("memory_group.aux_model_note")}
-                          </Text>
-                        </>
-                      ),
-                    },
-                  ]}
+                      : []
+                  }
                 />
               </div>
             ),
