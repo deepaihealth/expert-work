@@ -14,9 +14,15 @@ from expert_work.common.search.decay import (
     temporal_decay_factor,
 )
 from expert_work.common.search.rrf import rrf_fuse_scored
-from expert_work.common.threat_patterns import ThreatFinding, scan_for_threats
 from expert_work.persistence.knowledge.text_search import tokenize_for_search
-from expert_work.persistence.memory.base import MemoryInjectionBlockedError, MemoryStore
+from expert_work.persistence.memory.base import (
+    ConsolidationSourcesChangedError,
+    MemoryInjectionBlockedError,
+    MemoryStore,
+    MemoryWriteResult,
+    scan_memory_content,
+    split_blocked,
+)
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
 
@@ -85,19 +91,30 @@ def _cosine_distance(a: Sequence[float], b: Sequence[float]) -> float:
     return 1.0 - dot / (norm_a * norm_b)
 
 
+def _currently_valid(row: MemoryItem, *, now: datetime) -> bool:
+    """B-300 D1 — the current-time visibility ``retrieve`` applies (mirrors the
+    SQL store's ``_retrieve_filter(None)``): not archived, not folded into a
+    summary, not superseded, not expired."""
+    return (
+        row.status != "archived"
+        and (row.status == "consolidated" or row.consolidated_into is None)
+        and row.invalid_at is None
+        and (row.expired_at is None or row.expired_at > now)
+    )
+
+
 class InMemoryMemoryStore(MemoryStore):
     def __init__(self) -> None:
         self._rows: list[MemoryItem] = []
+        #: B-300 D4 — tenant → last swept user.
+        self._consolidation_cursors: dict[UUID, UUID] = {}
+        #: B-300 — (tenant, user, member hash) → (reason, rejected_at).
+        self._rejected_clusters: dict[tuple[UUID, UUID, str], tuple[str, datetime]] = {}
 
-    async def write(self, items: Sequence[MemoryItem]) -> None:
-        # Capability Uplift Sprint #2 (Mini-ADR U-3) — atomic strict scan.
-        blocked: list[tuple[object, list[ThreatFinding]]] = []
-        for item in items:
-            findings = scan_for_threats(item.content, scope="strict")
-            if findings:
-                blocked.append((item.id, findings))
-        if blocked:
-            raise MemoryInjectionBlockedError(blocked)  # type: ignore[arg-type]
+    async def write(self, items: Sequence[MemoryItem]) -> MemoryWriteResult:
+        # B-300 D2 — strict scan per item: blocked ones are dropped on their own
+        # and handed back; the rest of the batch is written.
+        items, blocked = split_blocked(items)
         # Stream P5b-2c T1 — mirrors SqlMemoryStore.write()'s func.now()
         # fallback (sql.py:175/181) so an in-memory item written without
         # explicit timestamps doesn't diverge from SQL (never "due" for
@@ -133,6 +150,7 @@ class InMemoryMemoryStore(MemoryStore):
                     }
                 )
             )
+        return MemoryWriteResult(blocked=tuple(blocked))
 
     async def retrieve(
         self,
@@ -360,6 +378,9 @@ class InMemoryMemoryStore(MemoryStore):
         old_id: UUID,
         new_item: MemoryItem,
     ) -> MemoryItem | None:
+        hit = scan_memory_content(new_item.id, new_item.content)
+        if hit is not None:
+            raise MemoryInjectionBlockedError([hit])
         now = datetime.now(UTC)
         idx = next(
             (
@@ -440,12 +461,47 @@ class InMemoryMemoryStore(MemoryStore):
                 seen.add(row.tenant_id)
         return sorted(seen)
 
-    async def distinct_users(self, *, tenant_id: UUID) -> list[UUID]:
+    async def distinct_users(
+        self, *, tenant_id: UUID, after: UUID | None = None, limit: int | None = None
+    ) -> list[UUID]:
         seen: set[UUID] = set()
         for row in self._rows:
             if row.tenant_id == tenant_id and row.deleted_at is None and row.status == "transient":
                 seen.add(row.user_id)
-        return sorted(seen)
+        ordered = sorted(u for u in seen if after is None or u > after)
+        return ordered if limit is None else ordered[:limit]
+
+    async def get_consolidation_cursor(self, *, tenant_id: UUID) -> UUID | None:
+        return self._consolidation_cursors.get(tenant_id)
+
+    async def set_consolidation_cursor(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        self._consolidation_cursors[tenant_id] = user_id
+
+    async def list_rejected_clusters(self, *, tenant_id: UUID, user_id: UUID) -> set[str]:
+        return {h for (t, u, h) in self._rejected_clusters if (t, u) == (tenant_id, user_id)}
+
+    async def record_rejected_cluster(
+        self, *, tenant_id: UUID, user_id: UUID, member_hash: str, reason: str
+    ) -> None:
+        self._rejected_clusters[(tenant_id, user_id, member_hash)] = (reason, datetime.now(UTC))
+
+    async def prune_rejected_clusters(
+        self, *, tenant_id: UUID, user_id: UUID, before: datetime
+    ) -> int:
+        doomed = [
+            key
+            for key, (_reason, at) in self._rejected_clusters.items()
+            if key[:2] == (tenant_id, user_id) and at < before
+        ]
+        for key in doomed:
+            del self._rejected_clusters[key]
+        return len(doomed)
+
+    async def delete_rejected_clusters_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
+        doomed = [key for key in self._rejected_clusters if key[:2] == (tenant_id, user_id)]
+        for key in doomed:
+            del self._rejected_clusters[key]
+        return len(doomed)
 
     async def list_transient(
         self,
@@ -455,7 +511,8 @@ class InMemoryMemoryStore(MemoryStore):
         max_age_days: int,
         limit: int,
     ) -> list[MemoryItem]:
-        cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(days=max_age_days)
         candidates = [
             row
             for row in self._rows
@@ -464,6 +521,7 @@ class InMemoryMemoryStore(MemoryStore):
             and row.deleted_at is None
             and row.status == "transient"
             and row.consolidated_into is None
+            and _currently_valid(row, now=now)  # B-300 D1
             and (row.created_at or datetime.now(UTC)) >= cutoff
         ]
         candidates.sort(key=lambda r: r.created_at or datetime.min.replace(tzinfo=UTC))
@@ -478,6 +536,7 @@ class InMemoryMemoryStore(MemoryStore):
         cosine_max: float,
         limit: int,
     ) -> list[MemoryItem]:
+        now = datetime.now(UTC)
         candidates = [
             row
             for row in self._rows
@@ -486,6 +545,7 @@ class InMemoryMemoryStore(MemoryStore):
             and row.deleted_at is None
             and row.status == "transient"
             and row.consolidated_into is None
+            and _currently_valid(row, now=now)  # B-300 D1
         ]
         scored = [(row, _cosine_distance(embedding, row.embedding)) for row in candidates]
         scored = [(row, d) for row, d in scored if d <= cosine_max]
@@ -501,14 +561,27 @@ class InMemoryMemoryStore(MemoryStore):
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
     ) -> MemoryItem:
-        # Idempotency guard — fail fast if any source already consolidated
-        for sid in source_ids:
-            for row in self._rows:
-                if row.id == sid and row.consolidated_into is not None:
-                    msg = f"memory item {sid} already consolidated_into {row.consolidated_into}"
-                    raise RuntimeError(msg)
         now = datetime.now(UTC)
         new_id = uuid4()
+        # B-300 D2 — the summary goes through the same strict scan as write().
+        hit = scan_memory_content(new_id, content)
+        if hit is not None:
+            raise MemoryInjectionBlockedError([hit])
+        # Idempotency guard — fail fast if any source already consolidated;
+        # B-300 D1 — or is missing / no longer current.
+        by_id = {
+            row.id: row
+            for row in self._rows
+            if row.tenant_id == tenant_id and row.user_id == user_id and row.id in set(source_ids)
+        }
+        for sid in source_ids:
+            row = by_id.get(sid)
+            if row is not None and row.consolidated_into is not None:
+                msg = f"memory item {sid} already consolidated_into {row.consolidated_into}"
+                raise ConsolidationSourcesChangedError(msg)
+            if row is None or row.deleted_at is not None or not _currently_valid(row, now=now):
+                msg = f"memory item {sid} is no longer current; skipping cluster"
+                raise ConsolidationSourcesChangedError(msg)
         new_item = MemoryItem(
             id=new_id,
             tenant_id=tenant_id,

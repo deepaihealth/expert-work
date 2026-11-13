@@ -8,7 +8,6 @@ from uuid import uuid4
 import pytest
 
 from expert_work.persistence import InMemoryMemoryStore
-from expert_work.persistence.memory.base import MemoryInjectionBlockedError
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
 
@@ -99,13 +98,13 @@ async def test_write_blocks_classic_prompt_injection() -> None:
     store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
     bad = _item(tenant=tenant, user=user, embedding=(1.0, 0.0), content=_injection_seed())
-    with pytest.raises(MemoryInjectionBlockedError) as exc_info:
-        await store.write([bad])
-    # Exception carries per-item findings so callers can audit each one.
-    assert exc_info.value.blocked
-    item_id, findings = exc_info.value.blocked[0]
-    assert item_id == bad.id
-    assert any(f.pattern_id == "prompt_injection" for f in findings)
+    result = await store.write([bad])
+    # B-300 D2 — the blocked item comes back (with its findings) so the
+    # caller can audit it; nothing is stored.
+    [blocked] = result.blocked
+    assert blocked.item_id == bad.id
+    assert any(f.pattern_id == "prompt_injection" for f in blocked.findings)
+    assert store._rows == []
 
 
 @pytest.mark.asyncio
@@ -113,25 +112,25 @@ async def test_write_blocks_invisible_unicode() -> None:
     store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
     bad = _item(tenant=tenant, user=user, embedding=(1.0, 0.0), content="user prefers​dark mode")
-    with pytest.raises(MemoryInjectionBlockedError):
-        await store.write([bad])
+    result = await store.write([bad])
+    assert [b.item_id for b in result.blocked] == [bad.id]
+    assert store._rows == []
 
 
 @pytest.mark.asyncio
-async def test_write_rejects_batch_atomically() -> None:
-    """Per § 3.2: a batch with any poisoned item is rejected whole —
-    no partial writes (avoids "which subset wrote?" semantics)."""
+async def test_write_drops_only_the_blocked_item() -> None:
+    """B-300 D2 (replaces the U-3 § 3.2 "reject the whole batch" rule): only the
+    poisoned item is dropped; the clean one in the same batch is written."""
     store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
     clean = _item(tenant=tenant, user=user, embedding=(1.0, 0.0), content="user likes tea")
     bad = _item(tenant=tenant, user=user, embedding=(0.0, 1.0), content=_injection_seed())
-    with pytest.raises(MemoryInjectionBlockedError):
-        await store.write([clean, bad])
-    # Neither item was persisted — the clean one too, on purpose.
+    result = await store.write([clean, bad])
+    assert [b.item_id for b in result.blocked] == [bad.id]
     hits = await store.retrieve(
         tenant_id=tenant, user_id=user, query_embedding=(1.0, 0.0), limit=10
     )
-    assert hits == []
+    assert [h.id for h in hits] == [clean.id]
 
 
 @pytest.mark.asyncio

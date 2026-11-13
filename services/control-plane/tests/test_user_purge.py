@@ -1591,3 +1591,26 @@ def test_the_purge_endpoint_wires_the_agent_file_version_store() -> None:
     deps = _build_purge_deps(SimpleNamespace(app=app))  # type: ignore[arg-type]
 
     assert deps.agent_file_versions is versions
+
+
+@pytest.mark.asyncio
+async def test_purge_user_deletes_the_users_rejected_cluster_markers_only() -> None:
+    """B-300 PR A —— 整理记下的「被拒的簇」随清除用户一并删;别人的不动。整理游标里
+    记着这个用户也不用删:下一轮从它之后接着取。"""
+    world = _LogWorld()
+    a = await world.seed()
+    other = uuid4()
+    deps = world.deps()
+    for user, member_hash in ((a, "h1"), (a, "h2"), (other, "h3")):
+        await deps.memory.record_rejected_cluster(
+            tenant_id=world.t1, user_id=user, member_hash=member_hash, reason="false_cluster"
+        )
+
+    summary = await purge_user(
+        tenant_id=world.t1, user_id=a, subject_id="subj-a", deps=deps, actor_id="admin"
+    )
+
+    assert summary.deleted["memory_cluster_rejection"] == 2
+    assert "memory_cluster_rejection" not in summary.failures
+    assert await deps.memory.list_rejected_clusters(tenant_id=world.t1, user_id=a) == set()
+    assert await deps.memory.list_rejected_clusters(tenant_id=world.t1, user_id=other) == {"h3"}

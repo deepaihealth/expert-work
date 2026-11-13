@@ -2007,6 +2007,7 @@ def create_app(
                             ),
                             usage_store=resolved_token_usage,
                             resolve_spec=_resolve_memory_spec,
+                            audit_logger=resolved_audit,
                         ),
                         interval_s=resolved_settings.memory_writeback_worker_interval_s,
                         lease_s=resolved_settings.memory_writeback_lease_s,
@@ -2397,6 +2398,7 @@ def create_app(
                 memory_store=resolved_memory_store,
                 embedder=embedder,
                 interval_s=resolved_settings.memory_dlq_worker_interval_s,
+                audit_logger=resolved_audit,
             )
             memory_dlq_worker.start()
             _app.state.memory_dlq_worker = memory_dlq_worker

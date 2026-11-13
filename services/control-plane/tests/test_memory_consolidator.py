@@ -1004,14 +1004,20 @@ async def test_sweep_runs_every_store_call_under_an_explicit_rls_context() -> No
 
     assert lock_ctx and set(lock_ctx) == {(None, None, True)}
     bypass_calls = {"memory.consolidator_distinct_tenant_ids", "memory.distinct_users"}
+    # B-300 D4 —— 整理游标是租户级的:只带租户。
+    tenant_calls = {
+        "tenant_config.get",
+        "memory.get_consolidation_cursor",
+        "memory.set_consolidation_cursor",
+    }
     seen = {name for name, _, _ in log}
     assert bypass_calls <= seen
-    assert "tenant_config.get" in seen
+    assert tenant_calls <= seen
     audit_tenants = set()
     for name, ctx, args in log:
         if name in bypass_calls:
             assert ctx == (None, None, True), name
-        elif name == "tenant_config.get":
+        elif name in tenant_calls:
             assert ctx == (_TENANT, None, False), name
         elif name == "audit.append":
             entry = args[0]

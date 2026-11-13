@@ -56,17 +56,25 @@ from expert_work.common.uplift_metrics import (
 )
 from expert_work.persistence import MemoryStore
 from expert_work.persistence.memory import MemoryWritebackDLQ, MemoryWritebackJobStore
-from expert_work.persistence.memory.base import MemoryInjectionBlockedError
+from expert_work.persistence.memory.base import BlockedMemory, MemoryInjectionBlockedError
 from expert_work.persistence.rls import (
     bypass_rls_var,
     current_tenant_id_var,
     current_user_id_var,
 )
 from expert_work.persistence.tenant_config import TenantConfigStore
-from expert_work.protocol import MemoryItem, MemoryRecallMode
+from expert_work.protocol import (
+    AuditAction,
+    AuditEntry,
+    AuditResult,
+    MemoryItem,
+    MemoryRecallMode,
+)
+from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from orchestrator.graph_builder._config import (
     MEMORY_WRITEBACK_INLINE_KEY,
+    audit_logger_from_config,
     cancellation_token,
     configurable_uuid,
     current_run_id,
@@ -893,6 +901,24 @@ def parse_reconcile_ops(text: str) -> dict[int, tuple[str, str | None]]:
     return out
 
 
+@dataclass(frozen=True)
+class _BlockedWrite:
+    """B-300 D2 —— 一条被写入扫描拦下的候选,连同发审计要用的上下文(不含正文)。"""
+
+    blocked: BlockedMemory
+    #: ``writeback``(新增那一批)或 ``reconcile_update``(被判成「更新」的那条)。
+    source: str
+    #: 在本次提炼结果里的序号。
+    candidate: int
+    #: 被判「更新」时要取代的那条记忆。
+    target_id: UUID | None = None
+
+
+class _Reconciled(NamedTuple):
+    direct: list[MemoryItem]
+    blocked: list[_BlockedWrite]
+
+
 async def _reconcile_and_apply(
     items: list[MemoryItem],
     *,
@@ -902,13 +928,16 @@ async def _reconcile_and_apply(
     token: CancellationToken,
     log_label: str,
     before_store: BeforeStore | None = None,
-) -> list[MemoryItem]:
+) -> _Reconciled:
     """Stream CM-7 (Mini-ADR CM-H4) — Mem0-style extract→update.
 
     Returns the items to write directly; UPDATE / DELETE are applied
     in place against the store. Best-effort throughout: every failure
     path degrades to keeping the candidate in the direct-write list
     (never lose a memory), and only cancellation propagates.
+
+    B-300 D2 —— 被判「更新」、但新内容被写入扫描拦下的候选:不落库、旧记忆不被作废,
+    也**不**退回直接写入(那样会再拦一次、再记一条审计);交回 ``blocked`` 由调用方发审计。
 
     P5b-2b ⑧ — ``corrections[i]`` aligns 1:1 with ``items[i]`` (the LLM's
     ``is_correction`` extraction flag); it rides along into the reconcile
@@ -946,7 +975,7 @@ async def _reconcile_and_apply(
             record_memory_reconcile(op="add")
             direct.append(item)
     if not pending:
-        return direct
+        return _Reconciled(direct, [])
 
     payload = {
         "candidates": [
@@ -978,6 +1007,8 @@ async def _reconcile_and_apply(
     except Exception:
         logger.warning("%s_reconcile_llm_failed — direct add all", log_label, exc_info=True)
 
+    position = {item.id: idx for idx, item in enumerate(items)}
+    blocked: list[_BlockedWrite] = []
     for idx, (item, similar, _is_corr) in enumerate(pending):
         op, target_raw = ops.get(idx, ("", None))
         valid = {str(n.id): n.id for n in similar}
@@ -985,9 +1016,16 @@ async def _reconcile_and_apply(
         if op == "NOOP":
             record_memory_reconcile(op="noop")
         elif op == "UPDATE" and target is not None:
-            updated = await _apply_update(
-                item, target, memory_store=memory_store, token=token, before_store=before_store
-            )
+            try:
+                updated = await _apply_update(
+                    item, target, memory_store=memory_store, token=token, before_store=before_store
+                )
+            except MemoryInjectionBlockedError as exc:
+                blocked.extend(
+                    _BlockedWrite(b, "reconcile_update", position[item.id], target)
+                    for b in exc.blocked
+                )
+                continue
             record_memory_reconcile(op="update" if updated else "degraded")
             if not updated:
                 direct.append(item)
@@ -1004,7 +1042,7 @@ async def _reconcile_and_apply(
             # Missing / malformed decision — never lose the memory.
             record_memory_reconcile(op="degraded")
             direct.append(item)
-    return direct
+    return _Reconciled(direct, blocked)
 
 
 async def _apply_update(
@@ -1016,7 +1054,10 @@ async def _apply_update(
     before_store: BeforeStore | None = None,
 ) -> bool:
     """Stream P5b — append-only UPDATE: supersede ``target`` with ``item``
-    (close old row + open new versioned row) instead of overwriting in place."""
+    (close old row + open new versioned row) instead of overwriting in place.
+
+    B-300 D2 —— 新内容被写入扫描拦下时 ``MemoryInjectionBlockedError`` 原样抛给调用方
+    (什么都没改);别的失败照旧返回 ``False``、由调用方退回直接写入。"""
     if before_store is not None:
         await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
     try:
@@ -1028,7 +1069,7 @@ async def _apply_update(
                 new_item=item,
             )
         )
-    except RunCancelledError:
+    except (RunCancelledError, MemoryInjectionBlockedError):
         raise
     except Exception:
         logger.warning("memory.reconcile_update_failed id=%s", target, exc_info=True)
@@ -1086,6 +1127,7 @@ async def flush_messages_to_memory(
     reconcile: bool = False,
     agent_name: str | None = None,
     write_min_importance: float = 0.0,
+    audit_logger: AuditLogger | None = None,
 ) -> int:
     """:func:`flush_messages_with_outcome` 只取写入条数 —— 压缩前抢存与评测脚本用。"""
     outcome = await flush_messages_with_outcome(
@@ -1103,6 +1145,7 @@ async def flush_messages_to_memory(
         reconcile=reconcile,
         agent_name=agent_name,
         write_min_importance=write_min_importance,
+        audit_logger=audit_logger,
     )
     return outcome.written
 
@@ -1124,6 +1167,7 @@ async def flush_messages_with_outcome(
     agent_name: str | None = None,
     write_min_importance: float = 0.0,
     before_store: BeforeStore | None = None,
+    audit_logger: AuditLogger | None = None,
 ) -> FlushOutcome:
     """Extract durable memories from ``messages``, embed, and persist them.
 
@@ -1137,8 +1181,10 @@ async def flush_messages_with_outcome(
     Best-effort, mirroring the original write-back contract:
 
     * ``RunCancelledError`` propagates (cancellation is never swallowed).
-    * ``MemoryInjectionBlockedError`` (strict scanner) → log + return 0;
-      the store has already emitted the block audit.
+    * B-300 D2 —— 写入扫描按条拦:被拦的那几条不落库(被判「更新」的不作废旧记忆),
+      其余照写;每条被拦的发一行 ``MEMORY_INJECTION_BLOCKED`` 审计(``audit_logger``
+      给了才发;只记序号、长度、命中的规则类别,不记正文),``failed`` 置真。内容是
+      确定的,重试也一样被拦,所以不进 DLQ。
     * Any other failure after a non-empty extraction → enqueue the pairs
       to ``dlq`` (Stream K.K7) when wired, else log-and-drop; return 0.
 
@@ -1168,6 +1214,8 @@ async def flush_messages_with_outcome(
         HumanMessage(content=_render_trajectory(list(messages))),
     ]
     extracted: list[ExtractedMemory] = []
+    blocked: list[_BlockedWrite] = []
+    written = 0
     try:
         with expert_work_span(ExpertWorkComponent.MEMORY, "extract"):
             response = await token.run_cancellable(llm_caller(messages=prompt, tools=[]))
@@ -1213,8 +1261,9 @@ async def flush_messages_with_outcome(
             )
             for mem, vector in zip(extracted, vectors, strict=True)
         ]
+        position = {item.id: idx for idx, item in enumerate(items)}
         if reconcile:
-            items = await _reconcile_and_apply(
+            items, blocked = await _reconcile_and_apply(
                 items,
                 corrections=[m.is_correction for m in extracted],
                 memory_store=memory_store,
@@ -1226,21 +1275,13 @@ async def flush_messages_with_outcome(
         if items:
             if before_store is not None:
                 await before_store()
-            await memory_store.write(items)
+            result = await memory_store.write(items)
+            blocked.extend(
+                _BlockedWrite(b, "writeback", position[b.item_id]) for b in result.blocked
+            )
+            written = len(items) - len(result.blocked)
     except RunCancelledError:
         raise
-    except MemoryInjectionBlockedError as exc:
-        # Capability Uplift Sprint #2 — LLM extracted something the strict
-        # scanner caught. The content is deterministic, so retrying will
-        # fail identically; drop the batch + log. The store has emitted
-        # MEMORY_INJECTION_BLOCKED audit(s) by the time we land here. Run
-        # is not affected.
-        logger.warning(
-            "%s_blocked count=%d — content rejected by strict scanner",
-            log_label,
-            len(exc.blocked),
-        )
-        return FlushOutcome(written=0, failed=True)
     except Exception as exc:
         # Stream K.K7 — don't lose the work the LLM already did. If the
         # extraction produced pairs, hand them to the DLQ for a retry
@@ -1269,8 +1310,64 @@ async def flush_messages_with_outcome(
         else:
             logger.warning("%s_failed — run unaffected", log_label, exc_info=True)
         return FlushOutcome(written=0, failed=True)
-    logger.info("%s count=%d", log_label, len(items))
-    return FlushOutcome(written=len(items), failed=False)
+    if blocked:
+        # LLM extracted something the strict scanner caught. The content is
+        # deterministic, so retrying fails identically: dropped, not queued.
+        logger.warning(
+            "%s_blocked count=%d — content rejected by strict scanner", log_label, len(blocked)
+        )
+        await _emit_blocked_audits(
+            audit_logger, blocked, tenant_id=tenant_id, user_id=user_id, run_id=run_id
+        )
+    logger.info("%s count=%d", log_label, written)
+    return FlushOutcome(written=written, failed=bool(blocked))
+
+
+async def _emit_blocked_audits(
+    audit_logger: AuditLogger | None,
+    blocked: Sequence[_BlockedWrite],
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    run_id: str | None,
+) -> None:
+    """B-300 D2 —— 每条被写入扫描拦下的候选一行 ``MEMORY_INJECTION_BLOCKED``。
+
+    只记候选序号、内容长度、命中的规则类别(与 B-176 D10 一致,不留正文)。尽力而为:
+    没有审计、或写审计失败都不影响写回。
+    """
+    if audit_logger is None:
+        return
+    for entry in blocked:
+        details: dict[str, Any] = {
+            "user_id": str(user_id),
+            "source": entry.source,
+            "candidate": entry.candidate,
+            "content_length": entry.blocked.content_length,
+            "categories": list(entry.blocked.categories),
+            "pattern_count": len(entry.blocked.findings),
+        }
+        if run_id is not None:
+            details["run_id"] = run_id
+        if entry.target_id is not None:
+            details["target_id"] = str(entry.target_id)
+        try:
+            await audit_logger.write(
+                AuditEntry(
+                    tenant_id=tenant_id,
+                    actor_type="system",
+                    actor_id="memory_writeback",
+                    action=AuditAction.MEMORY_INJECTION_BLOCKED,
+                    resource_type="memory_item",
+                    resource_id=None,
+                    result=AuditResult.DENIED,
+                    reason="strict_scan",
+                    trace_id=current_trace_id_hex(),
+                    details=details,
+                )
+            )
+        except Exception:
+            logger.exception("memory.blocked_audit_failed source=%s", entry.source)
 
 
 #: Stream CM-3 — a config-bound pre-compaction flush callback. Awaited by
@@ -1326,6 +1423,7 @@ def make_pre_compaction_flush(
             log_label="memory.precompaction_flush",
             agent_name=agent_name,
             write_min_importance=write_min_importance,
+            audit_logger=audit_logger_from_config(config),
         )
 
     return flush
@@ -1499,6 +1597,7 @@ def make_memory_writeback_node(
             reconcile=reconcile,
             agent_name=agent_name,
             write_min_importance=write_min_importance,
+            audit_logger=audit_logger_from_config(config),
         )
         # B-168 —— 只回条数(不带记忆正文):空 dict 在 updates 流里是空帧,拿不到耗时,
         # 控制台轨迹画不出「记忆写回」这一行;写 0 条也要回,才看得到它花了多久。
