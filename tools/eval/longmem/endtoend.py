@@ -27,6 +27,7 @@ fingerprint):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
@@ -97,6 +98,21 @@ class EndToEndReport:
         return data
 
 
+#: B-300 PR 1(设计 §4.1):第一次提炼只看白名单里「用户在对话里输入的文字」,只有生产的
+#: ``_build_human_message`` 写那个标记。这里的语料是整段会话塞进一条用户消息、不经那个构造点,
+#: 所以必须经提炼入口的**显式参数**声明「这几条是用户文字」,而不是去仿造标记。参数名以 PR 1 为准;
+#: 入口还没有这个参数(PR 1 之前的提交)时什么都不传,行为与改前一致。
+USER_TEXT_PARAM = "user_text_messages"
+
+
+def user_text_kwargs(entry: Callable[..., Any], messages: Sequence[Any]) -> dict[str, Any]:
+    """``entry`` 认 :data:`USER_TEXT_PARAM` 就把 ``messages`` 声明为用户文字;不认就返回空。"""
+    if USER_TEXT_PARAM in inspect.signature(entry).parameters:
+        return {USER_TEXT_PARAM: list(messages)}
+    logger.debug("longmem.ingest: %s has no %s parameter (pre-B-300 code)", entry, USER_TEXT_PARAM)
+    return {}
+
+
 def _session_transcripts(docs: Sequence[MemoryDoc]) -> list[tuple[datetime | None, str]]:
     """Group docs back into per-session transcripts, oldest first.
 
@@ -138,9 +154,10 @@ async def _ingest_corpus(
             if timestamp is not None
             else "[Conversation session]"
         )
+        session = HumanMessage(content=f"{header}\n{transcript}")
         async with sem:
             return await flush_messages_to_memory(
-                [HumanMessage(content=f"{header}\n{transcript}")],
+                [session],
                 memory_store=store,
                 embedder=embedder,  # type: ignore[arg-type]
                 llm_caller=llm_caller,
@@ -150,6 +167,7 @@ async def _ingest_corpus(
                 token=token,
                 log_label="longmem.ingest",
                 reconcile=reconcile,
+                **user_text_kwargs(flush_messages_to_memory, [session]),
             )
 
     counts = await asyncio.gather(

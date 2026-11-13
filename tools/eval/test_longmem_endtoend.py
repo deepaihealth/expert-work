@@ -288,3 +288,52 @@ def test_stratified_sample_deterministic_and_covers_types() -> None:
     assert [r.question_id for r in again] == [r.question_id for r in sample]
     # n >= len passes through untouched.
     assert stratified_sample(population, 200) is population
+
+
+def test_user_text_kwargs_declares_the_corpus_as_user_text() -> None:
+    """B-300 PR 1:入口有显式参数就把语料声明为用户文字;没有(改前的提交)就什么都不传。"""
+    from langchain_core.messages import HumanMessage
+    from longmem.endtoend import USER_TEXT_PARAM, user_text_kwargs
+
+    session = HumanMessage(content="[Conversation session]\nhello")
+
+    async def new_entry(messages: Any, *, user_text_messages: Any = None) -> int:
+        return 0
+
+    async def old_entry(messages: Any, *, reconcile: bool = False) -> int:
+        return 0
+
+    assert user_text_kwargs(new_entry, [session]) == {USER_TEXT_PARAM: [session]}
+    assert user_text_kwargs(old_entry, [session]) == {}
+
+
+@pytest.mark.asyncio
+async def test_ingest_passes_the_explicit_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_ingest_corpus`` 真的把语料经显式参数交给提炼入口(参数存在时)。"""
+    import asyncio
+
+    from longmem import endtoend
+
+    import orchestrator.graph_builder.memory as memory_mod
+    from expert_work.persistence import InMemoryMemoryStore
+    from expert_work.runtime.cancellation import CancellationToken
+
+    seen: list[dict[str, Any]] = []
+
+    async def fake_flush(messages: Any, *, user_text_messages: Any = None, **kw: Any) -> int:
+        seen.append({"messages": list(messages), "user_text": user_text_messages})
+        return 1
+
+    monkeypatch.setattr(memory_mod, "flush_messages_to_memory", fake_flush)
+    instances = load_longmemeval(FIXTURES / "longmemeval_mini.json")
+    written = await endtoend._ingest_corpus(
+        instances[0].docs,
+        store=InMemoryMemoryStore(),
+        embedder=KeywordEmbedder(),
+        llm_caller=None,
+        reconcile=False,
+        token=CancellationToken(),
+        sem=asyncio.Semaphore(1),
+    )
+    assert written == len(seen) > 0
+    assert all(row["user_text"] == row["messages"] for row in seen)
