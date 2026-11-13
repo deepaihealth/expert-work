@@ -6,12 +6,19 @@ pgvector (migration head, so the two consolidation-state tables exist).
 The two ``*_waits_for_*`` tests hold a row lock in a second connection while
 the store call runs, so they fail if the store's ``SELECT ... FOR UPDATE`` is
 removed (review LOW-1): without the lock the store decides on the old row.
+
+The ``*_lock_in_id_order`` tests pin the order of the multi-row locks (round-2
+review): the lowest id is held elsewhere and the rows sit in the table, and in
+every index, highest id first; a store call that locks in id order waits on the
+lowest id holding nothing, so the highest id is still free (``NOWAIT``). A
+call that locks in scan order would already hold it — the shape that deadlocks
+``write_consolidated`` against a user purge.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Awaitable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -20,6 +27,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
@@ -453,5 +461,83 @@ async def test_supersede_waits_for_a_fold_in_flight(sql_store: SqlStoreFixture) 
             await task
         listed = await store.list_for_user(tenant_id=t, user_id=u)
         assert new.id not in {m.id for m in listed}
+    finally:
+        await engine.dispose()
+
+
+async def _seed_high_id_first(store: SqlMemoryStore, t: UUID, u: UUID) -> tuple[UUID, UUID]:
+    """Two rows, the higher id written first and newer, so a scan in table or
+    ``created_at DESC`` order meets it before the lower id."""
+    low, high = sorted((uuid4(), uuid4()))
+    now = datetime.now(UTC)
+    for row_id, content, created in ((high, "high", now), (low, "low", now - timedelta(1))):
+        item = _item(tenant=t, user=u, content=content).model_copy(
+            update={"id": row_id, "created_at": created}
+        )
+        await store.write([item])
+    return low, high
+
+
+async def _high_is_free_while_call_waits_on_low(
+    engine: AsyncEngine, low: UUID, high: UUID, call: Awaitable[object]
+) -> None:
+    async with engine.connect() as holder:
+        await holder.begin()
+        await holder.execute(
+            text("SELECT id FROM memory_item WHERE id = :id FOR UPDATE"), {"id": low}
+        )
+        task = asyncio.ensure_future(call)
+        await asyncio.sleep(0.5)
+        assert not task.done()
+        async with engine.connect() as probe:
+            await probe.begin()
+            try:
+                await probe.execute(
+                    text("SELECT id FROM memory_item WHERE id = :id FOR UPDATE NOWAIT"),
+                    {"id": high},
+                )
+            except DBAPIError as exc:  # pragma: no cover - the failure being tested
+                pytest.fail(f"the store call already holds the higher id: {exc}")
+            finally:
+                await probe.rollback()
+        await holder.rollback()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_user_purge_locks_in_id_order(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        t, u = uuid4(), uuid4()
+        low, high = await _seed_high_id_first(store, t, u)
+        await _high_is_free_while_call_waits_on_low(
+            engine, low, high, store.delete_all_for_user(tenant_id=t, user_id=u)
+        )
+        assert await store.list_for_user(tenant_id=t, user_id=u) == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_write_consolidated_locks_in_id_order(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        t, u = uuid4(), uuid4()
+        low, high = await _seed_high_id_first(store, t, u)
+        listed = await store.list_for_user(tenant_id=t, user_id=u)
+        await _high_is_free_while_call_waits_on_low(
+            engine,
+            low,
+            high,
+            store.write_consolidated(
+                tenant_id=t,
+                user_id=u,
+                content="summary",
+                embedding=_vec(1.0),
+                source_ids=[high, low],
+                source_hashes=_hashes(listed),
+            ),
+        )
+        assert await _row_states(engine, u) != [("transient", None)] * 2
     finally:
         await engine.dispose()

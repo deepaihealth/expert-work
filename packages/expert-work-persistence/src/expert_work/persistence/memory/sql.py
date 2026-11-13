@@ -614,17 +614,34 @@ class SqlMemoryStore(MemoryStore):
 
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         now = datetime.now(UTC)
-        stmt = (
-            update(MemoryItemRow)
-            .where(
-                MemoryItemRow.tenant_id == tenant_id,
-                MemoryItemRow.user_id == user_id,
-                MemoryItemRow.deleted_at.is_(None),
-            )
-            .values(deleted_at=now)
-        )
+        live: list[ColumnElement[bool]] = [
+            MemoryItemRow.tenant_id == tenant_id,
+            MemoryItemRow.user_id == user_id,
+            MemoryItemRow.deleted_at.is_(None),
+        ]
         async with self._sf() as session:
-            result = await session.execute(stmt)
+            # B-300 —— 先按 id 顺序锁住这些行再改:一条不带顺序的批量 UPDATE 按扫描顺序
+            # 上锁,会与按 id 顺序锁成员的 ``write_consolidated`` 互相死锁。
+            ids = (
+                (
+                    await session.execute(
+                        select(MemoryItemRow.id)
+                        .where(*live)
+                        .order_by(MemoryItemRow.id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not ids:
+                await session.rollback()
+                return 0
+            result = await session.execute(
+                update(MemoryItemRow)
+                .where(MemoryItemRow.id.in_(list(ids)), *live)
+                .values(deleted_at=now)
+            )
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0)
 
@@ -825,7 +842,9 @@ class SqlMemoryStore(MemoryStore):
             # B-300 D1 — re-read the members under a row lock in this write's
             # own transaction: a concurrent supersede / expire / delete / in-place
             # correction either commits first (and is seen here) or waits for this
-            # commit. Locked in id order, like every other multi-row lock here.
+            # commit. Locked in id order; ``delete_all_for_user`` (user purge)
+            # locks the same way, so the two cannot deadlock. ``bump_access`` /
+            # ``flag_for_review`` still update in scan order (not changed here).
             owned: list[ColumnElement[bool]] = [
                 MemoryItemRow.id.in_(list(source_ids)),
                 MemoryItemRow.tenant_id == tenant_id,
