@@ -52,7 +52,7 @@ from orchestrator import (
     build_react_graph,
 )
 from orchestrator.context import ContextCompressor
-from orchestrator.graph_builder.memory import _render_trajectory
+from orchestrator.graph_builder.memory import _extraction_inputs
 from orchestrator.graph_builder.platform_context import (
     PLATFORM_CONTEXT_OPEN,
     RECOVERY_ADVISORY_MARK,
@@ -670,7 +670,11 @@ async def test_summariser_and_memory_flush_never_see_the_attached_advisory() -> 
         "失败那条不在被压缩的中段, 测试本身无效"
     )
     assert all(RECOVERY_ADVISORY_OPEN not in s for s in summaries)
-    assert RECOVERY_ADVISORY_OPEN not in _render_trajectory(middle)
+    extraction = _extraction_inputs(middle, ())
+    assert all(
+        RECOVERY_ADVISORY_OPEN not in line
+        for line in [*extraction.user.lines, *extraction.conversation.lines]
+    )
 
 
 def test_the_escape_pass_does_not_attach() -> None:

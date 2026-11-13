@@ -13,6 +13,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from expert_work.common.conversation_channel import HIDE_FROM_UI
+from expert_work.common.user_input import user_input_kwargs
 from expert_work.persistence import InMemoryMemoryStore
 from expert_work.persistence.memory import InMemoryMemoryWritebackJobStore
 from expert_work.persistence.rls import (
@@ -24,7 +25,7 @@ from expert_work.protocol import MemoryItem
 from expert_work.runtime.cancellation import CancellationToken
 from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import (
-    MEMORY_WRITEBACK_INLINE_KEY,
+    LONG_TERM_MEMORY_WRITE_OFF_KEY,
     GraphRunner,
     ToolRegistry,
     build_react_graph,
@@ -250,6 +251,26 @@ async def test_verify_memories_drops_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_verify_prompt_carries_recorded_dates_and_today() -> None:
+    """B-300 G9 —— 读时复核要判「过时没有」:每条带记录日期(绝对日期),并给出今天的日期。"""
+    from datetime import UTC, datetime
+
+    dated = (await _make_item("keep this")).model_copy(
+        update={"created_at": datetime(2026, 11, 3, 8, 0, tzinfo=UTC)}
+    )
+    undated = await _make_item("no date")
+    llm = _RecordingLLM(responses=[AIMessage(content='{"keep": [0, 1]}')])
+    await _verify_memories(
+        llm_caller=llm, query="q", candidates=[dated, undated], token=CancellationToken()
+    )
+    [(_system, human)] = llm.calls
+    text = str(human.content)
+    assert "[0] (recorded 2026-11-03) keep this" in text.splitlines()
+    assert "[1] no date" in text.splitlines()
+    assert f"TODAY'S DATE: {datetime.now(UTC).date().isoformat()}" in text.splitlines()
+
+
+@pytest.mark.asyncio
 async def test_verify_memories_fail_open_on_error() -> None:
     # A verifier failure must keep ALL candidates (recall never empties on a
     # transient verification error).
@@ -323,9 +344,17 @@ async def test_recall_node_runs_verification_when_enabled() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _typed(text: str) -> HumanMessage:
+    """用户在对话里输入的消息(``_build_human_message`` 的形状:带 B-300 白名单标记)。"""
+    return HumanMessage(
+        content=text,
+        additional_kwargs=user_input_kwargs(text=text, images=0, files=0, external_blocks=0),
+    )
+
+
 def _state(task: str) -> dict[str, object]:
     return {
-        "messages": [SystemMessage(content="help"), HumanMessage(content=task)],
+        "messages": [SystemMessage(content="help"), _typed(task)],
         "step_count": 0,
         "max_steps": 5,
     }
@@ -368,6 +397,91 @@ async def test_memory_recall_node_bumps_access_count_on_hit() -> None:
 
     await asyncio.gather(*list(_BACKGROUND_BUMP_TASKS))
 
+    [after] = await store.list_for_user(tenant_id=tenant, user_id=user)
+    assert after.access_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recall_bumps_only_the_memories_that_fit_the_injection_budget() -> None:
+    """B-300 D5 前半 —— 频次分只加给真正进了提示词的那几条(含被截短的那一条);按预算被挤掉的
+    不加。召回节点用注入同一套预算参数选一次。"""
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    for n in range(3):
+        await _seed(store, tenant=tenant, user=user, content=f"memory {n} " + "x" * 400)
+    node = make_memory_recall_node(
+        memory_store=store,
+        embedder=FakeEmbedder(dim=_DIM),
+        top_k=5,
+        injection_token_budget=150,
+        correction_token_budget=0,
+    )
+    out = await node(  # type: ignore[arg-type]
+        _state("which memory"),
+        {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
+    )
+    assert len(out["recalled_memories"]) == 3  # 召回到三条,只有两条进得了提示词
+
+    from orchestrator.graph_builder.memory import _BACKGROUND_BUMP_TASKS
+
+    await asyncio.gather(*list(_BACKGROUND_BUMP_TASKS))
+    counts = sorted(
+        m.access_count for m in await store.list_for_user(tenant_id=tenant, user_id=user)
+    )
+    assert counts == [0, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_recall_bumps_once_per_run_however_many_model_calls() -> None:
+    """B-300 D5 前半 —— 注入每次调模型前都做一遍,频次分每个 run 只加一次。"""
+    from orchestrator.graph_builder.memory import _BACKGROUND_BUMP_TASKS
+    from orchestrator.tools.registry import ToolContext, ToolResult
+
+    class _Noop:
+        @property
+        def spec(self) -> ToolSpec:
+            return ToolSpec(name="noop", description="noop", is_read_only=True)
+
+        async def call(self, args: Any, *, ctx: ToolContext) -> ToolResult:
+            del args, ctx
+            return ToolResult(content="ok")
+
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    await _seed(store, tenant=tenant, user=user, content="user is a botanist")
+    registry = ToolRegistry()
+    registry.register(_Noop())
+    calls = [
+        AIMessage(content="", tool_calls=[{"name": "noop", "args": {}, "id": f"t{i}"}])
+        for i in range(3)
+    ]
+    llm = _RecordingLLM(responses=[*calls, AIMessage(content="done")])
+    graph = build_react_graph(
+        llm_caller=llm,
+        tool_registry=registry,
+        memory_recall_node=make_memory_recall_node(
+            memory_store=store, embedder=FakeEmbedder(dim=_DIM), top_k=5
+        ),
+    )
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(graph)
+        await compiled.ainvoke(
+            {
+                "messages": [SystemMessage(content="help"), _typed("ferns?")],
+                "step_count": 0,
+                "max_steps": 8,
+            },
+            config={
+                "configurable": {
+                    "thread_id": str(uuid4()),
+                    "tenant_id": str(tenant),
+                    "user_id": str(user),
+                }
+            },
+        )
+    assert len(llm.calls) == 4
+    assert all("user is a botanist" in str(call[1].content) for call in llm.calls)
+    await asyncio.gather(*list(_BACKGROUND_BUMP_TASKS))
     [after] = await store.list_for_user(tenant_id=tenant, user_id=user)
     assert after.access_count == 1
 
@@ -835,23 +949,72 @@ async def test_running_the_writeback_node_twice_for_one_turn_queues_one_job() ->
 
 
 @pytest.mark.asyncio
-async def test_a_run_marked_inline_writes_in_the_run_even_in_background_mode() -> None:
-    """B-168 —— 草稿试跑(``MEMORY_WRITEBACK_INLINE_KEY``):worker 只认线上配置,这一轮在
-    本轮内写,不落任务。"""
+@pytest.mark.parametrize("key", [LONG_TERM_MEMORY_WRITE_OFF_KEY, "child_run"])
+async def test_a_run_that_must_not_write_long_term_memory_writes_nothing(key: str) -> None:
+    """B-300 D7 / 「子智能体不写」—— 草稿试跑(``LONG_TERM_MEMORY_WRITE_OFF_KEY``)与委派出去的
+    子运行(``_child_config`` 写的 ``child_run``)走同一个判断:不落写回任务、不调模型、不写库。"""
     store, jobs = InMemoryMemoryStore(), InMemoryMemoryWritebackJobStore()
     tenant, user = uuid4(), uuid4()
     llm = _RecordingLLM(responses=[_EXTRACT_TEA])
     config = _run_config(tenant, user, run_id=uuid4())
-    config["configurable"][MEMORY_WRITEBACK_INLINE_KEY] = True
+    config["configurable"][key] = True
 
     out = await _background_node(store, llm, jobs)(_state("done"), config)
 
     assert out == {
-        "written_memory_count": 1,
+        "written_memory_count": 0,
         "memory_writeback_failed": False,
         "memory_writeback_queued": False,
     }
     assert await jobs.count_backlog() == 0
+    assert llm.calls == []
+    assert await store.list_for_user(tenant_id=tenant, user_id=user) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", [LONG_TERM_MEMORY_WRITE_OFF_KEY, "child_run"])
+async def test_inline_writeback_is_skipped_too(key: str) -> None:
+    """没配后台任务表(纯 inline)时同样不写;回的键与 inline 一致。"""
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+    node = make_memory_writeback_node(
+        memory_store=store, embedder=FakeEmbedder(dim=_DIM), llm_caller=llm
+    )
+    out = await node(  # type: ignore[arg-type]
+        _state("done"),
+        {"configurable": {"tenant_id": str(tenant), "user_id": str(user), key: True}},
+    )
+    assert out == {"written_memory_count": 0, "memory_writeback_failed": False}
+    assert llm.calls == []
+    assert await store.list_for_user(tenant_id=tenant, user_id=user) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", [LONG_TERM_MEMORY_WRITE_OFF_KEY, "child_run"])
+async def test_pre_compaction_flush_is_skipped_too(key: str) -> None:
+    from orchestrator.graph_builder.memory import make_pre_compaction_flush
+
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+    flush = make_pre_compaction_flush(
+        memory_store=store, embedder=FakeEmbedder(dim=_DIM), llm_caller=llm
+    )
+    written = await flush(
+        [_typed("I like tea")],
+        {"configurable": {"tenant_id": str(tenant), "user_id": str(user), key: True}},
+        CancellationToken(),
+    )
+    assert written == 0
+    assert llm.calls == []
+    # 同一个回调在普通 run 里照常写(对照)。
+    written = await flush(
+        [_typed("I like tea")],
+        {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
+        CancellationToken(),
+    )
+    assert written == 1
 
 
 @pytest.mark.asyncio
@@ -888,12 +1051,11 @@ async def test_writeback_trajectory_omits_agent_system_prompt() -> None:
         _state("what timezone am I in"),
         {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
     )
-    # extraction prompt = [SystemMessage(_EXTRACT_SYSTEM), HumanMessage(trajectory)]
-    _extract_sys, human = llm.calls[0]
+    # B-300 —— 没有助手回答:只有第一次提炼(只给用户输入的文字)。
+    [(_extract_sys, human)] = llm.calls
     trajectory = str(human.content)
-    assert "[system]" not in trajectory  # no agent system-role line
     assert "help" not in trajectory  # agent system-prompt body gone
-    assert "[human] what timezone am I in" in trajectory  # real turn kept
+    assert trajectory == "what timezone am I in"  # real turn kept
 
 
 @pytest.mark.asyncio
@@ -902,14 +1064,14 @@ async def test_writeback_trajectory_omits_hidden_scaffolding() -> None:
     同理不进抽取输入;用户的话照留。"""
     store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
-    llm = _RecordingLLM(responses=[AIMessage(content='{"memories": []}')])
+    llm = _RecordingLLM(responses=[AIMessage(content='{"memories": []}')] * 2)
     node = make_memory_writeback_node(
         memory_store=store, embedder=FakeEmbedder(dim=_DIM), llm_caller=llm
     )
     state = {
         "messages": [
             SystemMessage(content="help"),
-            HumanMessage(content="what timezone am I in"),
+            _typed("what timezone am I in"),
             HumanMessage(content="PLATFORM-INPUTS-BLOCK", additional_kwargs={HIDE_FROM_UI: True}),
             AIMessage(content="UTC+8"),
         ],
@@ -919,10 +1081,10 @@ async def test_writeback_trajectory_omits_hidden_scaffolding() -> None:
     await node(  # type: ignore[arg-type]
         state, {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}}
     )
-    trajectory = str(llm.calls[0][1].content)
-    assert "PLATFORM-INPUTS-BLOCK" not in trajectory
-    assert "[human] what timezone am I in" in trajectory
-    assert "[ai] UTC+8" in trajectory
+    # B-300 —— 两次提炼:第一次只有用户的话,第二次是带标签的对话。
+    inputs = sorted(str(call[1].content) for call in llm.calls)
+    assert inputs == ["[user] what timezone am I in\n[assistant] UTC+8", "what timezone am I in"]
+    assert all("PLATFORM-INPUTS-BLOCK" not in text for text in inputs)
 
 
 @pytest.mark.asyncio
@@ -1080,7 +1242,7 @@ async def test_memory_writeback_node_enqueues_dlq_on_embed_failure() -> None:
 async def test_writeback_stamps_source_run_id_from_config() -> None:
     from uuid import uuid4
 
-    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.messages import AIMessage
 
     from expert_work.persistence.memory.memory import InMemoryMemoryStore
     from orchestrator.graph_builder.memory import make_memory_writeback_node
@@ -1106,7 +1268,7 @@ async def test_writeback_stamps_source_run_id_from_config() -> None:
         llm_caller=_extract_llm,  # type: ignore[arg-type]
     )
     await node(
-        {"messages": [HumanMessage(content="I like tea")], "step_count": 1, "max_steps": 5},  # type: ignore[arg-type]
+        {"messages": [_typed("I like tea")], "step_count": 1, "max_steps": 5},  # type: ignore[arg-type]
         {
             "configurable": {
                 "tenant_id": str(tenant),
@@ -1124,7 +1286,7 @@ async def test_writeback_stamps_source_run_id_from_config() -> None:
 async def test_flush_failure_enqueues_with_source_run_id() -> None:
     from uuid import uuid4
 
-    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.messages import AIMessage
 
     from expert_work.persistence.memory.dlq import InMemoryMemoryWritebackDLQ
     from expert_work.runtime.cancellation import CancellationToken
@@ -1152,7 +1314,7 @@ async def test_flush_failure_enqueues_with_source_run_id() -> None:
 
     dlq = InMemoryMemoryWritebackDLQ()
     await flush_messages_to_memory(
-        [HumanMessage(content="hi")],
+        [_typed("hi")],
         memory_store=_BoomStore(),  # type: ignore[arg-type]
         embedder=_Embedder(),  # type: ignore[arg-type]
         llm_caller=_extract_llm,  # type: ignore[arg-type]
@@ -1199,7 +1361,7 @@ async def test_before_store_runs_after_extraction_and_can_abort_the_write() -> N
     dlq = InMemoryMemoryWritebackDLQ()
     with pytest.raises(RunCancelledError):
         await flush_messages_with_outcome(
-            [HumanMessage(content="I like tea")],
+            [_typed("I like tea")],
             memory_store=store,
             embedder=FakeEmbedder(dim=_DIM),
             llm_caller=llm,
@@ -1219,7 +1381,7 @@ async def test_before_store_runs_after_extraction_and_can_abort_the_write() -> N
         calls.append(len(llm.calls))
 
     outcome = await flush_messages_with_outcome(
-        [HumanMessage(content="I like tea")],
+        [_typed("I like tea")],
         memory_store=store,
         embedder=FakeEmbedder(dim=_DIM),
         llm_caller=llm,
@@ -1286,7 +1448,7 @@ async def test_before_store_guards_every_write_after_the_reconcile_call(op: str)
 
     with pytest.raises(RunCancelledError):
         await flush_messages_with_outcome(
-            [HumanMessage(content="I moved to Berlin")],
+            [_typed("I moved to Berlin")],
             memory_store=store,
             embedder=_SameVector(),  # type: ignore[arg-type]
             llm_caller=llm,

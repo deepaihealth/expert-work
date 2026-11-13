@@ -41,9 +41,14 @@ class BlockedMemory:
 
 @dataclass(frozen=True)
 class MemoryWriteResult:
-    """B-300 D2 — what :meth:`MemoryStore.write` did not store, item by item."""
+    """B-300 D2 — what :meth:`MemoryStore.write` did not store, item by item.
+
+    B-300 D12 — ``written`` is how many rows actually landed: an item whose
+    ``(tenant, user, content_hash)`` already has a live row is skipped (the
+    dedup no-op), and a blocked item is not written either."""
 
     blocked: tuple[BlockedMemory, ...] = ()
+    written: int = 0
 
 
 def scan_memory_content(item_id: UUID, content: str) -> BlockedMemory | None:

@@ -30,6 +30,7 @@ from typing import Protocol
 
 from expert_work.protocol import MemoryItem, Plan, PlanStep
 from expert_work.protocol.plan import PlanStepExecution, PlanStepStatus
+from orchestrator.context.memory_render import MEMORY_LINE_LEGEND, MEMORY_REMINDER, memory_line
 
 logger = logging.getLogger(__name__)
 
@@ -177,11 +178,16 @@ def render_todo_md(plan: Plan | None) -> str:
 
 def render_memory_md(memories: Sequence[MemoryItem]) -> str:
     """Render ``MEMORY.md`` — a read-only digest of recalled / consolidated
-    long-term memories. Empty sequence → empty string."""
+    long-term memories. Empty sequence → empty string.
+
+    B-300 ③ —— 与提示词里的记忆块共用行渲染(带记录日期、内容去换行)和同一段提醒,否则模型
+    从文件读到的是没有提醒的同一批记忆。提醒紧跟在条目之后(它的措辞是「The memories above」)。
+    """
     if not memories:
         return ""
-    lines = [_READONLY_NOTE, "", "# Memory", ""]
-    lines.extend(f"- ({item.kind}) {item.content}" for item in memories)
+    lines = [_READONLY_NOTE, "", "# Memory", "", MEMORY_LINE_LEGEND]
+    lines.extend(memory_line(item) for item in memories)
+    lines.extend(["", MEMORY_REMINDER])
     return "\n".join(lines) + "\n"
 
 

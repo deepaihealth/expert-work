@@ -121,6 +121,27 @@ _memory_reconcile_total = expert_work_counter(
     label_names=("op",),  # add | update | delete | noop | degraded
 )
 
+# B-300 D3 (incl. G13) — long-term memory extraction, per pass. ``extraction_pass`` is
+# ``user`` (only what the user typed) or ``conversation`` (the transcript).
+_memory_extraction_total = expert_work_counter(
+    "expert_work_memory_extraction_total",
+    "Long-term memory extraction calls, by pass and outcome (B-300).",
+    label_names=(
+        "extraction_pass",
+        "outcome",
+    ),  # extracted | empty | truncated | parse_failed | error
+)
+_memory_extraction_input_capped_total = expert_work_counter(
+    "expert_work_memory_extraction_input_capped_total",
+    "Extraction inputs that went over the total character cap; oldest lines dropped (B-300).",
+    label_names=("extraction_pass",),
+)
+_memory_extraction_message_truncated_total = expert_work_counter(
+    "expert_work_memory_extraction_message_truncated_total",
+    "Messages cut at the per-message character cap in an extraction input (B-300).",
+    label_names=("extraction_pass",),
+)
+
 _anthropic_cache_anchors_total = expert_work_counter(
     "expert_work_uplift_anthropic_cache_anchors_total",
     "Total cache_control anchor markers added by upstream injectors "
@@ -461,6 +482,28 @@ def record_memory_reconcile(*, op: str) -> None:
     _memory_reconcile_total.labels(op=op).inc()
 
 
+def record_memory_extraction(*, pass_name: str, outcome: str) -> None:
+    """Bump ``expert_work_memory_extraction_total{extraction_pass, outcome}`` (B-300 D3).
+
+    ``outcome``: ``extracted`` (at least one memory), ``empty`` (a valid reply
+    with nothing worth remembering), ``truncated`` (the model stopped at its
+    output cap), ``parse_failed`` (no usable JSON), ``error`` (the call failed).
+    """
+    _memory_extraction_total.labels(extraction_pass=pass_name, outcome=outcome).inc()
+
+
+def record_memory_extraction_input_capped(*, pass_name: str) -> None:
+    """Bump ``expert_work_memory_extraction_input_capped_total{extraction_pass}`` (B-300 D3)."""
+    _memory_extraction_input_capped_total.labels(extraction_pass=pass_name).inc()
+
+
+def record_memory_extraction_message_truncated(*, pass_name: str, count: int) -> None:
+    """Add ``count`` to
+    ``expert_work_memory_extraction_message_truncated_total{extraction_pass}``."""
+    if count:
+        _memory_extraction_message_truncated_total.labels(extraction_pass=pass_name).inc(count)
+
+
 def record_anthropic_cache_anchor() -> None:
     """Bump ``expert_work_uplift_anthropic_cache_anchors_total`` once per
     anchor marker applied on the outbound Anthropic request."""
@@ -698,6 +741,9 @@ __all__ = [
     "record_memory_cluster_rejected",
     "record_memory_consolidated",
     "record_memory_drift",
+    "record_memory_extraction",
+    "record_memory_extraction_input_capped",
+    "record_memory_extraction_message_truncated",
     "record_memory_inject_mode",
     "record_memory_predictive_review",
     "record_memory_purged",

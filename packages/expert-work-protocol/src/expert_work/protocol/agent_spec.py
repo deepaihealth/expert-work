@@ -547,6 +547,8 @@ class LongTermMemorySpec(BaseModel):
 class MemorySpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # B-300 D12 —— 没有任何代码读 ``short_term``(短期记忆就是对话本身 + 压缩,不由它配置)。
+    # 字段留着:这个类禁止多余字段,已保存的配置里可能带着它,删掉会让它们校验失败。
     short_term: dict[str, Any] | None = None
     long_term: LongTermMemorySpec | None = None
 

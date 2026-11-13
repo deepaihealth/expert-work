@@ -79,7 +79,7 @@ from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.middleware import MiddlewareChain
 from expert_work.runtime.secret_store import SecretStore, parse_secret_ref
 from expert_work.runtime.skill_assets import ObjectStore as SkillAssetStore
-from expert_work.runtime.tokens import default_estimator
+from expert_work.runtime.tokens import TokenEstimator, default_estimator
 
 # B-26 follow-up — BuiltAgent moved to the neutral leaf ``orchestrator.built_agent``
 # (breaks the agent_factory ↔ orchestrator.tools import cycle). Re-exported here
@@ -1042,6 +1042,7 @@ async def build_agent(
         memory_env=memory_env,
         llm_caller=_metered(routers.memory, conversation_usage, memory_model(spec)),
         rerank_usage=platform_usage,
+        estimator=estimator,
     )
     # Stream L.L2 — context compressor preflight + summariser. The
     # default summariser shares the agent's main LLM router; a future
@@ -2994,6 +2995,7 @@ def _build_memory_nodes(
     memory_env: MemoryEnv | None,
     llm_caller: LLMCaller,
     rerank_usage: UsageIdentity | None = None,
+    estimator: TokenEstimator | None = None,
 ) -> tuple[MemoryNode | None, MemoryNode | None, PreCompactionFlush | None]:
     """Build ``(memory_recall, memory_writeback, pre_compaction_flush)`` — Stream J.3 / CM-3.
 
@@ -3041,6 +3043,11 @@ def _build_memory_nodes(
         rewrite_query=long_term.rewrite_reads,
         rewriter=llm_caller,
         abstain_threshold=long_term.abstain_threshold,
+        # B-300 D5 前半 —— 与注入同一套预算(builder 收到的也是这两个值和这个估算器),
+        # 召回节点只给真正进提示词的那几条加频次分。
+        injection_token_budget=long_term.injection_token_budget,
+        correction_token_budget=long_term.correction_token_budget,
+        estimator=estimator,
     )
     recall = _skip_in_delegated_runs(recall)
     writeback = (

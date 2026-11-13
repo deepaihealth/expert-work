@@ -1330,3 +1330,23 @@ async def test_get_live_returns_the_row_only_for_its_own_tenant_and_user() -> No
 
     assert await store.soft_delete(tenant_id=tenant, user_id=user, memory_id=mine.id)
     assert await store.get_live(tenant_id=tenant, user_id=user, memory_id=mine.id) is None
+
+
+@pytest.mark.asyncio
+async def test_write_reports_how_many_rows_landed() -> None:
+    """B-300 D12 —— ``written`` 是实际落库的条数:与库里已有的同内容、同批里被拦的都不算。"""
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    first = await store.write(
+        [_item(tenant=tenant, user=user, embedding=(1.0, 0.0), content="user likes tea")]
+    )
+    assert first.written == 1
+    again = await store.write(
+        [
+            _item(tenant=tenant, user=user, embedding=(1.0, 0.0), content="user likes tea"),
+            _item(tenant=tenant, user=user, embedding=(0.0, 1.0), content="user works remotely"),
+            _item(tenant=tenant, user=user, embedding=(0.0, 1.0), content=_injection_seed()),
+        ]
+    )
+    assert again.written == 1
+    assert len(again.blocked) == 1

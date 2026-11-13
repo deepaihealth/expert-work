@@ -104,6 +104,7 @@ from expert_work.common.observability import (
     expert_work_histogram,
 )
 from expert_work.common.spotlight import spotlight_untrusted
+from expert_work.common.user_input import user_input_kwargs
 from expert_work.persistence import ApprovalStore
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.memory import MemoryWritebackJob, MemoryWritebackJobStore
@@ -143,7 +144,7 @@ from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import (
     APPROVAL_TURN_RESET,
     LLM_CACHE_BYPASS_KEY,
-    MEMORY_WRITEBACK_INLINE_KEY,
+    LONG_TERM_MEMORY_WRITE_OFF_KEY,
     AgentFactoryError,
     BuiltAgent,
     pending_request_binding,
@@ -499,8 +500,19 @@ def _build_human_message(
     blocks are appended after the trusted instruction text (as a trailing
     text segment in both the content-block and plain paths) so the model
     can separate the user's instruction from attacker-controllable data.
+
+    B-300 —— 这里是用户在对话里输入的**唯一**构造点,所以由它在 ``additional_kwargs`` 记下
+    「正文开头哪一段是用户输入的文字」与附件 / 外部内容的计数
+    (:mod:`expert_work.common.user_input`)。
+    长期记忆的第一次提炼只读这一段;三条路径里输入文字都排在最前面。
     """
     text = input_text or ""
+    mark = user_input_kwargs(
+        text=text,
+        images=len(image_refs),
+        files=len(document_names or []),
+        external_blocks=len(untrusted_content or []),
+    )
     untrusted = (
         _fence_untrusted(untrusted_content, spotlight_nonce=spotlight_nonce)
         if untrusted_content
@@ -512,7 +524,7 @@ def _build_human_message(
     )
     if not image_refs:
         parts = [p for p in (text, doc_mentions, untrusted) if p]
-        return HumanMessage(content="\n\n".join(parts))
+        return HumanMessage(content="\n\n".join(parts), additional_kwargs=mark)
     if supports_vision:
         content: list[dict[str, Any]] = []
         if text:
@@ -522,10 +534,10 @@ def _build_human_message(
         trailer = "\n\n".join(p for p in (doc_mentions, untrusted) if p)
         if trailer:
             content.append({"type": "text", "text": trailer})
-        return HumanMessage(content=content)
+        return HumanMessage(content=content, additional_kwargs=mark)
     mentions = "\n".join(f"[image attached: {ref}]" for ref in image_refs)
     parts = [p for p in (text, mentions, doc_mentions, untrusted) if p]
-    return HumanMessage(content="\n\n".join(parts))
+    return HumanMessage(content="\n\n".join(parts), additional_kwargs=mark)
 
 
 def build_run_graph_input(
@@ -1759,9 +1771,9 @@ async def _start_run(
     # B-302 —— 时限与本段令牌;已用秒数记在检查点里(``orchestrator.tools.run_clock``)。
     configurable.update(run_segment_config(built.run_deadline_s))
     if payload.use_draft:
-        # B-168 —— 后台记忆写回按 (name, version) 取线上配置执行,而这一轮跑的是草稿:
-        # 草稿 run 的记忆写回留在本轮内,用的就是草稿自己的设置。
-        configurable[MEMORY_WRITEBACK_INLINE_KEY] = True
+        # B-300 D7 —— 草稿试跑不写长期记忆(它写的会进与线上同一个记忆库);召回照常,
+        # 调试要看得到召回。在调试台跑已发布版本不带这个标记。
+        configurable[LONG_TERM_MEMORY_WRITE_OFF_KEY] = True
     if replay_messages is not None:
         # B-66 —— ``:regenerate`` 重放的 [System, Human, (本轮输入段)?] 与原轮字节
         # 相同,不绕开响应缓存就必然命中、把旧答案原样端回来。``:edit`` 输入是新的,

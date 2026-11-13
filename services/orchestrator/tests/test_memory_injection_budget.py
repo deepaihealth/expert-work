@@ -34,6 +34,11 @@ from expert_work.common.spotlight import spotlight_untrusted
 from expert_work.protocol import MemoryItem
 from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import GraphRunner, ToolRegistry, build_react_graph
+from orchestrator.context.memory_render import (
+    MEMORY_BLOCK_HEADING,
+    MEMORY_LINE_LEGEND,
+    MEMORY_REMINDER,
+)
 from orchestrator.graph_builder.builder import (
     _MEMORY_TRUNCATION_MARKER,
     _inject_memories,
@@ -59,9 +64,20 @@ def _base_messages() -> list[BaseMessage]:
     return [SystemMessage(content="system"), HumanMessage(content="task")]
 
 
+def _strip_frame(text: str) -> str:
+    """B-300 ③ —— the block is heading + legend line + items + blank line + the
+    reminder section; these tests look at the heading and the items only (the
+    frame itself is pinned in ``test_memory_render.py``)."""
+    head = MEMORY_BLOCK_HEADING + "\n" + MEMORY_LINE_LEGEND + "\n"
+    tail = "\n\n" + MEMORY_REMINDER
+    assert text.startswith(head)
+    assert text.endswith(tail)
+    return MEMORY_BLOCK_HEADING + "\n" + text[len(head) : -len(tail)]
+
+
 def _body(out: list[BaseMessage]) -> str:
-    """The injected block's text in per_session mode (position 1)."""
-    return str(out[1].content)
+    """The injected block's heading + items in per_session mode (position 1)."""
+    return _strip_frame(str(out[1].content))
 
 
 def _counter_value(outcome: str) -> float:
@@ -92,7 +108,7 @@ def test_default_path_per_turn_unchanged() -> None:
         f"- (fact) {content}" for content in contents
     )
     out = _inject_memories(_base_messages(), [_memory(c) for c in contents], mode="per_turn")
-    assert str(out[-1].content) == expected
+    assert _strip_frame(str(out[-1].content)) == expected
 
 
 def test_default_path_spotlight_unchanged() -> None:
@@ -396,4 +412,4 @@ async def test_graph_threads_injection_budget_to_the_prompt() -> None:
     content = str(block.content)
     assert "Relevant memories" in content
     assert _MEMORY_TRUNCATION_MARKER in content
-    assert len(content) < 1_000
+    assert len(_strip_frame(content)) < 1_000

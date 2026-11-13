@@ -38,7 +38,7 @@ import logging
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
@@ -50,6 +50,7 @@ from control_plane.advisory_locks import MEMORY_CONSOLIDATOR_LOCK_CLASSID
 from control_plane.audit import emit as audit_emit
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
 from expert_work.common.credentials import CredentialsResolverError
+from expert_work.common.memory_language import detect_user_language, summary_language_section
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.uplift_metrics import (
     record_consolidator_llm_tokens,
@@ -275,9 +276,13 @@ represents any of:
 """
 
 
-def _build_cluster_prompt(items: Sequence[MemoryItem]) -> str:
+def _build_cluster_prompt(items: Sequence[MemoryItem], language: str | None = None) -> str:
     """Mini-ADR U-35 + U-36 three-in-one prompt: verify cluster + summarise
-    + apply anti-mislearn rules in a single LLM call."""
+    + apply anti-mislearn rules in a single LLM call.
+
+    B-300 —— 汇总句不再写成「durable user truth」、不再「优先用用户的说法」:保留每条记的是谁得出的,
+    不把它改写成不带出处的事实陈述(设计 §4.3);末尾加「Output language」一节(设计 §3,
+    ``language`` 由调用方按该用户这一批待整理记忆的全部内容判)。"""
     items_rendered = "\n".join(f"- ({item.id}) {item.content}" for item in items)
     valid_reasons = ["false_cluster"] + [f"anti_mislearn:{c}" for c in _REJECT_CATEGORIES]
     valid_reasons_json = json.dumps(valid_reasons)
@@ -286,9 +291,11 @@ def _build_cluster_prompt(items: Sequence[MemoryItem]) -> str:
 identified as likely-related.
 
 {_ANTI_MISLEARN_RULES}
-Otherwise, write ONE summary fact (under 200 chars) that captures the
-durable user truth this cluster represents. Prefer the user's own
-phrasing over paraphrase.
+Otherwise, write ONE summary fact (under 200 chars) that captures what
+these items durably record. Keep what each item says about where it comes
+from (for example that the assistant found it, or that the user only
+agreed); never turn that into a plain statement of fact. Reuse the items'
+wording where you can.
 
 Cluster items:
 {items_rendered}
@@ -299,6 +306,8 @@ Respond ONLY with JSON of the exact shape:
   "summary": "<= 200 chars OR null when keep=false>",
   "reject_reason": <one of {valid_reasons_json} OR null when keep=true>
 }}
+
+{summary_language_section(language)}
 """
 
 
@@ -323,10 +332,17 @@ Respond ONLY with JSON of the exact shape:
 """
 
 
-def _build_due_review_prompt(item: MemoryItem) -> str:
+def _build_due_review_prompt(item: MemoryItem, *, today: date | None = None) -> str:
     """P5b-2b ⑦ — predictive re-review of a fact whose validity window came
-    due. Verdict is still-true vs no-longer-true (NOT noise classification)."""
+    due. Verdict is still-true vs no-longer-true (NOT noise classification).
+
+    B-300 G9 —— 要模型判「今天还成立吗」,就给它记录日期和今天的日期(绝对日期)。"""
+    recorded = item.created_at.date().isoformat() if item.created_at is not None else "unknown"
+    today_text = (today or datetime.now(UTC).date()).isoformat()
     return f"""You are re-checking whether one long-term memory is still true today.
+
+Recorded on: {recorded}
+Today's date: {today_text}
 
 Item content:
 {item.content}
@@ -872,6 +888,8 @@ class MemoryConsolidator:
         if clusters:
             record_memory_cluster_candidates(len(clusters))
             summary.cluster_candidates += len(clusters)
+        # B-300 ④ —— 汇总句的语言按该用户这一批待整理记忆的全部内容判(同一个函数)。
+        language = detect_user_language(item.content for cluster in clusters for item in cluster)
         for cluster in clusters:
             try:
                 await self._consolidate_or_reject(
@@ -879,6 +897,7 @@ class MemoryConsolidator:
                     user_id=user_id,
                     cluster=cluster,
                     summary=summary,
+                    language=language,
                 )
             except Exception as exc:
                 logger.exception(
@@ -1056,8 +1075,9 @@ class MemoryConsolidator:
         user_id: UUID,
         cluster: Sequence[MemoryItem],
         summary: ConsolidatorRunSummary,
+        language: str | None = None,
     ) -> None:
-        prompt = _build_cluster_prompt(cluster)
+        prompt = _build_cluster_prompt(cluster, language)
         try:
             reply = await self._aux(
                 prompt=prompt,

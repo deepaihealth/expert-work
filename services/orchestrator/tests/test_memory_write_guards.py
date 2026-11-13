@@ -22,6 +22,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from prometheus_client import REGISTRY
 
+from expert_work.common.user_input import user_input_kwargs
 from expert_work.persistence import InMemoryMemoryStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.memory.hash import hash_content
@@ -86,7 +87,15 @@ def _config(tenant: UUID, user: UUID, audit: AuditLogger) -> dict[str, object]:
 
 def _state() -> dict[str, object]:
     return {
-        "messages": [SystemMessage(content="help"), HumanMessage(content="hi")],
+        "messages": [
+            SystemMessage(content="help"),
+            HumanMessage(
+                content="hi",
+                additional_kwargs=user_input_kwargs(
+                    text="hi", images=0, files=0, external_blocks=0
+                ),
+            ),
+        ],
         "step_count": 0,
         "max_steps": 5,
     }

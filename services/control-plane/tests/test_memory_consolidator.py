@@ -1071,3 +1071,67 @@ async def test_lock_txn_idle_timeout_outlasts_a_real_sweep() -> None:
     ]
     assert timeouts, statements
     assert min(timeouts) >= 4 * 60 * 60 * 1000
+
+
+# ─── B-300 PR 1 —— 汇总提示词、语言一节、到期复核带日期(G9)────────────
+
+
+@pytest.mark.asyncio
+async def test_summary_prompt_keeps_where_items_come_from() -> None:
+    """B-300 ① 副作用 —— 汇总提示词不再要求写成「durable user truth」、不再「优先用用户的说法」:
+    保留每条记的是谁得出的,不把它改写成不带出处的事实陈述(设计 §4.3)。"""
+    worker, store, aux, _audit = await _build_worker(
+        aux_replies=['{"keep": true, "summary": "s", "reject_reason": null}']
+    )
+    _seed_transient(store, contents=["dark UI", "dark mode preference", "wants dark theme"])
+    await worker.run_once()
+    [prompt] = aux.calls
+    assert "durable user truth" not in prompt
+    assert "Prefer the user's own phrasing" not in prompt
+    assert (
+        "captures what these items durably record. Keep what each item says about where it "
+        "comes from (for example that the assistant found it, or that the user only agreed); "
+        "never turn that into a plain statement of fact. Reuse the items' wording where you can."
+    ) in " ".join(prompt.split())
+
+
+@pytest.mark.asyncio
+async def test_summary_language_follows_the_users_batch() -> None:
+    """B-300 ④ —— 汇总句用这批记忆的语言:按该用户这一批待整理记忆的全部内容判。"""
+    worker, store, aux, _audit = await _build_worker(
+        aux_replies=['{"keep": true, "summary": "s", "reject_reason": null}']
+    )
+    _seed_transient(
+        store,
+        contents=["用户喜欢深色界面主题", "用户偏好暗色模式显示", "用户希望把界面换成深色"],
+    )
+    await worker.run_once()
+    [prompt] = aux.calls
+    assert "## Output language\nWrite the summary in Chinese" in prompt
+
+
+@pytest.mark.asyncio
+async def test_summary_language_unnamed_when_it_cannot_be_told() -> None:
+    worker, store, aux, _audit = await _build_worker(
+        aux_replies=['{"keep": true, "summary": "s", "reject_reason": null}']
+    )
+    _seed_transient(store, contents=["dark UI", "dark mode preference", "wants dark theme"])
+    await worker.run_once()
+    [prompt] = aux.calls
+    assert "Write the summary in the language most of these memories are written in." in prompt
+
+
+@pytest.mark.asyncio
+async def test_due_review_prompt_carries_recorded_and_todays_date() -> None:
+    """B-300 G9 —— 到期复核要模型判「过时没有」,就得给它记录日期和今天的日期。"""
+    worker, store, aux, _audit = await _build_worker(
+        aux_replies=['{"still_valid": true, "expected_valid_days": 730}']
+    )
+    item = await _seed_due_fact(store, expected_valid_days=365)
+    await worker._review_due_fact(
+        tenant_id=_TENANT, user_id=_USER, item=item, summary=ConsolidatorRunSummary()
+    )
+    [prompt] = aux.calls
+    assert item.created_at is not None
+    assert f"Recorded on: {item.created_at.date().isoformat()}" in prompt
+    assert f"Today's date: {datetime.now(UTC).date().isoformat()}" in prompt
