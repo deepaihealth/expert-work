@@ -249,7 +249,7 @@ def test_sub_budget_breach_stops_only_that_phase_and_is_not_persisted(tmp_path: 
         state_dir=tmp_path,
         quote_id="q",
         phase_caps={"C": 5.0, "B": 50.0},
-        budget_of=lambda p: phases.budget_of(p),
+        budget_of=phases.budget_of,
     )
     guard.reserve(item="x", model="m", cap=4.0, phase="c4")
     with pytest.raises(spend.SpendStopError, match="only this phase"):

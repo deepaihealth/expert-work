@@ -88,7 +88,7 @@ def test_guard_enforces_the_sub_budget() -> None:
         stop_line=100.0,
         prices={"m": Price(1, 1, 1, "t")},
         phase_caps={"C": 5.0},
-        budget_of=lambda p: phases.budget_of(p),
+        budget_of=phases.budget_of,
     )
     guard.reserve(item="x", model="m", cap=4.0, phase="c4")
     guard.reserve(item="y", model="m", cap=50.0, phase="b")  # B 没有分预算上限

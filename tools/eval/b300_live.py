@@ -405,6 +405,7 @@ def mark_run(exc: BaseException, *, run_id: str | None, started: bool | None) ->
         exc.b300_run_id = run_id  # type: ignore[attr-defined]
         exc.b300_run_started = started  # type: ignore[attr-defined]
     except AttributeError:
+        # 挂不上属性的异常:结算方读到 None = 不知道建没建起运行,预留按上限留着,不按 0 结。
         pass
 
 
