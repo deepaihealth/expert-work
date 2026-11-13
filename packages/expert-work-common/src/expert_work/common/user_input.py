@@ -18,7 +18,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from langchain_core.messages import BaseMessage
+
 from expert_work.common.conversation_channel import message_field, message_text
+from expert_work.common.spotlight import untrusted_fence_start
+
+#: 关掉 spotlight 时外部内容段的开头(``control_plane.api.runs._fence_untrusted``)。
+UNTRUSTED_PLAIN_MARKER = "[untrusted content]\n"
 
 #: ``additional_kwargs`` 里的键。
 USER_INPUT_KEY = "expert_work_user_input"
@@ -78,4 +84,48 @@ def read_user_input(message: Any) -> UserInput | None:
     )
 
 
-__all__ = ["USER_INPUT_KEY", "UserInput", "read_user_input", "user_input_kwargs"]
+#: B-300 review M1 —— 草稿试跑(``use_draft``)那一轮的用户消息上的服务端标记。长期记忆每次写回
+#: 都重抽整段对话,所以「这一轮不写」光靠这次 run 的配置不够:审批续跑(按已发布版本重建)、孤儿接管、
+#: 同一对话里后面的线上轮都会把它再抽一遍。带这个标记的那一整轮,两次提炼都跳过。只由
+#: ``control_plane.api.runs._start_run`` 盖;请求体没有任何字段能写到消息的附加字段上,伪造它也只会
+#: 让那一轮被跳过。
+DRAFT_TURN_KEY = "expert_work_draft_turn"
+
+
+def text_before_external_content(text: str) -> str:
+    """B-300 review L1 —— 用户消息里对接方外部内容之前的那段文字。
+
+    没有白名单标记的用户角色消息(发版前的旧消息等)也可能带着 ``_build_human_message`` 拼进去的
+    外部内容:spotlight 围栏,或关掉 spotlight 时的 ``[untrusted content]`` 段。它们一律排在用户文字
+    之后,所以从第一个围栏处切掉。"""
+    plain = text.find(UNTRUSTED_PLAIN_MARKER)
+    cuts = [
+        i for i in (untrusted_fence_start(text), plain if plain >= 0 else None) if i is not None
+    ]
+    return text[: min(cuts)] if cuts else text
+
+
+def mark_draft_turn(message: BaseMessage) -> BaseMessage:
+    """返回盖了草稿标记的**新**消息(已有的附加字段原样保留)。"""
+    return message.model_copy(
+        update={"additional_kwargs": {**message.additional_kwargs, DRAFT_TURN_KEY: True}}
+    )
+
+
+def is_draft_turn(message: Any) -> bool:
+    """这条消息是否是草稿试跑那一轮的用户消息(对象形态与 dict 形态都吃)。"""
+    kwargs = message_field(message, "additional_kwargs") or {}
+    return isinstance(kwargs, dict) and kwargs.get(DRAFT_TURN_KEY) is True
+
+
+__all__ = [
+    "DRAFT_TURN_KEY",
+    "UNTRUSTED_PLAIN_MARKER",
+    "USER_INPUT_KEY",
+    "UserInput",
+    "is_draft_turn",
+    "mark_draft_turn",
+    "read_user_input",
+    "text_before_external_content",
+    "user_input_kwargs",
+]

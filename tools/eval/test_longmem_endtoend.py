@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from longmem.adapter import load_longmemeval
 from longmem.embedders import KeywordEmbedder
 from longmem.endtoend import EndToEndConfig, QAResult, run_end_to_end
@@ -65,6 +65,8 @@ class _ScriptedCaller:
                 memories = [{"kind": "fact", "content": "User's favorite editor is expert_work"}]
             elif "vim" in body:
                 memories = [{"kind": "fact", "content": "User's favorite editor was vim"}]
+            elif "ferns" in body:
+                memories = [{"kind": "episodic", "content": "User watered the garden ferns"}]
             else:
                 memories = []
             return AIMessage(content=json.dumps({"memories": memories}))
@@ -97,8 +99,8 @@ async def test_end_to_end_fixture_pipeline() -> None:
     )
     assert report.n_instances == 2
     assert report.accuracy == 1.0
-    # One extraction call per session (2 + 2), one answer per question.
-    assert caller.extraction_calls == 4
+    # B-300 PR 1 —— 每段会话按角色拆开:用户的话一次(4 段),有助手回答的再一次(2 段)。
+    assert caller.extraction_calls == 6
     assert caller.answer_calls == 2
     assert report.memories_written == 4
     assert report.by_question_type["knowledge-update"]["accuracy"] == 1.0
@@ -342,4 +344,109 @@ async def test_ingest_passes_the_explicit_entry(monkeypatch: pytest.MonkeyPatch)
         sem=asyncio.Semaphore(1),
     )
     assert written == len(seen) > 0
-    assert all(row["user_text"] == row["messages"] for row in seen)
+    # 声明为用户文字的正好是这段会话里的用户消息(日期抬头 + 用户的每一轮),助手的回答不在里面。
+    for row in seen:
+        humans = [m for m in row["messages"] if isinstance(m, HumanMessage)]
+        assert row["user_text"] == humans
+        assert any(isinstance(m, AIMessage) for m in row["messages"]) or len(humans) >= 2
+
+
+def test_session_messages_split_by_role() -> None:
+    """B-300 PR 1 —— 一段会话拆成生产的形状:用户的每一轮一条 HumanMessage(经显式参数声明为用户
+    文字),助手的每一轮一条 AIMessage;日期抬头单独一条用户消息。LoCoMo 两个说话人都是人,保留名字。"""
+    from datetime import datetime
+
+    from longmem.adapter import MemoryDoc
+    from longmem.endtoend import _session_messages
+
+    def doc(content: str) -> MemoryDoc:
+        return MemoryDoc(doc_id=content[:8], session_id="s", content=content, timestamp=None)
+
+    when = datetime(2023, 4, 5, 19, 30)
+    out = _session_messages(
+        [doc("user: I moved to Berlin"), doc("assistant: Nice!"), doc("user: It is cold")], when
+    )
+    assert [(type(m).__name__, m.content) for m in out] == [
+        ("HumanMessage", "[Conversation session dated 2023-04-05 19:30]"),
+        ("HumanMessage", "I moved to Berlin"),
+        ("AIMessage", "Nice!"),
+        ("HumanMessage", "It is cold"),
+    ]
+    # LongMemEval 的 session 粒度:一个 doc 里是整段会话,按行首的角色切开(续行归上一轮)。
+    joined = _session_messages([doc("user: a\nmore of a\nassistant: b\nuser: c")], None)
+    assert [(type(m).__name__, m.content) for m in joined] == [
+        ("HumanMessage", "[Conversation session]"),
+        ("HumanMessage", "a\nmore of a"),
+        ("AIMessage", "b"),
+        ("HumanMessage", "c"),
+    ]
+    locomo = _session_messages([doc("Caroline: I went hiking"), doc("Melanie: Where?")], None)
+    assert [m.content for m in locomo[1:]] == ["Caroline: I went hiking", "Melanie: Where?"]
+    assert all(isinstance(m, HumanMessage) for m in locomo)
+
+
+@pytest.mark.asyncio
+async def test_ingest_through_pr1_extracts_user_turns_only() -> None:
+    """真走生产入口:第一次提炼看到的是用户的话、看不到助手的回答;写进库里。"""
+    import asyncio
+
+    from longmem import endtoend
+
+    from expert_work.persistence import InMemoryMemoryStore
+    from expert_work.runtime.cancellation import CancellationToken
+
+    first_inputs: list[str] = []
+
+    class _Spy(_ScriptedCaller):
+        async def __call__(
+            self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]
+        ) -> AIMessage:
+            if "The other side of the conversation is not shown." in str(messages[0].content):
+                first_inputs.append(str(messages[1].content))
+            return await super().__call__(messages=messages, tools=tools)
+
+    instances = load_longmemeval(FIXTURES / "longmemeval_mini.json")
+    written = await endtoend._ingest_corpus(
+        instances[0].docs,
+        store=InMemoryMemoryStore(),
+        embedder=KeywordEmbedder(),
+        llm_caller=_Spy(),
+        reconcile=False,
+        token=CancellationToken(),
+        sem=asyncio.Semaphore(1),
+        expect_user_text=True,
+    )
+    assert written == 2
+    assert len(first_inputs) == 2
+    assert all(
+        "wonderful trip" not in text and "classic Roman" not in text for text in first_inputs
+    )
+    assert any("Kyoto" in text for text in first_inputs)
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_that_writes_nothing_raises() -> None:
+    """一整段语料一条记忆都没写(入口没提炼、模型全回空)不能悄悄去打分:报错。"""
+    import asyncio
+
+    from longmem import endtoend
+
+    from expert_work.persistence import InMemoryMemoryStore
+    from expert_work.runtime.cancellation import CancellationToken
+
+    class _Empty:
+        async def __call__(self, *, messages: Any, tools: Any) -> AIMessage:
+            del messages, tools
+            return AIMessage(content=json.dumps({"memories": []}))
+
+    instances = load_longmemeval(FIXTURES / "longmemeval_mini.json")
+    with pytest.raises(endtoend.NothingIngestedError):
+        await endtoend._ingest_corpus(
+            instances[0].docs,
+            store=InMemoryMemoryStore(),
+            embedder=KeywordEmbedder(),
+            llm_caller=_Empty(),
+            reconcile=False,
+            token=CancellationToken(),
+            sem=asyncio.Semaphore(1),
+        )

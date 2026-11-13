@@ -107,6 +107,13 @@ class CancellationToken:
         waiter: asyncio.Task[bool] = asyncio.ensure_future(self._event.wait())
         try:
             await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            # B-300 review L3 —— the caller itself was cancelled (e.g. a sibling in a
+            # TaskGroup failed): interrupt the in-flight call too instead of leaving
+            # it running with nobody awaiting it.
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         finally:
             waiter.cancel()
             # Drain the cancelled waiter. ``gather(return_exceptions=True)``

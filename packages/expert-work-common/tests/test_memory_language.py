@@ -99,3 +99,30 @@ def test_summary_sections() -> None:
         "Write the summary in the language most of these memories are written in."
         in summary_language_section(None)
     )
+
+
+def test_a_slash_inside_cjk_text_is_not_a_path() -> None:
+    """B-300 review M2 —— 中日文不用空格分词:斜杠(血压 130/85)不能把整句当路径吃掉。"""
+    assert (
+        detect_user_language(["我的血压一般是130/85,医生说要每天早晚各量一次并记录下来"])
+        == "Chinese"
+    )
+    # 假名不到三成(汉字 + 少量假名):按规则不点名 —— 但绝不能因为斜杠吃掉了前一句而被点名成 Chinese。
+    assert (
+        detect_user_language(
+            [
+                "毎日の記録/東京都港区で働いています。",
+                "東京都港区勤務、営業部長、週末休日、自宅埼玉県川口市在住",
+            ]
+        )
+        is None
+    )
+
+
+def test_url_right_after_cjk_is_still_stripped() -> None:
+    """网址紧跟在汉字后面(前面没有空格)也要去掉,不让网址里的拉丁字母把占比推过八成。"""
+    url = "https://example.com/" + "abcdefghij" * 20
+    assert (
+        detect_user_language(["请帮我看看这个链接" + url + "里面写的东西我觉得很有意思"])
+        == "Chinese"
+    )

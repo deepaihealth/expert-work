@@ -104,7 +104,12 @@ from expert_work.common.observability import (
     expert_work_histogram,
 )
 from expert_work.common.spotlight import spotlight_untrusted
-from expert_work.common.user_input import user_input_kwargs
+from expert_work.common.user_input import (
+    DRAFT_TURN_KEY,
+    UNTRUSTED_PLAIN_MARKER,
+    mark_draft_turn,
+    user_input_kwargs,
+)
 from expert_work.persistence import ApprovalStore
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.memory import MemoryWritebackJob, MemoryWritebackJobStore
@@ -446,7 +451,7 @@ def _fence_untrusted(blocks: list[str], *, spotlight_nonce: str | None) -> str:
     if spotlight_nonce:
         fenced = [spotlight_untrusted(b, nonce=spotlight_nonce) for b in blocks]
     else:
-        fenced = [f"[untrusted content]\n{b}" for b in blocks]
+        fenced = [f"{UNTRUSTED_PLAIN_MARKER}{b}" for b in blocks]
     return "\n\n".join(fenced)
 
 
@@ -666,7 +671,8 @@ def replay_graph_input(
         kwargs = {
             k: v
             for k, v in msg.additional_kwargs.items()
-            if k not in (SUPERSEDED_BY, SUPERSEDED_AT)
+            # B-300 review M1 —— 草稿标记也不搬:这一轮是不是草稿由这次请求定(``_start_run``)。
+            if k not in (SUPERSEDED_BY, SUPERSEDED_AT, DRAFT_TURN_KEY)
         }
         fresh.append(msg.model_copy(update={"id": str(uuid4()), "additional_kwargs": kwargs}))
     if len(fresh) not in (2, 3):
@@ -1694,6 +1700,18 @@ async def _one_frame(frame: bytes) -> AsyncIterator[bytes]:
     yield frame
 
 
+def _mark_draft_turn_input(graph_input: dict[str, Any]) -> dict[str, Any]:
+    """B-300 review M1 —— 草稿试跑这一轮的用户消息(第一条不隐藏的 HumanMessage)盖上服务端草稿
+    标记。长期记忆每次写回都重抽整段对话:审批续跑(按已发布版本重建,不带这次 run 的配置)、孤儿
+    接管、同一对话里后面的线上轮,都靠这个标记整轮跳过草稿那一轮。返回新的输入,原消息不动。"""
+    messages = list(graph_input["messages"])
+    for index, message in enumerate(messages):
+        if isinstance(message, HumanMessage) and not is_hidden(message):
+            messages[index] = mark_draft_turn(message)
+            break
+    return {**graph_input, "messages": messages}
+
+
 async def _start_run(
     *,
     run_record: RunRecord,
@@ -1739,6 +1757,8 @@ async def _start_run(
             document_names=payload.document_names,
             document_original_names=payload.document_original_names,
         )
+    if payload.use_draft:
+        graph_input = _mark_draft_turn_input(graph_input)
     configurable: dict[str, Any] = {
         "thread_id": str(thread_id),
         "tenant_id": str(tenant_id),

@@ -62,7 +62,12 @@ from expert_work.common.uplift_metrics import (
     record_memory_rewrite,
     record_memory_verify,
 )
-from expert_work.common.user_input import UserInput, read_user_input
+from expert_work.common.user_input import (
+    UserInput,
+    is_draft_turn,
+    read_user_input,
+    text_before_external_content,
+)
 from expert_work.persistence import MemoryStore
 from expert_work.persistence.memory import MemoryWritebackDLQ, MemoryWritebackJobStore
 from expert_work.persistence.memory.base import (
@@ -310,7 +315,7 @@ def _activity_line(tool_names: Sequence[str]) -> str:
 
 def _segments(messages: Sequence[BaseMessage]) -> list[list[BaseMessage]]:
     """按轮切开:一条可见的用户消息(或定时投递)开一轮;系统消息、隐藏消息、被取代的消息
-    不进任何一轮(被取代的判断同 ``retrieval_query``)。"""
+    不进任何一轮(被取代的判断同 ``retrieval_query``);草稿试跑那一轮整轮去掉。"""
     segments: list[list[BaseMessage]] = []
     for message in messages:
         if isinstance(message, SystemMessage) or is_hidden(message) or is_superseded(message):
@@ -318,7 +323,9 @@ def _segments(messages: Sequence[BaseMessage]) -> list[list[BaseMessage]]:
         if opens_segment(message) or not segments:
             segments.append([])
         segments[-1].append(message)
-    return segments
+    # B-300 review M1 —— 草稿试跑那一整轮(用户消息带服务端草稿标记)两次提炼都不给:续跑、
+    # 接管、后面的线上轮重抽整段对话时也不会把它记下。
+    return [segment for segment in segments if not is_draft_turn(segment[0])]
 
 
 def _typed_input(message: HumanMessage, explicit: set[int]) -> UserInput | None:
@@ -348,7 +355,8 @@ def _extraction_inputs(
         if isinstance(opener, HumanMessage):
             typed = _typed_input(opener, explicit)
             if typed is None:
-                conversation.add(_reply_text(opener), "[task]")
+                # 外部内容(围栏里的)不跟着进 ``[task]``(review L1)。
+                conversation.add(text_before_external_content(_reply_text(opener)), "[task]")
             else:
                 user.add(typed.text)
                 conversation.add(typed.text, "[user]")
@@ -1391,9 +1399,9 @@ async def _extract_two_passes(
     token: CancellationToken,
     log_label: str,
 ) -> tuple[list[ExtractedMemory], bool]:
-    """B-300 ① —— 两次提炼(可并发),产出合在一起:第一次的在前,同内容只留一条。
+    """B-300 ① —— 两次提炼(并发),产出合在一起:第一次的在前,同内容只留一条。
 
-    返回 ``(产出, 是否有一次调用失败)``。取消原样抛出。"""
+    返回 ``(产出, 是否有一次调用失败)``。一次的普通失败只丢那一次;取消原样抛出,并先取消另一次。"""
     inputs = _extraction_inputs(messages, user_text_messages)
     plan: list[tuple[str, list[str]]] = []
     if inputs.user.lines:
@@ -1405,22 +1413,29 @@ async def _extract_two_passes(
         return [], False
     # 语言只按用户输入的文字判(附件、外部内容、助手的话都不算,B-300 ④)。
     language = detect_user_language(inputs.user.lines)
-    results = await asyncio.gather(
-        *(
-            _extract_pass(name, lines, language=language, llm_caller=llm_caller, token=token)
-            for name, lines in plan
-        ),
-        return_exceptions=True,
-    )
+
+    async def guarded(name: str, lines: list[str]) -> list[ExtractedMemory] | Exception:
+        # 普通失败交回来(只丢这一次);取消原样抛出,TaskGroup 随即取消另一次(review L3)。
+        try:
+            return await _extract_pass(
+                name, lines, language=language, llm_caller=llm_caller, token=token
+            )
+        except RunCancelledError:
+            raise
+        except Exception as exc:
+            return exc
+
+    try:
+        async with asyncio.TaskGroup() as group:
+            tasks = [group.create_task(guarded(name, lines)) for name, lines in plan]
+    except* RunCancelledError as cancelled:
+        raise cancelled.exceptions[0] from None
+    results = [task.result() for task in tasks]
     extracted: list[ExtractedMemory] = []
     seen: set[str] = set()
     failed = False
     for (name, _lines), result in zip(plan, results, strict=True):
-        if isinstance(result, RunCancelledError):
-            raise result
-        if isinstance(result, BaseException):
-            if not isinstance(result, Exception):
-                raise result
+        if isinstance(result, Exception):
             logger.warning(
                 "%s_extract_failed pass=%s — other pass kept", log_label, name, exc_info=result
             )

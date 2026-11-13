@@ -31,8 +31,11 @@ _MIN_KANA_SHARE = 0.3
 
 _FENCED_CODE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
 _INLINE_CODE = re.compile(r"`[^`\n]*`")
-_URL = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://\S+")
-_PATH = re.compile(r"\S*[/\\]\S*")
+# B-300 review M2 —— 网址与路径只认 ASCII:中日文不用空格分词,``\S*/\S*`` 会把「血压 130/85」
+# 所在的整句当路径吃掉。网址前面不要求词边界(紧跟在汉字后面也要去掉);路径只在行首、空白或
+# 括号之后开始,所以夹在汉字中间的斜杠不算。
+_URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[\x21-\x7e]+")
+_PATH = re.compile(r"(?<![^\s(\[])(?:[A-Za-z0-9_.~-]*[/\\])+[A-Za-z0-9_.~-]+")
 
 
 def _script(ch: str) -> str | None:

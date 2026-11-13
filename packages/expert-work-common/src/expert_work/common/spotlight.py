@@ -145,10 +145,19 @@ def unspotlight(text: str) -> str:
     return stripped.replace(DATAMARK_GLYPH, "")
 
 
+def untrusted_fence_start(text: str) -> int | None:
+    """Where the first spotlight fence opens in ``text`` (``None`` = no fence).
+
+    B-300 —— 长期记忆提炼给没有白名单标记的旧用户消息时,只取这之前的文字。"""
+    match = _FENCE_OPEN_RE.search(text)
+    return match.start() if match else None
+
+
 __all__ = [
     "DATAMARK_GLYPH",
     "SPOTLIGHT_SYSTEM_CLAUSE",
     "datamark",
     "spotlight_untrusted",
     "unspotlight",
+    "untrusted_fence_start",
 ]

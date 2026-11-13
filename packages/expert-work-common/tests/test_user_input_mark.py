@@ -6,7 +6,13 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from expert_work.common.user_input import USER_INPUT_KEY, read_user_input, user_input_kwargs
+from expert_work.common.user_input import (
+    USER_INPUT_KEY,
+    is_draft_turn,
+    mark_draft_turn,
+    read_user_input,
+    user_input_kwargs,
+)
 
 
 def _marked(content: str | list[str | dict[Any, Any]], *, text: str, **counts: int) -> HumanMessage:
@@ -76,3 +82,13 @@ def test_mark_survives_a_dict_shaped_message() -> None:
     got = read_user_input(msg.model_dump())
     assert got is not None
     assert got.text == "hi"
+
+
+def test_draft_turn_mark_round_trips_and_keeps_other_kwargs() -> None:
+    msg = _marked("hi", text="hi", images=0, files=0, external_blocks=0)
+    marked = mark_draft_turn(msg)
+    assert is_draft_turn(marked)
+    assert not is_draft_turn(msg)  # 原对象不动
+    assert read_user_input(marked) is not None  # 白名单标记还在
+    assert is_draft_turn(marked.model_dump())
+    assert not is_draft_turn(AIMessage(content="x"))

@@ -26,7 +26,7 @@ from langchain_core.messages import (
 )
 
 from expert_work.common.conversation_channel import HIDE_FROM_UI, SUPERSEDED_BY
-from expert_work.common.user_input import user_input_kwargs
+from expert_work.common.user_input import mark_draft_turn, user_input_kwargs
 from expert_work.persistence import InMemoryMemoryStore
 from expert_work.protocol import MemoryItem
 from expert_work.runtime.cancellation import CancellationToken
@@ -489,3 +489,122 @@ async def test_written_counts_only_rows_that_landed() -> None:
     )
     written, failed, _ = await _flush([_user("我住在成都,喜欢绿茶")], llm, store=store)
     assert (written, failed) == (1, False)
+
+
+# ---------------------------------------------------------------------------
+# B-300 review M1 —— 草稿那一轮,之后任何一次写回都整轮跳过
+# ---------------------------------------------------------------------------
+
+
+def _draft_turn_paused_then_resumed() -> list[BaseMessage]:
+    """草稿试跑的一轮:停在审批上,审批后续跑(续跑按已发布版本建、config 里没有草稿标记)。"""
+    return [
+        mark_draft_turn(_user("DRAFTSENTINEL 我住在深圳")),
+        AIMessage(content="", tool_calls=[{"name": "needs_approval", "args": {}, "id": "a1"}]),
+        ToolMessage(content="approved", tool_call_id="a1", name="needs_approval"),
+        AIMessage(content="DRAFTREPLYSENTINEL 已记下"),
+    ]
+
+
+async def test_draft_turn_resumed_after_approval_writes_nothing() -> None:
+    llm = _ByPassLLM(
+        user_reply=_reply({"kind": "fact", "content": "用户住在深圳"}),
+        conversation_reply=_reply({"kind": "fact", "content": "助手记下用户住在深圳"}),
+    )
+    written, failed, store = await _flush(_draft_turn_paused_then_resumed(), llm)
+    assert llm.calls == []
+    assert (written, failed) == (0, False)
+    assert await _rows(store) == []
+
+
+async def test_a_later_live_turn_does_not_extract_the_draft_turn() -> None:
+    messages = [
+        *_draft_turn_paused_then_resumed(),
+        _user("我喜欢绿茶"),
+        AIMessage(content="好的"),
+    ]
+    llm = _ByPassLLM()
+    await _flush(messages, llm)
+    assert llm.input_of("user") == "我喜欢绿茶"
+    assert llm.input_of("conversation") == "[user] 我喜欢绿茶\n[assistant] 好的"
+    for which in ("user", "conversation"):
+        assert "DRAFT" not in llm.input_of(which)
+
+
+async def test_task_line_leaves_out_fenced_external_content() -> None:
+    """B-300 review L1 —— 没有白名单标记的旧用户消息整条进 ``[task]`` 时,对接方的外部内容(spotlight
+    围栏,或关掉 spotlight 时的 ``[untrusted content]`` 段)不跟着进去:只取第一个围栏之前的文字。"""
+    from expert_work.common.spotlight import spotlight_untrusted
+
+    fenced = HumanMessage(
+        content="帮我核对一下\n\n" + spotlight_untrusted("EXTERNALSENTINEL 外部数据", nonce="n0nce")
+    )
+    plain = HumanMessage(content="再看一份\n\n[untrusted content]\nPLAINSENTINEL 外部数据")
+    llm = _ByPassLLM()
+    await _flush([fenced, AIMessage(content="好的"), plain, AIMessage(content="也好")], llm)
+    lines = llm.input_of("conversation").splitlines()
+    assert lines == [
+        "[task] 帮我核对一下",
+        "[assistant] 好的",
+        "[task] 再看一份",
+        "[assistant] 也好",
+    ]
+
+
+async def test_cancellation_in_one_pass_cancels_the_other() -> None:
+    """B-300 review L3 —— 一次提炼被取消(``RunCancelledError``),另一次不该接着跑完:立刻取消它,
+    取消原样抛给调用方。"""
+    import asyncio
+
+    from expert_work.runtime.cancellation import RunCancelledError
+
+    other_cancelled = asyncio.Event()
+
+    async def llm(*, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
+        del tools
+        if PASS1_MARK in str(messages[0].content):
+            raise RunCancelledError("run cancelled")
+        try:
+            await asyncio.Event().wait()  # 第二次一直挂着
+        except asyncio.CancelledError:
+            other_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    with pytest.raises(RunCancelledError):
+        await asyncio.wait_for(
+            flush_messages_with_outcome(
+                [_user("我住在成都"), AIMessage(content="好的")],
+                memory_store=InMemoryMemoryStore(),
+                embedder=FakeEmbedder(dim=_DIM),
+                llm_caller=llm,
+                tenant_id=_TENANT,
+                user_id=_USER,
+                thread_id=None,
+                token=CancellationToken(),
+            ),
+            timeout=2,
+        )
+    assert other_cancelled.is_set()
+
+
+async def test_an_ordinary_failure_in_one_pass_keeps_the_other() -> None:
+    """普通异常只丢那一次的产出(``failed`` 置真),另一次照写。"""
+
+    async def llm(*, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
+        del tools
+        if PASS1_MARK in str(messages[0].content):
+            raise RuntimeError("provider down")
+        return AIMessage(content=_reply({"kind": "episodic", "content": "助手查了天气"}))
+
+    outcome = await flush_messages_with_outcome(
+        [_user("我住在成都"), AIMessage(content="好的")],
+        memory_store=InMemoryMemoryStore(),
+        embedder=FakeEmbedder(dim=_DIM),
+        llm_caller=llm,
+        tenant_id=_TENANT,
+        user_id=_USER,
+        thread_id=None,
+        token=CancellationToken(),
+    )
+    assert (outcome.written, outcome.failed) == (1, True)
