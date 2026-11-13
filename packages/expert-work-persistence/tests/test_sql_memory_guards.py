@@ -2,10 +2,15 @@
 
 Same contract as ``test_in_memory_memory_guards.py`` against Postgres +
 pgvector (migration head, so the two consolidation-state tables exist).
+
+The two ``*_waits_for_*`` tests hold a row lock in a second connection while
+the store call runs, so they fail if the store's ``SELECT ... FOR UPDATE`` is
+removed (review LOW-1): without the lock the store decides on the old row.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,7 +33,9 @@ from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.memory.base import (
     ConsolidationSourcesChangedError,
     MemoryInjectionBlockedError,
+    SupersedeTargetChangedError,
 )
+from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
 
 pytestmark = pytest.mark.integration
@@ -73,6 +80,10 @@ def sql_store(postgres_container: PostgresContainer) -> Iterator[SqlStoreFixture
     command.upgrade(cfg, "head")
     engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
     yield SqlMemoryStore(create_async_session_factory(engine)), engine
+
+
+def _hashes(items: list[MemoryItem]) -> dict[UUID, str]:
+    return {m.id: m.content_hash or hash_content(m.content) for m in items}
 
 
 async def _seed_three(
@@ -153,6 +164,7 @@ async def test_write_consolidated_writes_nothing_when_a_member_stopped_being_cur
                     content=f"summary after {change}",
                     embedding=_vec(1.0),
                     source_ids=[m.id for m in members],
+                    source_hashes=_hashes(members),
                 )
         states = await _row_states(engine, u)
         assert all(status == "transient" for status, _ in states)
@@ -217,6 +229,7 @@ async def test_write_consolidated_with_blocked_summary_writes_nothing(
                 content=_INJECTION,
                 embedding=_vec(1.0),
                 source_ids=[m.id for m in members],
+                source_hashes=_hashes(members),
             )
         states = await _row_states(engine, u)
         assert states == [("transient", None)] * 3
@@ -286,21 +299,159 @@ async def test_rejected_cluster_markers_record_prune_and_delete_per_user(
         )
         assert await store.list_rejected_clusters(tenant_id=t, user_id=u) == {"h1", "h2"}
 
-        assert (
-            await store.prune_rejected_clusters(
-                tenant_id=t, user_id=u, before=datetime.now(UTC) - timedelta(days=1)
-            )
-            == 0
-        )
-        assert (
-            await store.prune_rejected_clusters(
-                tenant_id=t, user_id=u, before=datetime.now(UTC) + timedelta(minutes=1)
-            )
-            == 2
-        )
-        assert await store.list_rejected_clusters(tenant_id=t, user_id=u) == set()
-
         assert await store.delete_rejected_clusters_for_user(tenant_id=t, user_id=other) == 1
         assert await store.list_rejected_clusters(tenant_id=t, user_id=other) == set()
+        assert await store.list_rejected_clusters(tenant_id=t, user_id=u) == {"h1", "h2"}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rejected_cluster_prune_is_tenant_wide(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        t, t2, u, other = uuid4(), uuid4(), uuid4(), uuid4()
+        for tenant, user, member_hash in (
+            (t, u, "h1"),
+            (t, u, "h2"),
+            (t, other, "h3"),
+            (t2, u, "h9"),
+        ):
+            await store.record_rejected_cluster(
+                tenant_id=tenant, user_id=user, member_hash=member_hash, reason="false_cluster"
+            )
+        past = datetime.now(UTC) - timedelta(days=1)
+        assert await store.prune_rejected_clusters(tenant_id=t, before=past) == 0
+        soon = datetime.now(UTC) + timedelta(minutes=1)
+        assert await store.prune_rejected_clusters(tenant_id=t, before=soon) == 3
+        assert await store.list_rejected_clusters(tenant_id=t, user_id=u) == set()
+        assert await store.list_rejected_clusters(tenant_id=t, user_id=other) == set()
+        assert await store.list_rejected_clusters(tenant_id=t2, user_id=u) == {"h9"}
+    finally:
+        await engine.dispose()
+
+
+# ─── Review MEDIUM-1 / MEDIUM-2 / LOW-1 ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_write_consolidated_writes_nothing_when_a_member_was_corrected_meanwhile(
+    sql_store: SqlStoreFixture,
+) -> None:
+    store, engine = sql_store
+    try:
+        t, u = uuid4(), uuid4()
+        members = await _seed_three(store, t, u)
+        read_at_candidate_time = _hashes(members)
+        await store.update_content(
+            tenant_id=t,
+            user_id=u,
+            memory_id=members[0].id,
+            content="note 0, corrected",
+            embedding=_vec(1.0),
+            confidence=1.0,
+        )
+        with pytest.raises(ConsolidationSourcesChangedError):
+            await store.write_consolidated(
+                tenant_id=t,
+                user_id=u,
+                content="summary of the old text",
+                embedding=_vec(1.0),
+                source_ids=[m.id for m in members],
+                source_hashes=read_at_candidate_time,
+            )
+        assert await _row_states(engine, u) == [("transient", None)] * 3
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_write_consolidated_waits_for_a_correction_in_flight(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """A correction holds the member's row lock while the summary write starts;
+    the write must wait for it and then see the corrected text."""
+    store, engine = sql_store
+    try:
+        t, u = uuid4(), uuid4()
+        members = await _seed_three(store, t, u)
+        async with engine.connect() as conn:
+            await conn.begin()
+            await conn.execute(
+                text("UPDATE memory_item SET content = :c, content_hash = :h WHERE id = :id"),
+                {"c": "corrected", "h": hash_content("corrected"), "id": members[0].id},
+            )
+            task = asyncio.create_task(
+                store.write_consolidated(
+                    tenant_id=t,
+                    user_id=u,
+                    content="summary of the old text",
+                    embedding=_vec(1.0),
+                    source_ids=[m.id for m in members],
+                    source_hashes=_hashes(members),
+                )
+            )
+            await asyncio.sleep(0.5)
+            assert not task.done()
+            await conn.commit()
+        with pytest.raises(ConsolidationSourcesChangedError):
+            await task
+        assert await _row_states(engine, u) == [("transient", None)] * 3
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_supersede_refuses_a_target_folded_into_a_summary(
+    sql_store: SqlStoreFixture,
+) -> None:
+    store, engine = sql_store
+    try:
+        t, u = uuid4(), uuid4()
+        members = await _seed_three(store, t, u)
+        await store.write_consolidated(
+            tenant_id=t,
+            user_id=u,
+            content="summary",
+            embedding=_vec(1.0),
+            source_ids=[m.id for m in members],
+            source_hashes=_hashes(members),
+        )
+        new = _item(tenant=t, user=u, content="changed value", embedding=_vec(0.0, 1.0))
+        with pytest.raises(SupersedeTargetChangedError):
+            await store.supersede(tenant_id=t, user_id=u, old_id=members[0].id, new_item=new)
+        listed = await store.list_for_user(tenant_id=t, user_id=u)
+        assert new.id not in {m.id for m in listed}
+        assert all(m.invalid_at is None for m in listed)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_supersede_waits_for_a_fold_in_flight(sql_store: SqlStoreFixture) -> None:
+    """The consolidator holds the target's row lock while folding it; the
+    supersede must wait for it and then refuse the folded target."""
+    store, engine = sql_store
+    try:
+        t, u = uuid4(), uuid4()
+        target, parent = (_item(tenant=t, user=u, content=c) for c in ("target", "parent"))
+        await store.write([target, parent])
+        async with engine.connect() as conn:
+            await conn.begin()
+            await conn.execute(
+                text("UPDATE memory_item SET consolidated_into = :p WHERE id = :id"),
+                {"p": parent.id, "id": target.id},
+            )
+            new = _item(tenant=t, user=u, content="changed value", embedding=_vec(0.0, 1.0))
+            task = asyncio.create_task(
+                store.supersede(tenant_id=t, user_id=u, old_id=target.id, new_item=new)
+            )
+            await asyncio.sleep(0.5)
+            assert not task.done()
+            await conn.commit()
+        with pytest.raises(SupersedeTargetChangedError):
+            await task
+        listed = await store.list_for_user(tenant_id=t, user_id=u)
+        assert new.id not in {m.id for m in listed}
     finally:
         await engine.dispose()

@@ -12,7 +12,7 @@ persistence layer free of any embedding-model dependency.
 from __future__ import annotations
 
 import abc
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -84,6 +84,14 @@ class MemoryInjectionBlockedError(Exception):
     def __init__(self, blocked: Sequence[BlockedMemory]) -> None:
         super().__init__(f"{len(blocked)} memory item(s) blocked by strict threat scan")
         self.blocked = tuple(blocked)
+
+
+class SupersedeTargetChangedError(RuntimeError):
+    """B-300 D1 (the other direction) — the memory an UPDATE meant to replace
+    was folded into a summary, expired or archived after the write-back picked
+    it. Raised by :meth:`MemoryStore.supersede` under the target's row lock,
+    before anything changes; the caller stores the new fact as a plain write
+    instead, so it is not lost."""
 
 
 class ConsolidationSourcesChangedError(RuntimeError):
@@ -268,7 +276,12 @@ class MemoryStore(abc.ABC):
 
         B-300 D2 — ``new_item`` goes through the same strict scan as
         :meth:`write`; when blocked, :class:`MemoryInjectionBlockedError` is
-        raised before anything changes: the old row stays current."""
+        raised before anything changes: the old row stays current.
+
+        B-300 D1 (the other direction) — the target is re-read under a row lock;
+        when it was folded into a summary, expired or archived since the caller
+        picked it, :class:`SupersedeTargetChangedError` is raised and nothing
+        changes (``None`` keeps meaning unknown / deleted / already superseded)."""
 
     @abc.abstractmethod
     async def expire(
@@ -362,10 +375,9 @@ class MemoryStore(abc.ABC):
         same set refreshes its reason and time."""
 
     @abc.abstractmethod
-    async def prune_rejected_clusters(
-        self, *, tenant_id: UUID, user_id: UUID, before: datetime
-    ) -> int:
-        """Drop this user's markers recorded before ``before``; returns how many."""
+    async def prune_rejected_clusters(self, *, tenant_id: UUID, before: datetime) -> int:
+        """Drop the tenant's markers (every user) recorded before ``before``;
+        returns how many."""
 
     @abc.abstractmethod
     async def delete_rejected_clusters_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
@@ -415,6 +427,7 @@ class MemoryStore(abc.ABC):
         content: str,
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
+        source_hashes: Mapping[UUID, str],
     ) -> MemoryItem:
         """Sprint #7 SUB-PASS 1 commit — write a new consolidated item
         with ``status='consolidated'`` + ``consolidated_from=source_ids``
@@ -429,7 +442,10 @@ class MemoryStore(abc.ABC):
         B-300 — the members are re-read (row-locked) in the write's own
         transaction; when any is missing or no longer current
         :class:`ConsolidationSourcesChangedError` is raised and nothing is
-        written (D1). ``content`` goes through the strict write scan first;
+        written (D1). ``source_hashes`` carries each member's ``content_hash``
+        as it was read when the cluster was picked; a member corrected in place
+        meanwhile (still current, new text) counts as changed too — the summary
+        was decided on the old text. ``content`` goes through the strict write scan first;
         blocked → :class:`MemoryInjectionBlockedError`, nothing written (D2)."""
 
     @abc.abstractmethod

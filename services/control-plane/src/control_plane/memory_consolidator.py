@@ -54,6 +54,7 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.uplift_metrics import (
     record_consolidator_llm_tokens,
     record_consolidator_run,
+    record_memory_blocked,
     record_memory_cluster_candidates,
     record_memory_cluster_rejected,
     record_memory_consolidated,
@@ -65,6 +66,7 @@ from expert_work.persistence.memory.base import (
     ConsolidationSourcesChangedError,
     MemoryInjectionBlockedError,
 )
+from expert_work.persistence.memory.hash import hash_content
 from expert_work.persistence.rls import (
     bypass_rls_var,
     current_tenant_id_var,
@@ -733,7 +735,14 @@ class MemoryConsolidator:
                 summary.record_error(exc)
                 continue
             summary.tenant_count += 1
-            users = await self._users_this_tick(tenant_id)
+            await self._prune_rejected_clusters(tenant_id, summary)
+            try:
+                users = await self._users_this_tick(tenant_id)
+            except Exception as exc:
+                # 一个租户的游标读不了,不能拖垮整轮:记一次失败,接着做下一个租户。
+                logger.exception("memory_consolidator.user_list_failed tenant_id=%s", tenant_id)
+                summary.record_error(exc)
+                continue
             for user_id in users:
                 summary.user_count += 1
                 try:
@@ -811,6 +820,22 @@ class MemoryConsolidator:
                 users += [u for u in wrapped if u not in taken]
         return users
 
+    async def _prune_rejected_clusters(
+        self, tenant_id: UUID, summary: ConsolidatorRunSummary
+    ) -> None:
+        """被拒的簇的标记只在扫描窗口内有用(成员都比标记早,标记过了 30 天,成员也都出了
+        窗口)。每个租户每轮清一次、整租户一起清:没有可整理记忆的用户、清除用户时并发
+        又写回来的标记,也都会过期。"""
+        try:
+            with _scope(tenant_id):
+                await self._memory.prune_rejected_clusters(
+                    tenant_id=tenant_id,
+                    before=datetime.now(UTC) - timedelta(days=_TRANSIENT_SCAN_AGE_DAYS),
+                )
+        except Exception as exc:
+            logger.exception("memory_consolidator.marker_prune_failed tenant_id=%s", tenant_id)
+            summary.record_error(exc)
+
     async def _advance_cursor(
         self, tenant_id: UUID, user_id: UUID, summary: ConsolidatorRunSummary
     ) -> None:
@@ -837,13 +862,6 @@ class MemoryConsolidator:
         cfg: _ResolvedThresholds,
         summary: ConsolidatorRunSummary,
     ) -> None:
-        # B-300 —— 被拒的簇的标记只在扫描窗口内有用(成员都比标记早,标记过了 30 天,
-        # 成员也都出了窗口),同一轮里清掉。
-        await self._memory.prune_rejected_clusters(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            before=datetime.now(UTC) - timedelta(days=_TRANSIENT_SCAN_AGE_DAYS),
-        )
         # SUB-PASS 1: cluster → consolidate
         clusters = await self._find_candidate_clusters(
             tenant_id=tenant_id,
@@ -1076,9 +1094,14 @@ class MemoryConsolidator:
                     content=verdict.summary,
                     embedding=embedding,
                     source_ids=source_ids,
+                    # 取簇时读到的每条成员的内容哈希:判的这段时间里被原地更正过的
+                    # 成员也算变了(汇总是按旧内容写的)。
+                    source_hashes={
+                        item.id: item.content_hash or hash_content(item.content) for item in cluster
+                    },
                 )
             except ConsolidationSourcesChangedError:
-                # B-300 D1 —— 模型判的这段时间里有成员被取代 / 过期 / 删除 / 汇总:不写,
+                # B-300 D1 —— 模型判的这段时间里有成员被取代 / 过期 / 删除 / 汇总 / 更正:不写,
                 # 下一轮按当时的有效记忆重新取簇。
                 logger.info(
                     "memory_consolidator.cluster_skipped_sources_changed tenant=%s user=%s",
@@ -1089,6 +1112,7 @@ class MemoryConsolidator:
             except MemoryInjectionBlockedError as exc:
                 # B-300 D2 —— 汇总句被严格扫描拦下:这一簇不写,发审计(不带正文)。
                 for blocked in exc.blocked:
+                    record_memory_blocked(source="consolidation")
                     await self._safe_audit(
                         tenant_id=tenant_id,
                         action=AuditAction.MEMORY_INJECTION_BLOCKED,

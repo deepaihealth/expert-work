@@ -1004,11 +1004,12 @@ async def test_sweep_runs_every_store_call_under_an_explicit_rls_context() -> No
 
     assert lock_ctx and set(lock_ctx) == {(None, None, True)}
     bypass_calls = {"memory.consolidator_distinct_tenant_ids", "memory.distinct_users"}
-    # B-300 D4 —— 整理游标是租户级的:只带租户。
+    # B-300 D4 —— 整理游标、整租户清过期的被拒簇标记,都是租户级的:只带租户。
     tenant_calls = {
         "tenant_config.get",
         "memory.get_consolidation_cursor",
         "memory.set_consolidation_cursor",
+        "memory.prune_rejected_clusters",
     }
     seen = {name for name, _, _ in log}
     assert bypass_calls <= seen

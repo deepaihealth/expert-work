@@ -45,6 +45,7 @@ from expert_work.common.search import mmr_select, rrf_fuse
 from expert_work.common.threat_patterns import scan_for_threats
 from expert_work.common.uplift_metrics import (
     record_memory_abstain,
+    record_memory_blocked,
     record_memory_drift,
     record_memory_mmr,
     record_memory_reconcile,
@@ -56,7 +57,11 @@ from expert_work.common.uplift_metrics import (
 )
 from expert_work.persistence import MemoryStore
 from expert_work.persistence.memory import MemoryWritebackDLQ, MemoryWritebackJobStore
-from expert_work.persistence.memory.base import BlockedMemory, MemoryInjectionBlockedError
+from expert_work.persistence.memory.base import (
+    BlockedMemory,
+    MemoryInjectionBlockedError,
+    SupersedeTargetChangedError,
+)
 from expert_work.persistence.rls import (
     bypass_rls_var,
     current_tenant_id_var,
@@ -1026,6 +1031,14 @@ async def _reconcile_and_apply(
                     for b in exc.blocked
                 )
                 continue
+            except SupersedeTargetChangedError:
+                # B-300 D1 —— 判的这段时间里目标被整理汇总 / 过期了:不动它,新内容按新增
+                # 写入(照样过写入扫描),用户的新事实不丢。汇总行里可能仍是旧说法,由步 8
+                # 的汇总行复查处理。
+                logger.info("%s_update_target_changed id=%s — written as new", log_label, target)
+                record_memory_reconcile(op="target_changed")
+                direct.append(item)
+                continue
             record_memory_reconcile(op="update" if updated else "degraded")
             if not updated:
                 direct.append(item)
@@ -1057,7 +1070,8 @@ async def _apply_update(
     (close old row + open new versioned row) instead of overwriting in place.
 
     B-300 D2 —— 新内容被写入扫描拦下时 ``MemoryInjectionBlockedError`` 原样抛给调用方
-    (什么都没改);别的失败照旧返回 ``False``、由调用方退回直接写入。"""
+    (什么都没改);目标已被汇总 / 过期时 ``SupersedeTargetChangedError`` 也原样抛给调用方;
+    别的失败照旧返回 ``False``、由调用方退回直接写入。"""
     if before_store is not None:
         await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
     try:
@@ -1069,7 +1083,7 @@ async def _apply_update(
                 new_item=item,
             )
         )
-    except (RunCancelledError, MemoryInjectionBlockedError):
+    except (RunCancelledError, MemoryInjectionBlockedError, SupersedeTargetChangedError):
         raise
     except Exception:
         logger.warning("memory.reconcile_update_failed id=%s", target, exc_info=True)
@@ -1316,6 +1330,8 @@ async def flush_messages_with_outcome(
         logger.warning(
             "%s_blocked count=%d — content rejected by strict scanner", log_label, len(blocked)
         )
+        for entry in blocked:
+            record_memory_blocked(source=entry.source)
         await _emit_blocked_audits(
             audit_logger, blocked, tenant_id=tenant_id, user_id=user_id, run_id=run_id
         )

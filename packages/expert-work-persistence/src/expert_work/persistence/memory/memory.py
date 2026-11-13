@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID, uuid4
@@ -20,6 +20,7 @@ from expert_work.persistence.memory.base import (
     MemoryInjectionBlockedError,
     MemoryStore,
     MemoryWriteResult,
+    SupersedeTargetChangedError,
     scan_memory_content,
     split_blocked,
 )
@@ -396,6 +397,11 @@ class InMemoryMemoryStore(MemoryStore):
         )
         if idx is None:
             return None
+        if not _currently_valid(self._rows[idx], now=now):
+            # B-300 D1 (other direction) — folded into a summary / expired /
+            # archived since the caller picked it: change nothing.
+            msg = f"memory item {old_id} is no longer current; not superseding it"
+            raise SupersedeTargetChangedError(msg)
         self._rows[idx] = self._rows[idx].model_copy(
             update={"invalid_at": now, "superseded_by": new_item.id}
         )
@@ -485,13 +491,11 @@ class InMemoryMemoryStore(MemoryStore):
     ) -> None:
         self._rejected_clusters[(tenant_id, user_id, member_hash)] = (reason, datetime.now(UTC))
 
-    async def prune_rejected_clusters(
-        self, *, tenant_id: UUID, user_id: UUID, before: datetime
-    ) -> int:
+    async def prune_rejected_clusters(self, *, tenant_id: UUID, before: datetime) -> int:
         doomed = [
             key
             for key, (_reason, at) in self._rejected_clusters.items()
-            if key[:2] == (tenant_id, user_id) and at < before
+            if key[0] == tenant_id and at < before
         ]
         for key in doomed:
             del self._rejected_clusters[key]
@@ -560,6 +564,7 @@ class InMemoryMemoryStore(MemoryStore):
         content: str,
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
+        source_hashes: Mapping[UUID, str],
     ) -> MemoryItem:
         now = datetime.now(UTC)
         new_id = uuid4()
@@ -581,6 +586,10 @@ class InMemoryMemoryStore(MemoryStore):
                 raise ConsolidationSourcesChangedError(msg)
             if row is None or row.deleted_at is not None or not _currently_valid(row, now=now):
                 msg = f"memory item {sid} is no longer current; skipping cluster"
+                raise ConsolidationSourcesChangedError(msg)
+            # Review MEDIUM-1 — corrected in place since it was read.
+            if (row.content_hash or hash_content(row.content)) != source_hashes.get(sid):
+                msg = f"memory item {sid} changed since it was read; skipping cluster"
                 raise ConsolidationSourcesChangedError(msg)
         new_item = MemoryItem(
             id=new_id,

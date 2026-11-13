@@ -276,7 +276,8 @@ class MemoryDLQWorker:
             logger.error(
                 "memory.dlq_worker.blocked row_id=%s blocked=%d", row.id, len(result.blocked)
             )
-            record_memory_blocked(source="dlq")
+            for _blocked in result.blocked:
+                record_memory_blocked(source="dlq")  # one per item, as on the other paths
             await self._audit_blocked(row, items, result.blocked)
         await self._dlq.mark_done(row_id=row.id)
         return "ok"

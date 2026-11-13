@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID, uuid4
@@ -25,6 +25,7 @@ from expert_work.persistence.memory.base import (
     MemoryInjectionBlockedError,
     MemoryStore,
     MemoryWriteResult,
+    SupersedeTargetChangedError,
     scan_memory_content,
     split_blocked,
 )
@@ -535,19 +536,31 @@ class SqlMemoryStore(MemoryStore):
             raise MemoryInjectionBlockedError([hit])
         now = datetime.now(UTC)
         async with self._sf() as session:
+            target: list[ColumnElement[bool]] = [
+                MemoryItemRow.id == old_id,
+                MemoryItemRow.tenant_id == tenant_id,
+                MemoryItemRow.user_id == user_id,
+            ]
+            # B-300 D1 (other direction) — lock the target: a summary folding it
+            # (``write_consolidated``) either commits first and is seen below, or
+            # waits for this commit.
             old = (
                 await session.execute(
-                    select(MemoryItemRow).where(
-                        MemoryItemRow.id == old_id,
-                        MemoryItemRow.tenant_id == tenant_id,
-                        MemoryItemRow.user_id == user_id,
-                        MemoryItemRow.deleted_at.is_(None),
-                        MemoryItemRow.invalid_at.is_(None),
-                    )
+                    select(MemoryItemRow)
+                    .where(*target)
+                    .order_by(MemoryItemRow.id)
+                    .with_for_update()
                 )
             ).scalar_one_or_none()
-            if old is None:
+            if old is None or old.deleted_at is not None or old.invalid_at is not None:
                 return None
+            # The same "currently valid" predicate recall uses.
+            current = (
+                await session.execute(select(func.count()).where(*target, *_retrieve_filter()))
+            ).scalar_one()
+            if current != 1:
+                msg = f"memory item {old_id} is no longer current; not superseding it"
+                raise SupersedeTargetChangedError(msg)
             old.invalid_at = now
             old.superseded_by = new_item.id
             content = new_item.content
@@ -719,14 +732,11 @@ class SqlMemoryStore(MemoryStore):
             await session.execute(stmt)
             await session.commit()
 
-    async def prune_rejected_clusters(
-        self, *, tenant_id: UUID, user_id: UUID, before: datetime
-    ) -> int:
+    async def prune_rejected_clusters(self, *, tenant_id: UUID, before: datetime) -> int:
         return await delete_where(
             self._sf,
             MemoryClusterRejectionRow,
             MemoryClusterRejectionRow.tenant_id == tenant_id,
-            MemoryClusterRejectionRow.user_id == user_id,
             MemoryClusterRejectionRow.rejected_at < before,
         )
 
@@ -802,6 +812,7 @@ class SqlMemoryStore(MemoryStore):
         content: str,
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
+        source_hashes: Mapping[UUID, str],
     ) -> MemoryItem:
         now = datetime.now(UTC)
         new_id = uuid4()
@@ -812,8 +823,9 @@ class SqlMemoryStore(MemoryStore):
         content_hash = hash_content(content)
         async with self._sf() as session:
             # B-300 D1 — re-read the members under a row lock in this write's
-            # own transaction: a concurrent supersede / expire / delete either
-            # commits first (and is seen here) or waits for this commit.
+            # own transaction: a concurrent supersede / expire / delete / in-place
+            # correction either commits first (and is seen here) or waits for this
+            # commit. Locked in id order, like every other multi-row lock here.
             owned: list[ColumnElement[bool]] = [
                 MemoryItemRow.id.in_(list(source_ids)),
                 MemoryItemRow.tenant_id == tenant_id,
@@ -821,8 +833,13 @@ class SqlMemoryStore(MemoryStore):
             ]
             locked = (
                 await session.execute(
-                    select(MemoryItemRow.id, MemoryItemRow.consolidated_into)
+                    select(
+                        MemoryItemRow.id,
+                        MemoryItemRow.consolidated_into,
+                        MemoryItemRow.content_hash,
+                    )
                     .where(*owned)
+                    .order_by(MemoryItemRow.id)
                     .with_for_update()
                 )
             ).all()
@@ -832,6 +849,12 @@ class SqlMemoryStore(MemoryStore):
             if already is not None:
                 msg = f"memory item {already[0]} already consolidated_into {already[1]}; "
                 raise ConsolidationSourcesChangedError(msg + "skipping cluster")
+            # Review MEDIUM-1 — a member corrected in place since it was read: the
+            # summary was decided on the old text.
+            changed = next((row for row in locked if source_hashes.get(row[0]) != row[2]), None)
+            if changed is not None:
+                msg = f"memory item {changed[0]} changed since it was read; skipping cluster"
+                raise ConsolidationSourcesChangedError(msg)
             # The same "currently valid" predicate recall uses.
             current = (
                 await session.execute(

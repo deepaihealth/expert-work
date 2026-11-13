@@ -10,7 +10,11 @@ The SQL twin is ``test_sql_memory_guards.py``; both pin the same contract:
   back, ``supersede`` / ``write_consolidated`` raise before changing anything;
 * D4 — ``distinct_users`` is ordered by user id and resumes after a cursor; the
   per-tenant cursor round-trips;
-* rejected-cluster markers — record / list / prune / delete for a user.
+* rejected-cluster markers — record / list, tenant-wide prune, delete for a user.
+
+Review fixes (MEDIUM-1/2): ``write_consolidated`` also refuses a member whose
+text changed after it was read (an in-place correction), and ``supersede``
+refuses a target that was folded into a summary or expired meanwhile.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from expert_work.persistence import InMemoryMemoryStore
 from expert_work.persistence.memory.base import (
     ConsolidationSourcesChangedError,
     MemoryInjectionBlockedError,
+    SupersedeTargetChangedError,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
@@ -46,6 +51,11 @@ def _item(
         created_at=_NOW,
         last_used_at=_NOW,
     )
+
+
+def _hashes(items: list[MemoryItem]) -> dict[UUID, str]:
+    """Each member's content hash as the consolidator read it."""
+    return {m.id: m.content_hash or hash_content(m.content) for m in items}
 
 
 async def _seed_three(
@@ -102,6 +112,7 @@ async def test_write_consolidated_writes_nothing_when_a_member_was_superseded() 
             content="summary",
             embedding=(1.0, 0.0),
             source_ids=[m.id for m in members],
+            source_hashes=_hashes(members),
         )
     assert len(store._rows) == before
     assert all(r.consolidated_into is None for r in store._rows)
@@ -121,6 +132,7 @@ async def test_write_consolidated_writes_nothing_when_a_member_expired_or_was_de
                 content=f"summary after {change}",
                 embedding=(1.0, 0.0),
                 source_ids=[m.id for m in members],
+                source_hashes=_hashes(members),
             )
     assert not [r for r in store._rows if r.status == "consolidated"]
 
@@ -169,6 +181,7 @@ async def test_write_consolidated_with_blocked_summary_writes_nothing() -> None:
             content=_INJECTION,
             embedding=(1.0, 0.0),
             source_ids=[m.id for m in members],
+            source_hashes=_hashes(members),
         )
     assert len(store._rows) == 3
     assert all(r.consolidated_into is None for r in store._rows)
@@ -221,19 +234,95 @@ async def test_rejected_cluster_markers_record_prune_and_delete_per_user() -> No
     )
     assert await store.list_rejected_clusters(tenant_id=t, user_id=u) == {"h1", "h2"}
 
-    assert (
-        await store.prune_rejected_clusters(
-            tenant_id=t, user_id=u, before=datetime.now(UTC) - timedelta(days=1)
-        )
-        == 0
-    )
-    assert (
-        await store.prune_rejected_clusters(
-            tenant_id=t, user_id=u, before=datetime.now(UTC) + timedelta(minutes=1)
-        )
-        == 2
-    )
-    assert await store.list_rejected_clusters(tenant_id=t, user_id=u) == set()
-
     assert await store.delete_rejected_clusters_for_user(tenant_id=t, user_id=other) == 1
     assert await store.list_rejected_clusters(tenant_id=t, user_id=other) == set()
+    assert await store.list_rejected_clusters(tenant_id=t, user_id=u) == {"h1", "h2"}
+
+
+@pytest.mark.asyncio
+async def test_rejected_cluster_prune_is_tenant_wide() -> None:
+    """LOW-2 — one prune per tenant reaches every user's markers (also users
+    with no transient memory left), and no other tenant's."""
+    store = InMemoryMemoryStore()
+    t, t2, u, other = uuid4(), uuid4(), uuid4(), uuid4()
+    for tenant, user, member_hash in ((t, u, "h1"), (t, u, "h2"), (t, other, "h3"), (t2, u, "h9")):
+        await store.record_rejected_cluster(
+            tenant_id=tenant, user_id=user, member_hash=member_hash, reason="false_cluster"
+        )
+    before_now = datetime.now(UTC) - timedelta(days=1)
+    assert await store.prune_rejected_clusters(tenant_id=t, before=before_now) == 0
+    soon = datetime.now(UTC) + timedelta(minutes=1)
+    assert await store.prune_rejected_clusters(tenant_id=t, before=soon) == 3
+    assert await store.list_rejected_clusters(tenant_id=t, user_id=u) == set()
+    assert await store.list_rejected_clusters(tenant_id=t, user_id=other) == set()
+    assert await store.list_rejected_clusters(tenant_id=t2, user_id=u) == {"h9"}
+
+
+# ─── Review MEDIUM-1 / MEDIUM-2 ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_write_consolidated_writes_nothing_when_a_member_was_corrected_meanwhile() -> None:
+    """MEDIUM-1 — a correction rewrites the row in place (still current); the
+    summary was decided on the old text, so it must not be written."""
+    store = InMemoryMemoryStore()
+    t, u = uuid4(), uuid4()
+    members = await _seed_three(store, t, u)
+    read_at_candidate_time = _hashes(members)
+    await store.update_content(
+        tenant_id=t,
+        user_id=u,
+        memory_id=members[0].id,
+        content="note 0, corrected",
+        embedding=(1.0, 0.0),
+        confidence=1.0,
+    )
+    with pytest.raises(ConsolidationSourcesChangedError):
+        await store.write_consolidated(
+            tenant_id=t,
+            user_id=u,
+            content="summary of the old text",
+            embedding=(1.0, 0.0),
+            source_ids=[m.id for m in members],
+            source_hashes=read_at_candidate_time,
+        )
+    assert not [r for r in store._rows if r.status == "consolidated"]
+    corrected = next(r for r in store._rows if r.id == members[0].id)
+    assert corrected.content == "note 0, corrected"
+    assert corrected.consolidated_into is None
+
+
+@pytest.mark.asyncio
+async def test_supersede_refuses_a_target_folded_into_a_summary() -> None:
+    """MEDIUM-2 — the target was folded into a summary after the write-back
+    picked it: no new row, the target untouched, a dedicated error."""
+    store = InMemoryMemoryStore()
+    t, u = uuid4(), uuid4()
+    members = await _seed_three(store, t, u)
+    await store.write_consolidated(
+        tenant_id=t,
+        user_id=u,
+        content="summary",
+        embedding=(1.0, 0.0),
+        source_ids=[m.id for m in members],
+        source_hashes=_hashes(members),
+    )
+    before = list(store._rows)
+    new = _item(tenant=t, user=u, content="changed value", embedding=(0.0, 1.0))
+    with pytest.raises(SupersedeTargetChangedError):
+        await store.supersede(tenant_id=t, user_id=u, old_id=members[0].id, new_item=new)
+    assert store._rows == before
+
+
+@pytest.mark.asyncio
+async def test_supersede_refuses_an_expired_target() -> None:
+    store = InMemoryMemoryStore()
+    t, u = uuid4(), uuid4()
+    old = _item(tenant=t, user=u, content="lives in the north")
+    await store.write([old])
+    await store.expire(tenant_id=t, user_id=u, memory_id=old.id)
+    before = list(store._rows)
+    new = _item(tenant=t, user=u, content="lives in the south")
+    with pytest.raises(SupersedeTargetChangedError):
+        await store.supersede(tenant_id=t, user_id=u, old_id=old.id, new_item=new)
+    assert store._rows == before

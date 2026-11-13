@@ -10,7 +10,11 @@
 * rejected-cluster markers — a neighbourhood the model rejected costs 0 model
   calls next round (also when the next seed would pick a slightly different
   member set), a new member re-opens it, rejected clusters take no slot of the
-  per-user cap, markers older than 30 days are pruned.
+  per-user cap, markers older than 30 days are pruned tenant-wide;
+* review fixes — a member corrected in place while the model is deciding blocks
+  the summary (MEDIUM-1); a blocked summary bumps the blocked-writes metric
+  under ``consolidation`` (LOW-3); one tenant whose cursor cannot be read does
+  not stop the other tenants (LOW-4).
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
+from prometheus_client import REGISTRY
 
 from control_plane.memory_consolidator import ConsolidatorLLMReply, MemoryConsolidator
 from control_plane.tenancy import TenantConfigService
@@ -92,6 +97,13 @@ async def _worker(
     return worker, audit_store
 
 
+def _blocked_metric(source: str) -> float:
+    value = REGISTRY.get_sample_value(
+        "expert_work_uplift_memory_writes_blocked_total", {"source": source}
+    )
+    return value or 0.0
+
+
 def _consolidated(store: InMemoryMemoryStore) -> list[MemoryItem]:
     return [r for r in store._rows if r.status == "consolidated"]
 
@@ -125,6 +137,56 @@ async def test_superseded_memory_does_not_join_a_cluster() -> None:
     assert old.content not in aux.calls[0]
     [parent] = _consolidated(store)
     assert set(parent.consolidated_from) == {m.id for m in current}
+
+
+class _CorrectingAux:
+    """Model double: while it 'thinks', the user corrects a member in place."""
+
+    def __init__(self, store: InMemoryMemoryStore, member: MemoryItem) -> None:
+        self._store = store
+        self._member = member
+        self.calls = 0
+
+    async def __call__(
+        self,
+        *,
+        prompt: str,
+        model: str | None,
+        tenant_id: UUID,
+        output_schema: StructuredOutputSpec | None = None,
+    ) -> ConsolidatorLLMReply:
+        self.calls += 1
+        await self._store.update_content(
+            tenant_id=_TENANT,
+            user_id=_USER,
+            memory_id=self._member.id,
+            content="the corrected value",
+            embedding=(1.0, 0.0),
+            confidence=1.0,
+        )
+        return ConsolidatorLLMReply(text=_KEEP % "the old value", model="fake")
+
+
+@pytest.mark.asyncio
+async def test_member_corrected_while_deciding_blocks_the_summary() -> None:
+    store = InMemoryMemoryStore()
+    members = _seed(
+        store,
+        _item("the old value", (1.0, 0.0), minutes_ago=3),
+        _item("old value again", (1.0, 0.0), minutes_ago=2),
+        _item("the value is old", (1.0, 0.0), minutes_ago=1),
+    )
+    aux = _CorrectingAux(store, members[0])
+    worker, _audit = await _worker(store, aux)
+
+    summary = await worker.run_once()
+
+    assert aux.calls == 1
+    assert summary.consolidated == 0
+    assert _consolidated(store) == []
+    corrected = next(r for r in store._rows if r.id == members[0].id)
+    assert corrected.content == "the corrected value"
+    assert corrected.consolidated_into is None
 
 
 class _SupersedingAux:
@@ -187,8 +249,11 @@ async def test_blocked_summary_is_not_written_and_is_audited_without_text() -> N
         _item("c", (1.0, 0.0), minutes_ago=1),
     )
     worker, audit_store = await _worker(store, _ScriptedAuxModel([_KEEP % _INJECTION]))
+    metric_before = _blocked_metric("consolidation")
 
     summary = await worker.run_once()
+
+    assert _blocked_metric("consolidation") == metric_before + 1
 
     assert summary.consolidated == 0
     assert _consolidated(store) == []
@@ -403,3 +468,52 @@ async def test_markers_older_than_thirty_days_are_pruned_in_the_sweep() -> None:
     await worker.run_once()
 
     assert await store.list_rejected_clusters(tenant_id=_TENANT, user_id=_USER) == {"recent"}
+
+
+@pytest.mark.asyncio
+async def test_old_markers_of_users_with_no_transient_memory_are_pruned() -> None:
+    """LOW-2 — the prune is tenant-wide: a user with no memory left to sweep
+    (or a marker re-inserted after a purge race) still loses old markers."""
+    store = InMemoryMemoryStore()
+    _seed(store, _item("lone", (1.0, 0.0)))
+    gone_user = uuid4()
+    await store.record_rejected_cluster(
+        tenant_id=_TENANT, user_id=gone_user, member_hash="old", reason="false_cluster"
+    )
+    key = (_TENANT, gone_user, "old")
+    reason, _when = store._rejected_clusters[key]
+    store._rejected_clusters[key] = (reason, datetime.now(UTC) - timedelta(days=31))
+    worker, _audit = await _worker(store, _ScriptedAuxModel([]))
+
+    await worker.run_once()
+
+    assert await store.list_rejected_clusters(tenant_id=_TENANT, user_id=gone_user) == set()
+
+
+class _BrokenCursorFor(_SweepRecorder):
+    def __init__(self, inner: InMemoryMemoryStore, *, tenant: UUID) -> None:
+        super().__init__(inner)
+        self._broken = tenant
+
+    async def get_consolidation_cursor(self, *, tenant_id: UUID) -> UUID | None:
+        if tenant_id == self._broken:
+            raise RuntimeError("cursor read failed")
+        return await self._inner.get_consolidation_cursor(tenant_id=tenant_id)
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_whose_cursor_cannot_be_read_does_not_stop_the_others() -> None:
+    store = InMemoryMemoryStore()
+    other_tenant, other_user = UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), uuid4()
+    _seed(store, _item("mine", (1.0, 0.0)))
+    store._rows.append(
+        _item("theirs", (1.0, 0.0), user=other_user).model_copy(update={"tenant_id": other_tenant})
+    )
+    # The broken tenant sorts first, so a tick that aborts would sweep nobody.
+    recorder = _BrokenCursorFor(store, tenant=_TENANT)
+    worker, _audit = await _worker(recorder, _ScriptedAuxModel([]))  # type: ignore[arg-type]
+
+    summary = await worker.run_once()
+
+    assert recorder.users == [other_user]
+    assert summary.errors == 1

@@ -133,6 +133,7 @@ async def test_write_consolidated_links_sources_atomically() -> None:
         content="consolidated summary",
         embedding=(0.5, 0.5),
         source_ids=[s1.id, s2.id],
+        source_hashes={s.id: hash_content(s.content) for s in (s1, s2)},
     )
     assert parent.status == "consolidated"
     assert set(parent.consolidated_from) == {s1.id, s2.id}
@@ -155,6 +156,7 @@ async def test_write_consolidated_aborts_when_source_already_consolidated() -> N
             content="summary",
             embedding=(0.5, 0.5),
             source_ids=[s1.id],
+            source_hashes={s1.id: hash_content(s1.content)},
         )
 
 
