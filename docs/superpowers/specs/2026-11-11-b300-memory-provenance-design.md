@@ -134,7 +134,7 @@
 | 全是汉字(夹杂的拉丁字母不超过八成) | 点名 Chinese |
 | 全是假名,或假名 + 汉字且假名占三成以上 | 点名 Japanese |
 | 全是谚文 | 点名 Korean |
-| 全是拉丁字母,英语独有的标记词(the、and、you、this、with、please、today、单独大写的 I……)占词数一成以上,且至少两个不同的 —— the、you、this、please、I 这类强标记一个就够(用户 11-14,评测 A 组;两轮审查后定) | 点名 English |
+| 全是拉丁字母,英语独有的标记词(the、and、you、this、with、please、today、单独大写的 I……)占词数一成以上,且至少两个不同的 —— the、you、this、please 这类强标记一个就够;单独大写的 I 只算普通标记(瑞 / 挪 / 丹 / 意 / 波 / 捷语句首也有它)(用户 11-14,评测 A 组;三轮审查后定) | 点名 English |
 | 全是拉丁字母,但认不出是英语 | 不点名,但用「拉丁字母」那一档(见下) |
 | 其它(一种文字对应多种语言的,如西里尔、阿拉伯字母;几种文字混着的,如汉字里夹少量假名、英文里夹几个汉字) | 不点名 |
 
@@ -162,7 +162,7 @@ in the input — a language written in Latin letters, not Chinese, Japanese or K
 Keep names, codes, units and quoted terms exactly as they appear. Do not translate.
 ```
 
-**11-14 加 English 与「拉丁字母」档**(评测 A 组,§10.2 第 12 条):英文场景里,不点名档下第二次提炼约一成半(24 / 157)、第一次提炼约 5 / 98 的记忆被写成中文,另有约 10 / 157 与 3 / 98 写成葡语 / 西语一类。只说「拉丁字母的语言」不够,所以能认准英语就点名:全是拉丁字母时数英语**独有**的虚词(与别的拉丁字母语言同形的不收:a、an、in、no、do、as、was、me、he、i、so 与西、葡、法、德、意、荷语同形;for、at、to、of、or、but、my、we、by、if、can 等与丹麦、挪威、瑞典、波兰、荷兰、法语同形 —— 审查 LOW-1),is、had、been 与荷兰语同形也不收(复审);另收几个英语实词(please、today、tomorrow、month、new……)和句中单独大写的 I。占词数一成以上、且至少两个**不同**的(the、you、your、this、that、please、I 这类强标记一个就够)判 English(弯撇号按直撇号算)。**复审实测(11-14)**:评测 A 组 60 个英文场景的 80 次写回,用户文字判出 English 77 / 80(没判出的 3 次都是不足 20 个字母、按规则不点名);荷、丹、挪、瑞、波、德、西、葡、法语共 33 句,误判成 English 0 句。收紧前一版是 64 / 80、荷兰语 6 句误判 2 句;认不出的拉丁字母语言用第三档,让模型照用户自己的话(两次提炼的输入里都有:第一次就是用户的话,第二次是 `[user]` 行)的那种语言写。英文里夹几个汉字(人名、地名)仍按「几种文字混着」不点名。整理汇总同一档:`Write the summary in exactly the language most of these memories are written in — a language written in Latin letters, not Chinese, Japanese or Korean.`(保留「most of」:一批记忆里可能夹着别的语言,审查 LOW-2)
+**11-14 加 English 与「拉丁字母」档**(评测 A 组,§10.2 第 12 条):英文场景里,不点名档下第二次提炼约一成半(24 / 157)、第一次提炼约 5 / 98 的记忆被写成中文,另有约 10 / 157 与 3 / 98 写成葡语 / 西语一类。只说「拉丁字母的语言」不够,所以能认准英语就点名:全是拉丁字母时数英语**独有**的虚词(与别的拉丁字母语言同形的不收:a、an、in、no、do、as、was、me、he、i、so 与西、葡、法、德、意、荷语同形;for、at、to、of、or、but、my、we、by、if、can 等与丹麦、挪威、瑞典、波兰、荷兰、法语同形 —— 审查 LOW-1),is、had、been 与荷兰语同形也不收(复审);另收几个英语实词(please、today、tomorrow、month、new……)和句中单独大写的 I。占词数一成以上、且至少两个**不同**的(the、you、your、this、that、please 这类强标记一个就够;单独大写的 I 只算普通标记 —— 瑞 / 挪 / 丹语的「I dag」、意大利语冠词、波兰 / 捷克语的「I to / I když」句首都是它,复审 11-14)判 English(弯撇号按直撇号算)。**复审实测(11-14)**:评测 A 组 60 个英文场景的 80 次写回,用户文字判出 English 77 / 80(没判出的 3 次都是不足 20 个字母、按规则不点名);荷、丹、挪、瑞、波、德、西、葡、法语共 33 句,误判成 English 0 句。收紧前一版是 64 / 80、荷兰语 6 句误判 2 句;认不出的拉丁字母语言用第三档,让模型照用户自己的话(两次提炼的输入里都有:第一次就是用户的话,第二次是 `[user]` 行)的那种语言写。英文里夹几个汉字(人名、地名)仍按「几种文字混着」不点名。整理汇总同一档:`Write the summary in exactly the language most of these memories are written in — a language written in Latin letters, not Chinese, Japanese or Korean.`(保留「most of」:一批记忆里可能夹着别的语言,审查 LOW-2)
 
 整理汇总会生成新的汇总句,加同一节;语言按该用户这一批待整理记忆的全部内容用同一个函数判,不点名时写 `Write the summary in the language most of these memories are written in.`。去重合并、读时复核不生成记忆文字,不加。
 
@@ -253,12 +253,12 @@ What a [user] line says that can be understood on its own is recorded by another
 not record it again here — not in other words, not with a source added, and not when an
 [assistant] line repeats, confirms or uses it. A conclusion the assistant reached from what
 the user said is still recorded here; only the user's statement itself is not. A tool result
-or record lookup that only confirms a value the user already stated is not recorded again;
-one that differs from what the user said is recorded, with its source. What a [user] line
-says that cannot be understood without the assistant's previous message — a short answer,
-an agreement, or a short correction such as "it's Y now" or "no, it's the other one" — is
-recorded here, with its source, and with "is_correction" when it changes something; one
-line can hold both kinds, so judge each statement in it.
+or record lookup that only confirms what the user currently says (their latest value) is not
+recorded again; one that differs from the user's latest statement is recorded, with its
+source. What a [user] line says that cannot be understood without the assistant's previous
+message — a short answer, an agreement, or a short correction such as "it's Y now" or "no,
+it's the other one" — is recorded here, with its source, and with "is_correction" when it
+changes something; one line can hold both kinds, so judge each statement in it.
 Something the assistant concluded that the user then rejected is not recorded as a
 conclusion on its own. Record only the two sorts above; they include what the assistant
 reports that tool results or attachments told it.
@@ -275,7 +275,7 @@ Respond with ONLY a JSON object, no prose and no code fences:
 If there is nothing worth remembering, return {"memories": []}.
 ```
 
-**用户 11-14 改**(测试验收 118.5 重跑,§10.2 第 10 条;复审后合成一段):上面「What a [user] line says that can be understood on its own …」到「… attachments told it.」一段,替换了原来那句「Do not extract something a [user] line states completely on its own; that is recorded separately.」。实测第二次提炼仍从 `[user]` 行把用户自己说全的话换个说法、加上出处又记一遍(每轮都有,对照组也有)。分界用 §6.2 的同一把尺子:单独读得懂的用户的话归第一次;离开助手上一条读不懂的(短回答、同意、「现在是 Y 了」「不对,是另一个」这种短更正)仍由这一次记、带出处,改了什么就带 `is_correction`(118.5 的 Y 就是这种)。助手从用户的话里得出的结论照记,只是用户的话本身不记;按句判、不按行判:同一行里可以两样都有(例如「选 B,因为预算在 5000 以内」—— 预算那句单独读得懂,归第一次;「选了 B」离开助手的问题读不懂,归这一次)。第二类也含「用户纠正助手才定下的」;`[user]` 标签说明改成只说「单独读得懂的」另记,免得与这一段矛盾(复审 11-14)。**用户 11-14 加**(评测 A12,§10.2 第 13 条):「A tool result or record lookup that only confirms a value the user already stated is not recorded again; one that differs from what the user said is recorded, with its source.」—— 查记录 / 工具只是印证了用户在这段对话里说过的值时,不再记一条「助手查到并确认了 X」;查到的与用户说的不同,照旧记下、带出处。助手得出、用户随后否定的,不单独当结论记。「只记」的范围就是上面两类,包括「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它),没有另列一份更窄的;第二次提炼看不到工具结果,所以写的是「助手说工具 / 附件告诉它的」。只靠措辞,效果在付费评测小跑里量。
+**用户 11-14 改**(测试验收 118.5 重跑,§10.2 第 10 条;复审后合成一段):上面「What a [user] line says that can be understood on its own …」到「… attachments told it.」一段,替换了原来那句「Do not extract something a [user] line states completely on its own; that is recorded separately.」。实测第二次提炼仍从 `[user]` 行把用户自己说全的话换个说法、加上出处又记一遍(每轮都有,对照组也有)。分界用 §6.2 的同一把尺子:单独读得懂的用户的话归第一次;离开助手上一条读不懂的(短回答、同意、「现在是 Y 了」「不对,是另一个」这种短更正)仍由这一次记、带出处,改了什么就带 `is_correction`(118.5 的 Y 就是这种)。助手从用户的话里得出的结论照记,只是用户的话本身不记;按句判、不按行判:同一行里可以两样都有(例如「选 B,因为预算在 5000 以内」—— 预算那句单独读得懂,归第一次;「选了 B」离开助手的问题读不懂,归这一次)。第二类也含「用户纠正助手才定下的」;`[user]` 标签说明改成只说「单独读得懂的」另记,免得与这一段矛盾(复审 11-14)。**用户 11-14 加**(评测 A12,§10.2 第 13 条):「A tool result or record lookup that only confirms what the user currently says (their latest value) is not recorded again; one that differs from the user's latest statement is recorded, with its source.」—— 查记录 / 工具只是印证了用户**眼下**的说法(最新那个值)时,不再记一条「助手查到并确认了 X」;查到的与用户最新的说法不同,照旧记下、带出处(复审 11-14:以用户最新的值为准,不按更早说过、后来改掉的值比)。助手得出、用户随后否定的,不单独当结论记。「只记」的范围就是上面两类,包括「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它),没有另列一份更窄的;第二次提炼看不到工具结果,所以写的是「助手说工具 / 附件告诉它的」。只靠措辞,效果在付费评测小跑里量。
 
 ### 4.3 会丢什么、边界、副作用
 

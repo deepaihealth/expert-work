@@ -303,9 +303,10 @@ async def test_conversation_pass_does_not_restate_what_the_user_said() -> None:
         "pass: do not record it again here — not in other words, not with a source added, and "
         "not when an [assistant] line repeats, confirms or uses it. A conclusion the assistant "
         "reached from what the user said is still recorded here; only the user's statement "
-        "itself is not. A tool result or record lookup that only confirms a value the user "
-        "already stated is not recorded again; one that differs from what the user said is "
-        "recorded, with its source. What a [user] line says that cannot be understood without the "
+        "itself is not. A tool result or record lookup that only confirms what the user "
+        "currently says (their latest value) is not recorded again; one that differs from the "
+        "user's latest statement is recorded, with its source. What a [user] line says that "
+        "cannot be understood without the "
         "assistant's previous message — a short answer, an agreement, or a short correction "
         'such as "it\'s Y now" or "no, it\'s the other one" — is recorded here, with its '
         'source, and with "is_correction" when it changes something; one line can hold both '
@@ -318,10 +319,12 @@ async def test_conversation_pass_does_not_restate_what_the_user_said() -> None:
     # 用户 11-14(评测 A12):查记录 / 工具只是印证了用户说过的值 → 不再记一条「助手查到并确认了 X」;
     # 查到的与用户说的不同 → 照记、带出处。
     assert (
-        "A tool result or record lookup that only confirms a value the user already stated is "
-        "not recorded again;" in second
+        "A tool result or record lookup that only confirms what the user currently says (their "
+        "latest value) is not recorded again;" in second
     )
-    assert "one that differs from what the user said is recorded, with its source." in second
+    assert "one that differs from the user's latest statement is recorded, with its source." in (
+        second
+    )
     # 「两类」里仍有「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它)。
     assert '- what the assistant did or produced, and what was decided ("episodic");' in second
     assert second.index("of two sorts only:") < second.index(passage)

@@ -132,6 +132,26 @@ def test_short_english_sentences_are_named(text: str) -> None:
     assert detect_user_language([text]) == "English"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I dag ska jag till tandläkaren och sedan hem",
+        "I morgon börjar jag ett nytt jobb i Stockholm",
+        "I går köpte jag en ny cykel till min dotter",
+        "I går var jeg hos legen og fikk nye briller",
+        "I dag har jeg travlt med arbejdet hele dagen",
+        "I risultati delle analisi sono arrivati stamattina",
+        "I to wszystko, co chciałem powiedzieć o projekcie",
+        "I když prší, půjdu dnes na procházku do parku",
+    ],
+    ids=["sv-i-dag", "sv-i-morgon", "sv-i-gar", "no-i-gar", "da-i-dag", "it", "pl", "cs"],
+)
+def test_sentence_initial_capital_i_alone_is_not_english(text: str) -> None:
+    """复审(11-14):瑞、挪、丹语的「I dag / I morgon / I går」、意大利语的冠词、波兰 / 捷克语的
+    「I to / I když」句首都是大写 I —— 它只算普通标记,不能一个就判 English。"""
+    assert detect_user_language([text]) == LATIN_SCRIPT
+
+
 def test_code_heavy_english_is_judged_by_its_prose() -> None:
     code = "```python\n# 处理用户的请求并返回结果\nfor item in items: handle(item)\n```\n"
     assert detect_user_language(

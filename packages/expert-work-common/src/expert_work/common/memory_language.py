@@ -10,7 +10,8 @@
 * 不足 20 个 → 不点名(只发了几个汉字的日语用户不被点名成 Chinese);
 * 全是拉丁字母(评测 A 组,11-14:英文场景里有记忆被写成中文、葡语 / 西语一类)→ 英语独有的
   标记词(the、and、you、this、with、please、单独大写的 I……,不收与别的拉丁字母语言同形的)
-  至少两个不同的(the、you、this、please、I 这类强标记一个就够)、占词数一成以上 → English;
+  至少两个不同的(the、you、this、please 这类强标记一个就够;单独的 I 不算强标记)、占词数一成
+  以上 → English;
   否则 → :data:`LATIN_SCRIPT`(指令要求照用户自己的话的那种语言写,不点名、不翻译);
 * 夹着中日韩等别的文字、拉丁字母超过八成 → 不点名;
 * 其余信号字符全是汉字 → Chinese;
@@ -54,9 +55,9 @@ _ENGLISH_WORDS = frozenset(
 #: 句中单独大写的 I(英语的「我」)也算:意大利语的冠词 i 是小写。
 _ENGLISH_PRONOUN = "I"
 #: 强标记:在上面那几种语言里都不是词,出现一个就够(仍要占词数一成以上);其余标记词要两个不同的。
-_STRONG_ENGLISH = frozenset(
-    "the you your this that these those please it's i'm i've don't i".split()
-)
+#: 单独大写的 I 不算强标记(复审 11-14):瑞 / 挪 / 丹语的「I dag」、意大利语的冠词、波兰 / 捷克语的
+#: 「I to / I když」句首都是它。
+_STRONG_ENGLISH = frozenset("the you your this that these those please it's i'm i've don't".split())
 #: 一个词:任意文字的字母连在一起(带重音的字母不把词切开),中间可夹一个撇号。
 _LATIN_WORD = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
 

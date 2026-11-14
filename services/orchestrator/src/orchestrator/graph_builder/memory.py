@@ -255,12 +255,12 @@ What a [user] line says that can be understood on its own is recorded by another
 not record it again here — not in other words, not with a source added, and not when an
 [assistant] line repeats, confirms or uses it. A conclusion the assistant reached from what
 the user said is still recorded here; only the user's statement itself is not. A tool result
-or record lookup that only confirms a value the user already stated is not recorded again;
-one that differs from what the user said is recorded, with its source. What a [user] line
-says that cannot be understood without the assistant's previous message — a short answer,
-an agreement, or a short correction such as "it's Y now" or "no, it's the other one" — is
-recorded here, with its source, and with "is_correction" when it changes something; one
-line can hold both kinds, so judge each statement in it.
+or record lookup that only confirms what the user currently says (their latest value) is not
+recorded again; one that differs from the user's latest statement is recorded, with its
+source. What a [user] line says that cannot be understood without the assistant's previous
+message — a short answer, an agreement, or a short correction such as "it's Y now" or "no,
+it's the other one" — is recorded here, with its source, and with "is_correction" when it
+changes something; one line can hold both kinds, so judge each statement in it.
 Something the assistant concluded that the user then rejected is not recorded as a
 conclusion on its own. Record only the two sorts above; they include what the assistant
 reports that tool results or attachments told it.
@@ -282,7 +282,8 @@ def _sent_date_tag(typed: UserInput, message: BaseMessage) -> str:
     (``resolve_agent_timezone``,与智能体提示词里的「今天」同一口径)。先看白名单标记里的
     ``sent_at``;没有就用消息写入时盖的 ``expert_work_created_at``(复审 11-14:``sent_at`` 之前的
     消息大多有它);两样都没有(评测脚本显式声明的消息等)或读不懂 → 不加,指令要求这种行里的
-    相对日期原样不换算。
+    相对日期原样不换算。已知局限:``sent_at`` 之前的消息被「重新生成」时,
+    ``expert_work_created_at`` 是重新生成那天盖的,这一行就按那天换算(复审 11-14,接受)。
 
     审查 MEDIUM-1 / MEDIUM-2(11-14):每轮整段重读,不能按重读那天换算「今天早上」。"""
     stamped = message.additional_kwargs.get(STAMP_CREATED_AT)
