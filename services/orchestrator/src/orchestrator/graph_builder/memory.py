@@ -1120,9 +1120,10 @@ _RECONCILE_SYSTEM = (
     # 一条相同的用户记忆和一条来自助手的,模型会去「更新」后者,多出一条重复的)。
     "When an existing memory stated in user messages or corrected by the user already "
     "says the same thing as the candidate, the candidate is a NOOP, even if an existing "
-    "memory from the assistant also matches it; this comes before the next rule.\n"
+    "memory from the assistant also matches it; this takes precedence over the rule below "
+    "about memories from the assistant.\n"
     'Exception: a candidate with "is_correction": true is not a NOOP for this reason; '
-    "it DELETEs the existing memory it contradicts, if there is one.\n"
+    "it DELETEs the existing memory it contradicts, if there is one; otherwise it is a NOOP.\n"
     # B-300 §6.2 —— 双方都带 "source";用户后来自己说全了,旧的来自助手的版本应被取代。
     "A candidate stated in user messages that matches an existing memory from the "
     "assistant is an UPDATE, not a NOOP.\n"
@@ -1274,14 +1275,14 @@ class _BlockedWrite:
 
 
 def _provenance_rank(item: MemoryItem) -> int:
-    """11-14 重跑 118.5 —— 逐字相同时比来源强弱:用户一方(用户消息里说的 / 用户更正)最强,
-    来自助手与来源未记录同一档(都不是用户确认过的)。"""
+    """11-14 重跑 118.5 —— 内容相同(按 :func:`_normalized_text`)时比来源强弱:用户一方
+    (用户消息里说的 / 用户更正)最强,来自助手与来源未记录同一档(都不是用户确认过的)。"""
     return 1 if effective_origin(item) in USER_SIDE_ORIGINS else 0
 
 
-#: 句末标点:只在全文**末尾**去掉(反复)。全角的句号 / 叹号 / 问号 / 分号先经宽度折叠成
-#: 半角,只剩中文句号(U+3002)要单列。
-_TRAILING_SENTENCE_PUNCTUATION = frozenset(".!?;\u3002")
+#: 句末标点:只在全文**末尾**去掉(反复)。全角的句号 / 叹号 / 分号先经宽度折叠成半角,
+#: 只剩中文句号(U+3002)要单列。问号不去:问句和陈述句意思不同(终审 LOW-1)。
+_TRAILING_SENTENCE_PUNCTUATION = frozenset(".!;\u3002")
 
 
 def _fold_width(ch: str) -> str:
@@ -1310,15 +1311,40 @@ def _has_identical_neighbor(item: MemoryItem, neighbors: Sequence[MemoryItem]) -
     不含 kind)、且那条的来源不弱于候选 → 候选什么也不带来,确定性 NOOP:
     用户一方的候选只对上用户一方的;其余候选对上任何来源的。来源更弱的相同内容(用户说的候选对上
     来自助手 / 未记录的)照旧交给模型(升格成用户说的)。"""
+    return bool(_identical_neighbors(item, neighbors))
+
+
+def _identical_neighbors(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> list[MemoryItem]:
+    """:func:`_has_identical_neighbor` 认的那几条:同一格、来源不弱于候选、归一后内容相同。"""
     text = _normalized_text(item.content)
     rank = _provenance_rank(item)
-    return any(
-        n.kind == item.kind
+    return [
+        n
+        for n in neighbors
+        if n.kind == item.kind
         and n.agent_name == item.agent_name
         and _provenance_rank(n) >= rank
         and _normalized_text(n.content) == text
-        for n in neighbors
+    ]
+
+
+def _identical_user_side_ids(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> frozenset[UUID]:
+    """终审 MEDIUM-1 —— 带更正的候选与之内容相同的用户一方记忆。"""
+    return frozenset(
+        n.id
+        for n in _identical_neighbors(item, neighbors)
+        if effective_origin(n) in USER_SIDE_ORIGINS
     )
+
+
+def _redundant_correction_op(op: str, target: UUID | None, identical: frozenset[UUID]) -> str:
+    """终审 MEDIUM-1 —— 带更正、又与已有用户记忆内容相同的候选,它自己不再落成新行:删掉别的
+    冲突记忆照常(判「更新」别的那条按删除处理,拦截规则照样管);其余一律 NOOP —— 新增、NOOP、
+    更新 / 删除那条相同的记忆、没给决定(否则「更新」那条相同的会被第二条规则拦下按新增存下,
+    「更新」来自助手的会取代出第二条用户记忆)。"""
+    if op in ("UPDATE", "DELETE") and target is not None and target not in identical:
+        return "DELETE"
+    return "NOOP"
 
 
 class _Reconciled(NamedTuple):
@@ -1354,7 +1380,7 @@ async def _reconcile_and_apply(
     UPDATE/DELETE over ADD on an explicit user correction.
     """
     direct: list[MemoryItem] = []
-    pending: list[tuple[MemoryItem, list[MemoryItem], bool]] = []
+    pending: list[tuple[MemoryItem, list[MemoryItem], bool, frozenset[UUID]]] = []
     for idx, item in enumerate(items):
         is_corr = corrections[idx] if idx < len(corrections) else False
         try:
@@ -1374,8 +1400,8 @@ async def _reconcile_and_apply(
             direct.append(item)
             continue
         if not is_corr and _has_identical_neighbor(item, neighbors):
-            # 11-14 重跑 118.5 —— 逐字相同、来源不弱的已有记忆:不问模型,直接 NOOP。带更正的
-            # 候选照旧问模型(审查 MEDIUM):它可能要删掉旁边一条与之冲突的记忆。
+            # 11-14 重跑 118.5 —— 内容相同(归一后)、来源不弱的已有记忆:不问模型,直接 NOOP。
+            # 带更正的候选照旧问模型(审查 MEDIUM):它可能要删掉旁边一条与之冲突的记忆。
             logger.debug("%s_reconcile_identical_noop", log_label)
             record_memory_reconcile(op="noop")
             continue
@@ -1384,8 +1410,11 @@ async def _reconcile_and_apply(
             for n in neighbors
             if _reconcile_cosine(item.embedding, n.embedding) >= _RECONCILE_SIM_THRESHOLD
         ]
+        identical = _identical_user_side_ids(item, neighbors) if is_corr else frozenset()
         if similar:
-            pending.append((item, similar, is_corr))
+            pending.append((item, similar, is_corr, identical))
+        elif identical:
+            record_memory_reconcile(op="noop")  # 终审 MEDIUM-1:没有可删的,也不新增
         else:
             record_memory_reconcile(op="add")
             direct.append(item)
@@ -1405,7 +1434,7 @@ async def _reconcile_and_apply(
                     for n in similar
                 ],
             }
-            for idx, (item, similar, is_corr) in enumerate(pending)
+            for idx, (item, similar, is_corr, _identical) in enumerate(pending)
         ]
     }
     ops: dict[int, tuple[str, str | None]] = {}
@@ -1429,11 +1458,13 @@ async def _reconcile_and_apply(
     position = {item.id: idx for idx, item in enumerate(items)}
     blocked: list[_BlockedWrite] = []
     superseded = 0
-    for idx, (item, similar, is_corr) in enumerate(pending):
+    for idx, (item, similar, is_corr, identical) in enumerate(pending):
         op, target_raw = ops.get(idx, ("", None))
         valid = {str(n.id): n for n in similar}
         target_item = valid.get(target_raw) if target_raw is not None else None
         target = target_item.id if target_item is not None else None
+        if identical:
+            op = _redundant_correction_op(op, target, identical)
         # B-300 §6.2 拦截规则:来自助手的候选不得更新 / 删除用户一方的记忆;用户 11-14 加一条:
         # 「用户消息里说的」候选,置信度低于目标时同样不得(汇总行按成员里最高的用户一方置信度比)。
         guarded = item.origin == "assistant_derived"

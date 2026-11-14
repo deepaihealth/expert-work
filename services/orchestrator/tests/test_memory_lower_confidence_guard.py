@@ -32,7 +32,7 @@ from expert_work.persistence import InMemoryMemoryStore
 from expert_work.protocol import MemoryItem
 from expert_work.protocol.memory_item import MemoryOrigin
 from expert_work.runtime.cancellation import CancellationToken
-from orchestrator.graph_builder.memory import flush_messages_with_outcome
+from orchestrator.graph_builder.memory import _normalized_text, flush_messages_with_outcome
 
 _TENANT = UUID("00000000-0000-4000-8000-0000000000a3")
 _USER = UUID("00000000-0000-4000-8000-0000000000b3")
@@ -122,12 +122,15 @@ def _turn() -> list[BaseMessage]:
     return [user, AIMessage(content="the answer")]
 
 
-async def _flush(llm: _LLM, store: InMemoryMemoryStore, near: str = "cand") -> int:
-    """``near`` = 哪段候选文字的向量贴近种子(``_EAST``),进去重合并。"""
+async def _flush(
+    llm: _LLM, store: InMemoryMemoryStore, near: str | tuple[str, ...] = "cand"
+) -> int:
+    """``near`` = 哪(几)段候选文字的向量贴近种子(``_EAST``),进去重合并。"""
+    texts = (near,) if isinstance(near, str) else near
     outcome = await flush_messages_with_outcome(
         _turn(),
         memory_store=store,
-        embedder=_Embedder({near: _NEAR_EAST}),
+        embedder=_Embedder(dict.fromkeys(texts, _NEAR_EAST)),
         llm_caller=llm,  # type: ignore[arg-type]
         tenant_id=_TENANT,
         user_id=_USER,
@@ -491,23 +494,26 @@ async def test_reconcile_prompt_puts_an_identical_user_memory_first() -> None:
     rule = (
         "When an existing memory stated in user messages or corrected by the user already "
         "says the same thing as the candidate, the candidate is a NOOP, even if an existing "
-        "memory from the assistant also matches it; this comes before the next rule."
+        "memory from the assistant also matches it; this takes precedence over the rule below "
+        "about memories from the assistant."
     )
     assert rule in system
     assert system.index(rule) < system.index("is an UPDATE, not a NOOP.")
     # 审查 MEDIUM-2 —— 与代码里「带更正的不走确定性 NOOP」一致。
     exception = (
         'Exception: a candidate with "is_correction": true is not a NOOP for this reason; '
-        "it DELETEs the existing memory it contradicts, if there is one."
+        "it DELETEs the existing memory it contradicts, if there is one; otherwise it is a NOOP."
     )
     assert exception in system
     assert system.index(rule) < system.index(exception)
+    # 审查 LOW-4 —— 「优先于」指的是下面那句「用户说的对上来自助手的 → UPDATE」。
+    assert system.index(exception) < system.index("is an UPDATE, not a NOOP.")
 
 
 async def test_identical_correction_still_asks_so_a_conflicting_memory_can_be_retracted() -> None:
-    """审查 MEDIUM(11-14)—— 用户说「不,是 X」:候选 X 带 ``is_correction``,和已有的 X 逐字相同,
-    但旁边还有一条冲突的用户记忆 Y(把握度更低、经第二条拦截规则并存下来的)。确定性 NOOP 会让模型
-    永远没机会删掉 Y,所以带更正的候选照旧问模型。"""
+    """审查 MEDIUM(11-14)—— 用户说「不,是 X」:候选 X 带 ``is_correction``,和已有的 X
+    内容相同(归一后),但旁边还有一条冲突的用户记忆 Y(把握度更低、经第二条拦截规则并存下来的)。
+    确定性 NOOP 会让模型永远没机会删掉 Y,所以带更正的候选照旧问模型。"""
     store = InMemoryMemoryStore()
     stated = await _seed_row(store, "cand", origin="user_stated", confidence=0.9)
     conflicting = await _seed_row(store, "cand other", origin="user_stated", confidence=0.5)
@@ -559,3 +565,115 @@ async def test_identical_text_in_another_kind_or_agent_slot_still_asks(
     llm = _LLM(user_reply=_stated(0.9), ops_reply='{"ops": [{"index": 0, "op": "NOOP"}]}')
     _ = await _flush(llm, store)
     assert _reconcile_calls(llm) == 1
+
+
+# ---------------------------------------------------------------------------
+# 审查 MEDIUM-1(11-14 终审)—— 带更正、又与已有用户记忆内容相同的候选:模型可以删掉别的冲突
+# 记忆(判「更新」别的那条按删除处理),但这条候选本身不再落成新行
+# ---------------------------------------------------------------------------
+
+_X = "\u7528\u6237\u7684\u53d6\u4ef6\u7801\u662f7190"  # 用户的取件码是7190
+_X_STOP = _X + "\u3002"
+
+
+async def _x_and_derived(store: InMemoryMemoryStore) -> tuple[MemoryItem, MemoryItem]:
+    stated = await _seed_row(store, _X_STOP, origin="user_stated", confidence=0.95)
+    derived = await _seed_row(
+        store, _X + ",\u52a9\u624b\u63d0\u9192\u6309\u65f6\u53d6\u4ef6",
+        origin="assistant_derived", confidence=0.6,
+    )  # fmt: skip
+    return stated, derived
+
+
+def _valid(store: InMemoryMemoryStore) -> list[MemoryItem]:
+    return [r for r in store._rows if r.invalid_at is None and r.expired_at is None]
+
+
+def _user_rows_with_x(store: InMemoryMemoryStore) -> list[MemoryItem]:
+    return [
+        r
+        for r in _valid(store)
+        if r.origin == "user_stated" and _normalized_text(r.content) == _normalized_text(_X)
+    ]
+
+
+def _correction_x() -> str:
+    return _reply({"kind": "fact", "content": _X, "confidence": 0.9, "is_correction": True})
+
+
+@pytest.mark.parametrize("target", ["identical", "derived"])
+async def test_identical_correction_updating_anything_leaves_one_user_row(target: str) -> None:
+    """终审复现:模型判「更新」那条相同的 X(原来:被第二条规则拦下、按新增存下)或「更新」来自助手的
+    X+Y(原来:取代出第二条用户 X)。现在:前者 NOOP;后者按删除那条 X+Y 处理。"""
+    store = InMemoryMemoryStore()
+    stated, derived = await _x_and_derived(store)
+    tid = stated.id if target == "identical" else derived.id
+    llm = _LLM(user_reply=_correction_x(), ops_reply=_ops("UPDATE", tid))
+    assert await _flush(llm, store, near=_X) == 0
+    assert _reconcile_calls(llm) == 1
+    assert [r.id for r in _user_rows_with_x(store)] == [stated.id]
+    derived_now = next(r for r in store._rows if r.id == derived.id)
+    assert (derived_now.expired_at is not None) is (target == "derived")
+    assert derived_now.invalid_at is None
+
+
+@pytest.mark.parametrize(
+    "ops_reply",
+    ['{"ops": [{"index": 0, "op": "ADD"}]}', '{"ops": [{"index": 0, "op": "NOOP"}]}', "{}"],
+    ids=["add", "noop", "missing-decision"],
+)
+async def test_identical_correction_never_adds_a_row(ops_reply: str) -> None:
+    store = InMemoryMemoryStore()
+    stated, derived = await _x_and_derived(store)
+    llm = _LLM(user_reply=_correction_x(), ops_reply=ops_reply)
+    assert await _flush(llm, store, near=_X) == 0
+    assert [r.id for r in _user_rows_with_x(store)] == [stated.id]
+    assert {r.id for r in _valid(store)} == {stated.id, derived.id}
+
+
+async def test_identical_correction_deleting_the_identical_memory_is_a_noop() -> None:
+    store = InMemoryMemoryStore()
+    stated, _derived = await _x_and_derived(store)
+    llm = _LLM(user_reply=_correction_x(), ops_reply=_ops("DELETE", stated.id))
+    _ = await _flush(llm, store, near=_X)
+    assert [r.id for r in _user_rows_with_x(store)] == [stated.id]
+
+
+async def test_identical_correction_without_a_similar_neighbour_adds_nothing() -> None:
+    """向量不够近、没进模型的材料时,带更正的相同候选同样不落新行(原来会直接新增)。"""
+    store = InMemoryMemoryStore()
+    stated, _derived = await _x_and_derived(store)
+    llm = _LLM(user_reply=_correction_x())
+    assert await _flush(llm, store, near=()) == 0
+    assert _reconcile_calls(llm) == 0
+    assert [r.id for r in _user_rows_with_x(store)] == [stated.id]
+
+
+async def test_user_candidate_identical_to_a_user_correction_is_a_noop() -> None:
+    store = InMemoryMemoryStore()
+    corrected = await _seed_row(store, "cand", origin=None, confidence=1.0)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply=_ops("UPDATE", corrected.id))
+    assert await _flush(llm, store) == 0
+    assert _reconcile_calls(llm) == 0
+    assert [r.id for r in _valid(store)] == [corrected.id]
+
+
+async def test_decisions_stay_aligned_when_an_earlier_candidate_is_dropped() -> None:
+    """第一条候选被确定性 NOOP 掉,第二条进模型:模型的 index 0 指的是第二条。"""
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(store, "cand", origin="user_stated", confidence=0.9)
+    other = await _seed_row(store, "old other", origin="assistant_derived", confidence=0.6)
+    llm = _LLM(
+        user_reply=_reply(
+            {"kind": "fact", "content": "cand", "confidence": 0.9},
+            {"kind": "fact", "content": "new other", "confidence": 0.9},
+        ),
+        ops_reply=_ops("UPDATE", other.id),
+    )
+    assert await _flush(llm, store, near=("cand", "new other")) == 1
+    assert _reconcile_calls(llm) == 1
+    payload = json.loads(str(llm.calls[-1][1].content))  # 去重合并在两次提炼之后
+    assert [c["content"] for c in payload["candidates"]] == ["new other"]
+    rows = await _live(store)
+    assert set(rows) == {"cand", "new other"}
+    assert rows["new other"].supersedes == other.id
