@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import math
+import unicodedata
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -1276,18 +1277,53 @@ def _provenance_rank(item: MemoryItem) -> int:
     return 1 if effective_origin(item) in USER_SIDE_ORIGINS else 0
 
 
+#: 不当作可去掉的标点:去掉会改意思的(百分号、千分号、万分号、编号、地址 / 路径里的分隔、角分角秒)。
+_MEANINGFUL_PUNCTUATION = frozenset("%\u2030\u2031#@&/\\*\u2032\u2033")
+#: 不靠空格分词的文字(汉字、假名):它们旁边的空格去掉。韩文靠空格分词,不在其列。
+_UNSPACED_SCRIPTS = ("CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH", "HIRAGANA", "KATAKANA")
+
+
+def _is_unspaced_script(ch: str) -> bool:
+    return unicodedata.name(ch, "").startswith(_UNSPACED_SCRIPTS)
+
+
+def _keeps_punctuation(ch: str, prev: str, nxt: str) -> bool:
+    """夹在两个数字之间的(小数点、千分位、日期、时刻)和数字前的负号留下:「69.1」≠「691」。"""
+    if ch in _MEANINGFUL_PUNCTUATION or (prev.isdigit() and nxt.isdigit()):
+        return True
+    return ch == "-" and nxt.isdigit() and not prev.isdigit()
+
+
 def _normalized_text(text: str) -> str:
-    return " ".join(text.split())
+    """11-14 —— 判「内容相同」的口径:NFKC(全角半角)+ casefold;标点(Unicode P 类)去掉,
+    :func:`_keeps_punctuation` 的除外;空白合并成一个,挨着汉字 / 假名的去掉。宁可判不同。"""
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    kept = [
+        " " if ch.isspace() else ch
+        for i, ch in enumerate(folded)
+        if not unicodedata.category(ch).startswith("P")
+        or _keeps_punctuation(ch, folded[i - 1] if i else "", folded[i + 1 : i + 2])
+    ]
+    out = ""
+    for word in "".join(kept).split():
+        joined = bool(out) and not (_is_unspaced_script(out[-1]) or _is_unspaced_script(word[0]))
+        out += (" " if joined else "") + word
+    return out
 
 
 def _has_identical_neighbor(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> bool:
-    """候选与某条有效邻居内容逐字相同(空白归一后,区分大小写与标点)、且那条的来源不弱于候选
-    → 候选什么也不带来,确定性 NOOP:用户一方的候选只对上用户一方的;其余候选对上任何来源的。
-    来源更弱的相同内容(用户说的候选对上来自助手 / 未记录的)照旧交给模型(升格成用户说的)。"""
+    """候选与某条有效邻居内容相同(按 :func:`_normalized_text` 归一后)、在同一格(同 kind、同
+    agent_name,与写入去重同一格)、且那条的来源不弱于候选 → 候选什么也不带来,确定性 NOOP:
+    用户一方的候选只对上用户一方的;其余候选对上任何来源的。来源更弱的相同内容(用户说的候选对上
+    来自助手 / 未记录的)照旧交给模型(升格成用户说的)。"""
     text = _normalized_text(item.content)
     rank = _provenance_rank(item)
     return any(
-        _normalized_text(n.content) == text and _provenance_rank(n) >= rank for n in neighbors
+        n.kind == item.kind
+        and n.agent_name == item.agent_name
+        and _provenance_rank(n) >= rank
+        and _normalized_text(n.content) == text
+        for n in neighbors
     )
 
 

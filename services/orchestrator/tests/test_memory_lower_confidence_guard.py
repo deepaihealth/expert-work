@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import pytest
@@ -120,11 +120,12 @@ def _turn() -> list[BaseMessage]:
     return [user, AIMessage(content="the answer")]
 
 
-async def _flush(llm: _LLM, store: InMemoryMemoryStore) -> int:
+async def _flush(llm: _LLM, store: InMemoryMemoryStore, near: str = "cand") -> int:
+    """``near`` = 哪段候选文字的向量贴近种子(``_EAST``),进去重合并。"""
     outcome = await flush_messages_with_outcome(
         _turn(),
         memory_store=store,
-        embedder=_Embedder({"cand": _NEAR_EAST}),
+        embedder=_Embedder({near: _NEAR_EAST}),
         llm_caller=llm,  # type: ignore[arg-type]
         tenant_id=_TENANT,
         user_id=_USER,
@@ -393,12 +394,15 @@ async def _seed_row(
     *,
     origin: MemoryOrigin | None,
     confidence: float = 0.8,
+    kind: Literal["fact", "episodic"] = "fact",
+    agent_name: str | None = None,
 ) -> MemoryItem:
     item = MemoryItem(
         id=uuid4(),
         tenant_id=_TENANT,
         user_id=_USER,
-        kind="fact",
+        kind=kind,
+        agent_name=agent_name,
         content=content,
         embedding=_EAST,
         origin=origin,
@@ -467,7 +471,7 @@ async def test_user_candidate_identical_to_a_weaker_memory_still_asks(
     assert (rows["cand"].origin, rows["cand"].supersedes) == ("user_stated", weaker.id)
 
 
-@pytest.mark.parametrize("existing", ["cand.", "Cand", "cand x"])
+@pytest.mark.parametrize("existing", ["can d", "cand 2", "cand x"])
 async def test_non_identical_content_still_asks(existing: str) -> None:
     store = InMemoryMemoryStore()
     _ = await _seed_row(store, existing, origin="user_stated", confidence=0.9)
@@ -507,3 +511,42 @@ async def test_identical_correction_still_asks_so_a_conflicting_memory_can_be_re
     assert set(rows) == {"cand"}
     assert rows["cand"].id == stated.id
     assert next(r for r in store._rows if r.id == conflicting.id).expired_at is not None
+
+
+def _turn_six_llm(target: UUID) -> _LLM:
+    reply = _reply({"kind": "fact", "content": "用户的取件码是7190", "confidence": 0.9})
+    return _LLM(user_reply=reply, ops_reply=_ops("UPDATE", target))
+
+
+async def test_turn_six_candidate_differing_only_in_punctuation_is_a_noop() -> None:
+    """测试环境实测(8ef6b0a21)第 6 轮:已有用户说的 X(带句号「。」)和来自助手的 X+Y;用户候选 X
+    只差末尾标点。原来交给模型 → 「更新」X+Y → 多出一条只差标点的用户 X(content_hash 不同,
+    唯一索引挡不住)。现在按归一后的文字判相同,直接 NOOP。"""
+    store = InMemoryMemoryStore()
+    stated = await _seed_row(store, "用户的取件码是7190。", origin="user_stated", confidence=0.9)
+    derived = await _seed_row(
+        store, "用户的取件码是7190,助手提醒按时取件", origin="assistant_derived", confidence=0.6
+    )
+    llm = _turn_six_llm(derived.id)
+    assert await _flush(llm, store, near="用户的取件码是7190") == 0
+    assert _reconcile_calls(llm) == 0
+    assert {r.id for r in store._rows} == {stated.id, derived.id}
+    assert all(r.invalid_at is None for r in store._rows)
+
+
+@pytest.mark.parametrize(
+    ("kind", "agent_name"),
+    [("episodic", None), ("fact", "another-agent")],
+    ids=["other-kind", "other-agent"],
+)
+async def test_identical_text_in_another_kind_or_agent_slot_still_asks(
+    kind: Literal["fact", "episodic"], agent_name: str | None
+) -> None:
+    """审查 LOW-1 —— 只和同一 kind、同一 agent_name 的邻居比(写入去重也按这一格)。"""
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(
+        store, "cand", origin="user_stated", confidence=0.9, kind=kind, agent_name=agent_name
+    )
+    llm = _LLM(user_reply=_stated(0.9), ops_reply='{"ops": [{"index": 0, "op": "NOOP"}]}')
+    _ = await _flush(llm, store)
+    assert _reconcile_calls(llm) == 1
