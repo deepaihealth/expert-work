@@ -222,8 +222,8 @@ _USER_TEXT_EXTRACTION_SYSTEM = _USER_TEXT_EXTRACTION_HEADER + "\n" + _SCORING_TA
 # 「只记」的就是上面两类(设计 §4.2、§6.2、§10.2 第 10 条)。
 _CONVERSATION_EXTRACTION_SYSTEM = """You are a memory extraction module. The input is a conversation transcript, one message
 per line. Every line starts with a tag:
-- [user] — text the user typed. It is here for context only; what the user states is
-  recorded separately.
+- [user] — text the user typed. It is here for context; what a [user] line states on its
+  own is recorded separately.
 - [task] — text that started a turn but was not typed by the user in this conversation
   (for example a scheduled or delegated task). Context only.
 - [attached data] — a platform note that the message also carried images, files or
@@ -235,17 +235,18 @@ per line. Every line starts with a tag:
 Extract durable, reusable memories worth recalling in future sessions, of two sorts only:
 - what the assistant did or produced, and what was decided ("episodic");
 - what the assistant found, concluded or proposed, and what was settled only because the
-  user agreed with or answered the assistant ("fact" or "episodic").
+  user agreed with, answered or corrected the assistant ("fact" or "episodic").
 Write each one so that it says where it comes from — for example "the assistant found ...",
 "the assistant proposed ... and the user agreed", "asked by the assistant, the user
 answered ...". Never write it as a plain statement of fact with no source.
-A [user] line that can be understood on its own is recorded by another pass: do not record
-what it states again here — not in other words, not with a source added, and not when an
+What a [user] line says that can be understood on its own is recorded by another pass: do
+not record it again here — not in other words, not with a source added, and not when an
 [assistant] line repeats, confirms or uses it. A conclusion the assistant reached from what
-the user said is still recorded here; only the user's statement itself is not. A [user] line
-that cannot be understood without the assistant's preceding message — a short answer, an
-agreement, or a short correction such as "it's Y now" or "no, it's the other one" — is
-recorded here, with its source, and with "is_correction" when it changes something.
+the user said is still recorded here; only the user's statement itself is not. What a [user]
+line says that cannot be understood without the assistant's previous message — a short
+answer, an agreement, or a short correction such as "it's Y now" or "no, it's the other
+one" — is recorded here, with its source, and with "is_correction" when it changes
+something; one line can hold both kinds, so judge each statement in it.
 Something the assistant concluded that the user then rejected is not recorded as a
 conclusion on its own. Record only the two sorts above; they include what the assistant
 reports that tool results or attachments told it.

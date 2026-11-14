@@ -211,8 +211,8 @@ Only extract what these messages state on their own.
 ```text
 You are a memory extraction module. The input is a conversation transcript, one message
 per line. Every line starts with a tag:
-- [user] — text the user typed. It is here for context only; what the user states is
-  recorded separately.
+- [user] — text the user typed. It is here for context; what a [user] line states on its
+  own is recorded separately.
 - [task] — text that started a turn but was not typed by the user in this conversation
   (for example a scheduled or delegated task). Context only.
 - [attached data] — a platform note that the message also carried images, files or
@@ -224,17 +224,18 @@ per line. Every line starts with a tag:
 Extract durable, reusable memories worth recalling in future sessions, of two sorts only:
 - what the assistant did or produced, and what was decided ("episodic");
 - what the assistant found, concluded or proposed, and what was settled only because the
-  user agreed with or answered the assistant ("fact" or "episodic").
+  user agreed with, answered or corrected the assistant ("fact" or "episodic").
 Write each one so that it says where it comes from — for example "the assistant found ...",
 "the assistant proposed ... and the user agreed", "asked by the assistant, the user
 answered ...". Never write it as a plain statement of fact with no source.
-A [user] line that can be understood on its own is recorded by another pass: do not record
-what it states again here — not in other words, not with a source added, and not when an
+What a [user] line says that can be understood on its own is recorded by another pass: do
+not record it again here — not in other words, not with a source added, and not when an
 [assistant] line repeats, confirms or uses it. A conclusion the assistant reached from what
-the user said is still recorded here; only the user's statement itself is not. A [user] line
-that cannot be understood without the assistant's preceding message — a short answer, an
-agreement, or a short correction such as "it's Y now" or "no, it's the other one" — is
-recorded here, with its source, and with "is_correction" when it changes something.
+the user said is still recorded here; only the user's statement itself is not. What a [user]
+line says that cannot be understood without the assistant's previous message — a short
+answer, an agreement, or a short correction such as "it's Y now" or "no, it's the other
+one" — is recorded here, with its source, and with "is_correction" when it changes
+something; one line can hold both kinds, so judge each statement in it.
 Something the assistant concluded that the user then rejected is not recorded as a
 conclusion on its own. Record only the two sorts above; they include what the assistant
 reports that tool results or attachments told it.
@@ -251,7 +252,7 @@ Respond with ONLY a JSON object, no prose and no code fences:
 If there is nothing worth remembering, return {"memories": []}.
 ```
 
-**用户 11-14 改**(测试验收 118.5 重跑,§10.2 第 10 条;复审后合成一段):上面「A [user] line that can be understood on its own …」到「… attachments told it.」一段,替换了原来那句「Do not extract something a [user] line states completely on its own; that is recorded separately.」。实测第二次提炼仍从 `[user]` 行把用户自己说全的话换个说法、加上出处又记一遍(每轮都有,对照组也有)。分界用 §6.2 的同一把尺子:单独读得懂的用户的话归第一次;离开助手上一条读不懂的(短回答、同意、「现在是 Y 了」「不对,是另一个」这种短更正)仍由这一次记、带出处,改了什么就带 `is_correction`(118.5 的 Y 就是这种)。助手从用户的话里得出的结论照记,只是用户的话本身不记;助手得出、用户随后否定的,不单独当结论记。「只记」的范围就是上面两类,包括「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它),没有另列一份更窄的;第二次提炼看不到工具结果,所以写的是「助手说工具 / 附件告诉它的」。只靠措辞,效果在付费评测小跑里量。
+**用户 11-14 改**(测试验收 118.5 重跑,§10.2 第 10 条;复审后合成一段):上面「What a [user] line says that can be understood on its own …」到「… attachments told it.」一段,替换了原来那句「Do not extract something a [user] line states completely on its own; that is recorded separately.」。实测第二次提炼仍从 `[user]` 行把用户自己说全的话换个说法、加上出处又记一遍(每轮都有,对照组也有)。分界用 §6.2 的同一把尺子:单独读得懂的用户的话归第一次;离开助手上一条读不懂的(短回答、同意、「现在是 Y 了」「不对,是另一个」这种短更正)仍由这一次记、带出处,改了什么就带 `is_correction`(118.5 的 Y 就是这种)。助手从用户的话里得出的结论照记,只是用户的话本身不记;按句判、不按行判:同一行里可以两样都有(例如「选 B,因为预算在 5000 以内」—— 预算那句单独读得懂,归第一次;「选了 B」离开助手的问题读不懂,归这一次)。第二类也含「用户纠正助手才定下的」;`[user]` 标签说明改成只说「单独读得懂的」另记,免得与这一段矛盾(复审 11-14)。助手得出、用户随后否定的,不单独当结论记。「只记」的范围就是上面两类,包括「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它),没有另列一份更窄的;第二次提炼看不到工具结果,所以写的是「助手说工具 / 附件告诉它的」。只靠措辞,效果在付费评测小跑里量。
 
 ### 4.3 会丢什么、边界、副作用
 

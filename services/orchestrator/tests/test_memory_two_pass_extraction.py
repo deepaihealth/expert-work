@@ -298,14 +298,15 @@ async def test_conversation_pass_does_not_restate_what_the_user_said() -> None:
     await _flush(_turn_with_tools(), llm)
     second = " ".join(llm.system_of("conversation").split())
     passage = (
-        "A [user] line that can be understood on its own is recorded by another pass: do not "
-        "record what it states again here — not in other words, not with a source added, and "
+        "What a [user] line says that can be understood on its own is recorded by another "
+        "pass: do not record it again here — not in other words, not with a source added, and "
         "not when an [assistant] line repeats, confirms or uses it. A conclusion the assistant "
         "reached from what the user said is still recorded here; only the user's statement "
-        "itself is not. A [user] line that cannot be understood without the assistant's "
-        "preceding message — a short answer, an agreement, or a short correction such as "
-        '"it\'s Y now" or "no, it\'s the other one" — is recorded here, with its source, '
-        'and with "is_correction" when it changes something. Something the assistant '
+        "itself is not. What a [user] line says that cannot be understood without the "
+        "assistant's previous message — a short answer, an agreement, or a short correction "
+        'such as "it\'s Y now" or "no, it\'s the other one" — is recorded here, with its '
+        'source, and with "is_correction" when it changes something; one line can hold both '
+        "kinds, so judge each statement in it. Something the assistant "
         "concluded that the user then rejected is not recorded as a conclusion on its own. "
         "Record only the two sorts above; they include what the assistant reports that tool "
         "results or attachments told it."
@@ -314,6 +315,15 @@ async def test_conversation_pass_does_not_restate_what_the_user_said() -> None:
     # 「两类」里仍有「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它)。
     assert '- what the assistant did or produced, and what was decided ("episodic");' in second
     assert second.index("of two sorts only:") < second.index(passage)
+    # 复审 LOW(11-14):第二类含「用户纠正助手才定下的」;[user] 标签说明只说「单独读得懂的」另记。
+    assert (
+        "what was settled only because the user agreed with, answered or corrected the assistant"
+        in second
+    )
+    assert (
+        "[user] — text the user typed. It is here for context; what a [user] line states on "
+        "its own is recorded separately." in second
+    )
     # 合成一条规则:原来那句与上一版另起的两句都不在了。
     assert "states completely on its own" not in second
     assert "Record only what the assistant found" not in second
