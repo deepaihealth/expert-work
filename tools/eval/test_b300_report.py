@@ -60,6 +60,55 @@ def test_p2_leak_and_plain_statement_item() -> None:
     assert checks["pass1_leak"] is True and checks["plain"] is False and items == []
 
 
+def test_judge_wording_is_pinned() -> None:
+    """用户 11-14 复核:「助手推测 / 查询后告知 / 经助手询问用户答复」都算写了。措辞通用。"""
+    assert rep.SOURCE_WORDING == (
+        "A memory names its source if it says, in any wording, that the assistant looked the "
+        "value up, found it, read it, saw it, was told it by a tool result or an attachment, or "
+        "inferred, guessed, estimated or concluded it; a hedged guess by the assistant counts as "
+        "a source."
+    )
+    assert rep.USER_ANSWER_WORDING == (
+        "A memory says this if it says, in any wording, that the user gave the value in answer "
+        "to the assistant, when the assistant asked, or by agreeing with what the assistant said."
+    )
+
+
+@pytest.mark.parametrize("cls", ["P2", "P3", "P4", "P5"])
+def test_plain_prompt_carries_the_source_wording(cls: str) -> None:
+    s = _scenario(cls)
+    x = sc.fact("budget").texts[s.lang].x
+    _checks, items = rep.a_checks(_record([("pass1", _reply()), ("pass2", _reply(x))]), s)
+    (item,) = items
+    assert item.check == "plain"
+    head = item.prompt.split("Memories:\n")[0]
+    assert rep.SOURCE_WORDING in head and head.index(rep.SOURCE_WORDING) < head.index("Question:")
+    assert rep.USER_ANSWER_WORDING not in item.prompt
+
+
+@pytest.mark.parametrize("cls", ["P6", "P7"])
+def test_attributed_prompt_carries_the_user_answer_wording(cls: str) -> None:
+    s = _scenario(cls)
+    x = sc.fact("budget").texts[s.lang].x
+    _checks, items = rep.a_checks(_record([("pass1", _reply()), ("pass2", _reply(x))]), s)
+    (item,) = items
+    head = item.prompt.split("Memories:\n")[0]
+    assert item.check == "attributed" and rep.USER_ANSWER_WORDING in head
+    assert head.index(rep.USER_ANSWER_WORDING) < head.index("Question:")
+    assert rep.SOURCE_WORDING not in item.prompt
+
+
+def test_p9_prompt_carries_the_user_answer_wording() -> None:
+    p9 = _scenario("P9")
+    y = sc.fact("budget").texts[p9.lang].y
+    rec = _record([("pass1", _reply()), ("pass2", _reply(y, correction=True))])
+    (item,) = rep.a_checks(rec, p9)[1]
+    head = item.prompt.split("Memories:\n")[0]
+    assert rep.USER_ANSWER_WORDING in head and head.index(rep.USER_ANSWER_WORDING) < head.index(
+        "Question:"
+    )
+
+
 def test_p6_p8_p9_a11_a12_checks() -> None:
     p6 = _scenario("P6")
     x = sc.fact("budget").texts[p6.lang].x

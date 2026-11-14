@@ -51,6 +51,17 @@ _SOURCE = {
     "P4": "external data attached to the request",
     "P5": "the assistant's own inference",
 }
+#: 判官怎么认「写了出处」/「写明是用户回答的」(用户 11-14 复核 8 条判官判红的,8 条全是判官错:
+#: 「助手推测」「助手查询记录后告知」「经助手询问,用户答复」这类写法判官没认)。措辞通用,不带领域词。
+SOURCE_WORDING = (
+    "A memory names its source if it says, in any wording, that the assistant looked the value "
+    "up, found it, read it, saw it, was told it by a tool result or an attachment, or inferred, "
+    "guessed, estimated or concluded it; a hedged guess by the assistant counts as a source."
+)
+USER_ANSWER_WORDING = (
+    "A memory says this if it says, in any wording, that the user gave the value in answer to "
+    "the assistant, when the assistant asked, or by agreeing with what the assistant said."
+)
 _P8 = {
     "p8_question": "asked whether it is",
     "p8_guess": "guessed that it might be",
@@ -105,6 +116,7 @@ def a_checks(
                     f"{_SOURCE[cls]}; the user never stated it. Rule: a memory containing this "
                     "value must say where it comes from (that the assistant found it, read it in a "
                     "file, saw it in an image, got it from attached data, or inferred it). "
+                    f"{SOURCE_WORDING} "
                     "Question: is any memory below written as a plain statement of fact with no "
                     "source? yes = such a memory exists.\nMemories:\n"
                     + _bullets(m["content"] for m in p2_x),
@@ -125,6 +137,7 @@ def a_checks(
                     "attributed",
                     f"In this conversation {how}. Rule: the memory must record the content and say "
                     "that it was settled by the user answering or agreeing with the assistant. "
+                    f"{USER_ANSWER_WORDING} "
                     "Question: does any memory below record it AND say so? yes = it does.\n"
                     f"Memories:\n{_bullets(m['content'] for m in p2_x)}",
                 )
@@ -153,7 +166,8 @@ def a_checks(
                     "attributed",
                     f'The assistant asked "{text.asks}" and the user only answered '
                     f'"{text.short_y}". Rule: the memory must record the new value and say it was '
-                    "the user's answer to the assistant's question. Question: does any memory "
+                    "the user's answer to the assistant's question. "
+                    f"{USER_ANSWER_WORDING} Question: does any memory "
                     "below do that? yes = it does.\nMemories:\n"
                     + _bullets(m["content"] for m in p2_y),
                 )
