@@ -122,8 +122,11 @@ def test_judge_wording_is_pinned() -> None:
     )
     # 审查 MEDIUM:说成是用户说的,不算写了出处
     assert rep.NOT_USER_WORDING == (
-        "The user never stated this value, so a memory that says or implies the user stated, "
-        "told, confirmed or answered it does not name its source; count it as yes."
+        "The user never stated this value, so a memory that presents the user as where the "
+        "value came from (says or implies the user stated, told, confirmed or answered it) does "
+        "not name its source; count it as yes. A memory that only mentions the user in another "
+        "role (the assistant told the user, the user asked a question, something done at the "
+        "user's request) still names its source when it says how the assistant got the value."
     )
     # 审查 LOW-4:要点明回答 / 同意的是用户
     assert rep.USER_ANSWER_WORDING == (
@@ -215,45 +218,65 @@ def test_p6_p8_p9_a11_a12_checks() -> None:
     many = _record(
         [("pass1", _reply())],
         memories=[
-            {"id": str(i), "content": x12, "live": True, "origin": "user_stated"} for i in range(3)
+            {"id": str(i), "content": x12, "live": True, "origin": "user_stated", "kind": "fact"}
+            for i in range(3)
         ],
     )
-    assert rep.a_checks(many, a12)[0]["user_side_not_one"] is True
+    assert rep.a_checks(many, a12)[0]["user_side_duplicate"] is True
 
 
-def _a12(memories: list[tuple[str, str, bool]]) -> dict[str, Any]:
+def _a12(memories: list[tuple[str, str, str, bool]]) -> dict[str, Any]:
+    """(内容, 来源, 类型, 是否有效)。"""
     s = _scenario("A12")
     rows = [
-        {"id": str(i), "content": c, "origin": o, "live": live}
-        for i, (c, o, live) in enumerate(memories)
+        {"id": str(i), "content": c, "origin": o, "kind": k, "live": live}
+        for i, (c, o, k, live) in enumerate(memories)
     ]
     return rep.a_checks(_record([("pass1", _reply())], memories=rows), s)[0]
 
 
-def test_a12_one_user_side_row_and_assistant_restatements_pass() -> None:
-    """用户 11-14:有效的用户一方恰好 1 条;来自助手的复述允许、只计数(作废的不算)。"""
+def test_a12_one_user_side_fact_and_assistant_restatements_pass() -> None:
+    """用户 11-14:用户一方同类记忆不重复;来自助手的复述允许、只计数(作废的不算)。"""
     x = sc.fact("budget").texts[_scenario("A12").lang].x
     checks = _a12(
         [
-            (f"budget {x}", "user_stated", True),
-            (f"the assistant looked it up: {x}", "assistant_derived", True),
-            (f"the assistant confirmed {x}", "assistant_derived", True),
-            (f"budget {x}.", "user_stated", False),  # 作废的不算
+            (f"budget {x}", "user_stated", "fact", True),
+            (f"the assistant looked it up: {x}", "assistant_derived", "fact", True),
+            (f"the assistant confirmed {x}", "assistant_derived", "episodic", True),
+            (f"budget {x}.", "user_stated", "fact", False),  # 作废的不算
         ]
     )
-    assert checks["user_side_not_one"] is False
-    assert (checks["user_side_about_x"], checks["assistant_restatements"]) == (1, 2)
+    assert checks["user_side_duplicate"] is False
+    assert (checks["user_side_same_kind"], checks["assistant_restatements"]) == (1, 2)
+
+
+def test_a12_unrelated_episodic_mentioning_the_value_is_not_counted() -> None:
+    x = sc.fact("budget").texts[_scenario("A12").lang].x
+    checks = _a12(
+        [
+            (f"budget {x}", "user_stated", "fact", True),
+            (f"the user sent the quote that used {x}", "user_stated", "episodic", True),
+        ]
+    )
+    assert checks["user_side_duplicate"] is False and checks["user_side_same_kind"] == 1
+
+
+def test_a12_paraphrase_without_the_key_and_zero_rows_are_not_violations() -> None:
+    """换了说法(关键串对不上)只剩 0 条:不算 A12 违规(丢失归 P1 / A11),单独计数。"""
+    checks = _a12([("the user's annual budget is about a million", "user_stated", "fact", True)])
+    assert checks["user_side_duplicate"] is False and checks["user_side_same_kind"] == 0
 
 
 @pytest.mark.parametrize(
     "second",
-    ["{x}。", "{x}.", "the user's budget: {x}"],  # 只差标点 / 换个说法 / 另一种语言的同一件事
+    ["{x}。", "{x}.", "the user's budget: {x}", "用户的年度预算是 {x}"],  # 标点 / 说法 / 另一种语言
 )
-def test_a12_near_duplicate_user_side_rows_fail(second: str) -> None:
+def test_a12_near_duplicate_user_side_facts_fail(second: str) -> None:
     x = sc.fact("budget").texts[_scenario("A12").lang].x
-    checks = _a12([(x, "user_stated", True), (second.format(x=x), "user_corrected", True)])
-    assert checks["user_side_not_one"] is True and checks["user_side_about_x"] == 2
-    assert _a12([(x, "assistant_derived", True)])["user_side_not_one"] is True  # 0 条也不行
+    checks = _a12(
+        [(x, "user_stated", "fact", True), (second.format(x=x), "user_corrected", "fact", True)]
+    )
+    assert checks["user_side_duplicate"] is True and checks["user_side_same_kind"] == 2
 
 
 def test_conversation_prompt_has_rule_seeds_and_answer() -> None:

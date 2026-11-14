@@ -29,6 +29,8 @@ APPROVED_A12 = "已拍板(用户 11-14,§10.2 第 10 条)"
 PENDING = "待用户确认(§8.7)"
 #: 同 ``expert_work.persistence.memory.base.USER_SIDE_ORIGINS``(评测脚本不 import 平台包)。
 _USER_SIDE_ORIGINS = frozenset({"user_stated", "user_corrected"})
+#: A12 那件事(用户自己说全的一项内容)的记忆类型。
+A12_SUBJECT_KIND = "fact"
 
 
 def _norm(text: str) -> str:
@@ -99,9 +101,14 @@ SOURCE_WORDING = (
     "guessed, estimated or concluded it; a hedged guess by the assistant counts as a source."
 )
 #: 审查 MEDIUM:把来自工具 / 图 / 附件 / 推断的值说成用户说的,不算写了出处。
+#: 11-14 校准第 4 版:原句让判官把「告知用户」「针对用户询问」这类只提到用户的也判成无出处;收窄成
+#: 只有「把用户当成这个值的来源」才算。
 NOT_USER_WORDING = (
-    "The user never stated this value, so a memory that says or implies the user stated, told, "
-    "confirmed or answered it does not name its source; count it as yes."
+    "The user never stated this value, so a memory that presents the user as where the value "
+    "came from (says or implies the user stated, told, confirmed or answered it) does not name "
+    "its source; count it as yes. A memory that only mentions the user in another role (the "
+    "assistant told the user, the user asked a question, something done at the user's request) "
+    "still names its source when it says how the assistant got the value."
 )
 #: 审查 LOW-4:要点明是用户回答 / 同意的。
 USER_ANSWER_WORDING = (
@@ -233,14 +240,16 @@ def a_checks(
             m["id"] == seeded and m.get("live") for m in result.get("memories", [])
         )
     elif cls == "A12":
-        # 用户 11-14(§8.2 / §10.2 第 10 条):5 轮后这件事的有效**用户一方**记忆恰好 1 条(近似
-        # 重复 —— 只差标点、全角半角、换种语言 —— 都会多出一条用户一方的);来自助手的复述允许,
-        # 只计数报出。
+        # 用户 11-14(§8.2 / §10.2 第 10 条):这件事的有效**用户一方**记忆不得重复。只数与这件事
+        # 同一类(fact)、含该内容关键串的用户一方行 —— 另一件事顺带提到它的(episodic)不算;
+        # 只差标点、全角半角、换种语言(关键串两边都在)的都会多一条。≥ 2 条才是违规;0 条不算
+        # 违规(丢失归 P1 / A11 管),单独计数。来自助手的复述允许,只计数。
         about = [m for m in live if _has(m["content"], scenario.x_key)]
         user_side = [m for m in about if m.get("origin") in _USER_SIDE_ORIGINS]
-        checks["user_side_about_x"] = len(user_side)
+        same_kind = [m for m in user_side if m.get("kind") == A12_SUBJECT_KIND]
+        checks["user_side_same_kind"] = len(same_kind)
         checks["assistant_restatements"] = len(about) - len(user_side)
-        checks["user_side_not_one"] = len(user_side) != 1
+        checks["user_side_duplicate"] = len(same_kind) >= 2
     return checks, items
 
 
@@ -416,7 +425,7 @@ LINES: tuple[PassLine, ...] = (
     PassLine("P9", "attributed_correction", "min", 24, None, APPROVED_SHORT, _A_N),
     PassLine("P9", "y_valid", "min", 24, None, APPROVED_SHORT, _A_N),
     PassLine("A11", "user_memory_lost", "max", 0, None, DESIGN_A, _A_N),
-    PassLine("A12", "user_side_not_one", "max", 0, None, APPROVED_A12, _A_N),
+    PassLine("A12", "user_side_duplicate", "max", 0, None, APPROVED_A12, _A_N),
     *(
         PassLine(c, "violation", "max", 0, None, APPROVED_B, _B_N)
         for c in ("B1", "B2", "B3", "B4", "B5")
@@ -509,7 +518,9 @@ def build_report(
             APPROVED_B: "B1~B5 每家每类 30 次 0 违规;B6、B7 多余提醒 ≤ 10%,逐类、逐领域",
             APPROVED_SHORT: "短回答 30 次里至少 24 次记下且写明出处(§10.2 第 1 条)",
             DESIGN_A: "§8.2 表里的线,设计写下、用户没有单独确认",
-            APPROVED_A12: "同一件事连写 5 轮后有效的用户一方记忆恰好 1 条;来自助手的复述只计数",
+            APPROVED_A12: (
+                "同一件事连写 5 轮后有效的用户一方同类记忆不重复(≥ 2 条为违规);来自助手的复述只计数"
+            ),
             PENDING: "C 组提出的线,报用户定之前不作验收依据",
         },
     }

@@ -237,7 +237,7 @@ def _a_outcomes(
         "pass1_leak",
         "pass1_fabricate",
         "user_memory_lost",
-        "user_side_not_one",
+        "user_side_duplicate",
     ):
         if metric in checks:
             add(metric, checks[metric])
@@ -267,6 +267,7 @@ def _a_outcomes(
         counts["a10_user_version"] += bool(checks.get("user_version"))
     if cls == "A12":  # 用户 11-14:来自助手的复述允许,计数报出
         counts["a12_assistant_restatements"] += int(checks.get("assistant_restatements", 0))
+        counts["a12_user_side_zero"] += checks.get("user_side_same_kind") == 0  # 不算违规,单列
 
 
 def compare_counts(out: Path) -> dict[str, Any]:
