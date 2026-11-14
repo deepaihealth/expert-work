@@ -228,15 +228,18 @@ Extract durable, reusable memories worth recalling in future sessions, of two so
 Write each one so that it says where it comes from — for example "the assistant found ...",
 "the assistant proposed ... and the user agreed", "asked by the assistant, the user
 answered ...". Never write it as a plain statement of fact with no source.
-Do not extract something a [user] line states completely on its own; that is recorded
-separately. When the assistant only repeats something from earlier records or memory, do
-not extract it again.
-What the user states in their own messages is recorded by another pass: do not record it
-again here, not in other words, not with a source added, and not when an [assistant] line
-repeats, confirms or uses it. Record only what the assistant found, concluded or proposed,
-what tool results or attachments told it, and what was settled only because the user agreed
-with or answered the assistant — a short user answer that only makes sense with the
-assistant's question is recorded here, with its source.
+A [user] line that can be understood on its own is recorded by another pass: do not record
+what it states again here — not in other words, not with a source added, and not when an
+[assistant] line repeats, confirms or uses it. A conclusion the assistant reached from what
+the user said is still recorded here; only the user's statement itself is not. A [user] line
+that cannot be understood without the assistant's preceding message — a short answer, an
+agreement, or a short correction such as "it's Y now" or "no, it's the other one" — is
+recorded here, with its source, and with "is_correction" when it changes something.
+Something the assistant concluded that the user then rejected is not recorded as a
+conclusion on its own. Record only the two sorts above; they include what the assistant
+reports that tool results or attachments told it.
+When the assistant only repeats something from earlier records or memory, do not extract it
+again.
 For each memory give "importance" (0-1: how reusable it is in future sessions),
 "confidence" (0-1: how well the transcript supports it), "expected_valid_days" (a rough
 number of days it should stay valid, or null), and "is_correction": true only when the
@@ -248,7 +251,7 @@ Respond with ONLY a JSON object, no prose and no code fences:
 If there is nothing worth remembering, return {"memories": []}.
 ```
 
-**用户 11-14 加**(测试验收 118.5 重跑,§10.2 第 10 条):上面「What the user states in their own messages …」到「… with its source.」两句。原来只有「Do not extract something a [user] line states completely on its own」,实测第二次提炼仍从 `[user]` 行把用户自己说全的话换个说法、加上出处又记一遍(每轮都有,对照组也有)。离开助手的问题读不懂的短回答(118.5 的 Y)仍由这一次记、带出处。只靠措辞,效果在付费评测小跑里量。
+**用户 11-14 改**(测试验收 118.5 重跑,§10.2 第 10 条;复审后合成一段):上面「A [user] line that can be understood on its own …」到「… attachments told it.」一段,替换了原来那句「Do not extract something a [user] line states completely on its own; that is recorded separately.」。实测第二次提炼仍从 `[user]` 行把用户自己说全的话换个说法、加上出处又记一遍(每轮都有,对照组也有)。分界用 §6.2 的同一把尺子:单独读得懂的用户的话归第一次;离开助手上一条读不懂的(短回答、同意、「现在是 Y 了」「不对,是另一个」这种短更正)仍由这一次记、带出处,改了什么就带 `is_correction`(118.5 的 Y 就是这种)。助手从用户的话里得出的结论照记,只是用户的话本身不记;助手得出、用户随后否定的,不单独当结论记。「只记」的范围就是上面两类,包括「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它),没有另列一份更窄的;第二次提炼看不到工具结果,所以写的是「助手说工具 / 附件告诉它的」。只靠措辞,效果在付费评测小跑里量。
 
 ### 4.3 会丢什么、边界、副作用
 
@@ -466,7 +469,7 @@ B-300 合并时同步改 B-176 设计 §6.3 ③ 与计划 M2-2,随 ROADMAP 销�
 | P6 / P7 | 助手问、用户只答一个词;助手说、用户只回「对」 | 第一次编造出内容:0 次;第二次记下且写明出处:≥ 24 次,逐领域 ≥ 4 次(§10.2 第 1 条的验收线) |
 | P8 | 用户只是提到:问句、猜测、假设、转述别人 | 第一次把它提成陈述:0 次 |
 | P9 | 短更新:已有用户说的 X,助手问起,用户答「现在 Y 了」 | 第二次记下 Y、写明出处并标 `is_correction`:≥ 24 次;写回后 Y 在库里有效:同线 |
-| 另 3 类 | 用户后来自己说全了;已有用户说的内容时助手得出不同内容;同一对话连写 5 轮 | 前者出现「用户消息里说的」版本;中者用户那条仍有效(0 次违规);后者 5 轮后同一件事的有效记忆 ≤ 2 条 |
+| 另 3 类 | 用户后来自己说全了;已有用户说的内容时助手得出不同内容;同一对话连写 5 轮 | 前者出现「用户消息里说的」版本;中者用户那条仍有效(0 次违规);后者 5 轮后内容相同的有效**用户一方**记忆恰好 1 条、没有近似重复(含只差标点 / 全角半角的),来自助手的复述允许、计数报出(用户 11-14 改,原为「同一件事的有效记忆 ≤ 2 条」,§10.2 第 10 条) |
 
 ### 8.3 B 组 —— 召回后回答(测 ③)
 
@@ -618,7 +621,7 @@ PR 2 依赖 PR 1;同一班车上生产(已拍板 ③)。没有开关(已拍板 �
 | T8 | 迁移后看表结构;存量记忆显示「未记录」,存量更正显示「用户更正」 | 正常 | 2 |
 | T9 | 重复 T2 | `origin = assistant_derived`,置信度 ≤ 0.6;管理页有标签 | 2 |
 | T10 | 接着只回一句「对」;再开一轮自己把那项内容说全 | 前者之后没有新的 `user_stated` 记忆;后者之后有一条有效的(原条目是否作废记下来) | 2 |
-| T11 | 先让用户自己说一项内容;再让助手问起、用户只答一个不同的词;同一对话再聊三轮 | 用户那条仍有效;新回答存下且写明出处;同一件事的有效记忆 ≤ 2 条 | 2 |
+| T11 | 先让用户自己说一项内容;再让助手问起、用户只答一个不同的词;同一对话再聊三轮 | 用户那条一直有效(没被取代 / 过期);内容为它的有效用户一方行恰好 1 条、没有近似重复;新回答存下且写明出处;来自助手的复述允许、计数报出(用户 11-14 改,原为「同一件事的有效记忆 ≤ 2 条」) | 2 |
 | T12 | 滚动发布期间新旧副本各跑一轮带记忆的对话 | 无报错;旧副本写的记忆来源为空 | 2 |
 | T13 | 直接往库里种:X 已被 Y 取代,另有至少两条与 X 很像的记忆(让整理凑得成簇,理由同 §8.7 C5);手动触发一轮整理。先在发版前的版本上做一次确认这一片会被取成候选簇(同 §8.7 C5,脚本直接调 `_find_candidate_clusters` 记下成员 id) | 没有一条当前有效的汇总行把 X 说成现在的;已作废的 X 没进候选(看整理的取数记录) | A |
 | T14 | 构造一轮对话,让提炼出的一批记忆里有一条会被写入扫描拦下 | 只丢那一条,同批其它的照常写入;有一条 `MEMORY_INJECTION_BLOCKED` 审计 | A |
@@ -662,7 +665,7 @@ T17、T20 随第 2 条线的 PR 跑(11-13 从 PR 1 挪出)。**T20 必须在云�
 | 8(用户 11-14,测试验收 118.5 红后) | 用户自己说过的记忆被一个短回答取代、之后几轮来回翻(实测 6 轮复现:第一次提炼把用户让助手考自己时答的一个值读成了「更正」,置信度 0.5,去重合并拿它取代了 0.99 的那条;第 5 轮一条与用户那条意思相同的来自助手的候选被判成「新增」) | **三条都做,别的不做**:① 第一次提炼的指令写明「只有一个值、同一句里没说是什么的,永远不是更正,也不是对旧记忆的更新」,`is_correction` 只在同一句话自己说清改的是什么、新值是什么时才为真(§4.2);② 程序加第二条拦截规则:用户消息里说的候选,置信度低于目标(用户一方的记忆,含汇总行,汇总行按成员里最高的用户一方置信度比,查不完按 1.0)时不得更新 / 删除它,处理与第一条相同,预判 + 锁里重判,单独计数(§6.2);③ 去重合并的指令补上反方向:来自助手的候选对上用户说的 / 用户更正的已有记忆 → NOOP(§6.2) | 「每轮只读新消息」(根治整段重抽)明确推迟到记忆总计划,本项不做 |
 | 8 补(11-14 重跑 118.5) | 修后重跑:X 一直有效、短回答不再被当更正、`blocked_update_added` +2;但同一件事最后 3 条有效记忆(线是 ≤ 2):用户候选 X 同时对上相同的用户 X 和来自助手的 X+Y,模型「更新」了后者,多出一条重复的用户 X | 去重合并前程序判逐字相同 + 来源不弱 → 直接 NOOP;指令加「已有同样内容的用户一方记忆 → NOOP」并放在「更新来自助手的」那句之前(§6.2) | 只改指令(纯措辞,逐字相同的情况程序就能判,不必交给模型) |
 | 9(用户 11-14,再查 118.5 后) | 「内容相同」按什么口径比:实测重复行只差末尾标点 / 全角半角;第一版去掉所有标点(数字之间的除外)被审查指出会把意思不同的判成相同 | **用户原话:「只忽略不改变意思的差别」**。只忽略全角半角、大小写、空白多少、末尾的句末标点(§6.2)。别家做法(11-14 调研):mem0、Cognee、Dolma 对原文求哈希;Graphiti 原样比较;deer-flow、OpenViking 只忽略大小写与空白;去掉标点的做法(SQuAD / MLQA 的评测归一、datatrove、WeKnora)会把 69.1 / 691、50% / 50、-3 / 3 判成相同;UAX #15 说 NFKC 不能盲用 | 去掉句中标点(只留数字之间的):见第一版,被否;NFKC:上标、带圈数字、单位符号会被折成普通字符 |
-| 10(用户 11-14,`3a4cfd3b3` 重跑 118.5 后) | 修后重跑:X 6 轮一直有效、用户一方的 X 只有 1 条、只差标点的重复 0 条、「写了几条」6/6 对,但同一件事 3 条有效记忆(X 用户说的、X 来自助手 —— 第二次提炼从 `[user]` 行复述、X+Y 来自助手),原判据「≤ 2 条」不过 | **两样都做**:① 改 118.5 判据 —— 用户原来的 X 一直有效、内容为 X 的有效用户一方行恰好 1 条、Y 带出处存下、来自助手的 X 复述允许但要数出条数;按新判据这次重跑算过;② 第二次提炼指令加「用户自己说的由另一次记,这里不再记;只记助手得出的 / 工具与附件告诉它的 / 用户同意或回答助手才定下的,离开助手问题读不懂的短回答照记、带出处」(§4.2);它对复述条数的效果在付费评测小跑里量 | 只改判据不改指令;或程序里拦「来自助手的候选与用户说的同义」(没法不靠模型判同义) |
+| 10(用户 11-14,`3a4cfd3b3` 重跑 118.5 后) | 修后重跑:X 6 轮一直有效、用户一方的 X 只有 1 条、只差标点的重复 0 条、「写了几条」6/6 对,但同一件事 3 条有效记忆(X 用户说的、X 来自助手 —— 第二次提炼从 `[user]` 行复述、X+Y 来自助手),原判据「≤ 2 条」不过 | **两样都做**:① 改 118.5 判据 —— 用户原来的 X 一直有效、内容为 X 的有效用户一方行恰好 1 条、Y 带出处存下、来自助手的 X 复述允许但要数出条数;按新判据这次重跑算过;② 第二次提炼指令加一段(§4.2,复审后合成一条规则):单独读得懂的用户的话这里不再记(换说法、加出处、助手复述都不算),助手从中得出的结论照记;离开助手上一条读不懂的(短回答、同意、短更正)照记、带出处、改了就带 `is_correction`;助手得出、用户否定的不单独当结论记;「只记」的就是上面两类;它对复述条数的效果在付费评测小跑里量 | 只改判据不改指令;或程序里拦「来自助手的候选与用户说的同义」(没法不靠模型判同义) |
 
 ## 11. 未验证清单
 
@@ -841,7 +844,7 @@ T17、T20 随第 2 条线的 PR 跑(11-13 从 PR 1 挪出)。**T20 必须在云�
   - 0.6 的上限只剩一个常量 `ASSISTANT_DERIVED_MAX_CONFIDENCE`(LOW-2)。
 - **用户 11-14(§10.2 第 8 条)的做法**:`supersede` / `expire` 再多一个 `refuse_user_side_above`(写回给用户消息里说的候选传它的置信度);锁里的重判两个存储实现共用一个函数 `refuse_if_user_side`(`memory/base.py`),目标是用户一方的、且行上此刻的置信度高于它 → 抛 `UserSideHigherConfidenceError`(`UserSideTargetError` 的子类,原有的处理路径照样接得住,写回按类型分开计数)。计数标签 `lower_confidence_update_added` / `lower_confidence_update_dropped` / `lower_confidence_delete`,与来自助手的 `blocked_*` 分开。置信度相等可以改(规则是「低于」才拦)。比较口径一个函数 `user_side_confidence`(`memory/base.py`):不是汇总行就是它自己的置信度;汇总行取它自己(若是用户一方的)与成员里一层层往下所有用户一方记忆的置信度的最高值,遍历同 `is_user_side_protected`(已查集合防环、最多 8 层),到上限还有没查的成员按 1.0。预判时汇总行经新加的存储方法 `user_side_confidence` 查(查失败按不受保护放过,锁里兜底);锁里重判用同一个函数(独立审查 11-14)。
 - **11-14 重跑 118.5 后补的做法**:`graph_builder/memory.py` 的 `_has_identical_neighbor` 在读完邻居、算相似度之前判(用全部召回到的有效邻居里同 kind、同 agent_name 的,不只是过了相似度线的;归一函数 `_normalized_text`,只用于这一判断,不改 `content_hash`;`casefold` 比 `lower` 多折几种(如 ß → ss),接受(审查 LOW-3/4));命中就记 `expert_work_cm_memory_reconcile_total{op="noop"}` —— 与没有相似邻居时直接记 `add` 是同一个惯例(`add` / `noop` 都不区分模型判的还是程序判的),不另开标签。来源强弱用 `effective_origin`:用户一方 = 1,其余 = 0;邻居 ≥ 候选才 NOOP。带 `is_correction` 的候选不走这条,照旧问模型(独立审查 MEDIUM:用户说「不,是 X」时,X 与已有的 X 逐字相同,但模型要有机会删掉旁边那条冲突的、把握度更低而并存下来的 Y)。原来交给模型时会怎样(11-14 在 SQL 与内存两个实现上实测 `supersede`):有效行上有 `(tenant_id, user_id, content_hash, COALESCE(agent_name, ''))` 的部分唯一索引(`content_hash` 按去首尾空白、转小写算)。模型判「更新」**另一条**(例如来自助手的 X+Y)时,SQL 上取代出的同内容新行撞上仍有效的那条 X、报 `IntegrityError`,写回按 degraded 退回直接写入、再被去重挡掉 —— 所以 SQL 上不会多出一条完全相同的 X(内存实现没有这个索引,会多出);模型判「更新」**那条相同的 X 本身**时,旧行在同一事务里先被作废,新行照常写入(两个实现都是),等于换成置信度更新的一行 —— 现在这种候选直接 NOOP,不再换行,接受。 终审(11-14)后:带更正的候选在读邻居时记下与之内容相同的用户一方记忆(`_identical_user_side_ids`),模型的决定经 `_redundant_correction_op` 改写(见 §6.2);句末标点集合去掉了问号;提示词例外句末尾加「otherwise it is a NOOP」,规则句后半改为「takes precedence over the rule below about memories from the assistant」。
-- **§10.2 第 10 条(11-14)**:只改第二次提炼的指令(两句,§4.2),原有那句「Do not extract something a [user] line states completely on its own」保留;没有程序改动。
+- **§10.2 第 10 条(11-14)**:只改第二次提炼的指令(§4.2 的一段,替换原来那句「Do not extract something a [user] line states completely on its own」,复审后与上一版另起的两句合成一条规则);没有程序改动。
 
 ### 13.4 总计划 §6.2 列的设计细节,定稿
 
