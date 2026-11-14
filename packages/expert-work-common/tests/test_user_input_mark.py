@@ -15,10 +15,19 @@ from expert_work.common.user_input import (
 )
 
 
-def _marked(content: str | list[str | dict[Any, Any]], *, text: str, **counts: int) -> HumanMessage:
+def _marked(
+    content: str | list[str | dict[Any, Any]],
+    *,
+    text: str,
+    images: int,
+    files: int,
+    external_blocks: int,
+) -> HumanMessage:
     return HumanMessage(
         content=content,
-        additional_kwargs=user_input_kwargs(text=text, **counts),
+        additional_kwargs=user_input_kwargs(
+            text=text, images=images, files=files, external_blocks=external_blocks
+        ),
     )
 
 
@@ -92,3 +101,21 @@ def test_draft_turn_mark_round_trips_and_keeps_other_kwargs() -> None:
     assert read_user_input(marked) is not None  # 白名单标记还在
     assert is_draft_turn(marked.model_dump())
     assert not is_draft_turn(AIMessage(content="x"))
+
+
+def test_sent_at_rides_on_the_mark() -> None:
+    """审查 MEDIUM-1(11-14):第一次提炼每轮重读整段对话,相对日期要按那条消息自己的发送时间换算 ——
+    构造点在标记里记下发送时刻(UTC,ISO 8601)。"""
+    mark = user_input_kwargs(
+        text="hi", images=0, files=0, external_blocks=0, sent_at="2026-11-14T01:30:00+00:00"
+    )
+    msg = HumanMessage(content="hi", additional_kwargs=mark)
+    got = read_user_input(msg)
+    assert got is not None
+    assert got.sent_at == "2026-11-14T01:30:00+00:00"
+    # 没有(发版前的消息)或不是字符串:None。
+    old = HumanMessage(
+        content="hi",
+        additional_kwargs=user_input_kwargs(text="hi", images=0, files=0, external_blocks=0),
+    )
+    assert read_user_input(old).sent_at is None  # type: ignore[union-attr]

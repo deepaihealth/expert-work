@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from expert_work.common.memory_language import (
+    LATIN_SCRIPT,
     detect_user_language,
     extraction_language_section,
     summary_language_section,
@@ -39,8 +40,136 @@ def test_latin_above_eighty_percent_is_not_named() -> None:
     assert detect_user_language([mostly_latin]) is None
 
 
-def test_pure_latin_is_not_named() -> None:
-    assert detect_user_language([_EN]) is None
+# 评测 A 组(11-14):英文场景里约一成半的记忆被写成中文,另有一些写成葡语 / 西语一类 —— 只说
+# 「拉丁字母的语言」不够,能认准英语就点名,认不准的拉丁字母语言要求「照用户的话的那种语言写」。
+_ES = (
+    "Por favor, recuerda que el número de mi pedido de "
+    "devolución es RX-2291 y que la entrega fue en la oficina"
+)
+_PT = (
+    "Por favor, lembre que o número do meu pedido de "
+    "devolução é RX-2291 e que a entrega foi no escritório"
+)
+_FR = (
+    "Merci de noter que le numéro de ma commande de "
+    "retour est RX-2291 et que la livraison était au bureau"
+)
+_DE = (
+    "Bitte merke dir, dass die Nummer meiner Rücksendung RX-2291 ist und die Lieferung im Büro war"
+)
+_IT = "Per favore ricorda che il numero del mio reso è RX-2291 e che la consegna era in ufficio"
+_NL = (
+    "Onthoud alsjeblieft dat het nummer van mijn retour "
+    "RX-2291 is en dat de levering op kantoor was"
+)
+
+
+def test_english_is_named() -> None:
+    assert detect_user_language([_EN]) == "English"
+    assert detect_user_language(["my fasting glucose this morning was high", "it is 7.2"]) == (
+        "English"
+    )
+
+
+@pytest.mark.parametrize(
+    "text", [_ES, _PT, _FR, _DE, _IT, _NL], ids=["es", "pt", "fr", "de", "it", "nl"]
+)
+def test_other_latin_languages_are_latin_script_not_english(text: str) -> None:
+    assert detect_user_language([text]) == LATIN_SCRIPT
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Jeg har brug for at du hjælper mig med at finde for meget tid",
+        "Husk at jeg trenger hjelp for at bestillingen skal komme fram",
+        "Mój numer to 12345, a to jest mój pies Burek i to wszystko",
+        "Ik had het al gezegd, het is zo, mijn been doet pijn vandaag",
+        "Het is koud en ik had geen jas",
+    ],
+    ids=["da", "no", "pl", "nl-had-been", "nl-is-had"],
+)
+def test_homographs_do_not_make_other_languages_english(text: str) -> None:
+    """审查 LOW-1(11-14):for / at / to / my / we / of / or / but 一类在丹麦、挪威、波兰等语里
+    也是常用词。"""
+    assert detect_user_language([text]) == LATIN_SCRIPT
+
+
+def test_curly_apostrophes_and_short_english() -> None:
+    assert detect_user_language(
+        ["I\u2019m moving it because it\u2019s late and the room is busy"]
+    ) == ("English")
+    assert detect_user_language(["Thanks a lot!"]) is None
+
+
+def test_one_english_looking_word_repeated_is_not_enough() -> None:
+    """荷兰语的 is 与英语同形:只靠它一个词(再多次)不判 English,要至少两个不同的英语虚词。"""
+    assert detect_user_language(["Het is mooi en het is warm en het is zonnig vandaag"]) == (
+        LATIN_SCRIPT
+    )
+
+
+def test_contractions_with_curly_apostrophes_count() -> None:
+    """只靠缩写判得出的英文:弯撇号(U+2019)要按直撇号算,
+    否则 I\u2019m / don\u2019t 被切开、认不出。"""
+    assert detect_user_language(["I\u2019m done, don\u2019t wait for me tonight"]) == "English"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I moved to Berlin last month for a new job",
+        "Please book a table for two at 7pm tomorrow",
+        "This client's annual budget is 1.2 million.",
+        "The contract is set to be signed on December 15.",
+        "Yesterday I went to Berlin",
+    ],
+    ids=["moved", "book-a-table", "this-only", "the-only", "capital-i"],
+)
+def test_short_english_sentences_are_named(text: str) -> None:
+    """复审(11-14):收紧之后评测 A 组英文写回的召回掉了 —— 短句里常常只有一个强标记(the、this、
+    please、单独大写的 I)或只有 today / tomorrow / new 这类英语实词。"""
+    assert detect_user_language([text]) == "English"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I dag ska jag till tandläkaren och sedan hem",
+        "I morgon börjar jag ett nytt jobb i Stockholm",
+        "I går köpte jag en ny cykel till min dotter",
+        "I går var jeg hos legen og fikk nye briller",
+        "I dag har jeg travlt med arbejdet hele dagen",
+        "I risultati delle analisi sono arrivati stamattina",
+        "I to wszystko, co chciałem powiedzieć o projekcie",
+        "I když prší, půjdu dnes na procházku do parku",
+    ],
+    ids=["sv-i-dag", "sv-i-morgon", "sv-i-gar", "no-i-gar", "da-i-dag", "it", "pl", "cs"],
+)
+def test_sentence_initial_capital_i_alone_is_not_english(text: str) -> None:
+    """复审(11-14):瑞、挪、丹语的「I dag / I morgon / I går」、意大利语的冠词、波兰 / 捷克语的
+    「I to / I když」句首都是大写 I —— 它只算普通标记,不能一个就判 English。"""
+    assert detect_user_language([text]) == LATIN_SCRIPT
+
+
+def test_code_heavy_english_is_judged_by_its_prose() -> None:
+    code = "```python\n# 处理用户的请求并返回结果\nfor item in items: handle(item)\n```\n"
+    assert detect_user_language(
+        [code + "The build fails when I run the tests, can you fix it?"]
+    ) == ("English")
+    # 代码去掉后剩下的文字不够 20 个字母:不点名。
+    assert detect_user_language([code + "fix it"]) is None
+
+
+def test_english_with_a_few_cjk_characters_is_not_named() -> None:
+    """夹了几个汉字(人名、地名)的英文:几种文字混着,照旧不点名(不冒险说成 English)。"""
+    assert (
+        detect_user_language(["My colleague 王伟 will visit the Shanghai office next week"]) is None
+    )
+
+
+def test_mixed_chinese_with_english_words_stays_chinese() -> None:
+    assert detect_user_language([_ZH + " please use the new template"]) == "Chinese"
 
 
 def test_kana_text_is_japanese() -> None:
@@ -91,6 +220,28 @@ def test_unnamed_section_follows_the_user() -> None:
     assert text.startswith("## Output language\n")
     assert "in the language the user writes in" in text
     assert "If no user text\nis shown, use the language of the conversation." in text
+
+
+def test_english_section_names_english() -> None:
+    assert 'Write the "content" of every memory in English, in the same script' in (
+        extraction_language_section("English")
+    )
+
+
+def test_latin_script_section_points_at_the_users_own_messages() -> None:
+    text = extraction_language_section(LATIN_SCRIPT)
+    assert text.startswith("## Output language\n")
+    assert (
+        'Write the "content" of every memory in exactly the language of the user\'s own '
+        "messages in the input — a language written in Latin letters, not Chinese, Japanese "
+        "or Korean." in " ".join(text.split())
+    )
+    assert "Do not translate." in text
+    summary = " ".join(summary_language_section(LATIN_SCRIPT).split())
+    assert (
+        "Write the summary in exactly the language most of these memories are written in — a "
+        "language written in Latin letters, not Chinese, Japanese or Korean." in summary
+    )
 
 
 def test_summary_sections() -> None:

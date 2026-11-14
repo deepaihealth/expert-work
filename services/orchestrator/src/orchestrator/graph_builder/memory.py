@@ -41,6 +41,7 @@ from langchain_core.runnables import RunnableConfig
 
 from expert_work.common.conversation_channel import is_hidden, is_superseded, opens_segment
 from expert_work.common.memory_language import detect_user_language, extraction_language_section
+from expert_work.common.message_stamp import STAMP_CREATED_AT
 from expert_work.common.observability import (
     ExpertWorkComponent,
     current_trace_id_hex,
@@ -97,6 +98,7 @@ from expert_work.protocol.memory_item import MemoryOrigin, effective_origin
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from expert_work.runtime.tokens import CharTokenEstimator, TokenEstimator
+from orchestrator.agent_timezone import resolve_agent_timezone
 from orchestrator.context.memory_render import (
     origin_label,
     recorded_date,
@@ -177,13 +179,23 @@ _CONVERSATION_EXTRACTION = "conversation"
 # B-300 ① —— 第一次提炼:只有用户输入的文字(设计 §4.2 最终英文原文,一字不改;评测脚本
 # 靠 "The other side of the conversation is not shown." 认出这是第一次)。其后的打分、有效天数、
 # is_correction、JSON 格式沿用此前那段指令的文字。用户 11-14:加「只有一个值的那句永远不是更正」
-# 一条,``is_correction`` 改成「同一句话自己说清改的是什么、新值是什么」(验收 118.5)。
+# 一条,``is_correction`` 改成「同一句话自己说清改的是什么、新值是什么」(验收 118.5);评测 A 组
+# P1(用户 11-14「记,带上日期」):用户说自己的读数 / 编号 / 当前状态要记、带日期;审查后(11-14)
+# 日期按每行自己的发送日期(行首方括号)换算,不按重读那天,密码 / 验证码 / 卡号一类不记。
 _USER_TEXT_EXTRACTION_HEADER = """You are a memory extraction module. The input is every message one user typed in a
 conversation, one per line, oldest first. The other side of the conversation is not shown.
 Extract durable, reusable memories worth recalling in future sessions — stable facts or
 preferences the user states ("fact"), and things the user says were done or decided
-("episodic"). Extract nothing trivial or ephemeral.
+("episodic"). Extract nothing trivial: small talk and passing remarks that are not the
+user's own facts are not memories.
 Only extract what these messages state on their own.
+- A value the user states about themselves or their own things, with the same message saying
+  what it is — a reading or measurement, an id or number, a current status — is recorded even
+  though it may change, except passwords, one-time codes, bank card or bank account numbers
+  and other secrets, which are never recorded. Write it with the date or time it refers to, so
+  it is not later taken for a current value: a line that starts with a date in brackets was
+  sent on that date, so turn "this morning", "yesterday" and the like in that line into a date
+  counted from it; in a line without a date, leave such words as they are.
 - A message that only agrees with, answers or refers to something that is not shown here
   (a bare "yes", "ok, do that", or a value or name with nothing saying what it is) states
   nothing by itself: skip it, and do not guess what it was about.
@@ -242,11 +254,13 @@ answered ...". Never write it as a plain statement of fact with no source.
 What a [user] line says that can be understood on its own is recorded by another pass: do
 not record it again here — not in other words, not with a source added, and not when an
 [assistant] line repeats, confirms or uses it. A conclusion the assistant reached from what
-the user said is still recorded here; only the user's statement itself is not. What a [user]
-line says that cannot be understood without the assistant's previous message — a short
-answer, an agreement, or a short correction such as "it's Y now" or "no, it's the other
-one" — is recorded here, with its source, and with "is_correction" when it changes
-something; one line can hold both kinds, so judge each statement in it.
+the user said is still recorded here; only the user's statement itself is not. A tool result
+or record lookup that only confirms what the user currently says (their latest value) is not
+recorded again; one that differs from the user's latest statement is recorded, with its
+source. What a [user] line says that cannot be understood without the assistant's previous
+message — a short answer, an agreement, or a short correction such as "it's Y now" or "no,
+it's the other one" — is recorded here, with its source, and with "is_correction" when it
+changes something; one line can hold both kinds, so judge each statement in it.
 Something the assistant concluded that the user then rejected is not recorded as a
 conclusion on its own. Record only the two sorts above; they include what the assistant
 reports that tool results or attachments told it.
@@ -261,6 +275,28 @@ Respond with ONLY a JSON object, no prose and no code fences:
 "importance": <0-1>, "confidence": <0-1>, "expected_valid_days": <int or null>,
 "is_correction": <bool>}]}
 If there is nothing worth remembering, return {"memories": []}."""  # noqa: E501
+
+
+def _sent_date_tag(typed: UserInput, message: BaseMessage) -> str:
+    """第一次提炼一行的日期标签 ``[YYYY-MM-DD]``:那条消息的发送日期,按智能体的时区
+    (``resolve_agent_timezone``,与智能体提示词里的「今天」同一口径)。先看白名单标记里的
+    ``sent_at``;没有就用消息写入时盖的 ``expert_work_created_at``(复审 11-14:``sent_at`` 之前的
+    消息大多有它);两样都没有(评测脚本显式声明的消息等)或读不懂 → 不加,指令要求这种行里的
+    相对日期原样不换算。已知局限:``sent_at`` 之前的消息被「重新生成」时,
+    ``expert_work_created_at`` 是重新生成那天盖的,这一行就按那天换算(复审 11-14,接受)。
+
+    审查 MEDIUM-1 / MEDIUM-2(11-14):每轮整段重读,不能按重读那天换算「今天早上」。"""
+    stamped = message.additional_kwargs.get(STAMP_CREATED_AT)
+    raw = typed.sent_at or (stamped if isinstance(stamped, str) else None)
+    if raw is None:
+        return ""
+    try:
+        sent = datetime.fromisoformat(raw)
+    except ValueError:
+        return ""
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=UTC)
+    return f"[{sent.astimezone(resolve_agent_timezone()).date().isoformat()}]"
 
 
 def _extract_system(pass_name: str, language: str | None) -> str:
@@ -387,7 +423,7 @@ def _extraction_inputs(
                 # 外部内容(围栏里的)不跟着进 ``[task]``(review L1)。
                 conversation.add(text_before_external_content(_reply_text(opener)), "[task]")
             else:
-                user.add(typed.text)
+                user.add(typed.text, tag=_sent_date_tag(typed, opener))
                 conversation.add(typed.text, "[user]")
                 if typed.images or typed.files or typed.external_blocks:
                     conversation.add(_attached_line(typed), "[attached data]")
@@ -1128,13 +1164,19 @@ _RECONCILE_SYSTEM = (
     "correcting earlier info — strongly prefer UPDATE (or DELETE) against "
     "the matching existing memory over ADD, so the old value is superseded "
     "rather than left to coexist.\n"
+    # 审查(11-14)MEDIUM-4 / LOW-3 —— 带新值的更正是「更新」;不同日子的读数是新的一条。
+    "A correction that carries a new value is an UPDATE of the memory it replaces, not a "
+    "DELETE; DELETE only when the candidate retracts an existing memory without giving a "
+    "new value.\n"
+    "A reading, measurement or status that refers to a different date or time than an "
+    "existing one is a new memory (ADD), not an UPDATE of the earlier one.\n"
     # 11-14 重跑 118.5 —— 已有同样内容的用户一方记忆时一律 NOOP,先于下一句(否则候选同时对上
     # 一条相同的用户记忆和一条来自助手的,模型会去「更新」后者,多出一条重复的)。
     "When an existing memory stated in user messages or corrected by the user already "
     "says the same thing as the candidate, the candidate is a NOOP, even if an existing "
     "memory from the assistant also matches it; this takes precedence over the rule below "
     "about memories from the assistant.\n"
-    'Exception: a candidate with "is_correction": true is not a NOOP for this reason; '
+    'In that case, a candidate with "is_correction": true is not a NOOP for this reason; '
     "it DELETEs the existing memory it contradicts, if there is one; otherwise it is a NOOP.\n"
     # B-300 §6.2 —— 双方都带 "source";用户后来自己说全了,旧的来自助手的版本应被取代。
     "A candidate stated in user messages that matches an existing memory from the "
@@ -1176,14 +1218,18 @@ async def _protects_user_side(
 def _blocked_by_user_side(
     op: str, item: MemoryItem, *, is_correction: bool, lower_confidence: bool = False
 ) -> MemoryItem | None:
-    """B-300 §6.2 —— 被拦的删除什么都不做;被拦的更新:是用户的更正(短更新)→ 与旧的并存、
-    按新增存下(返回这条候选);否则丢弃(多半只是把用户说过的话换个说法又提了一遍)。
+    """B-300 §6.2 —— 被拦的更新 / 删除都不动目标。候选是用户的更正(短更新)→ 与旧的并存、按新增
+    存下(返回这条候选),更新与删除一样(评测 A 组 P9,11-14:更正被判成「删掉旧的」时,原来连新值
+    一起丢了);不是更正 → 被拦的更新丢弃(多半只是把用户说过的话换个说法又提了一遍),被拦的删除
+    什么都不做。计数 ``{prefix}_update_added`` / ``_update_dropped`` / ``_delete_added`` /
+    ``_delete``。
 
     ``lower_confidence``(用户 11-14)= 拦下的是置信度更低的「用户消息里说的」候选,处理相同,
     计数用 ``lower_confidence_*`` 标签,与来自助手的 ``blocked_*`` 分开。"""
     prefix = "lower_confidence" if lower_confidence else "blocked"
-    if op == "UPDATE" and is_correction:
-        record_memory_reconcile(op=f"{prefix}_update_added")
+    verb = "update" if op == "UPDATE" else "delete"
+    if is_correction:
+        record_memory_reconcile(op=f"{prefix}_{verb}_added")
         return item
     record_memory_reconcile(op=f"{prefix}_update_dropped" if op == "UPDATE" else f"{prefix}_delete")
     return None
@@ -1252,7 +1298,8 @@ def parse_reconcile_ops(text: str) -> dict[int, tuple[str, str | None]]:
     Tolerant — malformed entries are simply absent, and the caller
     treats an absent decision as a degraded direct ADD (CM-H4: never
     lose a memory over a parse failure). B-300 exception (11-14): a
-    correction that restates an existing user-side memory is never written
+    correction that restates an existing memory (same slot, provenance at
+    least as strong) is never written
     on a missing / failed decision — it is a NOOP (the memory is already
     there); see ``_redundant_correction_op``.
     """
@@ -1343,17 +1390,15 @@ def _identical_neighbors(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> l
     ]
 
 
-def _identical_user_side_ids(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> frozenset[UUID]:
-    """终审 MEDIUM-1 —— 带更正的候选与之内容相同的用户一方记忆。"""
-    return frozenset(
-        n.id
-        for n in _identical_neighbors(item, neighbors)
-        if effective_origin(n) in USER_SIDE_ORIGINS
-    )
+def _identical_neighbor_ids(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> frozenset[UUID]:
+    """带更正的候选与之内容相同、来源不弱于它的同格记忆(终审 MEDIUM-1 只认用户一方的;审查
+    MEDIUM-3 起任何来源都算,与确定性 NOOP 同一个判断)。这样的候选自己永远不落新行。"""
+    return frozenset(n.id for n in _identical_neighbors(item, neighbors))
 
 
 def _redundant_correction_op(op: str, target: UUID | None, identical: frozenset[UUID]) -> str:
-    """终审 MEDIUM-1 —— 带更正、又与已有用户记忆内容相同的候选,它自己不再落成新行:删掉别的
+    """终审 MEDIUM-1 —— 带更正、又与已有记忆内容相同(同格、来源不弱于它;审查 MEDIUM-3 起不只
+    用户一方的)的候选,它自己不再落成新行:删掉别的
     冲突记忆照常(判「更新」别的那条按删除处理,拦截规则照样管);其余一律 NOOP —— 新增、NOOP、
     更新 / 删除那条相同的记忆、没给决定(否则「更新」那条相同的会被第二条规则拦下按新增存下,
     「更新」来自助手的会取代出第二条用户记忆)。"""
@@ -1394,7 +1439,8 @@ async def _reconcile_and_apply(
     payload as ``"is_correction"`` per candidate so the ops LLM can bias
     UPDATE/DELETE over ADD on an explicit user correction.
 
-    B-300 11-14 —— 「每条失败路径都退回直接写入」有一个例外:带更正、又与已有用户一方记忆内容相同
+    B-300 11-14 —— 「每条失败路径都退回直接写入」有一个例外:带更正、又与已有记忆(同格、来源不弱于
+    它)内容相同
     (归一后)的候选永远不写 —— 模型没给决定、调用失败、判新增 / NOOP、改那条相同的记忆,都按 NOOP;
     只有删掉(或「更新」成删掉)别的冲突记忆会执行(``_redundant_correction_op``)。
     """
@@ -1429,7 +1475,9 @@ async def _reconcile_and_apply(
             for n in neighbors
             if _reconcile_cosine(item.embedding, n.embedding) >= _RECONCILE_SIM_THRESHOLD
         ]
-        identical = _identical_user_side_ids(item, neighbors) if is_corr else frozenset()
+        # 审查 MEDIUM-3(11-14):任何来源不弱于候选、内容相同的同格邻居都算(不只用户一方的),
+        # 否则来自助手的同一个更正每轮被拦后都按新增再存一条。
+        identical = _identical_neighbor_ids(item, neighbors) if is_corr else frozenset()
         if similar:
             pending.append((item, similar, is_corr, identical))
         elif identical:
@@ -1482,6 +1530,8 @@ async def _reconcile_and_apply(
         valid = {str(n.id): n for n in similar}
         target_item = valid.get(target_raw) if target_raw is not None else None
         target = target_item.id if target_item is not None else None
+        # 被拦时带更正的候选按新增存下 —— 与已有用户记忆内容相同的那种除外(它永远不落新行)。
+        adds_when_blocked = is_corr and not identical
         if identical:
             rewritten = _redundant_correction_op(op, target, identical)
             logger.debug(
@@ -1509,7 +1559,7 @@ async def _reconcile_and_apply(
             )
         ):
             kept = _blocked_by_user_side(
-                op, item, is_correction=is_corr, lower_confidence=not guarded
+                op, item, is_correction=adds_when_blocked, lower_confidence=not guarded
             )
             direct.extend([kept] if kept is not None else [])
         elif op == "NOOP":
@@ -1531,7 +1581,7 @@ async def _reconcile_and_apply(
                 kept = _blocked_by_user_side(
                     op,
                     item,
-                    is_correction=is_corr,
+                    is_correction=adds_when_blocked,
                     lower_confidence=isinstance(exc, UserSideHigherConfidenceError),
                 )
                 direct.extend([kept] if kept is not None else [])
@@ -1567,14 +1617,21 @@ async def _reconcile_and_apply(
                     refuse_user_side_above=above,
                 )
             except UserSideTargetError as exc:
-                _ = _blocked_by_user_side(  # 删除:不动
+                kept = _blocked_by_user_side(  # 目标不动;带更正的候选按新增存下
                     op,
                     item,
-                    is_correction=is_corr,
+                    is_correction=adds_when_blocked,
                     lower_confidence=isinstance(exc, UserSideHigherConfidenceError),
                 )
+                direct.extend([kept] if kept is not None else [])
                 continue
-            # The candidate is the retraction event — not stored either way.
+            if adds_when_blocked:
+                # 审查 MEDIUM-4(11-14):带新值的更正被判成「删除」—— 旧的作废,新值照样存下,
+                # 不能两样都没了(删除没成也存:不丢新值)。
+                record_memory_reconcile(op="delete_added" if deleted else "degraded")
+                direct.append(item)
+                continue
+            # The candidate is the retraction event — not stored.
             record_memory_reconcile(op="delete" if deleted else "degraded")
         elif op == "ADD":
             record_memory_reconcile(op="add")

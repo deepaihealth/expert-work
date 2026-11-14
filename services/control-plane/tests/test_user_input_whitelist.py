@@ -94,3 +94,15 @@ def test_only_build_human_message_writes_the_mark() -> None:
         if isinstance(node, ast.Name) and node.id in ("user_input_kwargs", "USER_INPUT_KEY")
     }
     assert callers == {"_build_human_message"}
+
+
+def test_construction_point_stamps_the_send_time() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    before = datetime.now(UTC)
+    msg = _build_human_message(input_text="hello", image_refs=[], supports_vision=False)
+    got = read_user_input(msg)
+    assert got is not None and got.sent_at is not None
+    sent = datetime.fromisoformat(got.sent_at)
+    assert sent.tzinfo is not None
+    assert before - timedelta(seconds=1) <= sent <= datetime.now(UTC) + timedelta(seconds=1)
