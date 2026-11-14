@@ -1133,7 +1133,9 @@ async def test_summary_language_for_latin_letters_that_are_not_english() -> None
     _seed_transient(store, contents=["dark UI", "dark mode preference", "wants dark theme"])
     await worker.run_once()
     [prompt] = aux.calls
-    assert "Write the summary in exactly the language these memories are written in" in prompt
+    assert "Write the summary in exactly the language most of these memories are written in" in (
+        prompt
+    )
 
 
 @pytest.mark.asyncio

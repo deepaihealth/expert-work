@@ -711,3 +711,74 @@ async def test_decisions_stay_aligned_when_an_earlier_candidate_is_dropped() -> 
     rows = await _live(store)
     assert set(rows) == {"cand", "new other"}
     assert rows["new other"].supersedes == other.id
+
+
+# ---------------------------------------------------------------------------
+# 审查(11-14,8ddd32c0f)MEDIUM-3 / MEDIUM-4 —— 更正型候选的新值既不重复落行,也不跟着删除丢掉
+# ---------------------------------------------------------------------------
+
+
+async def test_blocked_correction_restating_an_existing_memory_is_not_added_again() -> None:
+    """来自助手的更正 Y 每轮都被重抽;库里已有一条只差标点的来自助手的 Y。模型判「删掉用户的 X」被拦:
+    带更正也不再按新增存下 —— 几轮下来有效的 Y 只有一条。"""
+    store = InMemoryMemoryStore()
+    x = await _seed_row(store, "cand", origin="user_stated", confidence=0.9)
+    y = await _seed_row(store, "cand y\u3002", origin="assistant_derived", confidence=0.6)
+    for _turn_no in range(3):
+        llm = _LLM(
+            conversation_reply=_reply({"kind": "fact", "content": "cand y", "is_correction": True}),
+            ops_reply=_ops("DELETE", x.id),
+        )
+        assert await _flush(llm, store, near="cand y") == 0
+    valid = {r.id for r in _valid(store)}
+    assert valid == {x.id, y.id}
+
+
+@pytest.mark.parametrize(
+    ("candidate", "target_origin"),
+    [("user", "assistant_derived"), ("assistant", "assistant_derived"), ("user", None)],
+    ids=["user-vs-assistant", "assistant-vs-assistant", "user-vs-unrecorded"],
+)
+async def test_unblocked_delete_by_a_correction_keeps_the_new_value(
+    candidate: str, target_origin: MemoryOrigin | None
+) -> None:
+    """更正被判成「删除」而且没被拦(目标不受保护):旧的作废,新值也要存下,不能两样都没了。"""
+    store = InMemoryMemoryStore()
+    old = await _seed_row(store, "old value", origin=target_origin, confidence=0.6)
+    reply = _reply({"kind": "fact", "content": "cand", "confidence": 0.9, "is_correction": True})
+    llm = (
+        _LLM(user_reply=reply, ops_reply=_ops("DELETE", old.id))
+        if candidate == "user"
+        else _LLM(conversation_reply=reply, ops_reply=_ops("DELETE", old.id))
+    )
+    before = _count("delete_added")
+    assert await _flush(llm, store) == 1
+    rows = await _live(store)
+    assert set(rows) == {"cand"}
+    assert next(r for r in store._rows if r.id == old.id).expired_at is not None
+    assert _count("delete_added") == before + 1
+
+
+async def test_unblocked_delete_without_a_correction_still_stores_nothing() -> None:
+    store = InMemoryMemoryStore()
+    old = await _seed_row(store, "old value", origin="assistant_derived", confidence=0.6)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply=_ops("DELETE", old.id))
+    assert await _flush(llm, store) == 0
+    assert await _live(store) == {}
+
+
+async def test_reconcile_prompt_keeps_new_values_and_dated_readings() -> None:
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(store, "cand x", origin="user_stated", confidence=0.9)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply="{}")
+    _ = await _flush(llm, store)
+    system = " ".join(llm.system_of(None).split())
+    assert (
+        "A correction that carries a new value is an UPDATE of the memory it replaces, not a "
+        "DELETE; DELETE only when the candidate retracts an existing memory without giving a "
+        "new value." in system
+    )
+    assert (
+        "A reading, measurement or status that refers to a different date or time than an "
+        "existing one is a new memory (ADD), not an UPDATE of the earlier one." in system
+    )

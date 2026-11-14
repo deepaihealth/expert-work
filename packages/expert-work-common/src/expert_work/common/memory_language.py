@@ -8,8 +8,9 @@
 文字的字母,不含数字、标点、空白)。只有一种文字只对应一种语言时才判得准,所以只点名中日韩三种,外加英语(靠虚词判):
 
 * 不足 20 个 → 不点名(只发了几个汉字的日语用户不被点名成 Chinese);
-* 全是拉丁字母(评测 A 组,11-14:英文场景里有记忆被写成中文、葡语 / 西语一类)→ 英语常用虚词
-  (the、and、is、you、of、to……,不收与西、葡、法、德、意语同形的)占词数两成以上 → English;
+* 全是拉丁字母(评测 A 组,11-14:英文场景里有记忆被写成中文、葡语 / 西语一类)→ 英语独有的
+  虚词(the、and、is、you、this、with……,不收与别的拉丁字母语言同形的)至少两个不同的、占词数
+  15% 以上 → English;
   否则 → :data:`LATIN_SCRIPT`(指令要求照用户自己的话的那种语言写,不点名、不翻译);
 * 夹着中日韩等别的文字、拉丁字母超过八成 → 不点名;
 * 其余信号字符全是汉字 → Chinese;
@@ -35,16 +36,17 @@ _MIN_KANA_SHARE = 0.3
 
 #: 全是拉丁字母、但认不准是哪种语言(不是英语)时的返回值。
 LATIN_SCRIPT = "latin-script"
-#: 英语虚词至少占拉丁词数的这么多才判 English;词数太少不判。
-_MIN_ENGLISH_SHARE = 0.2
+#: 英语虚词至少占拉丁词数的这么多、且至少有这么多个不同的才判 English;词数太少不判。
+_MIN_ENGLISH_SHARE = 0.15
+_MIN_ENGLISH_DISTINCT = 2
 _MIN_LATIN_WORDS = 4
-#: 只收英语独有的虚词:与西、葡、法、德、意、荷语同形的(a、an、in、no、do、as、was、will、
-#: me、he、i、so……)不收,免得把这些语言判成英语。
+#: 只收英语独有的虚词。与别的拉丁字母语言同形的不收:a、an、in、no、do、as、was、will、me、he、
+#: i、so(西、葡、法、德、意、荷),for、at、to、of、or、but、my、we、by、if、can、then、here、
+#: some、any(丹麦、挪威、瑞典、波兰、荷兰、法语;审查 LOW-1,11-14)。
 _ENGLISH_WORDS = frozenset(
-    "the and or but is are were been have has had does did you your we our they their "
-    "she it its my this that these those to of at for with from by about not what when where "
-    "which who how if than then there here just some any can could would should please "
-    "it's i'm don't".split()
+    "the and is are were been have has had does did you your our they their she it its this "
+    "that these those with from about not what when where which who how than there just could "
+    "would should please it's i'm don't".split()
 )
 #: 一个词:任意文字的字母连在一起(带重音的字母不把词切开),中间可夹一个撇号。
 _LATIN_WORD = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
@@ -84,10 +86,12 @@ def _strip_non_prose(text: str) -> str:
 
 
 def _is_english(prose: str) -> bool:
-    words = _LATIN_WORD.findall(prose.casefold())
+    # 弯撇号(U+2019)按直撇号算。
+    words = _LATIN_WORD.findall(prose.casefold().replace("\u2019", "'"))
     if len(words) < _MIN_LATIN_WORDS:
         return False
-    return sum(word in _ENGLISH_WORDS for word in words) >= _MIN_ENGLISH_SHARE * len(words)
+    hits = [word for word in words if word in _ENGLISH_WORDS]
+    return len(set(hits)) >= _MIN_ENGLISH_DISTINCT and len(hits) >= _MIN_ENGLISH_SHARE * len(words)
 
 
 def detect_user_language(texts: Iterable[str]) -> str | None:
@@ -153,8 +157,8 @@ _SUMMARY_NAMED = (
 
 _SUMMARY_LATIN = (
     "## Output language\n"
-    "Write the summary in exactly the language these memories are written in — a language\n"
-    "written in Latin letters, not Chinese, Japanese or Korean.\n"
+    "Write the summary in exactly the language most of these memories are written in — a\n"
+    "language written in Latin letters, not Chinese, Japanese or Korean.\n"
     "Keep names, codes, units and quoted terms exactly as they appear. Do not translate."
 )
 

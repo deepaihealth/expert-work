@@ -457,8 +457,37 @@ async def test_other_latin_user_text_follows_the_users_own_language() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_user_text_pass_records_dated_one_off_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(memory_module, "_today", lambda: "2026-11-14")
+def _dated_user(text: str, sent_at: str) -> HumanMessage:
+    return HumanMessage(
+        content=text,
+        additional_kwargs=user_input_kwargs(
+            text=text, images=0, files=0, external_blocks=0, sent_at=sent_at
+        ),
+    )
+
+
+async def test_user_text_lines_carry_their_own_send_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    """审查 MEDIUM-1 / MEDIUM-2(11-14):每行带那条消息自己的发送日期(按智能体时区换算),重读旧消息时
+    「今天早上」仍按当天换算;发版前的旧消息没有发送时刻,不加日期。"""
+    monkeypatch.setenv("EXPERT_WORK_TIMEZONE", "Asia/Shanghai")
+    llm = _ByPassLLM()
+    await _flush(
+        [
+            _user("an old message with no send time"),
+            AIMessage(content="ok"),
+            # UTC 11-13 17:00 = 上海 11-14 01:00:按智能体时区是 11-14。
+            _dated_user("my fasting glucose this morning is 6.1", "2026-11-13T17:00:00+00:00"),
+            AIMessage(content="Noted."),
+        ],
+        llm,
+    )
+    assert llm.input_of("user").splitlines() == [
+        "an old message with no send time",
+        "[2026-11-14] my fasting glucose this morning is 6.1",
+    ]
+
+
+async def test_user_text_pass_records_dated_one_off_values() -> None:
     llm = _ByPassLLM()
     await _flush(
         [_user("my fasting glucose this morning is 6.1"), AIMessage(content="Noted.")], llm
@@ -467,11 +496,15 @@ async def test_user_text_pass_records_dated_one_off_values(monkeypatch: pytest.M
     rule = (
         "- A value the user states about themselves or their own things, with the same message "
         "saying what it is — a reading or measurement, an id or number, a current status — is "
-        "recorded even though it may change: write it with the date or time it refers to (today "
-        'is 2026-11-14; turn "this morning", "yesterday" and the like into a date), so it '
-        "is not later taken for a current value."
+        "recorded even though it may change, except passwords, one-time codes, card or account "
+        "numbers and other secrets, which are never recorded. Write it with the date or time it "
+        "refers to, so it is not later taken for a current value: a line that starts with a date "
+        'in brackets was sent on that date, so turn "this morning", "yesterday" and the '
+        "like in that line into a date counted from it; in a line without a date, leave such "
+        "words as they are."
     )
     assert rule in system
+    assert "today is" not in system
     # 「不记琐碎」仍在,但不再一概排除会变的值。
     assert "Extract nothing trivial or ephemeral." not in system
     assert (

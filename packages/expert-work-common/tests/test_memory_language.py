@@ -78,6 +78,41 @@ def test_other_latin_languages_are_latin_script_not_english(text: str) -> None:
     assert detect_user_language([text]) == LATIN_SCRIPT
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Jeg har brug for at du hjælper mig med at finde for meget tid",
+        "Husk at jeg trenger hjelp for at bestillingen skal komme fram",
+        "Mój numer to 12345, a to jest mój pies Burek i to wszystko",
+    ],
+    ids=["da", "no", "pl"],
+)
+def test_homographs_do_not_make_other_languages_english(text: str) -> None:
+    """审查 LOW-1(11-14):for / at / to / my / we / of / or / but 一类在丹麦、挪威、波兰等语里
+    也是常用词。"""
+    assert detect_user_language([text]) == LATIN_SCRIPT
+
+
+def test_curly_apostrophes_and_short_english() -> None:
+    assert detect_user_language(
+        ["I\u2019m moving it because it\u2019s late and the room is busy"]
+    ) == ("English")
+    assert detect_user_language(["Thanks a lot!"]) is None
+
+
+def test_one_english_looking_word_repeated_is_not_enough() -> None:
+    """荷兰语的 is 与英语同形:只靠它一个词(再多次)不判 English,要至少两个不同的英语虚词。"""
+    assert detect_user_language(["Het is mooi en het is warm en het is zonnig vandaag"]) == (
+        LATIN_SCRIPT
+    )
+
+
+def test_contractions_with_curly_apostrophes_count() -> None:
+    """只靠缩写判得出的英文:弯撇号(U+2019)要按直撇号算,
+    否则 I\u2019m / don\u2019t 被切开、认不出。"""
+    assert detect_user_language(["I\u2019m done, don\u2019t wait for me tonight"]) == "English"
+
+
 def test_code_heavy_english_is_judged_by_its_prose() -> None:
     code = "```python\n# 处理用户的请求并返回结果\nfor item in items: handle(item)\n```\n"
     assert detect_user_language(
@@ -165,8 +200,8 @@ def test_latin_script_section_points_at_the_users_own_messages() -> None:
     assert "Do not translate." in text
     summary = " ".join(summary_language_section(LATIN_SCRIPT).split())
     assert (
-        "Write the summary in exactly the language these memories are written in — a language "
-        "written in Latin letters, not Chinese, Japanese or Korean." in summary
+        "Write the summary in exactly the language most of these memories are written in — a "
+        "language written in Latin letters, not Chinese, Japanese or Korean." in summary
     )
 
 

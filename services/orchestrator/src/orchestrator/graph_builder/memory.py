@@ -97,6 +97,7 @@ from expert_work.protocol.memory_item import MemoryOrigin, effective_origin
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from expert_work.runtime.tokens import CharTokenEstimator, TokenEstimator
+from orchestrator.agent_timezone import resolve_agent_timezone
 from orchestrator.context.memory_render import (
     origin_label,
     recorded_date,
@@ -178,8 +179,8 @@ _CONVERSATION_EXTRACTION = "conversation"
 # 靠 "The other side of the conversation is not shown." 认出这是第一次)。其后的打分、有效天数、
 # is_correction、JSON 格式沿用此前那段指令的文字。用户 11-14:加「只有一个值的那句永远不是更正」
 # 一条,``is_correction`` 改成「同一句话自己说清改的是什么、新值是什么」(验收 118.5);评测 A 组
-# P1(用户 11-14「记,带上日期」):用户说自己的读数 / 编号 / 当前状态要记、带日期,``{today}``
-# 由 :func:`_extract_system` 填。
+# P1(用户 11-14「记,带上日期」):用户说自己的读数 / 编号 / 当前状态要记、带日期;审查后(11-14)
+# 日期按每行自己的发送日期(行首方括号)换算,不按重读那天,密码 / 验证码 / 卡号一类不记。
 _USER_TEXT_EXTRACTION_HEADER = """You are a memory extraction module. The input is every message one user typed in a
 conversation, one per line, oldest first. The other side of the conversation is not shown.
 Extract durable, reusable memories worth recalling in future sessions — stable facts or
@@ -189,9 +190,11 @@ user's own facts are not memories.
 Only extract what these messages state on their own.
 - A value the user states about themselves or their own things, with the same message saying
   what it is — a reading or measurement, an id or number, a current status — is recorded even
-  though it may change: write it with the date or time it refers to (today is {today}; turn
-  "this morning", "yesterday" and the like into a date), so it is not later taken for a
-  current value.
+  though it may change, except passwords, one-time codes, card or account numbers and other
+  secrets, which are never recorded. Write it with the date or time it refers to, so it is not
+  later taken for a current value: a line that starts with a date in brackets was sent on that
+  date, so turn "this morning", "yesterday" and the like in that line into a date counted from
+  it; in a line without a date, leave such words as they are.
 - A message that only agrees with, answers or refers to something that is not shown here
   (a bare "yes", "ok, do that", or a value or name with nothing saying what it is) states
   nothing by itself: skip it, and do not guess what it was about.
@@ -271,18 +274,27 @@ Respond with ONLY a JSON object, no prose and no code fences:
 If there is nothing worth remembering, return {"memories": []}."""  # noqa: E501
 
 
-def _today() -> str:
-    """提炼指令里的「今天」(UTC 日期,与读时复核同一口径)。"""
-    return datetime.now(UTC).date().isoformat()
+def _sent_date_tag(typed: UserInput) -> str:
+    """第一次提炼一行的日期标签 ``[YYYY-MM-DD]``:那条消息的发送日期,按智能体的时区
+    (``resolve_agent_timezone``,与智能体提示词里的「今天」同一口径)。没有发送时刻(发版前的
+    旧消息、评测脚本显式声明的消息)或读不懂 → 不加,指令要求这种行里的相对日期原样不换算。
+
+    审查 MEDIUM-1 / MEDIUM-2(11-14):每轮整段重读,不能按重读那天换算「今天早上」。"""
+    if typed.sent_at is None:
+        return ""
+    try:
+        sent = datetime.fromisoformat(typed.sent_at)
+    except ValueError:
+        return ""
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=UTC)
+    return f"[{sent.astimezone(resolve_agent_timezone()).date().isoformat()}]"
 
 
 def _extract_system(pass_name: str, language: str | None) -> str:
-    """一次提炼的系统提示词:那一次的指令 + 末尾单独一节「Output language」(B-300 ④)。
-
-    第一次提炼的指令带今天的日期(评测 A 组 P1,用户 11-14「记,带上日期」):用户说自己的读数、
-    编号、当前状态要记,写明指的是哪天。"""
+    """一次提炼的系统提示词:那一次的指令 + 末尾单独一节「Output language」(B-300 ④)。"""
     if pass_name == _USER_TEXT_EXTRACTION:
-        body = _USER_TEXT_EXTRACTION_SYSTEM.replace("{today}", _today())
+        body = _USER_TEXT_EXTRACTION_SYSTEM
     else:
         body = _CONVERSATION_EXTRACTION_SYSTEM
     return body + "\n\n" + extraction_language_section(language)
@@ -403,7 +415,7 @@ def _extraction_inputs(
                 # 外部内容(围栏里的)不跟着进 ``[task]``(review L1)。
                 conversation.add(text_before_external_content(_reply_text(opener)), "[task]")
             else:
-                user.add(typed.text)
+                user.add(typed.text, tag=_sent_date_tag(typed))
                 conversation.add(typed.text, "[user]")
                 if typed.images or typed.files or typed.external_blocks:
                     conversation.add(_attached_line(typed), "[attached data]")
@@ -1144,6 +1156,12 @@ _RECONCILE_SYSTEM = (
     "correcting earlier info — strongly prefer UPDATE (or DELETE) against "
     "the matching existing memory over ADD, so the old value is superseded "
     "rather than left to coexist.\n"
+    # 审查(11-14)MEDIUM-4 / LOW-3 —— 带新值的更正是「更新」;不同日子的读数是新的一条。
+    "A correction that carries a new value is an UPDATE of the memory it replaces, not a "
+    "DELETE; DELETE only when the candidate retracts an existing memory without giving a "
+    "new value.\n"
+    "A reading, measurement or status that refers to a different date or time than an "
+    "existing one is a new memory (ADD), not an UPDATE of the earlier one.\n"
     # 11-14 重跑 118.5 —— 已有同样内容的用户一方记忆时一律 NOOP,先于下一句(否则候选同时对上
     # 一条相同的用户记忆和一条来自助手的,模型会去「更新」后者,多出一条重复的)。
     "When an existing memory stated in user messages or corrected by the user already "
@@ -1363,13 +1381,10 @@ def _identical_neighbors(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> l
     ]
 
 
-def _identical_user_side_ids(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> frozenset[UUID]:
-    """终审 MEDIUM-1 —— 带更正的候选与之内容相同的用户一方记忆。"""
-    return frozenset(
-        n.id
-        for n in _identical_neighbors(item, neighbors)
-        if effective_origin(n) in USER_SIDE_ORIGINS
-    )
+def _identical_neighbor_ids(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> frozenset[UUID]:
+    """带更正的候选与之内容相同、来源不弱于它的同格记忆(终审 MEDIUM-1 只认用户一方的;审查
+    MEDIUM-3 起任何来源都算,与确定性 NOOP 同一个判断)。这样的候选自己永远不落新行。"""
+    return frozenset(n.id for n in _identical_neighbors(item, neighbors))
 
 
 def _redundant_correction_op(op: str, target: UUID | None, identical: frozenset[UUID]) -> str:
@@ -1449,7 +1464,9 @@ async def _reconcile_and_apply(
             for n in neighbors
             if _reconcile_cosine(item.embedding, n.embedding) >= _RECONCILE_SIM_THRESHOLD
         ]
-        identical = _identical_user_side_ids(item, neighbors) if is_corr else frozenset()
+        # 审查 MEDIUM-3(11-14):任何来源不弱于候选、内容相同的同格邻居都算(不只用户一方的),
+        # 否则来自助手的同一个更正每轮被拦后都按新增再存一条。
+        identical = _identical_neighbor_ids(item, neighbors) if is_corr else frozenset()
         if similar:
             pending.append((item, similar, is_corr, identical))
         elif identical:
@@ -1597,7 +1614,13 @@ async def _reconcile_and_apply(
                 )
                 direct.extend([kept] if kept is not None else [])
                 continue
-            # The candidate is the retraction event — not stored either way.
+            if adds_when_blocked:
+                # 审查 MEDIUM-4(11-14):带新值的更正被判成「删除」—— 旧的作废,新值照样存下,
+                # 不能两样都没了(删除没成也存:不丢新值)。
+                record_memory_reconcile(op="delete_added" if deleted else "degraded")
+                direct.append(item)
+                continue
+            # The candidate is the retraction event — not stored.
             record_memory_reconcile(op="delete" if deleted else "degraded")
         elif op == "ADD":
             record_memory_reconcile(op="add")
