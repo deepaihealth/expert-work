@@ -326,6 +326,14 @@ def a_votes_ready(out: Path, q: Mapping[str, Any]) -> int:
     """A 组判官(审查 M3):按报价的票数校准过(≥ 18 / 20)才判;一票没过就要按 3 票重新报价、
     重新校准。"""
     votes = int(q["judge"]["a_group_votes"])
+    path = calibration_path(out, "a")
+    if path.exists():
+        made_with = json.loads(path.read_text(encoding="utf-8")).get("wording_digest")
+        if made_with != rep.a_judge_wording_digest():
+            raise EvalError(
+                "the A-group calibration was made with other judge wording "
+                f"({made_with or 'not recorded'}); run `calibrate --set a` again, then judge"
+            )
     if calibration_ok(out, "a", votes=votes):
         return votes
     if votes == 1 and calibration_path(out, "a").exists():
@@ -385,7 +393,14 @@ def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     agree = sum(
         got.get(f"cal|{i}", {}).get("verdict") == bool(r["label"]) for i, r in enumerate(labels)
     )
-    result = {"judge_model": plan.JUDGE_MODEL, "votes": votes, "agree": agree, "of": len(labels)}
+    result: dict[str, Any] = {
+        "judge_model": plan.JUDGE_MODEL,
+        "votes": votes,
+        "agree": agree,
+        "of": len(labels),
+    }
+    if args.which == "a":  # 审查 LOW-2:校准绑定判官措辞
+        result["wording_digest"] = rep.a_judge_wording_digest()
     calibration_path(args.out, args.which).write_text(json.dumps(result), encoding="utf-8")
     emit(
         f"judge ({args.which}, {votes} vote(s)) agrees on {agree} / {len(labels)} "

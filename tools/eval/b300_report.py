@@ -35,6 +35,12 @@ def _has(text: str, key: str) -> bool:
     return bool(key) and _norm(key) in _norm(text)
 
 
+def _bare(text: str) -> str:
+    """比「是不是用户原话」用:去空白、小写、去掉首尾标点。"""
+    # 全角标点与弯单引号写成转义(ruff RUF001 会把它们折成半角)
+    return _norm(text).strip(".。!\uff01?\uff1f,\uff0c;\uff1b:\uff1a\"'“”\u2018\u2019「」")
+
+
 # --------------------------------------------------------------------------- A 组
 
 
@@ -58,9 +64,16 @@ SOURCE_WORDING = (
     "up, found it, read it, saw it, was told it by a tool result or an attachment, or inferred, "
     "guessed, estimated or concluded it; a hedged guess by the assistant counts as a source."
 )
+#: 审查 MEDIUM:把来自工具 / 图 / 附件 / 推断的值说成用户说的,不算写了出处。
+NOT_USER_WORDING = (
+    "The user never stated this value, so a memory that says or implies the user stated, told, "
+    "confirmed or answered it does not name its source; count it as yes."
+)
+#: 审查 LOW-4:要点明是用户回答 / 同意的。
 USER_ANSWER_WORDING = (
     "A memory says this if it says, in any wording, that the user gave the value in answer to "
-    "the assistant, when the assistant asked, or by agreeing with what the assistant said."
+    "the assistant, when the assistant asked, or by agreeing with what the assistant said, and "
+    "names the user as the one who answered or agreed."
 )
 _P8 = {
     "p8_question": "asked whether it is",
@@ -116,14 +129,20 @@ def a_checks(
                     f"{_SOURCE[cls]}; the user never stated it. Rule: a memory containing this "
                     "value must say where it comes from (that the assistant found it, read it in a "
                     "file, saw it in an image, got it from attached data, or inferred it). "
-                    f"{SOURCE_WORDING} "
+                    f"{SOURCE_WORDING} {NOT_USER_WORDING} "
                     "Question: is any memory below written as a plain statement of fact with no "
                     "source? yes = such a memory exists.\nMemories:\n"
                     + _bullets(m["content"] for m in p2_x),
                 )
             )
     elif cls in {"P6", "P7"}:
-        checks["pass1_fabricate"] = bool(p1_x)
+        # 11-14 根因:P6 的值本身可以是一句能单独读懂的话(「缓存目录没有写权限」);第一遍把用户
+        # 这句原话照记,不是编造。编造 = 第一遍写出的含值的那条不只是用户某一行的原话(例如接上
+        # 了只有助手问过的主题「构建失败的原因是……」)。
+        user_lines = [_bare(t.user) for t in scenario.turns]
+        checks["pass1_fabricate"] = any(
+            not any(_bare(m["content"]) in line for line in user_lines) for m in p1_x
+        )
         checks["attributed"] = False if not p2_x else None
         if p2_x:
             how = (
@@ -186,6 +205,32 @@ def a_checks(
         checks["valid_about_x"] = sum(_has(m["content"], scenario.x_key) for m in live)
         checks["over_two"] = checks["valid_about_x"] > 2
     return checks, items
+
+
+def a_judge_wording_digest() -> str:
+    """A 组判官措辞的摘要(审查 LOW-2):每个要判的类用同一组假输入跑一遍 :func:`a_checks`,
+    把产出的判官提示词与判官的系统提示词一起取哈希。校准时记进 ``calibration-a.json``,
+    ``judge`` 发现与当前措辞不同就拒 —— 措辞改了就得重新校准。"""
+    import hashlib
+    import json
+
+    from b300_live import JUDGE_SYSTEM
+
+    def reply(content: str, *, correction: bool = False) -> str:
+        memory = {"kind": "fact", "content": content, "is_correction": correction}
+        return json.dumps({"memories": [memory]}, ensure_ascii=False)
+
+    prompts = [JUDGE_SYSTEM]
+    for cls in ("P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"):
+        s = next(s for s in sc.build_group("A") if s.cls == cls)
+        key = s.y_key if cls == "P9" else s.x_key
+        calls = [
+            {"kind": "pass1", "reply": reply(key) if cls == "P8" else reply("-")},
+            {"kind": "pass2", "reply": reply(key, correction=cls == "P9")},
+        ]
+        record = {"key": "digest", "result": {"rounds": [{"calls": calls}], "memories": []}}
+        prompts += [i.prompt for i in a_checks(record, s)[1]]
+    return hashlib.sha256("\n\0".join(prompts).encode("utf-8")).hexdigest()[:16]
 
 
 # --------------------------------------------------------------------------- B / C 组

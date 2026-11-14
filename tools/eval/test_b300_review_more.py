@@ -9,6 +9,7 @@ from typing import Any
 import b300_eval as cli
 import b300_phases as phases
 import b300_plan as plan
+import b300_report as rep
 import b300_runs as runs
 import b300_scenarios as sc
 import b300_spend as spend
@@ -45,15 +46,38 @@ def test_a_judge_needs_its_own_calibration(tmp_path: Path) -> None:
     q = {"pilot": False, "judge": {"a_group_votes": 1}}
     with pytest.raises(cli.EvalError, match="calibrate --set a"):
         cli.judge_votes(tmp_path, q, "extraction")
+    digest = rep.a_judge_wording_digest()
     phases.calibration_path(tmp_path, "a").write_text(
-        json.dumps({"judge_model": plan.JUDGE_MODEL, "votes": 1, "agree": 15, "of": 20})
+        json.dumps(
+            {
+                "judge_model": plan.JUDGE_MODEL,
+                "votes": 1,
+                "agree": 15,
+                "of": 20,
+                "wording_digest": digest,
+            }
+        )
     )
     with pytest.raises(cli.EvalError, match="--a-judge-votes 3"):
         cli.judge_votes(tmp_path, q, "extraction")
-    phases.calibration_path(tmp_path, "a").write_text(
-        json.dumps({"judge_model": plan.JUDGE_MODEL, "votes": 1, "agree": 19, "of": 20})
-    )
+    passed = {
+        "judge_model": plan.JUDGE_MODEL,
+        "votes": 1,
+        "agree": 19,
+        "of": 20,
+        "wording_digest": digest,
+    }
+    phases.calibration_path(tmp_path, "a").write_text(json.dumps(passed))
     assert cli.judge_votes(tmp_path, q, "extraction") == 1
+    # 审查 LOW-2:校准时的判官措辞与现在不同(或没记)就拒,要重新校准
+    for stale in (
+        {**passed, "wording_digest": "0" * 16},
+        {k: passed[k] for k in passed if k != "wording_digest"},
+    ):
+        phases.calibration_path(tmp_path, "a").write_text(json.dumps(stale))
+        with pytest.raises(cli.EvalError, match="other judge wording"):
+            cli.judge_votes(tmp_path, q, "extraction")
+    phases.calibration_path(tmp_path, "a").write_text(json.dumps(passed))
     # B / C 组的校准与 A 组分开:A 组校过了不等于 B 组校过了
     with pytest.raises(cli.EvalError, match="not calibrated"):
         cli.judge_votes(tmp_path, q, "conversation")

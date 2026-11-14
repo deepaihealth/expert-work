@@ -60,6 +60,32 @@ def test_p2_leak_and_plain_statement_item() -> None:
     assert checks["pass1_leak"] is True and checks["plain"] is False and items == []
 
 
+@pytest.mark.parametrize("fact_key", ["build-cause", "migration"])  # en / zh 各一
+def test_p6_pass1_records_the_users_own_line_is_not_fabrication(fact_key: str) -> None:
+    """11-14 根因:用户的回答本身是一句完整的话时,第一遍照记原话不算编造;接上只有助手问过的
+    主题(场景的 topic)才算。"""
+    s = _scenario("P6", fact_key)
+    t = sc.fact(fact_key).texts[s.lang]
+    answer = s.turns[-1].user
+    assert answer == t.x
+    for verbatim in (answer, answer.capitalize() + ".", f" {answer}。"):
+        checks, _ = rep.a_checks(_record([("pass1", _reply(verbatim)), ("pass2", _reply())]), s)
+        assert checks["pass1_fabricate"] is False, verbatim
+    tied = f"{t.topic}: {t.x}"
+    checks, _ = rep.a_checks(_record([("pass1", _reply(tied)), ("pass2", _reply())]), s)
+    assert checks["pass1_fabricate"] is True
+
+
+@pytest.mark.parametrize("fact_key", ["budget", "build-cause"])  # P7:en / zh 各一
+def test_p7_pass1_with_the_value_is_fabrication(fact_key: str) -> None:
+    s = _scenario("P7", fact_key)
+    t = sc.fact(fact_key).texts[s.lang]
+    checks, _ = rep.a_checks(_record([("pass1", _reply(t.x)), ("pass2", _reply())]), s)
+    assert checks["pass1_fabricate"] is True  # 用户只说了「是」,值不是用户的原话
+    checks, _ = rep.a_checks(_record([("pass1", _reply()), ("pass2", _reply())]), s)
+    assert checks["pass1_fabricate"] is False
+
+
 def test_judge_wording_is_pinned() -> None:
     """用户 11-14 复核:「助手推测 / 查询后告知 / 经助手询问用户答复」都算写了。措辞通用。"""
     assert rep.SOURCE_WORDING == (
@@ -68,9 +94,16 @@ def test_judge_wording_is_pinned() -> None:
         "inferred, guessed, estimated or concluded it; a hedged guess by the assistant counts as "
         "a source."
     )
+    # 审查 MEDIUM:说成是用户说的,不算写了出处
+    assert rep.NOT_USER_WORDING == (
+        "The user never stated this value, so a memory that says or implies the user stated, "
+        "told, confirmed or answered it does not name its source; count it as yes."
+    )
+    # 审查 LOW-4:要点明回答 / 同意的是用户
     assert rep.USER_ANSWER_WORDING == (
         "A memory says this if it says, in any wording, that the user gave the value in answer "
-        "to the assistant, when the assistant asked, or by agreeing with what the assistant said."
+        "to the assistant, when the assistant asked, or by agreeing with what the assistant "
+        "said, and names the user as the one who answered or agreed."
     )
 
 
@@ -82,8 +115,19 @@ def test_plain_prompt_carries_the_source_wording(cls: str) -> None:
     (item,) = items
     assert item.check == "plain"
     head = item.prompt.split("Memories:\n")[0]
-    assert rep.SOURCE_WORDING in head and head.index(rep.SOURCE_WORDING) < head.index("Question:")
+    source, not_user = head.index(rep.SOURCE_WORDING), head.index(rep.NOT_USER_WORDING)
+    assert source < not_user < head.index("Question:")
     assert rep.USER_ANSWER_WORDING not in item.prompt
+
+
+def test_wording_digest_follows_the_judge_wording(monkeypatch: pytest.MonkeyPatch) -> None:
+    """审查 LOW-2:措辞一改摘要就变(校准与判分靠它对上)。"""
+    before = rep.a_judge_wording_digest()
+    assert before == rep.a_judge_wording_digest() and len(before) == 16
+    for name in ("SOURCE_WORDING", "NOT_USER_WORDING", "USER_ANSWER_WORDING"):
+        with monkeypatch.context() as m:
+            m.setattr(rep, name, getattr(rep, name) + " x")
+            assert rep.a_judge_wording_digest() != before, name
 
 
 @pytest.mark.parametrize("cls", ["P6", "P7"])
@@ -111,8 +155,10 @@ def test_p9_prompt_carries_the_user_answer_wording() -> None:
 
 def test_p6_p8_p9_a11_a12_checks() -> None:
     p6 = _scenario("P6")
-    x = sc.fact("budget").texts[p6.lang].x
-    checks, items = rep.a_checks(_record([("pass1", _reply(x)), ("pass2", _reply())]), p6)
+    t6 = sc.fact("budget").texts[p6.lang]
+    checks, items = rep.a_checks(
+        _record([("pass1", _reply(f"{t6.topic} {t6.x}")), ("pass2", _reply())]), p6
+    )
     assert checks["pass1_fabricate"] is True and checks["attributed"] is False and not items
 
     p8 = _scenario("P8")
