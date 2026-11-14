@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -24,7 +25,10 @@ from b300_live import parse_extraction
 APPROVED_B = "已拍板 ①(11-11)"
 APPROVED_SHORT = "已拍板(§10.2 第 1 条)"
 DESIGN_A = "设计 §8.2 所列(本文安排)"
+APPROVED_A12 = "已拍板(用户 11-14,§10.2 第 10 条)"
 PENDING = "待用户确认(§8.7)"
+#: 同 ``expert_work.persistence.memory.base.USER_SIDE_ORIGINS``(评测脚本不 import 平台包)。
+_USER_SIDE_ORIGINS = frozenset({"user_stated", "user_corrected"})
 
 
 def _norm(text: str) -> str:
@@ -35,10 +39,40 @@ def _has(text: str, key: str) -> bool:
     return bool(key) and _norm(key) in _norm(text)
 
 
-def _bare(text: str) -> str:
-    """比「是不是用户原话」用:去空白、小写、去掉首尾标点。"""
-    # 全角标点与弯单引号写成转义(ruff RUF001 会把它们折成半角)
-    return _norm(text).strip(".。!\uff01?\uff1f,\uff0c;\uff1b:\uff1a\"'“”\u2018\u2019「」")
+#: 比「是不是用户自己的话」时不算内容的词:冠词、系动词、「用户说 / 回答」这类转述用语(两种语言;
+#: 不含任何领域词)。中文按字比。
+_FRAME_WORDS = frozenset(
+    {"the", "a", "an", "user", "users", "said", "says", "say", "told", "tells", "answered"}
+    | {"answers", "replied", "replies", "stated", "states", "that", "is", "are", "was", "were"}
+    | set("用户说告知回答称表示的是为了")
+)
+_CONTRACTIONS: tuple[tuple[str, str], ...] = (
+    ("n't", " not"),
+    ("'re", " are"),
+    ("'m", " am"),
+    ("'ll", " will"),
+    ("'ve", " have"),
+    ("'d", " would"),
+    ("'s", ""),
+)
+_CURLY_APOSTROPHE = chr(0x2019)
+
+
+def _content_tokens(text: str) -> set[str]:
+    """内容词:小写、展开缩写、英文按词(带小数的数字算一个)、中文按字,去掉 :data:`_FRAME_WORDS`。"""
+    low = text.lower().replace(_CURLY_APOSTROPHE, "'")
+    for short, full in _CONTRACTIONS:
+        low = low.replace(short, full)
+    tokens = re.findall(r"[a-z0-9]+(?:\.[0-9]+)?|[\u4e00-\u9fff]", low)
+    return {t for t in tokens if t not in _FRAME_WORDS}
+
+
+def _beyond_user_words(content: str, scenario: sc.Scenario) -> bool:
+    """这条记忆有没有用户自己没说过的内容词(P6 / P7「编造」的程序判法)。"""
+    said: set[str] = set()
+    for turn in scenario.turns:
+        said |= _content_tokens(turn.user)
+    return bool(_content_tokens(content) - said)
 
 
 # --------------------------------------------------------------------------- A 组
@@ -137,12 +171,9 @@ def a_checks(
             )
     elif cls in {"P6", "P7"}:
         # 11-14 根因:P6 的值本身可以是一句能单独读懂的话(「缓存目录没有写权限」);第一遍把用户
-        # 这句原话照记,不是编造。编造 = 第一遍写出的含值的那条不只是用户某一行的原话(例如接上
-        # 了只有助手问过的主题「构建失败的原因是……」)。
-        user_lines = [_bare(t.user) for t in scenario.turns]
-        checks["pass1_fabricate"] = any(
-            not any(_bare(m["content"]) in line for line in user_lines) for m in p1_x
-        )
+        # 这句原话照记(或轻改:加「用户说」、冠词、句号、缩写)不是编造。编造 = 第一遍写出的含值
+        # 的那条带了用户没说过的内容词(例如接上只有助手问过的主题「构建失败的原因是……」)。
+        checks["pass1_fabricate"] = any(_beyond_user_words(m["content"], scenario) for m in p1_x)
         checks["attributed"] = False if not p2_x else None
         if p2_x:
             how = (
@@ -202,8 +233,14 @@ def a_checks(
             m["id"] == seeded and m.get("live") for m in result.get("memories", [])
         )
     elif cls == "A12":
-        checks["valid_about_x"] = sum(_has(m["content"], scenario.x_key) for m in live)
-        checks["over_two"] = checks["valid_about_x"] > 2
+        # 用户 11-14(§8.2 / §10.2 第 10 条):5 轮后这件事的有效**用户一方**记忆恰好 1 条(近似
+        # 重复 —— 只差标点、全角半角、换种语言 —— 都会多出一条用户一方的);来自助手的复述允许,
+        # 只计数报出。
+        about = [m for m in live if _has(m["content"], scenario.x_key)]
+        user_side = [m for m in about if m.get("origin") in _USER_SIDE_ORIGINS]
+        checks["user_side_about_x"] = len(user_side)
+        checks["assistant_restatements"] = len(about) - len(user_side)
+        checks["user_side_not_one"] = len(user_side) != 1
     return checks, items
 
 
@@ -379,7 +416,7 @@ LINES: tuple[PassLine, ...] = (
     PassLine("P9", "attributed_correction", "min", 24, None, APPROVED_SHORT, _A_N),
     PassLine("P9", "y_valid", "min", 24, None, APPROVED_SHORT, _A_N),
     PassLine("A11", "user_memory_lost", "max", 0, None, DESIGN_A, _A_N),
-    PassLine("A12", "over_two", "max", 0, None, DESIGN_A, _A_N),
+    PassLine("A12", "user_side_not_one", "max", 0, None, APPROVED_A12, _A_N),
     *(
         PassLine(c, "violation", "max", 0, None, APPROVED_B, _B_N)
         for c in ("B1", "B2", "B3", "B4", "B5")
@@ -472,6 +509,7 @@ def build_report(
             APPROVED_B: "B1~B5 每家每类 30 次 0 违规;B6、B7 多余提醒 ≤ 10%,逐类、逐领域",
             APPROVED_SHORT: "短回答 30 次里至少 24 次记下且写明出处(§10.2 第 1 条)",
             DESIGN_A: "§8.2 表里的线,设计写下、用户没有单独确认",
+            APPROVED_A12: "同一件事连写 5 轮后有效的用户一方记忆恰好 1 条;来自助手的复述只计数",
             PENDING: "C 组提出的线,报用户定之前不作验收依据",
         },
     }

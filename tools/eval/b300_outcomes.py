@@ -232,7 +232,13 @@ def _a_outcomes(
         else:
             outcomes[(cls, metric, vendor)].append((domain, bool(bad)))
 
-    for metric in ("missed", "pass1_leak", "pass1_fabricate", "user_memory_lost", "over_two"):
+    for metric in (
+        "missed",
+        "pass1_leak",
+        "pass1_fabricate",
+        "user_memory_lost",
+        "user_side_not_one",
+    ):
         if metric in checks:
             add(metric, checks[metric])
     if "plain" in checks:
@@ -259,6 +265,8 @@ def _a_outcomes(
             add("attributed", None if good is None else not good)
     if cls == "A10":
         counts["a10_user_version"] += bool(checks.get("user_version"))
+    if cls == "A12":  # 用户 11-14:来自助手的复述允许,计数报出
+        counts["a12_assistant_restatements"] += int(checks.get("assistant_restatements", 0))
 
 
 def compare_counts(out: Path) -> dict[str, Any]:
