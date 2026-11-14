@@ -1,7 +1,8 @@
-"""B-300 11-14 —— 去重合并前「内容相同」的判定口径(测试环境实测:重复的那条只差标点,含全角 / 半角)。
+"""B-300 11-14 —— 去重合并前「内容相同」的判定口径(用户 11-14:只忽略不改变意思的差别)。
 
-归一:NFKC(全角半角)、casefold、标点去掉 —— 但夹在两个数字之间的保留(小数点、千分位、日期、时刻),
-数字前的负号保留;空白合并,挨着中日文字的空白去掉。宁可判「不同」交给模型,不把意思不同的判成相同。
+NFC;只折宽度(全角 / 半角);casefold;空白合并、去首尾;再去掉**末尾**的句末标点(反复)。
+别的一律不动:句中标点、连字符、括号、上标、带圈数字、符号都算差别;中文旁边的空格也算。
+测试数据里易混淆的字符一律写成 ``\\u`` 转义。
 """
 
 from __future__ import annotations
@@ -14,22 +15,22 @@ from orchestrator.graph_builder.memory import _normalized_text
 @pytest.mark.parametrize(
     ("a", "b"),
     [
-        ("用户住在成都。", "用户住在成都"),
-        ("user lives in Paris.", "user lives in Paris"),
-        ("用户喜欢绿茶,也喜欢红茶", "用户喜欢绿茶\uff0c也喜欢红茶"),  # 半角 vs 全角逗号
-        ("User Lives In Paris", "user lives in paris"),
-        ("用户 住在 成都", "用户住在成都"),
-        ("user  lives\tin\nParis", "user lives in Paris"),
-        ("体重 69.1 公斤。", "体重69.1公斤"),
+        ("取件码是7190\u3002", "取件码是7190"),
+        ("\uff15\uff10\uff05", "50%"),
+        ("Likes Tea.", "likes tea"),
+        ("体重  69.1 kg", "体重 69.1 kg"),
+        ("体重\u300069.1 kg", "体重 69.1 kg"),
+        ("OK!!", "ok"),
+        ("住在成都\uff1f", "住在成都"),
     ],
     ids=[
         "trailing-cjk-stop",
-        "trailing-ascii-stop",
-        "full-vs-half-width-comma",
-        "case",
-        "cjk-inner-spaces",
-        "whitespace-runs",
-        "decimal-kept-spaces-dropped",
+        "full-width-digits-and-percent",
+        "case-and-trailing-dot",
+        "whitespace-run",
+        "ideographic-space",
+        "repeated-trailing-bang",
+        "full-width-question-mark",
     ],
 )
 def test_same_after_normalisation(a: str, b: str) -> None:
@@ -39,15 +40,51 @@ def test_same_after_normalisation(a: str, b: str) -> None:
 @pytest.mark.parametrize(
     ("a", "b"),
     [
-        ("体重 69.1 公斤", "体重 691 公斤"),
-        ("budget 1,000", "budget 1000"),
-        ("due 2026-11-14", "due 20261114"),
-        ("meeting at 10:30", "meeting at 1030"),
-        ("temperature -3", "temperature 3"),
-        ("growth 50%", "growth 50"),
-        ("dark roast", "darkroast"),
+        ("69.1", "691"),
+        (".5 mg", "5 mg"),
+        ("Rh-", "Rh"),
+        ("尿蛋白(-)", "尿蛋白"),
+        ("HER2-", "HER2"),
+        ("10\u2075", "105"),
+        ("x\u00b2", "x2"),
+        ("\u2460", "1"),
+        ("50%", "50"),
+        ("-3", "3"),
+        ("\u20132", "2"),
+        ("1,000", "1000"),
+        ("2026-11-14", "20261114"),
+        ("10:30", "1030"),
+        ("a.b@x.com", "ab@x.com"),
+        ("li_ming", "liming"),
+        ("it's", "its"),
+        ("每日3次\uff0c每次2片", "每日3次每次2片"),
+        ("3-5", "35"),
+        ("1/2", "12"),
+        ("体重 69.1", "体重69.1"),
     ],
-    ids=["decimal", "thousands", "date", "time", "minus-sign", "percent", "latin-word-space"],
+    ids=[
+        "decimal",
+        "leading-decimal",
+        "trailing-minus",
+        "bracketed-minus",
+        "her2-negative",
+        "superscript",
+        "squared",
+        "circled-digit",
+        "percent",
+        "minus",
+        "en-dash",
+        "thousands",
+        "date",
+        "time",
+        "email-dot",
+        "underscore",
+        "apostrophe",
+        "inner-cjk-comma",
+        "range",
+        "fraction",
+        "inner-space-presence",
+    ],
 )
 def test_different_after_normalisation(a: str, b: str) -> None:
     assert _normalized_text(a) != _normalized_text(b)

@@ -9,8 +9,10 @@
   被拦的删除什么都不做;被拦的更新带 ``is_correction`` 按新增存下,不带就丢弃。预判一次,
   ``supersede`` / ``expire`` 的行锁里按此刻的行再判一次。计数用单独的标签。
 * ③ 去重合并的指令补上另一个方向:来自助手的候选对上用户说的 / 用户更正的已有记忆 → NOOP。
-* ④(11-14 重跑 118.5)内容与一条有效邻居逐字相同(空白归一后)、且邻居的来源不弱于候选 →
-  不问模型,直接 NOOP;指令里也写明「已有同样内容的用户说的 / 用户更正的 → NOOP」优先。
+* ④(11-14 重跑 118.5)内容与一条同 kind、同 agent_name 的有效邻居相同(按
+  ``_normalized_text``:只忽略宽度、大小写、空白多少、末尾句末标点)、邻居的来源不弱于候选、候选
+  不是更正 → 不问模型,直接 NOOP;指令里也写明「已有同样内容的用户说的 / 用户更正的 → NOOP」优先,
+  带更正的例外(删掉与它矛盾的那条)。
 """
 
 from __future__ import annotations
@@ -493,6 +495,13 @@ async def test_reconcile_prompt_puts_an_identical_user_memory_first() -> None:
     )
     assert rule in system
     assert system.index(rule) < system.index("is an UPDATE, not a NOOP.")
+    # 审查 MEDIUM-2 —— 与代码里「带更正的不走确定性 NOOP」一致。
+    exception = (
+        'Exception: a candidate with "is_correction": true is not a NOOP for this reason; '
+        "it DELETEs the existing memory it contradicts, if there is one."
+    )
+    assert exception in system
+    assert system.index(rule) < system.index(exception)
 
 
 async def test_identical_correction_still_asks_so_a_conflicting_memory_can_be_retracted() -> None:

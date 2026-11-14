@@ -1121,6 +1121,8 @@ _RECONCILE_SYSTEM = (
     "When an existing memory stated in user messages or corrected by the user already "
     "says the same thing as the candidate, the candidate is a NOOP, even if an existing "
     "memory from the assistant also matches it; this comes before the next rule.\n"
+    'Exception: a candidate with "is_correction": true is not a NOOP for this reason; '
+    "it DELETEs the existing memory it contradicts, if there is one.\n"
     # B-300 §6.2 —— 双方都带 "source";用户后来自己说全了,旧的来自助手的版本应被取代。
     "A candidate stated in user messages that matches an existing memory from the "
     "assistant is an UPDATE, not a NOOP.\n"
@@ -1277,43 +1279,35 @@ def _provenance_rank(item: MemoryItem) -> int:
     return 1 if effective_origin(item) in USER_SIDE_ORIGINS else 0
 
 
-#: 不当作可去掉的标点:去掉会改意思的(百分号、千分号、万分号、编号、地址 / 路径里的分隔、角分角秒)。
-_MEANINGFUL_PUNCTUATION = frozenset("%\u2030\u2031#@&/\\*\u2032\u2033")
-#: 不靠空格分词的文字(汉字、假名):它们旁边的空格去掉。韩文靠空格分词,不在其列。
-_UNSPACED_SCRIPTS = ("CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH", "HIRAGANA", "KATAKANA")
+#: 句末标点:只在全文**末尾**去掉(反复)。全角的句号 / 叹号 / 问号 / 分号先经宽度折叠成
+#: 半角,只剩中文句号(U+3002)要单列。
+_TRAILING_SENTENCE_PUNCTUATION = frozenset(".!?;\u3002")
 
 
-def _is_unspaced_script(ch: str) -> bool:
-    return unicodedata.name(ch, "").startswith(_UNSPACED_SCRIPTS)
-
-
-def _keeps_punctuation(ch: str, prev: str, nxt: str) -> bool:
-    """夹在两个数字之间的(小数点、千分位、日期、时刻)和数字前的负号留下:「69.1」≠「691」。"""
-    if ch in _MEANINGFUL_PUNCTUATION or (prev.isdigit() and nxt.isdigit()):
-        return True
-    return ch == "-" and nxt.isdigit() and not prev.isdigit()
+def _fold_width(ch: str) -> str:
+    """全角 / 半角(兼容分解标 ``<wide>`` / ``<narrow>`` 的,含全角空格)折成对应的普通字符;
+    别的兼容分解(上标、分数、带圈数字、单位符号)不折 —— 它们和普通字符意思不同(UAX #15)。"""
+    decomposition = unicodedata.decomposition(ch)
+    if decomposition.startswith(("<wide>", "<narrow>")):
+        return "".join(chr(int(code, 16)) for code in decomposition.split()[1:])
+    return ch
 
 
 def _normalized_text(text: str) -> str:
-    """11-14 —— 判「内容相同」的口径:NFKC(全角半角)+ casefold;标点(Unicode P 类)去掉,
-    :func:`_keeps_punctuation` 的除外;空白合并成一个,挨着汉字 / 假名的去掉。宁可判不同。"""
-    folded = unicodedata.normalize("NFKC", text).casefold()
-    kept = [
-        " " if ch.isspace() else ch
-        for i, ch in enumerate(folded)
-        if not unicodedata.category(ch).startswith("P")
-        or _keeps_punctuation(ch, folded[i - 1] if i else "", folded[i + 1 : i + 2])
-    ]
-    out = ""
-    for word in "".join(kept).split():
-        joined = bool(out) and not (_is_unspaced_script(out[-1]) or _is_unspaced_script(word[0]))
-        out += (" " if joined else "") + word
+    """11-14 —— 判「内容相同」的口径,只忽略不改变意思的差别(用户 11-14):NFC;只折宽度;
+    casefold;空白合并成一个、去首尾;再去掉**末尾**的句末标点(反复)。句中标点、连字符、括号、
+    符号、上标、带圈数字一律不动,中文旁边的空格也不动。宁可判不同、交给模型。"""
+    folded = "".join(_fold_width(ch) for ch in unicodedata.normalize("NFC", text)).casefold()
+    out = " ".join(folded.split())
+    while out and out[-1] in _TRAILING_SENTENCE_PUNCTUATION:
+        out = out[:-1].rstrip()
     return out
 
 
 def _has_identical_neighbor(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> bool:
     """候选与某条有效邻居内容相同(按 :func:`_normalized_text` 归一后)、在同一格(同 kind、同
-    agent_name,与写入去重同一格)、且那条的来源不弱于候选 → 候选什么也不带来,确定性 NOOP:
+    agent_name —— 比写入去重严:SQL 唯一索引那一格是 (tenant, user, content_hash, agent_name),
+    不含 kind)、且那条的来源不弱于候选 → 候选什么也不带来,确定性 NOOP:
     用户一方的候选只对上用户一方的;其余候选对上任何来源的。来源更弱的相同内容(用户说的候选对上
     来自助手 / 未记录的)照旧交给模型(升格成用户说的)。"""
     text = _normalized_text(item.content)
