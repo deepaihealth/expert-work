@@ -4,7 +4,7 @@
 # resolved by pip from manylinux wheels — no compiler in the image. Keep
 # this list narrow: every library here is import-available to office agents
 # and is part of the sandbox's trusted surface.
-pandas==3.1.0          # tabular data / xlsx+csv analysis
+pandas==3.1.1          # tabular data / xlsx+csv analysis
 openpyxl==3.1.5        # .xlsx read/write
 python-docx==1.2.0     # .docx read/write
 python-pptx==1.0.2     # .pptx read/write
@@ -15,7 +15,7 @@ pdfplumber==0.11.10    # PDF text + table extraction
 # the baked noto-cjk fonts (needs the libpango/cairo apt libs added in the
 # Dockerfile). This closes the gap that made md→PDF tasks thrash on the missing
 # installer.
-markdown==3.11.2         # Markdown → HTML
+markdown==3.11.3         # Markdown → HTML
 weasyprint==70.0       # HTML+CSS → PDF (report generation)
 # weasyprint 与 pydyf 必须**成对**升级,不能各升各的:weasyprint 声明的
 # ``pydyf>=…`` 没有上界,而 pydyf 的 Stream API 在 0.12.x 重做过——weasyprint
