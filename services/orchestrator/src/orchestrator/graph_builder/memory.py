@@ -1343,8 +1343,9 @@ async def _reconcile_and_apply(
             record_memory_reconcile(op="degraded")
             direct.append(item)
             continue
-        if _has_identical_neighbor(item, neighbors):
-            # 11-14 重跑 118.5 —— 逐字相同、来源不弱的已有记忆:不问模型,直接 NOOP。
+        if not is_corr and _has_identical_neighbor(item, neighbors):
+            # 11-14 重跑 118.5 —— 逐字相同、来源不弱的已有记忆:不问模型,直接 NOOP。带更正的
+            # 候选照旧问模型(审查 MEDIUM):它可能要删掉旁边一条与之冲突的记忆。
             logger.debug("%s_reconcile_identical_noop", log_label)
             record_memory_reconcile(op="noop")
             continue

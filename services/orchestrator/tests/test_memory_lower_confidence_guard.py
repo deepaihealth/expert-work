@@ -59,15 +59,19 @@ class _LLM:
     while_deciding: Callable[[], Awaitable[object]] | None = None
     calls: list[list[BaseMessage]] = field(default_factory=list)
 
-    def system_of(self, mark: str | None) -> str:
-        """``mark`` = 哪一次提炼;``None`` = 去重合并那次。"""
+    def systems_of(self, mark: str | None) -> list[str]:
+        """``mark`` = 哪一次提炼;``None`` = 去重合并那几次。"""
         marks = (PASS1_MARK, PASS2_MARK)
-        for call in self.calls:
-            system = str(call[0].content)
-            hit = mark in system if mark is not None else not any(m in system for m in marks)
-            if hit:
-                return system
-        raise AssertionError(f"no call for {mark!r}")
+        systems = [str(call[0].content) for call in self.calls]
+        if mark is not None:
+            return [s for s in systems if mark in s]
+        return [s for s in systems if not any(m in s for m in marks)]
+
+    def system_of(self, mark: str | None) -> str:
+        systems = self.systems_of(mark)
+        if not systems:
+            raise AssertionError(f"no call for {mark!r}")
+        return systems[0]
 
     async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
         del tools
@@ -405,8 +409,7 @@ async def _seed_row(
 
 
 def _reconcile_calls(llm: _LLM) -> int:
-    marks = (PASS1_MARK, PASS2_MARK)
-    return sum(1 for call in llm.calls if not any(m in str(call[0].content) for m in marks))
+    return len(llm.systems_of(None))
 
 
 async def test_user_candidate_identical_to_a_user_memory_is_a_noop_without_asking() -> None:
@@ -486,3 +489,21 @@ async def test_reconcile_prompt_puts_an_identical_user_memory_first() -> None:
     )
     assert rule in system
     assert system.index(rule) < system.index("is an UPDATE, not a NOOP.")
+
+
+async def test_identical_correction_still_asks_so_a_conflicting_memory_can_be_retracted() -> None:
+    """审查 MEDIUM(11-14)—— 用户说「不,是 X」:候选 X 带 ``is_correction``,和已有的 X 逐字相同,
+    但旁边还有一条冲突的用户记忆 Y(把握度更低、经第二条拦截规则并存下来的)。确定性 NOOP 会让模型
+    永远没机会删掉 Y,所以带更正的候选照旧问模型。"""
+    store = InMemoryMemoryStore()
+    stated = await _seed_row(store, "cand", origin="user_stated", confidence=0.9)
+    conflicting = await _seed_row(store, "cand other", origin="user_stated", confidence=0.5)
+    llm = _LLM(
+        user_reply=_stated(0.9, is_correction=True), ops_reply=_ops("DELETE", conflicting.id)
+    )
+    _ = await _flush(llm, store)
+    assert _reconcile_calls(llm) == 1
+    rows = await _live(store)
+    assert set(rows) == {"cand"}
+    assert rows["cand"].id == stated.id
+    assert next(r for r in store._rows if r.id == conflicting.id).expired_at is not None
