@@ -27,12 +27,13 @@ from expert_work.persistence.memory.base import (
     MemoryStore,
     MemoryWriteResult,
     SupersedeTargetChangedError,
-    UserSideTargetError,
     is_mixed_origin,
     is_user_side_protected,
+    refuse_if_user_side,
     scan_memory_content,
     split_blocked,
     summary_fields,
+    user_side_confidence,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.persistence.models import (
@@ -166,14 +167,18 @@ def _member_loader(session: AsyncSession, tenant_id: UUID, user_id: UUID) -> Mem
     return load
 
 
-async def _refuse_if_user_side(session: AsyncSession, row: MemoryItemRow, *, refuse: bool) -> None:
-    """B-300 review MEDIUM-1 — with ``refuse``, raise on a user-side target (the
-    row is already locked by the caller; members are read, not locked)."""
-    if refuse and await is_user_side_protected(
-        _row_to_item(row), _member_loader(session, row.tenant_id, row.user_id)
-    ):
-        msg = f"memory item {row.id} is on the user's side; not changing it"
-        raise UserSideTargetError(msg)
+async def _refuse_if_user_side(
+    session: AsyncSession, row: MemoryItemRow, *, refuse: bool, above: float | None
+) -> None:
+    """B-300 review MEDIUM-1, user 11-14 — raise on a user-side target (the row is
+    already locked by the caller, so its confidence is the current one; members are
+    read, not locked)."""
+    await refuse_if_user_side(
+        _row_to_item(row),
+        _member_loader(session, row.tenant_id, row.user_id),
+        refuse=refuse,
+        above=above,
+    )
 
 
 class SqlMemoryStore(MemoryStore):
@@ -598,6 +603,7 @@ class SqlMemoryStore(MemoryStore):
         old_id: UUID,
         new_item: MemoryItem,
         refuse_user_side: bool = False,
+        refuse_user_side_above: float | None = None,
     ) -> MemoryItem | None:
         hit = scan_memory_content(new_item.id, new_item.content)
         if hit is not None:
@@ -630,7 +636,9 @@ class SqlMemoryStore(MemoryStore):
                 msg = f"memory item {old_id} is no longer current; not superseding it"
                 raise SupersedeTargetChangedError(msg)
             # B-300 review MEDIUM-1 / MEDIUM-3 — re-judged on the locked row.
-            await _refuse_if_user_side(session, old, refuse=refuse_user_side)
+            await _refuse_if_user_side(
+                session, old, refuse=refuse_user_side, above=refuse_user_side_above
+            )
             old.invalid_at = now
             old.superseded_by = new_item.id
             content = new_item.content
@@ -668,6 +676,7 @@ class SqlMemoryStore(MemoryStore):
         user_id: UUID,
         memory_id: UUID,
         refuse_user_side: bool = False,
+        refuse_user_side_above: float | None = None,
     ) -> bool:
         now = datetime.now(UTC)
         async with self._sf() as session:
@@ -687,7 +696,9 @@ class SqlMemoryStore(MemoryStore):
             ).scalar_one_or_none()
             if row is None:
                 return False
-            await _refuse_if_user_side(session, row, refuse=refuse_user_side)
+            await _refuse_if_user_side(
+                session, row, refuse=refuse_user_side, above=refuse_user_side_above
+            )
             row.expired_at = now
             await session.commit()
         return True
@@ -706,6 +717,25 @@ class SqlMemoryStore(MemoryStore):
             if row is None:
                 return False
             return await is_user_side_protected(
+                _row_to_item(row), _member_loader(session, tenant_id, user_id)
+            )
+
+    async def user_side_confidence(
+        self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID
+    ) -> float | None:
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(MemoryItemRow).where(
+                        MemoryItemRow.id == memory_id,
+                        MemoryItemRow.tenant_id == tenant_id,
+                        MemoryItemRow.user_id == user_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return await user_side_confidence(
                 _row_to_item(row), _member_loader(session, tenant_id, user_id)
             )
 

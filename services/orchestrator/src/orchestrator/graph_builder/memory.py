@@ -76,6 +76,7 @@ from expert_work.persistence.memory.base import (
     BlockedMemory,
     MemoryInjectionBlockedError,
     SupersedeTargetChangedError,
+    UserSideHigherConfidenceError,
     UserSideTargetError,
 )
 from expert_work.persistence.rls import (
@@ -174,7 +175,8 @@ _CONVERSATION_EXTRACTION = "conversation"
 
 # B-300 ① —— 第一次提炼:只有用户输入的文字(设计 §4.2 最终英文原文,一字不改;评测脚本
 # 靠 "The other side of the conversation is not shown." 认出这是第一次)。其后的打分、有效天数、
-# is_correction、JSON 格式沿用此前那段指令的文字。
+# is_correction、JSON 格式沿用此前那段指令的文字。用户 11-14:加「只有一个值的那句永远不是更正」
+# 一条,``is_correction`` 改成「同一句话自己说清改的是什么、新值是什么」(验收 118.5)。
 _USER_TEXT_EXTRACTION_HEADER = """You are a memory extraction module. The input is every message one user typed in a
 conversation, one per line, oldest first. The other side of the conversation is not shown.
 Extract durable, reusable memories worth recalling in future sessions — stable facts or
@@ -184,6 +186,9 @@ Only extract what these messages state on their own.
 - A message that only agrees with, answers or refers to something that is not shown here
   (a bare "yes", "ok, do that", or a value or name with nothing saying what it is) states
   nothing by itself: skip it, and do not guess what it was about.
+- A value or name on its own, with nothing in the same message saying what it is, is never
+  a correction and never an update of an earlier memory, even when it differs from
+  something said before.
 - A question, a guess, a hypothetical, or a repeat of what someone else said is not a
   statement by the user: skip it."""  # noqa: E501
 
@@ -198,9 +203,9 @@ _SCORING_TAIL = (
     "~7, seasonal/plans ~90, yearly ~365, stable preferences ~1095, "
     "near-permanent identity facts ~3650. Omit or null if you cannot "
     "estimate.\n"
-    '- "is_correction": true ONLY if this memory explicitly corrects or '
-    "updates something stated earlier in the conversation (e.g. the user "
-    "says they moved, changed jobs, renamed a thing); otherwise false.\n"
+    '- "is_correction": true ONLY when the same message itself says what is '
+    "being corrected and gives the new value (e.g. the user says they moved, "
+    "changed jobs, renamed a thing); otherwise false.\n"
     "Respond with ONLY a JSON object, no prose and no code fences:\n"
     '{"memories": [{"kind": "fact" | "episodic", "content": "<one concise '
     'sentence>", "importance": <0-1>, "confidence": <0-1>, '
@@ -1113,6 +1118,9 @@ _RECONCILE_SYSTEM = (
     # B-300 §6.2 —— 双方都带 "source";用户后来自己说全了,旧的来自助手的版本应被取代。
     "A candidate stated in user messages that matches an existing memory from the "
     "assistant is an UPDATE, not a NOOP.\n"
+    # 用户 11-14 —— 另一个方向(验收 118.5 第 5 轮:来自助手的同义候选被判成 ADD)。
+    "A candidate from the assistant that matches an existing memory stated in user "
+    "messages or corrected by the user is a NOOP, not an ADD.\n"
     "Respond with ONLY a JSON object, no prose and no code fences:\n"
     '{"ops": [{"index": <candidate index>, "op": "ADD", '
     '"target_id": "<existing id, only for UPDATE/DELETE>"}]}'
@@ -1144,14 +1152,66 @@ async def _protects_user_side(
         return False
 
 
-def _blocked_by_user_side(op: str, item: MemoryItem, *, is_correction: bool) -> MemoryItem | None:
+def _blocked_by_user_side(
+    op: str, item: MemoryItem, *, is_correction: bool, lower_confidence: bool = False
+) -> MemoryItem | None:
     """B-300 §6.2 —— 被拦的删除什么都不做;被拦的更新:是用户的更正(短更新)→ 与旧的并存、
-    按新增存下(返回这条候选);否则丢弃(多半只是把用户说过的话换个说法又提了一遍)。"""
+    按新增存下(返回这条候选);否则丢弃(多半只是把用户说过的话换个说法又提了一遍)。
+
+    ``lower_confidence``(用户 11-14)= 拦下的是置信度更低的「用户消息里说的」候选,处理相同,
+    计数用 ``lower_confidence_*`` 标签,与来自助手的 ``blocked_*`` 分开。"""
+    prefix = "lower_confidence" if lower_confidence else "blocked"
     if op == "UPDATE" and is_correction:
-        record_memory_reconcile(op="blocked_update_added")
+        record_memory_reconcile(op=f"{prefix}_update_added")
         return item
-    record_memory_reconcile(op="blocked_update_dropped" if op == "UPDATE" else "blocked_delete")
+    record_memory_reconcile(op=f"{prefix}_update_dropped" if op == "UPDATE" else f"{prefix}_delete")
     return None
+
+
+async def _user_side_confidence(
+    memory_store: MemoryStore, target: MemoryItem, token: CancellationToken, log_label: str
+) -> float | None:
+    """用户 11-14 第二条拦截规则的预判口径(审查 11-14):不是汇总行 → 用户一方的就是它自己的
+    置信度;汇总行 → 成员里最高的用户一方置信度(存储里查,查不完按 1.0)。查失败按「不受保护」
+    放过,由 ``supersede`` / ``expire`` 锁里那道兜底(同 :func:`_protects_user_side`)。"""
+    if not target.consolidated_from:
+        return target.confidence if effective_origin(target) in USER_SIDE_ORIGINS else None
+    try:
+        return await token.run_cancellable(
+            memory_store.user_side_confidence(
+                tenant_id=target.tenant_id, user_id=target.user_id, memory_id=target.id
+            )
+        )
+    except RunCancelledError:
+        raise
+    except Exception:
+        logger.warning("%s_confidence_lookup_failed id=%s", log_label, target.id, exc_info=True)
+        return None
+
+
+async def _refused_before_apply(
+    memory_store: MemoryStore,
+    target: MemoryItem,
+    *,
+    guarded: bool,
+    above: float | None,
+    token: CancellationToken,
+    log_label: str,
+) -> bool:
+    """去重合并改库前的预判:来自助手的候选碰用户一方的(第一条);用户消息里说的候选碰比它更确定的
+    用户一方的(第二条)。"""
+    if guarded:
+        return await _protects_user_side(memory_store, target, token, log_label)
+    if above is None:
+        return False
+    confidence = await _user_side_confidence(memory_store, target, token, log_label)
+    return confidence is not None and confidence > above
+
+
+def _lower_confidence_guard(item: MemoryItem) -> float | None:
+    """用户 11-14 —— 「用户消息里说的」候选只能改置信度不高于它的用户一方记忆:返回要交给
+    ``supersede`` / ``expire`` 的 ``refuse_user_side_above``(候选的置信度);别的候选 ``None``。"""
+    return item.confidence if item.origin == "user_stated" else None
 
 
 def _reconcile_cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -1208,6 +1268,8 @@ class _BlockedWrite:
 class _Reconciled(NamedTuple):
     direct: list[MemoryItem]
     blocked: list[_BlockedWrite]
+    #: B-300 D12 —— 「更新」时 ``supersede`` 已经落库的新行数(不经 ``write``,要另算)。
+    superseded: int = 0
 
 
 async def _reconcile_and_apply(
@@ -1304,20 +1366,31 @@ async def _reconcile_and_apply(
 
     position = {item.id: idx for idx, item in enumerate(items)}
     blocked: list[_BlockedWrite] = []
+    superseded = 0
     for idx, (item, similar, is_corr) in enumerate(pending):
         op, target_raw = ops.get(idx, ("", None))
         valid = {str(n.id): n for n in similar}
         target_item = valid.get(target_raw) if target_raw is not None else None
         target = target_item.id if target_item is not None else None
-        # B-300 §6.2 唯一的拦截规则:来自助手的候选不得更新 / 删除用户一方的记忆。
+        # B-300 §6.2 拦截规则:来自助手的候选不得更新 / 删除用户一方的记忆;用户 11-14 加一条:
+        # 「用户消息里说的」候选,置信度低于目标时同样不得(汇总行按成员里最高的用户一方置信度比)。
         guarded = item.origin == "assistant_derived"
+        above = _lower_confidence_guard(item)
         if (
             op in ("UPDATE", "DELETE")
             and target_item is not None
-            and guarded
-            and await _protects_user_side(memory_store, target_item, token, log_label)
+            and await _refused_before_apply(
+                memory_store,
+                target_item,
+                guarded=guarded,
+                above=above,
+                token=token,
+                log_label=log_label,
+            )
         ):
-            kept = _blocked_by_user_side(op, item, is_correction=is_corr)
+            kept = _blocked_by_user_side(
+                op, item, is_correction=is_corr, lower_confidence=not guarded
+            )
             direct.extend([kept] if kept is not None else [])
         elif op == "NOOP":
             record_memory_reconcile(op="noop")
@@ -1330,10 +1403,17 @@ async def _reconcile_and_apply(
                     token=token,
                     before_store=before_store,
                     refuse_user_side=guarded,
+                    refuse_user_side_above=above,
                 )
-            except UserSideTargetError:
-                # 审查 MEDIUM-1 —— 读邻居之后目标变成了用户一方的(例如用户这时点了更正)。
-                kept = _blocked_by_user_side(op, item, is_correction=is_corr)
+            except UserSideTargetError as exc:
+                # 审查 MEDIUM-1 —— 读邻居之后目标变成了用户一方的(例如用户这时点了更正);
+                # 用户 11-14 —— 或者目标此刻比这条用户候选更确定。
+                kept = _blocked_by_user_side(
+                    op,
+                    item,
+                    is_correction=is_corr,
+                    lower_confidence=isinstance(exc, UserSideHigherConfidenceError),
+                )
                 direct.extend([kept] if kept is not None else [])
                 continue
             except MemoryInjectionBlockedError as exc:
@@ -1351,7 +1431,9 @@ async def _reconcile_and_apply(
                 direct.append(item)
                 continue
             record_memory_reconcile(op="update" if updated else "degraded")
-            if not updated:
+            if updated:
+                superseded += 1
+            else:
                 direct.append(item)
         elif op == "DELETE" and target is not None:
             try:
@@ -1362,9 +1444,15 @@ async def _reconcile_and_apply(
                     token=token,
                     before_store=before_store,
                     refuse_user_side=guarded,
+                    refuse_user_side_above=above,
                 )
-            except UserSideTargetError:
-                _ = _blocked_by_user_side(op, item, is_correction=is_corr)  # 删除:不动
+            except UserSideTargetError as exc:
+                _ = _blocked_by_user_side(  # 删除:不动
+                    op,
+                    item,
+                    is_correction=is_corr,
+                    lower_confidence=isinstance(exc, UserSideHigherConfidenceError),
+                )
                 continue
             # The candidate is the retraction event — not stored either way.
             record_memory_reconcile(op="delete" if deleted else "degraded")
@@ -1375,7 +1463,7 @@ async def _reconcile_and_apply(
             # Missing / malformed decision — never lose the memory.
             record_memory_reconcile(op="degraded")
             direct.append(item)
-    return _Reconciled(direct, blocked)
+    return _Reconciled(direct, blocked, superseded)
 
 
 async def _apply_update(
@@ -1386,6 +1474,7 @@ async def _apply_update(
     token: CancellationToken,
     before_store: BeforeStore | None = None,
     refuse_user_side: bool = False,
+    refuse_user_side_above: float | None = None,
 ) -> bool:
     """Stream P5b — append-only UPDATE: supersede ``target`` with ``item``
     (close old row + open new versioned row) instead of overwriting in place.
@@ -1393,7 +1482,8 @@ async def _apply_update(
     B-300 D2 —— 新内容被写入扫描拦下时 ``MemoryInjectionBlockedError`` 原样抛给调用方
     (什么都没改);目标已被汇总 / 过期时 ``SupersedeTargetChangedError`` 也原样抛给调用方;
     ``refuse_user_side`` 时目标在锁里重判成用户一方的,``UserSideTargetError`` 原样抛
-    (审查 MEDIUM-1);别的失败照旧返回 ``False``、由调用方退回直接写入。"""
+    (审查 MEDIUM-1;``refuse_user_side_above`` 同理,抛它的子类,用户 11-14);别的失败照旧
+    返回 ``False``、由调用方退回直接写入。"""
     if before_store is not None:
         await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
     try:
@@ -1404,6 +1494,7 @@ async def _apply_update(
                 old_id=target,
                 new_item=item,
                 refuse_user_side=refuse_user_side,
+                refuse_user_side_above=refuse_user_side_above,
             )
         )
     except (
@@ -1427,12 +1518,14 @@ async def _apply_delete(
     token: CancellationToken,
     before_store: BeforeStore | None = None,
     refuse_user_side: bool = False,
+    refuse_user_side_above: float | None = None,
 ) -> bool:
     """Stream P5b — retraction: expire ``target`` (world no longer true, no
     successor) instead of soft-deleting it (which means user-forget).
 
     B-300 审查 MEDIUM-1 —— ``refuse_user_side`` 时目标在锁里重判成用户一方的:
-    ``UserSideTargetError`` 原样抛给调用方(什么都没改)。"""
+    ``UserSideTargetError`` 原样抛给调用方(什么都没改);``refuse_user_side_above`` 同理
+    (用户 11-14)。"""
     if before_store is not None:
         await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
     try:
@@ -1442,6 +1535,7 @@ async def _apply_delete(
                 user_id=item.user_id,
                 memory_id=target,
                 refuse_user_side=refuse_user_side,
+                refuse_user_side_above=refuse_user_side_above,
             )
         )
     except (RunCancelledError, UserSideTargetError):
@@ -1676,7 +1770,9 @@ async def flush_messages_with_outcome(
     调用方(评测脚本)显式声明「这几条消息整条都是用户文字」,不经 ``_build_human_message`` 的
     白名单标记。
 
-    B-300 D12 —— 返回的条数是实际落库的条数(与库里已有同内容的、被拦的都不算)。
+    B-300 D12 —— 返回的条数是实际落库的条数(与库里已有同内容的、被拦的都不算;去重合并里
+    「更新」由 ``supersede`` 取代出来的新行要算,「删除」只作废旧行、不算)。出错走失败分支时
+    条数一律是 0、``failed`` 为真 —— 即使去重合并里已有取代落了库、之后的 ``write`` 才抛错。
     """
     extracted: list[ExtractedMemory] = []
     blocked: list[_BlockedWrite] = []
@@ -1739,7 +1835,7 @@ async def flush_messages_with_outcome(
         ]
         position = {item.id: idx for idx, item in enumerate(items)}
         if reconcile:
-            items, blocked = await _reconcile_and_apply(
+            items, blocked, written = await _reconcile_and_apply(
                 items,
                 corrections=[m.is_correction for m in extracted],
                 memory_store=memory_store,
@@ -1758,7 +1854,7 @@ async def flush_messages_with_outcome(
             blocked.extend(
                 _BlockedWrite(b, "writeback", position[b.item_id]) for b in result.blocked
             )
-            written = result.written
+            written += result.written
     except RunCancelledError:
         raise
     except Exception as exc:

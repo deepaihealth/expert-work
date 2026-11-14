@@ -146,20 +146,90 @@ exceeds 50 % of cluster decisions for 1 day.
 
 ## 7. Manual sweep (operator-only)
 
-There is no operator endpoint to trigger a sweep in Sprint #7. To dump a
-diagnostic sweep, attach a debugger / shell to the control-plane pod and
-call:
+There is no operator endpoint to trigger a sweep. `app.state.memory_consolidator`
+only exists after the app **lifespan** has run (it is built and started there,
+together with the credentials resolver and the embedder it needs), so a bare
+`create_app().state.memory_consolidator` raises `AttributeError`. Do not enter
+the lifespan from a shell either: it starts every background worker in that
+process.
+
+To sweep **one user**, build a consolidator from what `create_app()` already
+puts on `app.state`, never `start()` it, and call `_sweep_user` for that user
+under the same RLS scope the sweep uses. Run it in the control-plane pod
+(`python -` with the script on stdin):
 
 ```python
+import asyncio
+from uuid import UUID
+
 from control_plane.app import create_app
-app = create_app()
-consolidator = app.state.memory_consolidator
-summary = await consolidator.run_once()
-print(summary.as_audit_details())
+from control_plane.aux_model_adapter import make_llm_router_aux_model
+from control_plane.memory_consolidator import (
+    ConsolidatorRunSummary,
+    MemoryConsolidator,
+    _scope,
+    make_consolidator_embedder,
+)
+from control_plane.runtime import DynamicResolvingEmbedder
+from control_plane.tenant_secret_overlay import TenantOverlayCredentialsResolver
+
+TENANT = UUID("<tenant id>")
+USER = UUID("<tenant_user id>")
+
+
+async def main() -> None:
+    s = create_app().state  # no lifespan: nothing is started
+    cfg = s.settings
+    secrets = s.platform_secrets_service
+    resolver = TenantOverlayCredentialsResolver(
+        tenant_provider_view=secrets.effective_provider_credentials_for,
+        tenant_tool_view=secrets.effective_tool_credentials_for,
+        tenant_provider_keys_view=secrets.effective_provider_secret_refs_for,
+        platform_provider_credentials=cfg.effective_platform_provider_credentials,
+        platform_tool_credentials=cfg.effective_platform_tool_credentials,
+        tenant_config_getter=s.tenant_config_service,
+        platform_provider_getter=secrets.effective_provider_credentials,
+        platform_tool_getter=secrets.effective_tool_credentials,
+    )
+    embedder = DynamicResolvingEmbedder(
+        config_service=s.platform_embedding_config_service,
+        resolver=resolver,
+        secret_store=s.secret_store,
+        max_input_bytes=cfg.embedding_max_input_bytes,
+    )
+    consolidator = MemoryConsolidator(
+        memory_store=s.memory_repo,
+        tenant_config_service=s.tenant_config_service,
+        audit_logger=s.audit_logger,
+        aux_model=make_llm_router_aux_model(
+            resolver=resolver,
+            secret_store=s.secret_store,
+            default_provider=cfg.memory_consolidator_default_aux_provider,
+            default_model=cfg.memory_consolidator_default_aux_model,
+        ),
+        embedder=make_consolidator_embedder(embedder),
+        default_aux_model_name=cfg.memory_consolidator_default_aux_model,
+        usage_store=s.token_usage_store,  # aux spend lands in token_usage as usual
+    )
+    summary = ConsolidatorRunSummary()
+    with _scope(TENANT):
+        thresholds = await consolidator._resolve_thresholds(TENANT)
+    with _scope(TENANT, USER):
+        await consolidator._sweep_user(
+            tenant_id=TENANT, user_id=USER, cfg=thresholds, summary=summary
+        )
+    print(summary.as_audit_details())
+
+
+asyncio.run(main())
 ```
 
-The summary is also written as a `MEMORY_CONSOLIDATOR_RUN` audit row
-once per sweep — query the audit log for the canonical record.
+This one-user sweep writes **no** `MEMORY_CONSOLIDATOR_RUN` audit row and does
+not move the per-tenant user cursor (both belong to the full sweep). The full
+sweep's summary is written as a `MEMORY_CONSOLIDATOR_RUN` audit row once per
+sweep — query the audit log for the canonical record. For the B-300 eval there
+is also `tools/eval/b300_inpod.py` (`consolidate` op), which builds the same
+pieces without `create_app()` and caps the number of model calls.
 
 ## 8. Schema reference
 

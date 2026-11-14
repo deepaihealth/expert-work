@@ -108,12 +108,70 @@ async def is_user_side_protected(item: MemoryItem, load: MemberLoader) -> bool:
     return bool(frontier)
 
 
+#: 汇总成员查不完时按这个置信度算(保守方向:等于用户更正,任何提炼出的候选都低于它)。
+FAIL_CLOSED_CONFIDENCE = 1.0
+
+
+async def user_side_confidence(item: MemoryItem, load: MemberLoader) -> float | None:
+    """B-300 用户 11-14(审查 11-14)—— 第二条拦截规则拿来与候选比的置信度;``None`` = 目标
+    不是用户一方的(与 :func:`is_user_side_protected` 同一个判定)。
+
+    * 不是汇总行:用户一方的就是它自己的置信度;
+    * 汇总行:它自己(若是用户一方的)与成员里一层层往下所有用户一方记忆的置信度取**最高**——
+      不用汇总行自己那一行(成员最小值),否则一条用户更正(1.0)和来源未记录的成员汇在一起,
+      就会被置信度一般的用户候选取代;
+    * 遍历同 :func:`is_user_side_protected`(``visited`` 防环、``MAX_SUMMARY_DEPTH`` 层);
+      查到上限还有没查的成员 → :data:`FAIL_CLOSED_CONFIDENCE`。"""
+    found = [item.confidence] if effective_origin(item) in USER_SIDE_ORIGINS else []
+    visited = {item.id}
+    frontier = [sid for sid in item.consolidated_from if sid not in visited]
+    for _depth in range(MAX_SUMMARY_DEPTH):
+        if not frontier:
+            break
+        visited.update(frontier)
+        members = await load(frontier)
+        found.extend(m.confidence for m in members if effective_origin(m) in USER_SIDE_ORIGINS)
+        frontier = list(
+            dict.fromkeys(sid for m in members for sid in m.consolidated_from if sid not in visited)
+        )
+    if frontier:
+        return FAIL_CLOSED_CONFIDENCE
+    return max(found) if found else None
+
+
 class UserSideTargetError(RuntimeError):
     """B-300 审查 MEDIUM-1 —— 带保护的 ``supersede`` / ``expire``(``refuse_user_side``)
     在锁里重读目标,发现它(或它汇总的成员)是用户一方的:什么都没改。
 
     去重合并读邻居与真正改库之间隔着一次模型调用,用户可能恰好在这几秒里「更正」了这一条;
     调用方按拦截规则处理(被拦的更新带更正 → 按新增,否则丢弃;被拦的删除 → 不动)。"""
+
+
+class UserSideHigherConfidenceError(UserSideTargetError):
+    """B-300 用户 11-14 —— ``refuse_user_side_above``:锁里重读的目标是用户一方的、且它此刻的
+    置信度高于调用方给的值(候选的置信度):什么都没改。是 :class:`UserSideTargetError` 的子类,
+    同一条处理路径接得住;调用方据类型分开计数。"""
+
+
+async def refuse_if_user_side(
+    row: MemoryItem, load: MemberLoader, *, refuse: bool, above: float | None
+) -> None:
+    """两个存储实现在行锁里共用的重判(行已由调用方锁住 / 重读,成员只读):
+
+    * ``refuse``(来自助手的候选):目标是用户一方的 → :class:`UserSideTargetError`;
+    * ``above``(用户消息里说的候选的置信度)::func:`user_side_confidence` 高于它 →
+      :class:`UserSideHigherConfidenceError`(汇总行按成员里最高的用户一方置信度比)。"""
+    if refuse:
+        if await is_user_side_protected(row, load):
+            msg = f"memory item {row.id} is on the user's side; not changing it"
+            raise UserSideTargetError(msg)
+        return
+    if above is None:
+        return
+    confidence = await user_side_confidence(row, load)
+    if confidence is not None and confidence > above:
+        msg = f"memory item {row.id} is on the user's side and more certain; not changing it"
+        raise UserSideHigherConfidenceError(msg)
 
 
 @dataclass(frozen=True)
@@ -375,6 +433,7 @@ class MemoryStore(abc.ABC):
         old_id: UUID,
         new_item: MemoryItem,
         refuse_user_side: bool = False,
+        refuse_user_side_above: float | None = None,
     ) -> MemoryItem | None:
         """P5b — append-only UPDATE. Atomically close ``old_id`` (set
         ``invalid_at=now``, ``superseded_by=new_item.id``) and insert
@@ -398,7 +457,12 @@ class MemoryStore(abc.ABC):
         B-300 review MEDIUM-1 — ``refuse_user_side`` (the write-back passes it for
         an assistant-derived candidate): under the same row lock, a target that
         is :func:`is_user_side_protected` raises :class:`UserSideTargetError` and
-        nothing changes."""
+        nothing changes.
+
+        B-300 user 11-14 — ``refuse_user_side_above`` (the write-back passes the
+        candidate's confidence for a user-stated candidate): under the same row
+        lock, a user-side target whose confidence is above it raises
+        :class:`UserSideHigherConfidenceError` and nothing changes."""
 
     @abc.abstractmethod
     async def expire(
@@ -408,6 +472,7 @@ class MemoryStore(abc.ABC):
         user_id: UUID,
         memory_id: UUID,
         refuse_user_side: bool = False,
+        refuse_user_side_above: float | None = None,
     ) -> bool:
         """P5b — retraction: stamp ``expired_at=now`` on a fact that stopped
         being true in the world with NO successor (orthogonal to ``supersede``'s
@@ -417,12 +482,20 @@ class MemoryStore(abc.ABC):
 
         B-300 review MEDIUM-1 — the target row is locked (``FOR UPDATE``) before
         it is changed; with ``refuse_user_side`` a :func:`is_user_side_protected`
-        target raises :class:`UserSideTargetError` and nothing changes."""
+        target raises :class:`UserSideTargetError` and nothing changes;
+        ``refuse_user_side_above`` as in :meth:`supersede`."""
 
     @abc.abstractmethod
     async def user_side_protected(self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID) -> bool:
         """B-300 review MEDIUM-3 — :func:`is_user_side_protected` for one row, its
         summary members read whatever their current validity. Unknown id → False."""
+
+    @abc.abstractmethod
+    async def user_side_confidence(
+        self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID
+    ) -> float | None:
+        """B-300 user 11-14 — :func:`user_side_confidence` for one row (members read
+        the same way as :meth:`user_side_protected`). Unknown id → None."""
 
     @abc.abstractmethod
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:

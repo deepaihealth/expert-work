@@ -474,14 +474,18 @@ def record_memory_reconcile(*, op: str) -> None:
 
     ``op`` ∈ ``{"add", "update", "delete", "noop", "degraded",
     "target_changed", "blocked_update_added", "blocked_update_dropped",
-    "blocked_delete"}`` — the operation actually applied per extracted
+    "blocked_delete", "lower_confidence_update_added",
+    "lower_confidence_update_dropped", "lower_confidence_delete"}`` — the
+    operation actually applied per extracted
     candidate; ``degraded`` = the reconcile decision failed and the candidate
     fell back to a direct ADD (never lose a memory); ``target_changed`` (B-300)
     = the UPDATE's target was folded into a summary / expired meanwhile, so the
     candidate was written as a direct ADD instead. ``blocked_*`` (B-300 PR 2) =
     an assistant-derived candidate was refused an UPDATE / DELETE of a memory the
     user stated or corrected: the update was stored as a new memory (it was a
-    correction) or dropped, the delete did nothing.
+    correction) or dropped, the delete did nothing. ``lower_confidence_*``
+    (B-300, user 11-14) = the same three outcomes for a candidate stated in user
+    messages that was less certain than the user-side memory it would change.
     """
     _memory_reconcile_total.labels(op=op).inc()
 

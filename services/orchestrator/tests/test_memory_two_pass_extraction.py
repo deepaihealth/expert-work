@@ -271,9 +271,9 @@ async def test_prompts_carry_the_design_text() -> None:
         "conversation, one per line, oldest first. The other side of the conversation is not shown."
     )
     assert "- A question, a guess, a hypothetical, or a repeat of what someone else said" in first
-    # 打分、有效天数、is_correction、JSON 格式沿用现有文字。
+    # 打分、有效天数、JSON 格式沿用现有文字;is_correction 一句用户 11-14 改过(设计 §4.2)。
     assert '"expected_valid_days"' in first
-    assert '"is_correction": true ONLY if' in first
+    assert '"is_correction": true ONLY when the same message itself says' in first
     second = llm.system_of("conversation")
     assert second.startswith(
         "You are a memory extraction module. The input is a conversation transcript, one message\n"
