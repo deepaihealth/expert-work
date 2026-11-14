@@ -9,6 +9,8 @@
   被拦的删除什么都不做;被拦的更新带 ``is_correction`` 按新增存下,不带就丢弃。预判一次,
   ``supersede`` / ``expire`` 的行锁里按此刻的行再判一次。计数用单独的标签。
 * ③ 去重合并的指令补上另一个方向:来自助手的候选对上用户说的 / 用户更正的已有记忆 → NOOP。
+* ④(11-14 重跑 118.5)内容与一条有效邻居逐字相同(空白归一后)、且邻居的来源不弱于候选 →
+  不问模型,直接 NOOP;指令里也写明「已有同样内容的用户说的 / 用户更正的 → NOOP」优先。
 """
 
 from __future__ import annotations
@@ -373,3 +375,114 @@ async def test_target_made_more_certain_while_deciding_is_rechecked_under_the_lo
     assert set(rows) == expected_live
     assert rows["corrected by the user"].confidence == 1.0
     assert _count(label) == before + 1
+
+
+# ---------------------------------------------------------------------------
+# ④ 逐字相同的邻居(11-14 重跑 118.5:用户候选 X 同时对上一条相同的用户 X 与一条来自助手的
+#    X+Y,模型照「用户说的对上来自助手的 → UPDATE」取代了后者,多出一条重复的用户 X)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_row(
+    store: InMemoryMemoryStore,
+    content: str,
+    *,
+    origin: MemoryOrigin | None,
+    confidence: float = 0.8,
+) -> MemoryItem:
+    item = MemoryItem(
+        id=uuid4(),
+        tenant_id=_TENANT,
+        user_id=_USER,
+        kind="fact",
+        content=content,
+        embedding=_EAST,
+        origin=origin,
+        confidence=confidence,
+    )
+    _ = await store.write([item])
+    return item
+
+
+def _reconcile_calls(llm: _LLM) -> int:
+    marks = (PASS1_MARK, PASS2_MARK)
+    return sum(1 for call in llm.calls if not any(m in str(call[0].content) for m in marks))
+
+
+async def test_user_candidate_identical_to_a_user_memory_is_a_noop_without_asking() -> None:
+    """118.5 重跑的第 4 轮原样:邻居里有相同的用户 X 和来自助手的 X+Y,模型若被问会去取代后者。"""
+    store = InMemoryMemoryStore()
+    stated = await _seed_row(store, "cand", origin="user_stated", confidence=0.9)
+    derived = await _seed_row(store, "cand and more", origin="assistant_derived", confidence=0.6)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply=_ops("UPDATE", derived.id))
+    before = _count("noop")
+    assert await _flush(llm, store) == 0
+    assert _reconcile_calls(llm) == 0
+    rows = await _live(store)
+    assert set(rows) == {"cand", "cand and more"}
+    assert rows["cand"].id == stated.id
+    assert len(store._rows) == 2
+    assert _count("noop") == before + 1
+
+
+@pytest.mark.parametrize(
+    ("origin", "confidence"),
+    [("user_stated", 0.9), (None, 1.0), ("assistant_derived", 0.6), (None, 0.5)],
+    ids=["user_stated", "user_corrected", "assistant_derived", "unrecorded"],
+)
+async def test_assistant_candidate_identical_to_any_memory_is_a_noop(
+    origin: MemoryOrigin | None, confidence: float
+) -> None:
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(store, "  cand \n", origin=origin, confidence=confidence)
+    other = await _seed_row(store, "something else", origin="assistant_derived", confidence=0.6)
+    llm = _LLM(
+        conversation_reply=_reply({"kind": "fact", "content": "cand"}),
+        ops_reply=_ops("UPDATE", other.id),
+    )
+    assert await _flush(llm, store) == 0
+    assert _reconcile_calls(llm) == 0
+    assert len(store._rows) == 2
+
+
+@pytest.mark.parametrize(
+    ("origin", "confidence"),
+    [("assistant_derived", 0.6), (None, 0.5)],
+    ids=["assistant_derived", "unrecorded"],
+)
+async def test_user_candidate_identical_to_a_weaker_memory_still_asks(
+    origin: MemoryOrigin | None, confidence: float
+) -> None:
+    """用户说的候选对上相同内容、但来源更弱的那条:照旧问模型(判「更新」就把它升成用户说的)。"""
+    store = InMemoryMemoryStore()
+    weaker = await _seed_row(store, "cand", origin=origin, confidence=confidence)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply=_ops("UPDATE", weaker.id))
+    _ = await _flush(llm, store)
+    assert _reconcile_calls(llm) == 1
+    rows = await _live(store)
+    assert set(rows) == {"cand"}
+    assert (rows["cand"].origin, rows["cand"].supersedes) == ("user_stated", weaker.id)
+
+
+@pytest.mark.parametrize("existing", ["cand.", "Cand", "cand x"])
+async def test_non_identical_content_still_asks(existing: str) -> None:
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(store, existing, origin="user_stated", confidence=0.9)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply='{"ops": [{"index": 0, "op": "NOOP"}]}')
+    _ = await _flush(llm, store)
+    assert _reconcile_calls(llm) == 1
+
+
+async def test_reconcile_prompt_puts_an_identical_user_memory_first() -> None:
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(store, "cand x", origin="user_stated", confidence=0.9)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply="{}")
+    _ = await _flush(llm, store)
+    system = llm.system_of(None)
+    rule = (
+        "When an existing memory stated in user messages or corrected by the user already "
+        "says the same thing as the candidate, the candidate is a NOOP, even if an existing "
+        "memory from the assistant also matches it; this comes before the next rule."
+    )
+    assert rule in system
+    assert system.index(rule) < system.index("is an UPDATE, not a NOOP.")

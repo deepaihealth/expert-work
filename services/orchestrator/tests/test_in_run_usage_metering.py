@@ -358,7 +358,9 @@ async def _seeded_memory() -> InMemoryMemoryStore:
                 tenant_id=_TENANT,
                 user_id=_USER,
                 kind="fact",
-                content="user likes tea",
+                # 与提炼出的 "user likes tea" 向量相同、文字不同:逐字相同的会被确定性 NOOP、
+                # 不调去重合并的模型(11-14),这里要的正是那次调用被计量。
+                content="the user likes tea",
                 embedding=vec,
             )
         ]

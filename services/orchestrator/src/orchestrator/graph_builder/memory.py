@@ -1115,6 +1115,11 @@ _RECONCILE_SYSTEM = (
     "correcting earlier info — strongly prefer UPDATE (or DELETE) against "
     "the matching existing memory over ADD, so the old value is superseded "
     "rather than left to coexist.\n"
+    # 11-14 重跑 118.5 —— 已有同样内容的用户一方记忆时一律 NOOP,先于下一句(否则候选同时对上
+    # 一条相同的用户记忆和一条来自助手的,模型会去「更新」后者,多出一条重复的)。
+    "When an existing memory stated in user messages or corrected by the user already "
+    "says the same thing as the candidate, the candidate is a NOOP, even if an existing "
+    "memory from the assistant also matches it; this comes before the next rule.\n"
     # B-300 §6.2 —— 双方都带 "source";用户后来自己说全了,旧的来自助手的版本应被取代。
     "A candidate stated in user messages that matches an existing memory from the "
     "assistant is an UPDATE, not a NOOP.\n"
@@ -1265,6 +1270,27 @@ class _BlockedWrite:
     target_id: UUID | None = None
 
 
+def _provenance_rank(item: MemoryItem) -> int:
+    """11-14 重跑 118.5 —— 逐字相同时比来源强弱:用户一方(用户消息里说的 / 用户更正)最强,
+    来自助手与来源未记录同一档(都不是用户确认过的)。"""
+    return 1 if effective_origin(item) in USER_SIDE_ORIGINS else 0
+
+
+def _normalized_text(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _has_identical_neighbor(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> bool:
+    """候选与某条有效邻居内容逐字相同(空白归一后,区分大小写与标点)、且那条的来源不弱于候选
+    → 候选什么也不带来,确定性 NOOP:用户一方的候选只对上用户一方的;其余候选对上任何来源的。
+    来源更弱的相同内容(用户说的候选对上来自助手 / 未记录的)照旧交给模型(升格成用户说的)。"""
+    text = _normalized_text(item.content)
+    rank = _provenance_rank(item)
+    return any(
+        _normalized_text(n.content) == text and _provenance_rank(n) >= rank for n in neighbors
+    )
+
+
 class _Reconciled(NamedTuple):
     direct: list[MemoryItem]
     blocked: list[_BlockedWrite]
@@ -1316,6 +1342,11 @@ async def _reconcile_and_apply(
             logger.warning("%s_reconcile_recall_failed — direct add", log_label, exc_info=True)
             record_memory_reconcile(op="degraded")
             direct.append(item)
+            continue
+        if _has_identical_neighbor(item, neighbors):
+            # 11-14 重跑 118.5 —— 逐字相同、来源不弱的已有记忆:不问模型,直接 NOOP。
+            logger.debug("%s_reconcile_identical_noop", log_label)
+            record_memory_reconcile(op="noop")
             continue
         similar = [
             n
