@@ -9,6 +9,10 @@
   被拦的删除什么都不做;被拦的更新带 ``is_correction`` 按新增存下,不带就丢弃。预判一次,
   ``supersede`` / ``expire`` 的行锁里按此刻的行再判一次。计数用单独的标签。
 * ③ 去重合并的指令补上另一个方向:来自助手的候选对上用户说的 / 用户更正的已有记忆 → NOOP。
+* ④(11-14 重跑 118.5)内容与一条同 kind、同 agent_name 的有效邻居相同(按
+  ``_normalized_text``:只忽略宽度、大小写、空白多少、末尾句末标点)、邻居的来源不弱于候选、候选
+  不是更正 → 不问模型,直接 NOOP;指令里也写明「已有同样内容的用户说的 / 用户更正的 → NOOP」优先,
+  带更正的例外(删掉与它矛盾的那条)。
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import pytest
@@ -28,7 +32,7 @@ from expert_work.persistence import InMemoryMemoryStore
 from expert_work.protocol import MemoryItem
 from expert_work.protocol.memory_item import MemoryOrigin
 from expert_work.runtime.cancellation import CancellationToken
-from orchestrator.graph_builder.memory import flush_messages_with_outcome
+from orchestrator.graph_builder.memory import _normalized_text, flush_messages_with_outcome
 
 _TENANT = UUID("00000000-0000-4000-8000-0000000000a3")
 _USER = UUID("00000000-0000-4000-8000-0000000000b3")
@@ -57,15 +61,19 @@ class _LLM:
     while_deciding: Callable[[], Awaitable[object]] | None = None
     calls: list[list[BaseMessage]] = field(default_factory=list)
 
-    def system_of(self, mark: str | None) -> str:
-        """``mark`` = 哪一次提炼;``None`` = 去重合并那次。"""
+    def systems_of(self, mark: str | None) -> list[str]:
+        """``mark`` = 哪一次提炼;``None`` = 去重合并那几次。"""
         marks = (PASS1_MARK, PASS2_MARK)
-        for call in self.calls:
-            system = str(call[0].content)
-            hit = mark in system if mark is not None else not any(m in system for m in marks)
-            if hit:
-                return system
-        raise AssertionError(f"no call for {mark!r}")
+        systems = [str(call[0].content) for call in self.calls]
+        if mark is not None:
+            return [s for s in systems if mark in s]
+        return [s for s in systems if not any(m in s for m in marks)]
+
+    def system_of(self, mark: str | None) -> str:
+        systems = self.systems_of(mark)
+        if not systems:
+            raise AssertionError(f"no call for {mark!r}")
+        return systems[0]
 
     async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
         del tools
@@ -114,11 +122,15 @@ def _turn() -> list[BaseMessage]:
     return [user, AIMessage(content="the answer")]
 
 
-async def _flush(llm: _LLM, store: InMemoryMemoryStore) -> int:
+async def _flush(
+    llm: _LLM, store: InMemoryMemoryStore, near: str | tuple[str, ...] = "cand"
+) -> int:
+    """``near`` = 哪(几)段候选文字的向量贴近种子(``_EAST``),进去重合并。"""
+    texts = (near,) if isinstance(near, str) else near
     outcome = await flush_messages_with_outcome(
         _turn(),
         memory_store=store,
-        embedder=_Embedder({"cand": _NEAR_EAST}),
+        embedder=_Embedder(dict.fromkeys(texts, _NEAR_EAST)),
         llm_caller=llm,  # type: ignore[arg-type]
         tenant_id=_TENANT,
         user_id=_USER,
@@ -373,3 +385,325 @@ async def test_target_made_more_certain_while_deciding_is_rechecked_under_the_lo
     assert set(rows) == expected_live
     assert rows["corrected by the user"].confidence == 1.0
     assert _count(label) == before + 1
+
+
+# ---------------------------------------------------------------------------
+# ④ 逐字相同的邻居(11-14 重跑 118.5:用户候选 X 同时对上一条相同的用户 X 与一条来自助手的
+#    X+Y,模型照「用户说的对上来自助手的 → UPDATE」取代了后者,多出一条重复的用户 X)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_row(
+    store: InMemoryMemoryStore,
+    content: str,
+    *,
+    origin: MemoryOrigin | None,
+    confidence: float = 0.8,
+    kind: Literal["fact", "episodic"] = "fact",
+    agent_name: str | None = None,
+) -> MemoryItem:
+    item = MemoryItem(
+        id=uuid4(),
+        tenant_id=_TENANT,
+        user_id=_USER,
+        kind=kind,
+        agent_name=agent_name,
+        content=content,
+        embedding=_EAST,
+        origin=origin,
+        confidence=confidence,
+    )
+    _ = await store.write([item])
+    return item
+
+
+def _reconcile_calls(llm: _LLM) -> int:
+    return len(llm.systems_of(None))
+
+
+async def test_user_candidate_identical_to_a_user_memory_is_a_noop_without_asking() -> None:
+    """118.5 重跑的第 4 轮原样:邻居里有相同的用户 X 和来自助手的 X+Y,模型若被问会去取代后者。"""
+    store = InMemoryMemoryStore()
+    stated = await _seed_row(store, "cand", origin="user_stated", confidence=0.9)
+    derived = await _seed_row(store, "cand and more", origin="assistant_derived", confidence=0.6)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply=_ops("UPDATE", derived.id))
+    before = _count("noop")
+    assert await _flush(llm, store) == 0
+    assert _reconcile_calls(llm) == 0
+    rows = await _live(store)
+    assert set(rows) == {"cand", "cand and more"}
+    assert rows["cand"].id == stated.id
+    assert len(store._rows) == 2
+    assert _count("noop") == before + 1
+
+
+@pytest.mark.parametrize(
+    ("origin", "confidence"),
+    [("user_stated", 0.9), (None, 1.0), ("assistant_derived", 0.6), (None, 0.5)],
+    ids=["user_stated", "user_corrected", "assistant_derived", "unrecorded"],
+)
+async def test_assistant_candidate_identical_to_any_memory_is_a_noop(
+    origin: MemoryOrigin | None, confidence: float
+) -> None:
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(store, "  cand \n", origin=origin, confidence=confidence)
+    other = await _seed_row(store, "something else", origin="assistant_derived", confidence=0.6)
+    llm = _LLM(
+        conversation_reply=_reply({"kind": "fact", "content": "cand"}),
+        ops_reply=_ops("UPDATE", other.id),
+    )
+    assert await _flush(llm, store) == 0
+    assert _reconcile_calls(llm) == 0
+    assert len(store._rows) == 2
+
+
+@pytest.mark.parametrize(
+    ("origin", "confidence"),
+    [("assistant_derived", 0.6), (None, 0.5)],
+    ids=["assistant_derived", "unrecorded"],
+)
+async def test_user_candidate_identical_to_a_weaker_memory_still_asks(
+    origin: MemoryOrigin | None, confidence: float
+) -> None:
+    """用户说的候选对上相同内容、但来源更弱的那条:照旧问模型(判「更新」就把它升成用户说的)。"""
+    store = InMemoryMemoryStore()
+    weaker = await _seed_row(store, "cand", origin=origin, confidence=confidence)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply=_ops("UPDATE", weaker.id))
+    _ = await _flush(llm, store)
+    assert _reconcile_calls(llm) == 1
+    rows = await _live(store)
+    assert set(rows) == {"cand"}
+    assert (rows["cand"].origin, rows["cand"].supersedes) == ("user_stated", weaker.id)
+
+
+@pytest.mark.parametrize("existing", ["can d", "cand 2", "cand x"])
+async def test_non_identical_content_still_asks(existing: str) -> None:
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(store, existing, origin="user_stated", confidence=0.9)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply='{"ops": [{"index": 0, "op": "NOOP"}]}')
+    _ = await _flush(llm, store)
+    assert _reconcile_calls(llm) == 1
+
+
+async def test_reconcile_prompt_puts_an_identical_user_memory_first() -> None:
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(store, "cand x", origin="user_stated", confidence=0.9)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply="{}")
+    _ = await _flush(llm, store)
+    system = llm.system_of(None)
+    rule = (
+        "When an existing memory stated in user messages or corrected by the user already "
+        "says the same thing as the candidate, the candidate is a NOOP, even if an existing "
+        "memory from the assistant also matches it; this takes precedence over the rule below "
+        "about memories from the assistant."
+    )
+    assert rule in system
+    assert system.index(rule) < system.index("is an UPDATE, not a NOOP.")
+    # 审查 MEDIUM-2 —— 与代码里「带更正的不走确定性 NOOP」一致。
+    exception = (
+        'Exception: a candidate with "is_correction": true is not a NOOP for this reason; '
+        "it DELETEs the existing memory it contradicts, if there is one; otherwise it is a NOOP."
+    )
+    assert exception in system
+    assert system.index(rule) < system.index(exception)
+    # 审查 LOW-4 —— 「优先于」指的是下面那句「用户说的对上来自助手的 → UPDATE」。
+    assert system.index(exception) < system.index("is an UPDATE, not a NOOP.")
+
+
+async def test_identical_correction_still_asks_so_a_conflicting_memory_can_be_retracted() -> None:
+    """审查 MEDIUM(11-14)—— 用户说「不,是 X」:候选 X 带 ``is_correction``,和已有的 X
+    内容相同(归一后),但旁边还有一条冲突的用户记忆 Y(把握度更低、经第二条拦截规则并存下来的)。
+    确定性 NOOP 会让模型永远没机会删掉 Y,所以带更正的候选照旧问模型。"""
+    store = InMemoryMemoryStore()
+    stated = await _seed_row(store, "cand", origin="user_stated", confidence=0.9)
+    conflicting = await _seed_row(store, "cand other", origin="user_stated", confidence=0.5)
+    llm = _LLM(
+        user_reply=_stated(0.9, is_correction=True), ops_reply=_ops("DELETE", conflicting.id)
+    )
+    _ = await _flush(llm, store)
+    assert _reconcile_calls(llm) == 1
+    rows = await _live(store)
+    assert set(rows) == {"cand"}
+    assert rows["cand"].id == stated.id
+    assert next(r for r in store._rows if r.id == conflicting.id).expired_at is not None
+
+
+def _turn_six_llm(target: UUID) -> _LLM:
+    reply = _reply({"kind": "fact", "content": "用户的取件码是7190", "confidence": 0.9})
+    return _LLM(user_reply=reply, ops_reply=_ops("UPDATE", target))
+
+
+async def test_turn_six_candidate_differing_only_in_punctuation_is_a_noop() -> None:
+    """测试环境实测(8ef6b0a21)第 6 轮:已有用户说的 X(带句号「。」)和来自助手的 X+Y;用户候选 X
+    只差末尾标点。原来交给模型 → 「更新」X+Y → 多出一条只差标点的用户 X(content_hash 不同,
+    唯一索引挡不住)。现在按归一后的文字判相同,直接 NOOP。"""
+    store = InMemoryMemoryStore()
+    stated = await _seed_row(store, "用户的取件码是7190。", origin="user_stated", confidence=0.9)
+    derived = await _seed_row(
+        store, "用户的取件码是7190,助手提醒按时取件", origin="assistant_derived", confidence=0.6
+    )
+    llm = _turn_six_llm(derived.id)
+    assert await _flush(llm, store, near="用户的取件码是7190") == 0
+    assert _reconcile_calls(llm) == 0
+    assert {r.id for r in store._rows} == {stated.id, derived.id}
+    assert all(r.invalid_at is None for r in store._rows)
+
+
+@pytest.mark.parametrize(
+    ("kind", "agent_name"),
+    [("episodic", None), ("fact", "another-agent")],
+    ids=["other-kind", "other-agent"],
+)
+async def test_identical_text_in_another_kind_or_agent_slot_still_asks(
+    kind: Literal["fact", "episodic"], agent_name: str | None
+) -> None:
+    """审查 LOW-1 —— 只和同一 kind、同一 agent_name 的邻居比(写入去重也按这一格)。"""
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(
+        store, "cand", origin="user_stated", confidence=0.9, kind=kind, agent_name=agent_name
+    )
+    llm = _LLM(user_reply=_stated(0.9), ops_reply='{"ops": [{"index": 0, "op": "NOOP"}]}')
+    _ = await _flush(llm, store)
+    assert _reconcile_calls(llm) == 1
+
+
+# ---------------------------------------------------------------------------
+# 审查 MEDIUM-1(11-14 终审)—— 带更正、又与已有用户记忆内容相同的候选:模型可以删掉别的冲突
+# 记忆(判「更新」别的那条按删除处理),但这条候选本身不再落成新行
+# ---------------------------------------------------------------------------
+
+_X = "\u7528\u6237\u7684\u53d6\u4ef6\u7801\u662f7190"  # 用户的取件码是7190
+_X_STOP = _X + "\u3002"
+
+
+async def _x_and_derived(
+    store: InMemoryMemoryStore, x_confidence: float = 0.95
+) -> tuple[MemoryItem, MemoryItem]:
+    stated = await _seed_row(store, _X_STOP, origin="user_stated", confidence=x_confidence)
+    derived = await _seed_row(
+        store, _X + ",\u52a9\u624b\u63d0\u9192\u6309\u65f6\u53d6\u4ef6",
+        origin="assistant_derived", confidence=0.6,
+    )  # fmt: skip
+    return stated, derived
+
+
+def _valid(store: InMemoryMemoryStore) -> list[MemoryItem]:
+    return [r for r in store._rows if r.invalid_at is None and r.expired_at is None]
+
+
+def _user_rows_with_x(store: InMemoryMemoryStore) -> list[MemoryItem]:
+    return [
+        r
+        for r in _valid(store)
+        if r.origin == "user_stated" and _normalized_text(r.content) == _normalized_text(_X)
+    ]
+
+
+def _correction_x() -> str:
+    return _reply({"kind": "fact", "content": _X, "confidence": 0.9, "is_correction": True})
+
+
+#: 已有用户 X 的把握度:0.95 高于候选(0.9),对 X 的改动先被第二条拦截规则拦下;0.5 低于候选,
+#: 拦截规则放行,只剩 ``_redundant_correction_op`` 把它改成 NOOP(复审 LOW-1:否则把「删掉相同
+#: 那条」的变异也放过了)。
+_X_CONFIDENCES = pytest.mark.parametrize("x_confidence", [0.95, 0.5], ids=["x-more", "x-less"])
+
+
+@_X_CONFIDENCES
+@pytest.mark.parametrize("target", ["identical", "derived"])
+async def test_identical_correction_updating_anything_leaves_one_user_row(
+    target: str, x_confidence: float
+) -> None:
+    """终审复现:模型判「更新」那条相同的 X(原来:被第二条规则拦下、按新增存下)或「更新」来自助手的
+    X+Y(原来:取代出第二条用户 X)。现在:前者 NOOP;后者按删除那条 X+Y 处理。"""
+    store = InMemoryMemoryStore()
+    stated, derived = await _x_and_derived(store, x_confidence)
+    tid = stated.id if target == "identical" else derived.id
+    llm = _LLM(user_reply=_correction_x(), ops_reply=_ops("UPDATE", tid))
+    assert await _flush(llm, store, near=_X) == 0
+    assert _reconcile_calls(llm) == 1
+    assert [r.id for r in _user_rows_with_x(store)] == [stated.id]
+    derived_now = next(r for r in store._rows if r.id == derived.id)
+    assert (derived_now.expired_at is not None) is (target == "derived")
+    assert derived_now.invalid_at is None
+
+
+@pytest.mark.parametrize(
+    "ops_reply",
+    ['{"ops": [{"index": 0, "op": "ADD"}]}', '{"ops": [{"index": 0, "op": "NOOP"}]}', "{}"],
+    ids=["add", "noop", "missing-decision"],
+)
+async def test_identical_correction_never_adds_a_row(ops_reply: str) -> None:
+    store = InMemoryMemoryStore()
+    stated, derived = await _x_and_derived(store)
+    llm = _LLM(user_reply=_correction_x(), ops_reply=ops_reply)
+    assert await _flush(llm, store, near=_X) == 0
+    assert [r.id for r in _user_rows_with_x(store)] == [stated.id]
+    assert {r.id for r in _valid(store)} == {stated.id, derived.id}
+
+
+@_X_CONFIDENCES
+async def test_identical_correction_deleting_the_identical_memory_is_a_noop(
+    x_confidence: float,
+) -> None:
+    store = InMemoryMemoryStore()
+    stated, _derived = await _x_and_derived(store, x_confidence)
+    llm = _LLM(user_reply=_correction_x(), ops_reply=_ops("DELETE", stated.id))
+    _ = await _flush(llm, store, near=_X)
+    assert [r.id for r in _user_rows_with_x(store)] == [stated.id]
+    assert next(r for r in store._rows if r.id == stated.id).expired_at is None
+
+
+async def test_converted_update_of_a_more_certain_user_memory_is_refused() -> None:
+    """复审 LOW-2 —— 模型判「更新」一条更有把握的冲突用户记忆 → 改写成删除 → 第二条拦截规则拒绝:
+    什么都没改,计在 ``lower_confidence_delete``,不会按新增存下。"""
+    store = InMemoryMemoryStore()
+    stated = await _seed_row(store, _X_STOP, origin="user_stated", confidence=0.5)
+    other = await _seed_row(store, _X + "?", origin="user_stated", confidence=0.95)
+    before_delete = _count("lower_confidence_delete")
+    before_added = _count("lower_confidence_update_added")
+    llm = _LLM(user_reply=_correction_x(), ops_reply=_ops("UPDATE", other.id))
+    assert await _flush(llm, store, near=_X) == 0
+    assert {r.id for r in _valid(store)} == {stated.id, other.id}
+    assert _count("lower_confidence_delete") == before_delete + 1
+    assert _count("lower_confidence_update_added") == before_added
+
+
+async def test_identical_correction_without_a_similar_neighbour_adds_nothing() -> None:
+    """向量不够近、没进模型的材料时,带更正的相同候选同样不落新行(原来会直接新增)。"""
+    store = InMemoryMemoryStore()
+    stated, _derived = await _x_and_derived(store)
+    llm = _LLM(user_reply=_correction_x())
+    assert await _flush(llm, store, near=()) == 0
+    assert _reconcile_calls(llm) == 0
+    assert [r.id for r in _user_rows_with_x(store)] == [stated.id]
+
+
+async def test_user_candidate_identical_to_a_user_correction_is_a_noop() -> None:
+    store = InMemoryMemoryStore()
+    corrected = await _seed_row(store, "cand", origin=None, confidence=1.0)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply=_ops("UPDATE", corrected.id))
+    assert await _flush(llm, store) == 0
+    assert _reconcile_calls(llm) == 0
+    assert [r.id for r in _valid(store)] == [corrected.id]
+
+
+async def test_decisions_stay_aligned_when_an_earlier_candidate_is_dropped() -> None:
+    """第一条候选被确定性 NOOP 掉,第二条进模型:模型的 index 0 指的是第二条。"""
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(store, "cand", origin="user_stated", confidence=0.9)
+    other = await _seed_row(store, "old other", origin="assistant_derived", confidence=0.6)
+    llm = _LLM(
+        user_reply=_reply(
+            {"kind": "fact", "content": "cand", "confidence": 0.9},
+            {"kind": "fact", "content": "new other", "confidence": 0.9},
+        ),
+        ops_reply=_ops("UPDATE", other.id),
+    )
+    assert await _flush(llm, store, near=("cand", "new other")) == 1
+    assert _reconcile_calls(llm) == 1
+    payload = json.loads(str(llm.calls[-1][1].content))  # 去重合并在两次提炼之后
+    assert [c["content"] for c in payload["candidates"]] == ["new other"]
+    rows = await _live(store)
+    assert set(rows) == {"cand", "new other"}
+    assert rows["new other"].supersedes == other.id
