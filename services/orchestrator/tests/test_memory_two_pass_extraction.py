@@ -284,6 +284,55 @@ async def test_prompts_carry_the_design_text() -> None:
         assert "From the conversation, extract" not in system
 
 
+async def test_conversation_pass_does_not_restate_what_the_user_said() -> None:
+    """用户 11-14(验收 118.5 重跑,3a4cfd3b3):第二次提炼把 [user] 行里用户自己说全的话又记了一遍
+    (换个说法、加上出处),同一件事多出一条来自助手的。复审(11-14)后合成一段、一条规则:
+
+    * 单独读得懂的 [user] 行由另一次记,这里不再记(换说法、加出处、助手复述 / 确认 / 用到都不算);
+    * 助手从用户的话里得出的结论照记,只是用户的话本身不记;
+    * 离开助手上一条读不懂的 [user] 行(短回答、同意、「现在是 Y 了」一类短更正)由这一次记,带出处,
+      改了什么就带 ``is_correction``(设计 §6.2 的同一把尺子);
+    * 助手得出、用户随后否定的,不单独当结论记;
+    * 「只记」的范围就是上面两类(含助手做了什么、产出了什么、定了什么),不另列一份更窄的。"""
+    llm = _ByPassLLM()
+    await _flush(_turn_with_tools(), llm)
+    second = " ".join(llm.system_of("conversation").split())
+    passage = (
+        "What a [user] line says that can be understood on its own is recorded by another "
+        "pass: do not record it again here — not in other words, not with a source added, and "
+        "not when an [assistant] line repeats, confirms or uses it. A conclusion the assistant "
+        "reached from what the user said is still recorded here; only the user's statement "
+        "itself is not. What a [user] line says that cannot be understood without the "
+        "assistant's previous message — a short answer, an agreement, or a short correction "
+        'such as "it\'s Y now" or "no, it\'s the other one" — is recorded here, with its '
+        'source, and with "is_correction" when it changes something; one line can hold both '
+        "kinds, so judge each statement in it. Something the assistant "
+        "concluded that the user then rejected is not recorded as a conclusion on its own. "
+        "Record only the two sorts above; they include what the assistant reports that tool "
+        "results or attachments told it."
+    )
+    assert passage in second
+    # 「两类」里仍有「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它)。
+    assert '- what the assistant did or produced, and what was decided ("episodic");' in second
+    assert second.index("of two sorts only:") < second.index(passage)
+    # 复审 LOW(11-14):第二类含「用户纠正助手才定下的」;[user] 标签说明只说「单独读得懂的」另记。
+    assert (
+        "what was settled only because the user agreed with, answered or corrected the assistant"
+        in second
+    )
+    assert (
+        "[user] — text the user typed. It is here for context; what a [user] line states on "
+        "its own is recorded separately." in second
+    )
+    # 合成一条规则:原来那句与上一版另起的两句都不在了。
+    assert "states completely on its own" not in second
+    assert "Record only what the assistant found" not in second
+    # 原有的「助手提出、用户同意」示例、出处要求、复述旧记录不再记都还在。
+    assert '"the assistant proposed ... and the user agreed"' in second
+    assert "Never write it as a plain statement of fact with no source." in second
+    assert "When the assistant only repeats something from earlier records or memory" in second
+
+
 async def test_no_user_text_skips_pass_one() -> None:
     llm = _ByPassLLM()
     await _flush([HumanMessage(content="SEED"), AIMessage(content="done")], llm)
