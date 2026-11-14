@@ -289,25 +289,42 @@ async def test_assistant_update_marked_as_correction_is_added_alongside(
 
 
 @pytest.mark.parametrize(
+    ("is_correction", "expected_live", "label"),
+    [
+        (False, {"user said"}, "blocked_delete"),
+        (True, {"user said", "cand"}, "blocked_delete_added"),
+    ],
+    ids=["no-correction-noop", "correction-added"],
+)
+@pytest.mark.parametrize(
     ("origin", "confidence"),
     [("user_stated", 0.9), (None, 1.0)],
     ids=["user_stated", "user_corrected"],
 )
-async def test_assistant_delete_of_a_user_memory_does_nothing(
-    origin: MemoryOrigin | None, confidence: float
+async def test_assistant_delete_of_a_user_memory_never_removes_it(
+    origin: MemoryOrigin | None,
+    confidence: float,
+    is_correction: bool,
+    expected_live: set[str],
+    label: str,
 ) -> None:
+    """被拦的删除不动用户那条;评测 A 组 P9(11-14):候选带更正时按新增存下(与被拦的更新同样
+    处理),否则新值就丢了。"""
     store = InMemoryMemoryStore()
     target = await _seed(store, "user said", origin=origin, confidence=confidence)
     llm = _LLM(
-        conversation_reply=_assistant_candidate(is_correction=True),
+        conversation_reply=_assistant_candidate(is_correction=is_correction),
         ops_reply=_ops("DELETE", target.id),
     )
-    before = _reconcile_count("blocked_delete")
+    before = _reconcile_count(label)
     written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
-    assert written == 0
-    assert set(await _live(store)) == {"user said"}
+    assert written == len(expected_live) - 1
+    rows = await _live(store)
+    assert set(rows) == expected_live
     assert all(r.expired_at is None for r in store._rows if r.id == target.id)
-    assert _reconcile_count("blocked_delete") == before + 1
+    if "cand" in rows:
+        assert (rows["cand"].origin, rows["cand"].supersedes) == ("assistant_derived", None)
+    assert _reconcile_count(label) == before + 1
 
 
 @pytest.mark.parametrize("origin", ["assistant_derived", None])
@@ -397,9 +414,10 @@ def _correct_while_deciding(
     [
         ("UPDATE", False, {"corrected by the user"}, "blocked_update_dropped"),
         ("UPDATE", True, {"corrected by the user", "cand"}, "blocked_update_added"),
-        ("DELETE", True, {"corrected by the user"}, "blocked_delete"),
+        ("DELETE", False, {"corrected by the user"}, "blocked_delete"),
+        ("DELETE", True, {"corrected by the user", "cand"}, "blocked_delete_added"),
     ],
-    ids=["update-dropped", "update-added", "delete-noop"],
+    ids=["update-dropped", "update-added", "delete-noop", "delete-correction-added"],
 )
 async def test_target_corrected_while_the_model_decides_is_still_protected(
     op: str, is_correction: bool, expected_live: set[str], label: str

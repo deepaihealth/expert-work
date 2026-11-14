@@ -1115,10 +1115,25 @@ async def test_summary_language_unnamed_when_it_cannot_be_told() -> None:
     worker, store, aux, _audit = await _build_worker(
         aux_replies=['{"keep": true, "summary": "s", "reject_reason": null}']
     )
-    _seed_transient(store, contents=["dark UI", "dark mode preference", "wants dark theme"])
+    # 几种文字混着(拉丁字母 + 谚文):认不准,不点名。
+    _seed_transient(
+        store, contents=["dark UI preference", "\ub2e4\ud06c \ubaa8\ub4dc", "wants dark theme"]
+    )
     await worker.run_once()
     [prompt] = aux.calls
     assert "Write the summary in the language most of these memories are written in." in prompt
+
+
+@pytest.mark.asyncio
+async def test_summary_language_for_latin_letters_that_are_not_english() -> None:
+    """评测 A 组(11-14):全是拉丁字母、又认不出是英语时,不点名,但要求照这些记忆的那种语言写。"""
+    worker, store, aux, _audit = await _build_worker(
+        aux_replies=['{"keep": true, "summary": "s", "reject_reason": null}']
+    )
+    _seed_transient(store, contents=["dark UI", "dark mode preference", "wants dark theme"])
+    await worker.run_once()
+    [prompt] = aux.calls
+    assert "Write the summary in exactly the language these memories are written in" in prompt
 
 
 @pytest.mark.asyncio

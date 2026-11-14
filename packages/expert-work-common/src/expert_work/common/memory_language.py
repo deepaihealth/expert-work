@@ -1,13 +1,17 @@
 """B-300 ④ —— 长期记忆用用户的语言写:判语言 + 指令里的「Output language」一节。
 
 规则只有一条:记忆用用户的语言写。程序认得出来时把语言名写进指令,让这条规则更硬;认不出来时
-指令仍是同一条规则,只是不点名(设计 §3)。
+指令仍是同一条规则,只是不点名(设计 §3);全是拉丁字母、又不是英语时,要求照用户自己的话的那种
+语言写(11-14)。
 
 **怎么判**:只看用户输入的文字;去掉代码块、行内代码、网址、路径后,数「有信号的字符」(各种
-文字的字母,不含数字、标点、空白)。只有一种文字只对应一种语言时才判得准,所以只点名三种:
+文字的字母,不含数字、标点、空白)。只有一种文字只对应一种语言时才判得准,所以只点名中日韩三种,外加英语(靠虚词判):
 
 * 不足 20 个 → 不点名(只发了几个汉字的日语用户不被点名成 Chinese);
-* 拉丁字母超过八成 → 不点名;
+* 全是拉丁字母(评测 A 组,11-14:英文场景里有记忆被写成中文、葡语 / 西语一类)→ 英语常用虚词
+  (the、and、is、you、of、to……,不收与西、葡、法、德、意语同形的)占词数两成以上 → English;
+  否则 → :data:`LATIN_SCRIPT`(指令要求照用户自己的话的那种语言写,不点名、不翻译);
+* 夹着中日韩等别的文字、拉丁字母超过八成 → 不点名;
 * 其余信号字符全是汉字 → Chinese;
 * 全是假名,或假名 + 汉字且假名占三成以上 → Japanese(汉字里只夹少量假名算「混着」);
 * 全是谚文 → Korean;
@@ -28,6 +32,22 @@ _MIN_SIGNAL_CHARS = 20
 _MAX_LATIN_SHARE = 0.8
 #: 假名 + 汉字时,假名至少占这么多才算日语。
 _MIN_KANA_SHARE = 0.3
+
+#: 全是拉丁字母、但认不准是哪种语言(不是英语)时的返回值。
+LATIN_SCRIPT = "latin-script"
+#: 英语虚词至少占拉丁词数的这么多才判 English;词数太少不判。
+_MIN_ENGLISH_SHARE = 0.2
+_MIN_LATIN_WORDS = 4
+#: 只收英语独有的虚词:与西、葡、法、德、意、荷语同形的(a、an、in、no、do、as、was、will、
+#: me、he、i、so……)不收,免得把这些语言判成英语。
+_ENGLISH_WORDS = frozenset(
+    "the and or but is are were been have has had does did you your we our they their "
+    "she it its my this that these those to of at for with from by about not what when where "
+    "which who how if than then there here just some any can could would should please "
+    "it's i'm don't".split()
+)
+#: 一个词:任意文字的字母连在一起(带重音的字母不把词切开),中间可夹一个撇号。
+_LATIN_WORD = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
 
 _FENCED_CODE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
 _INLINE_CODE = re.compile(r"`[^`\n]*`")
@@ -63,19 +83,32 @@ def _strip_non_prose(text: str) -> str:
     return _PATH.sub(" ", text)
 
 
+def _is_english(prose: str) -> bool:
+    words = _LATIN_WORD.findall(prose.casefold())
+    if len(words) < _MIN_LATIN_WORDS:
+        return False
+    return sum(word in _ENGLISH_WORDS for word in words) >= _MIN_ENGLISH_SHARE * len(words)
+
+
 def detect_user_language(texts: Iterable[str]) -> str | None:
-    """用户文字的语言名(``Chinese`` / ``Japanese`` / ``Korean``),认不准时 ``None``。
+    """用户文字的语言名(``English`` / ``Chinese`` / ``Japanese`` / ``Korean``);全是拉丁字母但
+    不是英语时 :data:`LATIN_SCRIPT`;认不准时 ``None``。
 
     ``texts`` 只能是用户输入的文字:附件、外部内容、助手的话都不该传进来。"""
     counts: dict[str, int] = {}
+    prose: list[str] = []
     for text in texts:
-        for ch in _strip_non_prose(text):
+        stripped = _strip_non_prose(text)
+        prose.append(stripped)
+        for ch in stripped:
             script = _script(ch)
             if script is not None:
                 counts[script] = counts.get(script, 0) + 1
     total = sum(counts.values())
     if total < _MIN_SIGNAL_CHARS:
         return None
+    if set(counts) == {"latin"}:
+        return "English" if _is_english("\n".join(prose)) else LATIN_SCRIPT
     if counts.get("latin", 0) > _MAX_LATIN_SHARE * total:
         return None
     others = {name for name, n in counts.items() if n and name != "latin"}
@@ -105,9 +138,23 @@ _UNNAMED = (
     "exactly as they appear. Do not translate."
 )
 
+_LATIN = (
+    "## Output language\n"
+    'Write the "content" of every memory in exactly the language of the user\'s own messages\n'
+    "in the input — a language written in Latin letters, not Chinese, Japanese or Korean.\n"
+    "Keep names, codes, units and quoted terms exactly as they appear. Do not translate."
+)
+
 _SUMMARY_NAMED = (
     "## Output language\n"
     "Write the summary in {language}, in the same script the user writes in.\n"
+    "Keep names, codes, units and quoted terms exactly as they appear. Do not translate."
+)
+
+_SUMMARY_LATIN = (
+    "## Output language\n"
+    "Write the summary in exactly the language these memories are written in — a language\n"
+    "written in Latin letters, not Chinese, Japanese or Korean.\n"
     "Keep names, codes, units and quoted terms exactly as they appear. Do not translate."
 )
 
@@ -119,16 +166,21 @@ _SUMMARY_UNNAMED = (
 
 
 def extraction_language_section(language: str | None) -> str:
-    """两段提炼指令末尾的「Output language」一节(设计 §3 的两档原文)。"""
+    """两段提炼指令末尾的「Output language」一节(设计 §3 的三档原文)。"""
+    if language == LATIN_SCRIPT:
+        return _LATIN
     return _NAMED.format(language=language) if language else _UNNAMED
 
 
 def summary_language_section(language: str | None) -> str:
     """整理汇总指令末尾的同一节;不点名时按这批记忆多数的语言写。"""
+    if language == LATIN_SCRIPT:
+        return _SUMMARY_LATIN
     return _SUMMARY_NAMED.format(language=language) if language else _SUMMARY_UNNAMED
 
 
 __all__ = [
+    "LATIN_SCRIPT",
     "detect_user_language",
     "extraction_language_section",
     "summary_language_section",

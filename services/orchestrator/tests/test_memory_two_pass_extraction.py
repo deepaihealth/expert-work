@@ -425,6 +425,67 @@ async def test_language_not_named_without_user_text() -> None:
     assert "in the language the user writes in" in llm.system_of("conversation")
 
 
+async def test_english_user_text_names_english() -> None:
+    """评测 A 组(11-14):英文场景里约一成半的记忆被写成中文 / 葡西语一类 —— 英语要点名。"""
+    llm = _ByPassLLM()
+    await _flush(
+        [
+            _user("Please remember that my return order number is RX-2291"),
+            AIMessage(content="Noted."),
+        ],
+        llm,
+    )
+    for which in ("user", "conversation"):
+        assert 'Write the "content" of every memory in English, in the same script' in (
+            llm.system_of(which)
+        )
+
+
+async def test_other_latin_user_text_follows_the_users_own_language() -> None:
+    llm = _ByPassLLM()
+    await _flush(
+        [_user("Por favor, mueve la reunión al jueves por la tarde"), AIMessage(content="Noted.")],
+        llm,
+    )
+    for which in ("user", "conversation"):
+        system = " ".join(llm.system_of(which).split())
+        assert "in exactly the language of the user's own messages in the input" in system
+
+
+# ---------------------------------------------------------------------------
+# 评测 A 组 P1(用户 11-14「记,带上日期」)—— 用户说自己的一次性读数 / 编号 / 状态要记,带日期
+# ---------------------------------------------------------------------------
+
+
+async def test_user_text_pass_records_dated_one_off_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(memory_module, "_today", lambda: "2026-11-14")
+    llm = _ByPassLLM()
+    await _flush(
+        [_user("my fasting glucose this morning is 6.1"), AIMessage(content="Noted.")], llm
+    )
+    system = " ".join(llm.system_of("user").split())
+    rule = (
+        "- A value the user states about themselves or their own things, with the same message "
+        "saying what it is — a reading or measurement, an id or number, a current status — is "
+        "recorded even though it may change: write it with the date or time it refers to (today "
+        'is 2026-11-14; turn "this morning", "yesterday" and the like into a date), so it '
+        "is not later taken for a current value."
+    )
+    assert rule in system
+    # 「不记琐碎」仍在,但不再一概排除会变的值。
+    assert "Extract nothing trivial or ephemeral." not in system
+    assert (
+        "Extract nothing trivial: small talk and passing remarks that are not the user's own "
+        "facts are not memories." in system
+    )
+    # 光有一个值、没说是什么的那句,仍不是更正(11-14 那条不变)。
+    assert "A value or name on its own, with nothing in the same message saying what it is" in (
+        system
+    )
+    # 第二次提炼不加这一条。
+    assert "A value the user states about themselves" not in llm.system_of("conversation")
+
+
 # ---------------------------------------------------------------------------
 # D3 输入上限与计数
 # ---------------------------------------------------------------------------

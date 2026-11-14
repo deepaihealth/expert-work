@@ -134,11 +134,13 @@
 | 全是汉字(夹杂的拉丁字母不超过八成) | 点名 Chinese |
 | 全是假名,或假名 + 汉字且假名占三成以上 | 点名 Japanese |
 | 全是谚文 | 点名 Korean |
-| 其它(一种文字对应多种语言的,如拉丁、西里尔、阿拉伯字母;几种文字混着的,如汉字里夹少量假名) | 不点名 |
+| 全是拉丁字母,英语独有的虚词(the、and、is、you、of、to……)占词数两成以上(用户 11-14,评测 A 组) | 点名 English |
+| 全是拉丁字母,但认不出是英语 | 不点名,但用「拉丁字母」那一档(见下) |
+| 其它(一种文字对应多种语言的,如西里尔、阿拉伯字母;几种文字混着的,如汉字里夹少量假名、英文里夹几个汉字) | 不点名 |
 
-**只点名这三种是检测能力的限制**:靠数字符,只有一种文字只对应一种语言时才判得准。其它语言的用户走不点名档,行为是「跟随用户的语言」,不降级、不会被写成别的语言。20 个字符的门槛是为了不把只发了几个汉字的日语用户点名成 Chinese;超过 20 个字还一个假名都没有的日文极少,仍可能误判,记为已知。
+**只点名这三种(外加靠虚词判的英语)是检测能力的限制**:靠数字符,只有一种文字只对应一种语言时才判得准。其它语言的用户走不点名档,行为是「跟随用户的语言」,不降级、不会被写成别的语言。20 个字符的门槛是为了不把只发了几个汉字的日语用户点名成 Chinese;超过 20 个字还一个假名都没有的日文极少,仍可能误判,记为已知。
 
-**两档指令**(追加在两段提炼指令末尾,单独一节;`{language}` 由程序填):
+**三档指令**(追加在两段提炼指令末尾,单独一节;`{language}` 由程序填;第三档是 11-14 加的):
 
 ```text
 ## Output language
@@ -152,6 +154,15 @@ Write the "content" of every memory in the language the user writes in. If no us
 is shown, use the language of the conversation. Keep names, codes, units and quoted terms
 exactly as they appear. Do not translate.
 ```
+
+```text
+## Output language
+Write the "content" of every memory in exactly the language of the user's own messages
+in the input — a language written in Latin letters, not Chinese, Japanese or Korean.
+Keep names, codes, units and quoted terms exactly as they appear. Do not translate.
+```
+
+**11-14 加 English 与「拉丁字母」档**(评测 A 组,§10.2 第 12 条):英文场景里,不点名档下第二次提炼约一成半(24 / 157)、第一次提炼约 5 / 98 的记忆被写成中文,另有约 10 / 157 与 3 / 98 写成葡语 / 西语一类。只说「拉丁字母的语言」不够,所以能认准英语就点名:全是拉丁字母时数英语**独有**的虚词(与西、葡、法、德、意、荷语同形的 a、an、in、no、do、as、was、me、he、i、so 等不收),占词数两成以上判 English;认不出的拉丁字母语言用第三档,让模型照用户自己的话(两次提炼的输入里都有:第一次就是用户的话,第二次是 `[user]` 行)的那种语言写。英文里夹几个汉字(人名、地名)仍按「几种文字混着」不点名。整理汇总同一档:`Write the summary in exactly the language these memories are written in — a language written in Latin letters, not Chinese, Japanese or Korean.`
 
 整理汇总会生成新的汇总句,加同一节;语言按该用户这一批待整理记忆的全部内容用同一个函数判,不点名时写 `Write the summary in the language most of these memories are written in.`。去重合并、读时复核不生成记忆文字,不加。
 
@@ -192,8 +203,14 @@ You are a memory extraction module. The input is every message one user typed in
 conversation, one per line, oldest first. The other side of the conversation is not shown.
 Extract durable, reusable memories worth recalling in future sessions — stable facts or
 preferences the user states ("fact"), and things the user says were done or decided
-("episodic"). Extract nothing trivial or ephemeral.
+("episodic"). Extract nothing trivial: small talk and passing remarks that are not the
+user's own facts are not memories.
 Only extract what these messages state on their own.
+- A value the user states about themselves or their own things, with the same message saying
+  what it is — a reading or measurement, an id or number, a current status — is recorded even
+  though it may change: write it with the date or time it refers to (today is {today}; turn
+  "this morning", "yesterday" and the like into a date), so it is not later taken for a
+  current value.
 - A message that only agrees with, answers or refers to something that is not shown here
   (a bare "yes", "ok, do that", or a value or name with nothing saying what it is) states
   nothing by itself: skip it, and do not guess what it was about.
@@ -205,6 +222,8 @@ Only extract what these messages state on their own.
 ```
 
 **用户 11-14 改**(测试验收 118.5 红,§10.2 第 8 条):上面加了「A value or name on its own …」一条;沿用的打分文字里 `is_correction` 一句改成 `"is_correction": true ONLY when the same message itself says what is being corrected and gives the new value (e.g. the user says they moved, changed jobs, renamed a thing); otherwise false.`(原文是「explicitly corrects or updates something stated earlier in the conversation」)。
+
+**用户 11-14 改**(评测 A 组 P1,「记,带上日期」,§10.2 第 11 条):原来的「Extract nothing trivial or ephemeral.」让第一次提炼把用户说自己的一次性读数、编号、当前状态(「今早空腹血糖是 X」「这次迁移现在是 X 状态」「退货单号是 X」一类)当成会变的琐事跳过(30 次里 7 次)。改成上面两处:只把不是用户自己事实的闲聊当琐碎;用户说自己的、同一句里说清是什么的值要记,并写明指的是哪天 —— `{today}` 由程序填当天的 UTC 日期(与读时复核同一口径),免得以后被当成现在的值。它和 11-14 那条「光有一个值、没说是什么的那句不是更正」不冲突:那条说的是没有主语的光秃秃的值,这条要求同一句里说清是什么。第二次提炼不加:它记的是助手得出的与用户回答助手才定下的,本来就带出处,召回块里每条也带记录日期。
 
 第二次(对话)。整段自成一体,不沿用现有的打分文字:
 
@@ -369,7 +388,7 @@ PR 1(还没有来源列)时说明行是 `(kind · date recorded)`,第二条不�
 
 **置信度封顶**:来自助手 ≤ 0.6(程序压);用户消息里说的 ≤ 0.99(现有);更正 = 1.0(现有)。封顶不改变排序(§1 #13),作用是管理页如实显示、不与 1.0 的约定冲突。
 
-**第一条拦截规则**(11-13 前是唯一的一条;去重合并时,程序执行;有效来源按 §5.1 的函数):候选是「来自助手」时,不得「更新」或「删除」一条有效来源为用户消息里说的或用户更正的记忆。被拦的「删除」什么都不做。被拦的「更新」:带 `is_correction` → 按新增存下;不带 → **丢弃**(它多半只是把用户说过的话换个说法又提了一遍;按新增的话,每轮整段重抽都会多出一条近似重复)。其余照旧。
+**第一条拦截规则**(11-13 前是唯一的一条;去重合并时,程序执行;有效来源按 §5.1 的函数):候选是「来自助手」时,不得「更新」或「删除」一条有效来源为用户消息里说的或用户更正的记忆。被拦的「删除」不动目标;候选带 `is_correction` 时按新增存下(用户 11-14,评测 A 组 P9:更正被判成「删掉旧的」时,原来新值也一起丢了),不带就什么都不做。被拦的「更新」:带 `is_correction` → 按新增存下;不带 → **丢弃**(它多半只是把用户说过的话换个说法又提了一遍;按新增的话,每轮整段重抽都会多出一条近似重复)。其余照旧。
 
 **第二条拦截规则(用户 11-14 定,§10.2 第 8 条)**:候选是「用户消息里说的」、且它的置信度**低于**目标时,同样不得「更新」或「删除」一条用户一方的记忆(用户一方 = 上一条的同一个定义,含成员里有用户一方的汇总行;**汇总行按成员里(一层层往下)最高的用户一方置信度比**,不按汇总行自己那一行 —— 那是成员最小值,{用户更正 1.0, 未记录 0.5} 汇成的 0.5 汇总行会被 0.6 的候选取代、更正被抹掉(独立审查 11-14);查到层数上限还有没查的成员按 1.0)。被拦后的处理与上一条相同:删除什么都不做;更新带 `is_correction` 按新增存下,不带就丢弃。置信度相等或更高照旧可以改。读邻居时预判一次,`supersede` / `expire` 的行锁里按目标此刻的置信度再判一次。起因:测试验收 118.5,第一次提炼把一个孤零零的短回答读成了「更正」(置信度 0.5),去重合并拿它取代了用户自己说的那条(0.99),之后几轮来回翻。控制台的改内容与「更正」不走去重合并,不受影响。
 
@@ -667,6 +686,8 @@ T17、T20 随第 2 条线的 PR 跑(11-13 从 PR 1 挪出)。**T20 必须在云�
 | 8 补(11-14 重跑 118.5) | 修后重跑:X 一直有效、短回答不再被当更正、`blocked_update_added` +2;但同一件事最后 3 条有效记忆(线是 ≤ 2):用户候选 X 同时对上相同的用户 X 和来自助手的 X+Y,模型「更新」了后者,多出一条重复的用户 X | 去重合并前程序判逐字相同 + 来源不弱 → 直接 NOOP;指令加「已有同样内容的用户一方记忆 → NOOP」并放在「更新来自助手的」那句之前(§6.2) | 只改指令(纯措辞,逐字相同的情况程序就能判,不必交给模型) |
 | 9(用户 11-14,再查 118.5 后) | 「内容相同」按什么口径比:实测重复行只差末尾标点 / 全角半角;第一版去掉所有标点(数字之间的除外)被审查指出会把意思不同的判成相同 | **用户原话:「只忽略不改变意思的差别」**。只忽略全角半角、大小写、空白多少、末尾的句末标点(§6.2)。别家做法(11-14 调研):mem0、Cognee、Dolma 对原文求哈希;Graphiti 原样比较;deer-flow、OpenViking 只忽略大小写与空白;去掉标点的做法(SQuAD / MLQA 的评测归一、datatrove、WeKnora)会把 69.1 / 691、50% / 50、-3 / 3 判成相同;UAX #15 说 NFKC 不能盲用 | 去掉句中标点(只留数字之间的):见第一版,被否;NFKC:上标、带圈数字、单位符号会被折成普通字符 |
 | 10(用户 11-14,`3a4cfd3b3` 重跑 118.5 后) | 修后重跑:X 6 轮一直有效、用户一方的 X 只有 1 条、只差标点的重复 0 条、「写了几条」6/6 对,但同一件事 3 条有效记忆(X 用户说的、X 来自助手 —— 第二次提炼从 `[user]` 行复述、X+Y 来自助手),原判据「≤ 2 条」不过 | **两样都做**:① 改 118.5 判据 —— 用户原来的 X 一直有效、内容为 X 的有效用户一方行恰好 1 条、Y 带出处存下、来自助手的 X 复述允许但要数出条数;按新判据这次重跑算过;② 第二次提炼指令加一段(§4.2,复审后合成一条规则):单独读得懂的用户的话这里不再记(换说法、加出处、助手复述都不算),助手从中得出的结论照记;离开助手上一条读不懂的(短回答、同意、短更正)照记、带出处、改了就带 `is_correction`;助手得出、用户否定的不单独当结论记;「只记」的就是上面两类;它对复述条数的效果在付费评测小跑里量 | 只改判据不改指令;或程序里拦「来自助手的候选与用户说的同义」(没法不靠模型判同义) |
+| 11(用户 11-14,付费评测 A 组后) | 用户说自己的一次性读数、编号、当前状态被第一次提炼当琐事跳过(P1,30 次里 7 次) | **用户原话:「记,带上日期」**。第一次提炼的指令改为:用户说自己的、同一句里说清是什么的值要记,写明指的是哪天(程序给当天日期);只把不是用户自己事实的闲聊当琐碎(§4.2) | 照旧不记(只记稳定的事实) |
+| 12(用户 11-14,付费评测 A 组后) | 英文场景的记忆有被写成中文、葡语 / 西语一类的(第二次提炼约 24 + 10 / 157);被拦的更正型「删除」把新值丢了(P9,30 次里 7 次) | ① 语言:能认准英语就点名 English,认不出的拉丁字母语言用新的第三档「照用户自己的话的那种语言写」(§3);② 被拦的删除若候选带更正,按新增存下,与被拦的更新同样处理,计 `blocked_delete_added` / `lower_confidence_delete_added`(§6.2);与已有用户记忆内容相同的更正仍不落新行 | ① 只说「拉丁字母的语言」(评测里仍会写成别的拉丁字母语言);② 被拦的删除一律不动(新值丢失) |
 
 ## 11. 未验证清单
 
@@ -846,6 +867,7 @@ T17、T20 随第 2 条线的 PR 跑(11-13 从 PR 1 挪出)。**T20 必须在云�
 - **用户 11-14(§10.2 第 8 条)的做法**:`supersede` / `expire` 再多一个 `refuse_user_side_above`(写回给用户消息里说的候选传它的置信度);锁里的重判两个存储实现共用一个函数 `refuse_if_user_side`(`memory/base.py`),目标是用户一方的、且行上此刻的置信度高于它 → 抛 `UserSideHigherConfidenceError`(`UserSideTargetError` 的子类,原有的处理路径照样接得住,写回按类型分开计数)。计数标签 `lower_confidence_update_added` / `lower_confidence_update_dropped` / `lower_confidence_delete`,与来自助手的 `blocked_*` 分开。置信度相等可以改(规则是「低于」才拦)。比较口径一个函数 `user_side_confidence`(`memory/base.py`):不是汇总行就是它自己的置信度;汇总行取它自己(若是用户一方的)与成员里一层层往下所有用户一方记忆的置信度的最高值,遍历同 `is_user_side_protected`(已查集合防环、最多 8 层),到上限还有没查的成员按 1.0。预判时汇总行经新加的存储方法 `user_side_confidence` 查(查失败按不受保护放过,锁里兜底);锁里重判用同一个函数(独立审查 11-14)。
 - **11-14 重跑 118.5 后补的做法**:`graph_builder/memory.py` 的 `_has_identical_neighbor` 在读完邻居、算相似度之前判(用全部召回到的有效邻居里同 kind、同 agent_name 的,不只是过了相似度线的;归一函数 `_normalized_text`,只用于这一判断,不改 `content_hash`;`casefold` 比 `lower` 多折几种(如 ß → ss),接受(审查 LOW-3/4));命中就记 `expert_work_cm_memory_reconcile_total{op="noop"}` —— 与没有相似邻居时直接记 `add` 是同一个惯例(`add` / `noop` 都不区分模型判的还是程序判的),不另开标签。来源强弱用 `effective_origin`:用户一方 = 1,其余 = 0;邻居 ≥ 候选才 NOOP。带 `is_correction` 的候选不走这条,照旧问模型(独立审查 MEDIUM:用户说「不,是 X」时,X 与已有的 X 逐字相同,但模型要有机会删掉旁边那条冲突的、把握度更低而并存下来的 Y)。原来交给模型时会怎样(11-14 在 SQL 与内存两个实现上实测 `supersede`):有效行上有 `(tenant_id, user_id, content_hash, COALESCE(agent_name, ''))` 的部分唯一索引(`content_hash` 按去首尾空白、转小写算)。模型判「更新」**另一条**(例如来自助手的 X+Y)时,SQL 上取代出的同内容新行撞上仍有效的那条 X、报 `IntegrityError`,写回按 degraded 退回直接写入、再被去重挡掉 —— 所以 SQL 上不会多出一条完全相同的 X(内存实现没有这个索引,会多出);模型判「更新」**那条相同的 X 本身**时,旧行在同一事务里先被作废,新行照常写入(两个实现都是),等于换成置信度更新的一行 —— 现在这种候选直接 NOOP,不再换行,接受。 终审(11-14)后:带更正的候选在读邻居时记下与之内容相同的用户一方记忆(`_identical_user_side_ids`),模型的决定经 `_redundant_correction_op` 改写(见 §6.2);句末标点集合去掉了问号;提示词例外句末尾加「otherwise it is a NOOP」,规则句后半改为「takes precedence over the rule below about memories from the assistant」。
 - **§10.2 第 10 条(11-14)**:只改第二次提炼的指令(§4.2 的一段,替换原来那句「Do not extract something a [user] line states completely on its own」,复审后与上一版另起的两句合成一条规则);没有程序改动。
+- **§10.2 第 11、12 条(11-14,评测 A 组)的做法**:① `memory_language.detect_user_language` 全是拉丁字母时数英语独有虚词(按 Unicode 字母切词,带重音的字母不切开)判 English,否则返回 `LATIN_SCRIPT`,`extraction_language_section` / `summary_language_section` 对它给第三档;② `_blocked_by_user_side` 对带更正的被拦删除返回候选(计 `{prefix}_delete_added`),预判、更新的锁里重判、删除的锁里重判三处都把它放进直接写入;带更正、又与已有用户记忆内容相同的候选(`identical` 非空)传「不是更正」,所以被拦时仍什么都不写;③ 第一次提炼指令里的 `{today}` 由 `_extract_system` 用 `_today()`(UTC 日期)填。
 
 ### 13.4 总计划 §6.2 列的设计细节,定稿
 

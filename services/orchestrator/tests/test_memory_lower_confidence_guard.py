@@ -229,9 +229,10 @@ async def test_reconcile_prompt_says_an_assistant_copy_of_a_user_memory_is_a_noo
     [
         ("UPDATE", True, {"user said", "cand"}, 1, "lower_confidence_update_added"),
         ("UPDATE", False, {"user said"}, 0, "lower_confidence_update_dropped"),
-        ("DELETE", True, {"user said"}, 0, "lower_confidence_delete"),
+        ("DELETE", False, {"user said"}, 0, "lower_confidence_delete"),
+        ("DELETE", True, {"user said", "cand"}, 1, "lower_confidence_delete_added"),
     ],
-    ids=["update-correction-added", "update-dropped", "delete-noop"],
+    ids=["update-correction-added", "update-dropped", "delete-noop", "delete-correction-added"],
 )
 @pytest.mark.parametrize(
     ("origin", "confidence"),
@@ -364,9 +365,10 @@ def _raise_confidence_while_deciding(
     [
         ("UPDATE", True, {"corrected by the user", "cand"}, "lower_confidence_update_added"),
         ("UPDATE", False, {"corrected by the user"}, "lower_confidence_update_dropped"),
-        ("DELETE", True, {"corrected by the user"}, "lower_confidence_delete"),
+        ("DELETE", False, {"corrected by the user"}, "lower_confidence_delete"),
+        ("DELETE", True, {"corrected by the user", "cand"}, "lower_confidence_delete_added"),
     ],
-    ids=["update-added", "update-dropped", "delete-noop"],
+    ids=["update-added", "update-dropped", "delete-noop", "delete-correction-added"],
 )
 async def test_target_made_more_certain_while_deciding_is_rechecked_under_the_lock(
     op: str, is_correction: bool, expected_live: set[str], label: str
@@ -654,15 +656,17 @@ async def test_identical_correction_deleting_the_identical_memory_is_a_noop(
     assert next(r for r in store._rows if r.id == stated.id).expired_at is None
 
 
-async def test_converted_update_of_a_more_certain_user_memory_is_refused() -> None:
-    """复审 LOW-2 —— 模型判「更新」一条更有把握的冲突用户记忆 → 改写成删除 → 第二条拦截规则拒绝:
-    什么都没改,计在 ``lower_confidence_delete``,不会按新增存下。"""
+@pytest.mark.parametrize("op", ["UPDATE", "DELETE"])
+async def test_converted_update_of_a_more_certain_user_memory_is_refused(op: str) -> None:
+    """复审 LOW-2 —— 模型判「更新」(改写成删除)或「删除」一条更有把握的冲突用户记忆 → 第二条
+    拦截规则拒绝:什么都没改,计在 ``lower_confidence_delete``。评测 A 组 P9(11-14)后被拦的删除
+    带更正会按新增存下,但与已有用户记忆内容相同的这种除外 —— 仍不落新行。"""
     store = InMemoryMemoryStore()
     stated = await _seed_row(store, _X_STOP, origin="user_stated", confidence=0.5)
     other = await _seed_row(store, _X + "?", origin="user_stated", confidence=0.95)
     before_delete = _count("lower_confidence_delete")
     before_added = _count("lower_confidence_update_added")
-    llm = _LLM(user_reply=_correction_x(), ops_reply=_ops("UPDATE", other.id))
+    llm = _LLM(user_reply=_correction_x(), ops_reply=_ops(op, other.id))
     assert await _flush(llm, store, near=_X) == 0
     assert {r.id for r in _valid(store)} == {stated.id, other.id}
     assert _count("lower_confidence_delete") == before_delete + 1

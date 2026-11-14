@@ -177,13 +177,21 @@ _CONVERSATION_EXTRACTION = "conversation"
 # B-300 ① —— 第一次提炼:只有用户输入的文字(设计 §4.2 最终英文原文,一字不改;评测脚本
 # 靠 "The other side of the conversation is not shown." 认出这是第一次)。其后的打分、有效天数、
 # is_correction、JSON 格式沿用此前那段指令的文字。用户 11-14:加「只有一个值的那句永远不是更正」
-# 一条,``is_correction`` 改成「同一句话自己说清改的是什么、新值是什么」(验收 118.5)。
+# 一条,``is_correction`` 改成「同一句话自己说清改的是什么、新值是什么」(验收 118.5);评测 A 组
+# P1(用户 11-14「记,带上日期」):用户说自己的读数 / 编号 / 当前状态要记、带日期,``{today}``
+# 由 :func:`_extract_system` 填。
 _USER_TEXT_EXTRACTION_HEADER = """You are a memory extraction module. The input is every message one user typed in a
 conversation, one per line, oldest first. The other side of the conversation is not shown.
 Extract durable, reusable memories worth recalling in future sessions — stable facts or
 preferences the user states ("fact"), and things the user says were done or decided
-("episodic"). Extract nothing trivial or ephemeral.
+("episodic"). Extract nothing trivial: small talk and passing remarks that are not the
+user's own facts are not memories.
 Only extract what these messages state on their own.
+- A value the user states about themselves or their own things, with the same message saying
+  what it is — a reading or measurement, an id or number, a current status — is recorded even
+  though it may change: write it with the date or time it refers to (today is {today}; turn
+  "this morning", "yesterday" and the like into a date), so it is not later taken for a
+  current value.
 - A message that only agrees with, answers or refers to something that is not shown here
   (a bare "yes", "ok, do that", or a value or name with nothing saying what it is) states
   nothing by itself: skip it, and do not guess what it was about.
@@ -263,10 +271,18 @@ Respond with ONLY a JSON object, no prose and no code fences:
 If there is nothing worth remembering, return {"memories": []}."""  # noqa: E501
 
 
+def _today() -> str:
+    """提炼指令里的「今天」(UTC 日期,与读时复核同一口径)。"""
+    return datetime.now(UTC).date().isoformat()
+
+
 def _extract_system(pass_name: str, language: str | None) -> str:
-    """一次提炼的系统提示词:那一次的指令 + 末尾单独一节「Output language」(B-300 ④)。"""
+    """一次提炼的系统提示词:那一次的指令 + 末尾单独一节「Output language」(B-300 ④)。
+
+    第一次提炼的指令带今天的日期(评测 A 组 P1,用户 11-14「记,带上日期」):用户说自己的读数、
+    编号、当前状态要记,写明指的是哪天。"""
     if pass_name == _USER_TEXT_EXTRACTION:
-        body = _USER_TEXT_EXTRACTION_SYSTEM
+        body = _USER_TEXT_EXTRACTION_SYSTEM.replace("{today}", _today())
     else:
         body = _CONVERSATION_EXTRACTION_SYSTEM
     return body + "\n\n" + extraction_language_section(language)
@@ -1176,14 +1192,18 @@ async def _protects_user_side(
 def _blocked_by_user_side(
     op: str, item: MemoryItem, *, is_correction: bool, lower_confidence: bool = False
 ) -> MemoryItem | None:
-    """B-300 §6.2 —— 被拦的删除什么都不做;被拦的更新:是用户的更正(短更新)→ 与旧的并存、
-    按新增存下(返回这条候选);否则丢弃(多半只是把用户说过的话换个说法又提了一遍)。
+    """B-300 §6.2 —— 被拦的更新 / 删除都不动目标。候选是用户的更正(短更新)→ 与旧的并存、按新增
+    存下(返回这条候选),更新与删除一样(评测 A 组 P9,11-14:更正被判成「删掉旧的」时,原来连新值
+    一起丢了);不是更正 → 被拦的更新丢弃(多半只是把用户说过的话换个说法又提了一遍),被拦的删除
+    什么都不做。计数 ``{prefix}_update_added`` / ``_update_dropped`` / ``_delete_added`` /
+    ``_delete``。
 
     ``lower_confidence``(用户 11-14)= 拦下的是置信度更低的「用户消息里说的」候选,处理相同,
     计数用 ``lower_confidence_*`` 标签,与来自助手的 ``blocked_*`` 分开。"""
     prefix = "lower_confidence" if lower_confidence else "blocked"
-    if op == "UPDATE" and is_correction:
-        record_memory_reconcile(op=f"{prefix}_update_added")
+    verb = "update" if op == "UPDATE" else "delete"
+    if is_correction:
+        record_memory_reconcile(op=f"{prefix}_{verb}_added")
         return item
     record_memory_reconcile(op=f"{prefix}_update_dropped" if op == "UPDATE" else f"{prefix}_delete")
     return None
@@ -1482,6 +1502,8 @@ async def _reconcile_and_apply(
         valid = {str(n.id): n for n in similar}
         target_item = valid.get(target_raw) if target_raw is not None else None
         target = target_item.id if target_item is not None else None
+        # 被拦时带更正的候选按新增存下 —— 与已有用户记忆内容相同的那种除外(它永远不落新行)。
+        adds_when_blocked = is_corr and not identical
         if identical:
             rewritten = _redundant_correction_op(op, target, identical)
             logger.debug(
@@ -1509,7 +1531,7 @@ async def _reconcile_and_apply(
             )
         ):
             kept = _blocked_by_user_side(
-                op, item, is_correction=is_corr, lower_confidence=not guarded
+                op, item, is_correction=adds_when_blocked, lower_confidence=not guarded
             )
             direct.extend([kept] if kept is not None else [])
         elif op == "NOOP":
@@ -1531,7 +1553,7 @@ async def _reconcile_and_apply(
                 kept = _blocked_by_user_side(
                     op,
                     item,
-                    is_correction=is_corr,
+                    is_correction=adds_when_blocked,
                     lower_confidence=isinstance(exc, UserSideHigherConfidenceError),
                 )
                 direct.extend([kept] if kept is not None else [])
@@ -1567,12 +1589,13 @@ async def _reconcile_and_apply(
                     refuse_user_side_above=above,
                 )
             except UserSideTargetError as exc:
-                _ = _blocked_by_user_side(  # 删除:不动
+                kept = _blocked_by_user_side(  # 目标不动;带更正的候选按新增存下
                     op,
                     item,
-                    is_correction=is_corr,
+                    is_correction=adds_when_blocked,
                     lower_confidence=isinstance(exc, UserSideHigherConfidenceError),
                 )
+                direct.extend([kept] if kept is not None else [])
                 continue
             # The candidate is the retraction event — not stored either way.
             record_memory_reconcile(op="delete" if deleted else "degraded")

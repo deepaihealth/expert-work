@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from expert_work.common.memory_language import (
+    LATIN_SCRIPT,
     detect_user_language,
     extraction_language_section,
     summary_language_section,
@@ -39,8 +40,62 @@ def test_latin_above_eighty_percent_is_not_named() -> None:
     assert detect_user_language([mostly_latin]) is None
 
 
-def test_pure_latin_is_not_named() -> None:
-    assert detect_user_language([_EN]) is None
+# 评测 A 组(11-14):英文场景里约一成半的记忆被写成中文,另有一些写成葡语 / 西语一类 —— 只说
+# 「拉丁字母的语言」不够,能认准英语就点名,认不准的拉丁字母语言要求「照用户的话的那种语言写」。
+_ES = (
+    "Por favor, recuerda que el número de mi pedido de "
+    "devolución es RX-2291 y que la entrega fue en la oficina"
+)
+_PT = (
+    "Por favor, lembre que o número do meu pedido de "
+    "devolução é RX-2291 e que a entrega foi no escritório"
+)
+_FR = (
+    "Merci de noter que le numéro de ma commande de "
+    "retour est RX-2291 et que la livraison était au bureau"
+)
+_DE = (
+    "Bitte merke dir, dass die Nummer meiner Rücksendung RX-2291 ist und die Lieferung im Büro war"
+)
+_IT = "Per favore ricorda che il numero del mio reso è RX-2291 e che la consegna era in ufficio"
+_NL = (
+    "Onthoud alsjeblieft dat het nummer van mijn retour "
+    "RX-2291 is en dat de levering op kantoor was"
+)
+
+
+def test_english_is_named() -> None:
+    assert detect_user_language([_EN]) == "English"
+    assert detect_user_language(["my fasting glucose this morning was high", "it is 7.2"]) == (
+        "English"
+    )
+
+
+@pytest.mark.parametrize(
+    "text", [_ES, _PT, _FR, _DE, _IT, _NL], ids=["es", "pt", "fr", "de", "it", "nl"]
+)
+def test_other_latin_languages_are_latin_script_not_english(text: str) -> None:
+    assert detect_user_language([text]) == LATIN_SCRIPT
+
+
+def test_code_heavy_english_is_judged_by_its_prose() -> None:
+    code = "```python\n# 处理用户的请求并返回结果\nfor item in items: handle(item)\n```\n"
+    assert detect_user_language(
+        [code + "The build fails when I run the tests, can you fix it?"]
+    ) == ("English")
+    # 代码去掉后剩下的文字不够 20 个字母:不点名。
+    assert detect_user_language([code + "fix it"]) is None
+
+
+def test_english_with_a_few_cjk_characters_is_not_named() -> None:
+    """夹了几个汉字(人名、地名)的英文:几种文字混着,照旧不点名(不冒险说成 English)。"""
+    assert (
+        detect_user_language(["My colleague 王伟 will visit the Shanghai office next week"]) is None
+    )
+
+
+def test_mixed_chinese_with_english_words_stays_chinese() -> None:
+    assert detect_user_language([_ZH + " please use the new template"]) == "Chinese"
 
 
 def test_kana_text_is_japanese() -> None:
@@ -91,6 +146,28 @@ def test_unnamed_section_follows_the_user() -> None:
     assert text.startswith("## Output language\n")
     assert "in the language the user writes in" in text
     assert "If no user text\nis shown, use the language of the conversation." in text
+
+
+def test_english_section_names_english() -> None:
+    assert 'Write the "content" of every memory in English, in the same script' in (
+        extraction_language_section("English")
+    )
+
+
+def test_latin_script_section_points_at_the_users_own_messages() -> None:
+    text = extraction_language_section(LATIN_SCRIPT)
+    assert text.startswith("## Output language\n")
+    assert (
+        'Write the "content" of every memory in exactly the language of the user\'s own '
+        "messages in the input — a language written in Latin letters, not Chinese, Japanese "
+        "or Korean." in " ".join(text.split())
+    )
+    assert "Do not translate." in text
+    summary = " ".join(summary_language_section(LATIN_SCRIPT).split())
+    assert (
+        "Write the summary in exactly the language these memories are written in — a language "
+        "written in Latin letters, not Chinese, Japanese or Korean." in summary
+    )
 
 
 def test_summary_sections() -> None:
