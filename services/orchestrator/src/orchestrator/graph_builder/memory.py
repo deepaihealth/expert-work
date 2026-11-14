@@ -1239,7 +1239,10 @@ def parse_reconcile_ops(text: str) -> dict[int, tuple[str, str | None]]:
 
     Tolerant — malformed entries are simply absent, and the caller
     treats an absent decision as a degraded direct ADD (CM-H4: never
-    lose a memory over a parse failure).
+    lose a memory over a parse failure). B-300 exception (11-14): a
+    correction that restates an existing user-side memory is never written
+    on a missing / failed decision — it is a NOOP (the memory is already
+    there); see ``_redundant_correction_op``.
     """
     raw = _extract_json_object(text)
     if raw is None:
@@ -1378,6 +1381,10 @@ async def _reconcile_and_apply(
     ``is_correction`` extraction flag); it rides along into the reconcile
     payload as ``"is_correction"`` per candidate so the ops LLM can bias
     UPDATE/DELETE over ADD on an explicit user correction.
+
+    B-300 11-14 —— 「每条失败路径都退回直接写入」有一个例外:带更正、又与已有用户一方记忆内容相同
+    (归一后)的候选永远不写 —— 模型没给决定、调用失败、判新增 / NOOP、改那条相同的记忆,都按 NOOP;
+    只有删掉(或「更新」成删掉)别的冲突记忆会执行(``_redundant_correction_op``)。
     """
     direct: list[MemoryItem] = []
     pending: list[tuple[MemoryItem, list[MemoryItem], bool, frozenset[UUID]]] = []
@@ -1464,7 +1471,15 @@ async def _reconcile_and_apply(
         target_item = valid.get(target_raw) if target_raw is not None else None
         target = target_item.id if target_item is not None else None
         if identical:
-            op = _redundant_correction_op(op, target, identical)
+            rewritten = _redundant_correction_op(op, target, identical)
+            logger.debug(
+                "%s_reconcile_identical_correction op=%s target=%s rewritten=%s",
+                log_label,
+                op or "-",
+                target,
+                rewritten,
+            )
+            op = rewritten
         # B-300 §6.2 拦截规则:来自助手的候选不得更新 / 删除用户一方的记忆;用户 11-14 加一条:
         # 「用户消息里说的」候选,置信度低于目标时同样不得(汇总行按成员里最高的用户一方置信度比)。
         guarded = item.origin == "assistant_derived"

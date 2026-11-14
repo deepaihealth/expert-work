@@ -576,8 +576,10 @@ _X = "\u7528\u6237\u7684\u53d6\u4ef6\u7801\u662f7190"  # 用户的取件码是71
 _X_STOP = _X + "\u3002"
 
 
-async def _x_and_derived(store: InMemoryMemoryStore) -> tuple[MemoryItem, MemoryItem]:
-    stated = await _seed_row(store, _X_STOP, origin="user_stated", confidence=0.95)
+async def _x_and_derived(
+    store: InMemoryMemoryStore, x_confidence: float = 0.95
+) -> tuple[MemoryItem, MemoryItem]:
+    stated = await _seed_row(store, _X_STOP, origin="user_stated", confidence=x_confidence)
     derived = await _seed_row(
         store, _X + ",\u52a9\u624b\u63d0\u9192\u6309\u65f6\u53d6\u4ef6",
         origin="assistant_derived", confidence=0.6,
@@ -601,12 +603,21 @@ def _correction_x() -> str:
     return _reply({"kind": "fact", "content": _X, "confidence": 0.9, "is_correction": True})
 
 
+#: 已有用户 X 的把握度:0.95 高于候选(0.9),对 X 的改动先被第二条拦截规则拦下;0.5 低于候选,
+#: 拦截规则放行,只剩 ``_redundant_correction_op`` 把它改成 NOOP(复审 LOW-1:否则把「删掉相同
+#: 那条」的变异也放过了)。
+_X_CONFIDENCES = pytest.mark.parametrize("x_confidence", [0.95, 0.5], ids=["x-more", "x-less"])
+
+
+@_X_CONFIDENCES
 @pytest.mark.parametrize("target", ["identical", "derived"])
-async def test_identical_correction_updating_anything_leaves_one_user_row(target: str) -> None:
+async def test_identical_correction_updating_anything_leaves_one_user_row(
+    target: str, x_confidence: float
+) -> None:
     """终审复现:模型判「更新」那条相同的 X(原来:被第二条规则拦下、按新增存下)或「更新」来自助手的
     X+Y(原来:取代出第二条用户 X)。现在:前者 NOOP;后者按删除那条 X+Y 处理。"""
     store = InMemoryMemoryStore()
-    stated, derived = await _x_and_derived(store)
+    stated, derived = await _x_and_derived(store, x_confidence)
     tid = stated.id if target == "identical" else derived.id
     llm = _LLM(user_reply=_correction_x(), ops_reply=_ops("UPDATE", tid))
     assert await _flush(llm, store, near=_X) == 0
@@ -631,12 +642,31 @@ async def test_identical_correction_never_adds_a_row(ops_reply: str) -> None:
     assert {r.id for r in _valid(store)} == {stated.id, derived.id}
 
 
-async def test_identical_correction_deleting_the_identical_memory_is_a_noop() -> None:
+@_X_CONFIDENCES
+async def test_identical_correction_deleting_the_identical_memory_is_a_noop(
+    x_confidence: float,
+) -> None:
     store = InMemoryMemoryStore()
-    stated, _derived = await _x_and_derived(store)
+    stated, _derived = await _x_and_derived(store, x_confidence)
     llm = _LLM(user_reply=_correction_x(), ops_reply=_ops("DELETE", stated.id))
     _ = await _flush(llm, store, near=_X)
     assert [r.id for r in _user_rows_with_x(store)] == [stated.id]
+    assert next(r for r in store._rows if r.id == stated.id).expired_at is None
+
+
+async def test_converted_update_of_a_more_certain_user_memory_is_refused() -> None:
+    """复审 LOW-2 —— 模型判「更新」一条更有把握的冲突用户记忆 → 改写成删除 → 第二条拦截规则拒绝:
+    什么都没改,计在 ``lower_confidence_delete``,不会按新增存下。"""
+    store = InMemoryMemoryStore()
+    stated = await _seed_row(store, _X_STOP, origin="user_stated", confidence=0.5)
+    other = await _seed_row(store, _X + "?", origin="user_stated", confidence=0.95)
+    before_delete = _count("lower_confidence_delete")
+    before_added = _count("lower_confidence_update_added")
+    llm = _LLM(user_reply=_correction_x(), ops_reply=_ops("UPDATE", other.id))
+    assert await _flush(llm, store, near=_X) == 0
+    assert {r.id for r in _valid(store)} == {stated.id, other.id}
+    assert _count("lower_confidence_delete") == before_delete + 1
+    assert _count("lower_confidence_update_added") == before_added
 
 
 async def test_identical_correction_without_a_similar_neighbour_adds_nothing() -> None:
