@@ -79,7 +79,7 @@ dependencies = [
     # Stream J.10 (Mini-ADR J-42) — cron-expression math for the trigger
     # scheduler. Lightweight pure-Python; the scheduler polls the
     # agent_trigger table rather than running APScheduler.
-    "croniter>=2.0,<7",
+    "croniter>=2.0,<8",
     # PR1 地基(scheduled-tasks-conversational) — RRULE (RFC 5545) scheduling
     # with per-task IANA timezone. Was only a transitive dep (via croniter's
     # own tree) until now; the scheduler imports it directly so it must be
