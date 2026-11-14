@@ -284,6 +284,32 @@ async def test_prompts_carry_the_design_text() -> None:
         assert "From the conversation, extract" not in system
 
 
+async def test_conversation_pass_does_not_restate_what_the_user_said() -> None:
+    """用户 11-14(验收 118.5 重跑,3a4cfd3b3):第二次提炼把 [user] 行里用户自己说全的话又记了一遍
+    (换个说法、加上出处),同一件事多出一条来自助手的。指令写明:用户自己说的由另一次记,这里不再记,
+    助手复述 / 确认 / 用到它也不算;只记助手得出的、工具 / 附件告诉它的、用户同意或回答助手才定下的
+    —— 离开助手的问题读不懂的短回答仍由这一次记、带出处。"""
+    llm = _ByPassLLM()
+    await _flush(_turn_with_tools(), llm)
+    second = " ".join(llm.system_of("conversation").split())
+    rule = (
+        "What the user states in their own messages is recorded by another pass: do not record "
+        "it again here, not in other words, not with a source added, and not when an "
+        "[assistant] line repeats, confirms or uses it."
+    )
+    keep = (
+        "Record only what the assistant found, concluded or proposed, what tool results or "
+        "attachments told it, and what was settled only because the user agreed with or "
+        "answered the assistant — a short user answer that only makes sense with the "
+        "assistant's question is recorded here, with its source."
+    )
+    assert rule in second
+    assert keep in second
+    # 原有的「助手提出、用户同意」与出处要求都还在。
+    assert '"the assistant proposed ... and the user agreed"' in second
+    assert "Never write it as a plain statement of fact with no source." in second
+
+
 async def test_no_user_text_skips_pass_one() -> None:
     llm = _ByPassLLM()
     await _flush([HumanMessage(content="SEED"), AIMessage(content="done")], llm)

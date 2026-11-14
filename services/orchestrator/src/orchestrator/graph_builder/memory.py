@@ -217,7 +217,8 @@ _SCORING_TAIL = (
 _USER_TEXT_EXTRACTION_SYSTEM = _USER_TEXT_EXTRACTION_HEADER + "\n" + _SCORING_TAIL
 
 # B-300 ① —— 第二次提炼:整段对话(设计 §4.2 最终英文原文,整段自成一体,一字不改;评测脚本靠
-# "Every line starts with a tag:" 认出这是第二次)。
+# "Every line starts with a tag:" 认出这是第二次)。用户 11-14(验收 118.5 重跑):加「用户自己说的
+# 由另一次记,这里不再记」与「只记哪些」两句(设计 §4.2、§10.2 第 10 条)。
 _CONVERSATION_EXTRACTION_SYSTEM = """You are a memory extraction module. The input is a conversation transcript, one message
 per line. Every line starts with a tag:
 - [user] — text the user typed. It is here for context only; what the user states is
@@ -240,6 +241,12 @@ answered ...". Never write it as a plain statement of fact with no source.
 Do not extract something a [user] line states completely on its own; that is recorded
 separately. When the assistant only repeats something from earlier records or memory, do
 not extract it again.
+What the user states in their own messages is recorded by another pass: do not record it
+again here, not in other words, not with a source added, and not when an [assistant] line
+repeats, confirms or uses it. Record only what the assistant found, concluded or proposed,
+what tool results or attachments told it, and what was settled only because the user agreed
+with or answered the assistant — a short user answer that only makes sense with the
+assistant's question is recorded here, with its source.
 For each memory give "importance" (0-1: how reusable it is in future sessions),
 "confidence" (0-1: how well the transcript supports it), "expected_valid_days" (a rough
 number of days it should stay valid, or null), and "is_correction": true only when the
