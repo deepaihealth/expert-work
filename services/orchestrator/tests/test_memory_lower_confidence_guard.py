@@ -503,7 +503,7 @@ async def test_reconcile_prompt_puts_an_identical_user_memory_first() -> None:
     assert system.index(rule) < system.index("is an UPDATE, not a NOOP.")
     # 审查 MEDIUM-2 —— 与代码里「带更正的不走确定性 NOOP」一致。
     exception = (
-        'Exception: a candidate with "is_correction": true is not a NOOP for this reason; '
+        'In that case, a candidate with "is_correction": true is not a NOOP for this reason; '
         "it DELETEs the existing memory it contradicts, if there is one; otherwise it is a NOOP."
     )
     assert exception in system

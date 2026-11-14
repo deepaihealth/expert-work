@@ -9,8 +9,8 @@
 
 * 不足 20 个 → 不点名(只发了几个汉字的日语用户不被点名成 Chinese);
 * 全是拉丁字母(评测 A 组,11-14:英文场景里有记忆被写成中文、葡语 / 西语一类)→ 英语独有的
-  虚词(the、and、is、you、this、with……,不收与别的拉丁字母语言同形的)至少两个不同的、占词数
-  15% 以上 → English;
+  标记词(the、and、you、this、with、please、单独大写的 I……,不收与别的拉丁字母语言同形的)
+  至少两个不同的(the、you、this、please、I 这类强标记一个就够)、占词数一成以上 → English;
   否则 → :data:`LATIN_SCRIPT`(指令要求照用户自己的话的那种语言写,不点名、不翻译);
 * 夹着中日韩等别的文字、拉丁字母超过八成 → 不点名;
 * 其余信号字符全是汉字 → Chinese;
@@ -36,17 +36,26 @@ _MIN_KANA_SHARE = 0.3
 
 #: 全是拉丁字母、但认不准是哪种语言(不是英语)时的返回值。
 LATIN_SCRIPT = "latin-script"
-#: 英语虚词至少占拉丁词数的这么多、且至少有这么多个不同的才判 English;词数太少不判。
-_MIN_ENGLISH_SHARE = 0.15
+#: 英语标记词至少占拉丁词数的这么多、且至少有这么多个不同的才判 English;词数太少不判。
+#: 复审(11-14)按评测 A 组的英文写回与一组荷、丹、挪、瑞、波、德、西、葡、法语句子量过再定。
+_MIN_ENGLISH_SHARE = 0.10
 _MIN_ENGLISH_DISTINCT = 2
 _MIN_LATIN_WORDS = 4
-#: 只收英语独有的虚词。与别的拉丁字母语言同形的不收:a、an、in、no、do、as、was、will、me、he、
+#: 只收英语独有的词。与别的拉丁字母语言同形的不收:a、an、in、no、do、as、was、will、me、he、
 #: i、so(西、葡、法、德、意、荷),for、at、to、of、or、but、my、we、by、if、can、then、here、
-#: some、any(丹麦、挪威、瑞典、波兰、荷兰、法语;审查 LOW-1,11-14)。
+#: some、any、her、just(丹、挪、瑞、波、荷、法),is、had、been(荷兰语;复审 11-14)。另收
+#: 几个常用的英语实词(please、today、tomorrow、month、new……),短句里常常只有它们。
 _ENGLISH_WORDS = frozenset(
-    "the and is are were been have has had does did you your our they their she it its this "
-    "that these those with from about not what when where which who how than there just could "
-    "would should please it's i'm don't".split()
+    "the and are were have has does did you your yours our they their them she him his it its "
+    "this that these those with from about not what when where which who how than there could "
+    "would should it's i'm i've i'll i'd don't doesn't didn't can't won't isn't that's let's "
+    "please thanks thank today tomorrow yesterday tonight morning evening month new".split()
+)
+#: 句中单独大写的 I(英语的「我」)也算:意大利语的冠词 i 是小写。
+_ENGLISH_PRONOUN = "I"
+#: 强标记:在上面那几种语言里都不是词,出现一个就够(仍要占词数一成以上);其余标记词要两个不同的。
+_STRONG_ENGLISH = frozenset(
+    "the you your this that these those please it's i'm i've don't i".split()
 )
 #: 一个词:任意文字的字母连在一起(带重音的字母不把词切开),中间可夹一个撇号。
 _LATIN_WORD = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
@@ -86,12 +95,18 @@ def _strip_non_prose(text: str) -> str:
 
 
 def _is_english(prose: str) -> bool:
-    # 弯撇号(U+2019)按直撇号算。
-    words = _LATIN_WORD.findall(prose.casefold().replace("\u2019", "'"))
+    # 弯撇号(U+2019)按直撇号算;大小写只用来认单独的 I。
+    words = _LATIN_WORD.findall(prose.replace("\u2019", "'"))
     if len(words) < _MIN_LATIN_WORDS:
         return False
-    hits = [word for word in words if word in _ENGLISH_WORDS]
-    return len(set(hits)) >= _MIN_ENGLISH_DISTINCT and len(hits) >= _MIN_ENGLISH_SHARE * len(words)
+    hits = [
+        word.casefold()
+        for word in words
+        if word == _ENGLISH_PRONOUN or word.casefold() in _ENGLISH_WORDS
+    ]
+    distinct = set(hits)
+    enough_kinds = len(distinct) >= _MIN_ENGLISH_DISTINCT or bool(distinct & _STRONG_ENGLISH)
+    return enough_kinds and len(hits) >= _MIN_ENGLISH_SHARE * len(words)
 
 
 def detect_user_language(texts: Iterable[str]) -> str | None:

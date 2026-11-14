@@ -26,6 +26,7 @@ from langchain_core.messages import (
 )
 
 from expert_work.common.conversation_channel import HIDE_FROM_UI, SUPERSEDED_BY
+from expert_work.common.message_stamp import STAMP_CREATED_AT
 from expert_work.common.user_input import mark_draft_turn, user_input_kwargs
 from expert_work.persistence import InMemoryMemoryStore
 from expert_work.protocol import MemoryItem
@@ -457,6 +458,12 @@ async def test_other_latin_user_text_follows_the_users_own_language() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _created_user(text: str, created_at: str) -> HumanMessage:
+    """``sent_at`` 之前的用户消息:只有写入时盖的 ``expert_work_created_at``。"""
+    kwargs = user_input_kwargs(text=text, images=0, files=0, external_blocks=0)
+    return HumanMessage(content=text, additional_kwargs={**kwargs, STAMP_CREATED_AT: created_at})
+
+
 def _dated_user(text: str, sent_at: str) -> HumanMessage:
     return HumanMessage(
         content=text,
@@ -475,6 +482,9 @@ async def test_user_text_lines_carry_their_own_send_date(monkeypatch: pytest.Mon
         [
             _user("an old message with no send time"),
             AIMessage(content="ok"),
+            # sent_at 之前的消息:写入时盖的 expert_work_created_at 兜底(复审 11-14)。
+            _created_user("my weight yesterday was 70 kg", "2026-11-12T03:00:00+00:00"),
+            AIMessage(content="ok"),
             # UTC 11-13 17:00 = 上海 11-14 01:00:按智能体时区是 11-14。
             _dated_user("my fasting glucose this morning is 6.1", "2026-11-13T17:00:00+00:00"),
             AIMessage(content="Noted."),
@@ -483,6 +493,7 @@ async def test_user_text_lines_carry_their_own_send_date(monkeypatch: pytest.Mon
     )
     assert llm.input_of("user").splitlines() == [
         "an old message with no send time",
+        "[2026-11-12] my weight yesterday was 70 kg",
         "[2026-11-14] my fasting glucose this morning is 6.1",
     ]
 
@@ -496,12 +507,12 @@ async def test_user_text_pass_records_dated_one_off_values() -> None:
     rule = (
         "- A value the user states about themselves or their own things, with the same message "
         "saying what it is — a reading or measurement, an id or number, a current status — is "
-        "recorded even though it may change, except passwords, one-time codes, card or account "
-        "numbers and other secrets, which are never recorded. Write it with the date or time it "
-        "refers to, so it is not later taken for a current value: a line that starts with a date "
-        'in brackets was sent on that date, so turn "this morning", "yesterday" and the '
-        "like in that line into a date counted from it; in a line without a date, leave such "
-        "words as they are."
+        "recorded even though it may change, except passwords, one-time codes, bank card or "
+        "bank account numbers and other secrets, which are never recorded. Write it with the "
+        "date or time it refers to, so it is not later taken for a current value: a line that "
+        'starts with a date in brackets was sent on that date, so turn "this morning", '
+        '"yesterday" and the like in that line into a date counted from it; in a line without '
+        "a date, leave such words as they are."
     )
     assert rule in system
     assert "today is" not in system

@@ -472,7 +472,7 @@ def record_memory_rewrite(*, outcome: str) -> None:
 def record_memory_reconcile(*, op: str) -> None:
     """Bump ``expert_work_cm_memory_reconcile_total{op}`` (Stream CM-7).
 
-    ``op`` ∈ ``{"add", "update", "delete", "noop", "degraded",
+    ``op`` ∈ ``{"add", "update", "delete", "delete_added", "noop", "degraded",
     "target_changed", "blocked_update_added", "blocked_update_dropped",
     "blocked_delete", "blocked_delete_added", "lower_confidence_update_added",
     "lower_confidence_update_dropped", "lower_confidence_delete",
@@ -488,6 +488,8 @@ def record_memory_reconcile(*, op: str) -> None:
     update is dropped and the delete does nothing. ``lower_confidence_*``
     (B-300, user 11-14) = the same outcomes for a candidate stated in user
     messages that was less certain than the user-side memory it would change.
+    ``delete_added`` (B-300, 11-14) = a correction candidate whose DELETE was not
+    blocked: the target was retracted and the candidate stored as well.
     """
     _memory_reconcile_total.labels(op=op).inc()
 

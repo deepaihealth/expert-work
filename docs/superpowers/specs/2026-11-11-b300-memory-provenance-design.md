@@ -134,7 +134,7 @@
 | 全是汉字(夹杂的拉丁字母不超过八成) | 点名 Chinese |
 | 全是假名,或假名 + 汉字且假名占三成以上 | 点名 Japanese |
 | 全是谚文 | 点名 Korean |
-| 全是拉丁字母,英语独有的虚词(the、and、is、you、this、with……)至少两个不同的、占词数 15% 以上(用户 11-14,评测 A 组;审查后收紧) | 点名 English |
+| 全是拉丁字母,英语独有的标记词(the、and、you、this、with、please、today、单独大写的 I……)占词数一成以上,且至少两个不同的 —— the、you、this、please、I 这类强标记一个就够(用户 11-14,评测 A 组;两轮审查后定) | 点名 English |
 | 全是拉丁字母,但认不出是英语 | 不点名,但用「拉丁字母」那一档(见下) |
 | 其它(一种文字对应多种语言的,如西里尔、阿拉伯字母;几种文字混着的,如汉字里夹少量假名、英文里夹几个汉字) | 不点名 |
 
@@ -162,7 +162,7 @@ in the input — a language written in Latin letters, not Chinese, Japanese or K
 Keep names, codes, units and quoted terms exactly as they appear. Do not translate.
 ```
 
-**11-14 加 English 与「拉丁字母」档**(评测 A 组,§10.2 第 12 条):英文场景里,不点名档下第二次提炼约一成半(24 / 157)、第一次提炼约 5 / 98 的记忆被写成中文,另有约 10 / 157 与 3 / 98 写成葡语 / 西语一类。只说「拉丁字母的语言」不够,所以能认准英语就点名:全是拉丁字母时数英语**独有**的虚词(与别的拉丁字母语言同形的不收:a、an、in、no、do、as、was、me、he、i、so 与西、葡、法、德、意、荷语同形;for、at、to、of、or、but、my、we、by、if、can 等与丹麦、挪威、瑞典、波兰、荷兰、法语同形 —— 审查 LOW-1),至少两个**不同**的、占词数 15% 以上判 English(只靠一个同形词反复出现不算;弯撇号按直撇号算);认不出的拉丁字母语言用第三档,让模型照用户自己的话(两次提炼的输入里都有:第一次就是用户的话,第二次是 `[user]` 行)的那种语言写。英文里夹几个汉字(人名、地名)仍按「几种文字混着」不点名。整理汇总同一档:`Write the summary in exactly the language most of these memories are written in — a language written in Latin letters, not Chinese, Japanese or Korean.`(保留「most of」:一批记忆里可能夹着别的语言,审查 LOW-2)
+**11-14 加 English 与「拉丁字母」档**(评测 A 组,§10.2 第 12 条):英文场景里,不点名档下第二次提炼约一成半(24 / 157)、第一次提炼约 5 / 98 的记忆被写成中文,另有约 10 / 157 与 3 / 98 写成葡语 / 西语一类。只说「拉丁字母的语言」不够,所以能认准英语就点名:全是拉丁字母时数英语**独有**的虚词(与别的拉丁字母语言同形的不收:a、an、in、no、do、as、was、me、he、i、so 与西、葡、法、德、意、荷语同形;for、at、to、of、or、but、my、we、by、if、can 等与丹麦、挪威、瑞典、波兰、荷兰、法语同形 —— 审查 LOW-1),is、had、been 与荷兰语同形也不收(复审);另收几个英语实词(please、today、tomorrow、month、new……)和句中单独大写的 I。占词数一成以上、且至少两个**不同**的(the、you、your、this、that、please、I 这类强标记一个就够)判 English(弯撇号按直撇号算)。**复审实测(11-14)**:评测 A 组 60 个英文场景的 80 次写回,用户文字判出 English 77 / 80(没判出的 3 次都是不足 20 个字母、按规则不点名);荷、丹、挪、瑞、波、德、西、葡、法语共 33 句,误判成 English 0 句。收紧前一版是 64 / 80、荷兰语 6 句误判 2 句;认不出的拉丁字母语言用第三档,让模型照用户自己的话(两次提炼的输入里都有:第一次就是用户的话,第二次是 `[user]` 行)的那种语言写。英文里夹几个汉字(人名、地名)仍按「几种文字混着」不点名。整理汇总同一档:`Write the summary in exactly the language most of these memories are written in — a language written in Latin letters, not Chinese, Japanese or Korean.`(保留「most of」:一批记忆里可能夹着别的语言,审查 LOW-2)
 
 整理汇总会生成新的汇总句,加同一节;语言按该用户这一批待整理记忆的全部内容用同一个函数判,不点名时写 `Write the summary in the language most of these memories are written in.`。去重合并、读时复核不生成记忆文字,不加。
 
@@ -208,11 +208,11 @@ user's own facts are not memories.
 Only extract what these messages state on their own.
 - A value the user states about themselves or their own things, with the same message saying
   what it is — a reading or measurement, an id or number, a current status — is recorded even
-  though it may change, except passwords, one-time codes, card or account numbers and other
-  secrets, which are never recorded. Write it with the date or time it refers to, so it is not
-  later taken for a current value: a line that starts with a date in brackets was sent on that
-  date, so turn "this morning", "yesterday" and the like in that line into a date counted from
-  it; in a line without a date, leave such words as they are.
+  though it may change, except passwords, one-time codes, bank card or bank account numbers
+  and other secrets, which are never recorded. Write it with the date or time it refers to, so
+  it is not later taken for a current value: a line that starts with a date in brackets was
+  sent on that date, so turn "this morning", "yesterday" and the like in that line into a date
+  counted from it; in a line without a date, leave such words as they are.
 - A message that only agrees with, answers or refers to something that is not shown here
   (a bare "yes", "ok, do that", or a value or name with nothing saying what it is) states
   nothing by itself: skip it, and do not guess what it was about.
@@ -225,7 +225,7 @@ Only extract what these messages state on their own.
 
 **用户 11-14 改**(测试验收 118.5 红,§10.2 第 8 条):上面加了「A value or name on its own …」一条;沿用的打分文字里 `is_correction` 一句改成 `"is_correction": true ONLY when the same message itself says what is being corrected and gives the new value (e.g. the user says they moved, changed jobs, renamed a thing); otherwise false.`(原文是「explicitly corrects or updates something stated earlier in the conversation」)。
 
-**用户 11-14 改**(评测 A 组 P1,「记,带上日期」,§10.2 第 11 条):原来的「Extract nothing trivial or ephemeral.」让第一次提炼把用户说自己的一次性读数、编号、当前状态(「今早空腹血糖是 X」「这次迁移现在是 X 状态」「退货单号是 X」一类)当成会变的琐事跳过(30 次里 7 次)。改成上面两处:只把不是用户自己事实的闲聊当琐碎;用户说自己的、同一句里说清是什么的值要记,并写明指的是哪天,免得以后被当成现在的值。**审查后(11-14)**:① 第一次提炼每轮重读整段对话,按「今天」换算会把 11-14 说的「今天早上」在 11-16 重读时写成 11-16 —— 改成每行带那条消息自己的发送日期(行首 `[YYYY-MM-DD]`):构造点 `_build_human_message` 在白名单标记里记下发送时刻 `sent_at`(UTC),提炼时按智能体的时区(`resolve_agent_timezone`,与智能体提示词里的「今天」同一口径;这个日期会写进记忆正文,所以不能用 UTC)换成日期;发版前的旧消息没有发送时刻,不加日期,指令要求这种行里的相对说法原样不换算。② 密码、一次性验证码、卡号 / 账号等秘密一律不记。它和 11-14 那条「光有一个值、没说是什么的那句不是更正」不冲突:那条说的是没有主语的光秃秃的值,这条要求同一句里说清是什么。第二次提炼不加:它记的是助手得出的与用户回答助手才定下的,本来就带出处,召回块里每条也带记录日期。
+**用户 11-14 改**(评测 A 组 P1,「记,带上日期」,§10.2 第 11 条):原来的「Extract nothing trivial or ephemeral.」让第一次提炼把用户说自己的一次性读数、编号、当前状态(「今早空腹血糖是 X」「这次迁移现在是 X 状态」「退货单号是 X」一类)当成会变的琐事跳过(30 次里 7 次)。改成上面两处:只把不是用户自己事实的闲聊当琐碎;用户说自己的、同一句里说清是什么的值要记,并写明指的是哪天,免得以后被当成现在的值。**审查后(11-14)**:① 第一次提炼每轮重读整段对话,按「今天」换算会把 11-14 说的「今天早上」在 11-16 重读时写成 11-16 —— 改成每行带那条消息自己的发送日期(行首 `[YYYY-MM-DD]`):构造点 `_build_human_message` 在白名单标记里记下发送时刻 `sent_at`(UTC),提炼时按智能体的时区(`resolve_agent_timezone`,与智能体提示词里的「今天」同一口径;这个日期会写进记忆正文,所以不能用 UTC)换成日期;发版前的旧消息没有发送时刻,不加日期,指令要求这种行里的相对说法原样不换算。② 密码、一次性验证码、银行卡号 / 银行账号等秘密一律不记(复审 11-14 收窄成「银行」的:会员号、平台账号一类照记)。没有 `sent_at` 的消息(本改动之前的)用写入时盖的 `expert_work_created_at` 兜底;两样都没有才不加日期。它和 11-14 那条「光有一个值、没说是什么的那句不是更正」不冲突:那条说的是没有主语的光秃秃的值,这条要求同一句里说清是什么。第二次提炼不加:它记的是助手得出的与用户回答助手才定下的,本来就带出处,召回块里每条也带记录日期。
 
 第二次(对话)。整段自成一体,不沿用现有的打分文字:
 
@@ -396,9 +396,9 @@ PR 1(还没有来源列)时说明行是 `(kind · date recorded)`,第二条不�
 
 **用户后来自己说全了**:下一次的第一次提炼里就有这条 → 去重合并通常判「更新」,旧的「来自助手」版本作废(给去重合并的材料带上双方来源,指令加一句 `A candidate stated in user messages that matches an existing memory from the assistant is an UPDATE, not a NOOP.`)。反方向(用户 11-14 补):`A candidate from the assistant that matches an existing memory stated in user messages or corrected by the user is a NOOP, not an ADD.` —— 118.5 第 5 轮里,一条和用户说的那条意思相同的来自助手的候选被判成了「新增」。模型若仍判重复,那条记忆继续带「来自助手」标记 —— 保守方向,不另加机制;终端用户也可以直接点「更正」。
 
-**逐字相同的已有记忆(11-14 重跑 118.5 后补)**:重跑时同一件事最后有 3 条有效记忆 —— 第 4 轮第一次提炼出的用户候选 X 同时对上一条**逐字相同**的用户 X 和一条来自助手的「X+Y」,模型照上面「用户说的对上来自助手的 → 更新」那句取代了后者,取代出来的是第二条相同的用户 X。补两处:① 去重合并前程序先判 —— 候选内容与某条**同一格**(同 kind、同 agent_name —— 比写入去重严:SQL 唯一索引那一格是 (tenant, user, content_hash, agent_name),不含 kind)的有效邻居相同、且那条的来源**不弱于**候选,就直接 NOOP。「相同」按归一后比(11-14 测试环境实测:重复的那条与原来的 X 只差末尾标点 / 全角半角,`content_hash` 不同、唯一索引挡不住;用户 11-14 定「只忽略不改变意思的差别」,§10.2 第 9 条):NFC;只折宽度(全角 / 半角,即兼容分解标 `<wide>` / `<narrow>` 的,含全角空格;不做 NFKC —— 上标、分数、带圈数字、单位符号与普通字符意思不同,UAX #15 也说 NFKC 不能盲用);casefold(不分大小写,含 ß → ss 这类折叠,接受);空白合并成一个、去首尾;再去掉**末尾**的句末标点(。 . ! ;,反复;问号不去 —— 问句和陈述句意思不同,终审 LOW-1)。别的一律不动 —— 句中标点、连字符、括号、符号都算差别,中文旁边有没有空格也算。所以「69.1」≠「691」、「50%」≠「50」、「-3」≠「3」、「Rh-」≠「Rh」、「x²」≠「x2」。宁可判不同交给模型,这条候选不进模型的材料。来源强弱只分两档:用户一方(用户消息里说的 / 用户更正)> 其余(来自助手、来源未记录)。所以用户一方的候选只在对上用户一方的相同内容时 NOOP;来自助手的(以及来源未记录的)候选对上任何来源的相同内容都 NOOP;用户说的候选对上来自助手 / 未记录的相同内容照旧交给模型(判「更新」就把它升成用户说的)。内容不完全相同的一律照旧;带 `is_correction` 的候选也照旧问模型(它可能要删掉旁边一条冲突的记忆)。② 指令在「用户说的对上来自助手的 → UPDATE」之前加一句:`When an existing memory stated in user messages or corrected by the user already says the same thing as the candidate, the candidate is a NOOP, even if an existing memory from the assistant also matches it; this takes precedence over the rule below about memories from the assistant.`(终审 LOW-4 改了后半句:原来的「before the next rule」加了例外句之后指错了地方) —— 管「意思相同但字面不完全一样」的那种,只靠措辞。紧接一句例外(审查 MEDIUM-2,与代码里「带更正的不走确定性 NOOP」一致):`Exception: a candidate with "is_correction": true is not a NOOP for this reason; it DELETEs the existing memory it contradicts, if there is one; otherwise it is a NOOP.`
+**逐字相同的已有记忆(11-14 重跑 118.5 后补)**:重跑时同一件事最后有 3 条有效记忆 —— 第 4 轮第一次提炼出的用户候选 X 同时对上一条**逐字相同**的用户 X 和一条来自助手的「X+Y」,模型照上面「用户说的对上来自助手的 → 更新」那句取代了后者,取代出来的是第二条相同的用户 X。补两处:① 去重合并前程序先判 —— 候选内容与某条**同一格**(同 kind、同 agent_name —— 比写入去重严:SQL 唯一索引那一格是 (tenant, user, content_hash, agent_name),不含 kind)的有效邻居相同、且那条的来源**不弱于**候选,就直接 NOOP。「相同」按归一后比(11-14 测试环境实测:重复的那条与原来的 X 只差末尾标点 / 全角半角,`content_hash` 不同、唯一索引挡不住;用户 11-14 定「只忽略不改变意思的差别」,§10.2 第 9 条):NFC;只折宽度(全角 / 半角,即兼容分解标 `<wide>` / `<narrow>` 的,含全角空格;不做 NFKC —— 上标、分数、带圈数字、单位符号与普通字符意思不同,UAX #15 也说 NFKC 不能盲用);casefold(不分大小写,含 ß → ss 这类折叠,接受);空白合并成一个、去首尾;再去掉**末尾**的句末标点(。 . ! ;,反复;问号不去 —— 问句和陈述句意思不同,终审 LOW-1)。别的一律不动 —— 句中标点、连字符、括号、符号都算差别,中文旁边有没有空格也算。所以「69.1」≠「691」、「50%」≠「50」、「-3」≠「3」、「Rh-」≠「Rh」、「x²」≠「x2」。宁可判不同交给模型,这条候选不进模型的材料。来源强弱只分两档:用户一方(用户消息里说的 / 用户更正)> 其余(来自助手、来源未记录)。所以用户一方的候选只在对上用户一方的相同内容时 NOOP;来自助手的(以及来源未记录的)候选对上任何来源的相同内容都 NOOP;用户说的候选对上来自助手 / 未记录的相同内容照旧交给模型(判「更新」就把它升成用户说的)。内容不完全相同的一律照旧;带 `is_correction` 的候选也照旧问模型(它可能要删掉旁边一条冲突的记忆)。② 指令在「用户说的对上来自助手的 → UPDATE」之前加一句:`When an existing memory stated in user messages or corrected by the user already says the same thing as the candidate, the candidate is a NOOP, even if an existing memory from the assistant also matches it; this takes precedence over the rule below about memories from the assistant.`(终审 LOW-4 改了后半句:原来的「before the next rule」加了例外句之后指错了地方) —— 管「意思相同但字面不完全一样」的那种,只靠措辞。紧接一句例外(审查 MEDIUM-2,与代码里「带更正的不走确定性 NOOP」一致):`In that case, a candidate with "is_correction": true is not a NOOP for this reason; it DELETEs the existing memory it contradicts, if there is one; otherwise it is a NOOP.`
 
-**带更正、又与已有用户记忆内容相同的候选(终审 MEDIUM-1,11-14)**:它照旧进模型(要给模型删掉冲突记忆的机会),但它**自己不再落成新行**。模型的决定按下面改写:删掉别的记忆 → 照常执行(拦截规则照样管);「更新」别的(内容不同的)那条 → 按删除那条执行;其余一律 NOOP、不进直接写入 —— 新增、NOOP、更新 / 删除那条相同的记忆、没给决定。向量不够近、没进模型材料的,同样 NOOP。原来的两条路都会多出一条近似重复的用户记忆:模型「更新」那条相同的 X → 第二条拦截规则拦下、带更正按新增存下;模型「更新」来自助手的 X+Y → 取代出第二条用户 X(与 X。只差末尾句号)。计在 `op="noop"`(或删除那条的 `delete` / 拦截标签)。「更新」被改写成删除时,那条记忆在库里是**过期**(`expired_at` 有值),不是被取代(没有 `superseded_by`、也没有接替它的新行);调试日志 `…_reconcile_identical_correction` 记原决定、目标 id 和改写后的决定(不记正文)。
+**带更正、又与已有记忆内容相同的候选(终审 MEDIUM-1,11-14;复审起「已有记忆」= 同格、来源不弱于候选的任何一条,不只用户一方的)**:它照旧进模型(要给模型删掉冲突记忆的机会),但它**自己不再落成新行**。模型的决定按下面改写:删掉别的记忆 → 照常执行(拦截规则照样管);「更新」别的(内容不同的)那条 → 按删除那条执行;其余一律 NOOP、不进直接写入 —— 新增、NOOP、更新 / 删除那条相同的记忆、没给决定。向量不够近、没进模型材料的,同样 NOOP。原来的两条路都会多出一条近似重复的用户记忆:模型「更新」那条相同的 X → 第二条拦截规则拦下、带更正按新增存下;模型「更新」来自助手的 X+Y → 取代出第二条用户 X(与 X。只差末尾句号)。计在 `op="noop"`(或删除那条的 `delete` / 拦截标签)。「更新」被改写成删除时,那条记忆在库里是**过期**(`expired_at` 有值),不是被取代(没有 `superseded_by`、也没有接替它的新行);调试日志 `…_reconcile_identical_correction` 记原决定、目标 id 和改写后的决定(不记正文)。
 
 **已知、接受的口径代价**:① casefold 会把只差大小写、意思却可能不同的写法判成相同 —— 例如 Cal / cal(大卡 / 卡)、Mg / mg、ß / ss(终审 LOW-2;接受,写进来);② 判成相同而直接 NOOP 的候选不会抬高已有那条的置信度,也不会刷新它的 `expected_valid_days`(终审 LOW-3):用户把一件事再说一遍,已有那条保持原来的分数与有效天数。与第二条拦截规则的关系:已有那条若是把握度较低的用户记忆(例如 0.5),用户后来更有把握地重说同样内容(0.9),这条候选会被 NOOP 掉,那条仍是 0.5 —— 之后一条 0.6 的用户候选仍能改它。记忆总计划里「每轮只读新消息」之后再看是否要「相同则刷新分数」。
 

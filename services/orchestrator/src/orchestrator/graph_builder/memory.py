@@ -41,6 +41,7 @@ from langchain_core.runnables import RunnableConfig
 
 from expert_work.common.conversation_channel import is_hidden, is_superseded, opens_segment
 from expert_work.common.memory_language import detect_user_language, extraction_language_section
+from expert_work.common.message_stamp import STAMP_CREATED_AT
 from expert_work.common.observability import (
     ExpertWorkComponent,
     current_trace_id_hex,
@@ -190,11 +191,11 @@ user's own facts are not memories.
 Only extract what these messages state on their own.
 - A value the user states about themselves or their own things, with the same message saying
   what it is — a reading or measurement, an id or number, a current status — is recorded even
-  though it may change, except passwords, one-time codes, card or account numbers and other
-  secrets, which are never recorded. Write it with the date or time it refers to, so it is not
-  later taken for a current value: a line that starts with a date in brackets was sent on that
-  date, so turn "this morning", "yesterday" and the like in that line into a date counted from
-  it; in a line without a date, leave such words as they are.
+  though it may change, except passwords, one-time codes, bank card or bank account numbers
+  and other secrets, which are never recorded. Write it with the date or time it refers to, so
+  it is not later taken for a current value: a line that starts with a date in brackets was
+  sent on that date, so turn "this morning", "yesterday" and the like in that line into a date
+  counted from it; in a line without a date, leave such words as they are.
 - A message that only agrees with, answers or refers to something that is not shown here
   (a bare "yes", "ok, do that", or a value or name with nothing saying what it is) states
   nothing by itself: skip it, and do not guess what it was about.
@@ -274,16 +275,20 @@ Respond with ONLY a JSON object, no prose and no code fences:
 If there is nothing worth remembering, return {"memories": []}."""  # noqa: E501
 
 
-def _sent_date_tag(typed: UserInput) -> str:
+def _sent_date_tag(typed: UserInput, message: BaseMessage) -> str:
     """第一次提炼一行的日期标签 ``[YYYY-MM-DD]``:那条消息的发送日期,按智能体的时区
-    (``resolve_agent_timezone``,与智能体提示词里的「今天」同一口径)。没有发送时刻(发版前的
-    旧消息、评测脚本显式声明的消息)或读不懂 → 不加,指令要求这种行里的相对日期原样不换算。
+    (``resolve_agent_timezone``,与智能体提示词里的「今天」同一口径)。先看白名单标记里的
+    ``sent_at``;没有就用消息写入时盖的 ``expert_work_created_at``(复审 11-14:``sent_at`` 之前的
+    消息大多有它);两样都没有(评测脚本显式声明的消息等)或读不懂 → 不加,指令要求这种行里的
+    相对日期原样不换算。
 
     审查 MEDIUM-1 / MEDIUM-2(11-14):每轮整段重读,不能按重读那天换算「今天早上」。"""
-    if typed.sent_at is None:
+    stamped = message.additional_kwargs.get(STAMP_CREATED_AT)
+    raw = typed.sent_at or (stamped if isinstance(stamped, str) else None)
+    if raw is None:
         return ""
     try:
-        sent = datetime.fromisoformat(typed.sent_at)
+        sent = datetime.fromisoformat(raw)
     except ValueError:
         return ""
     if sent.tzinfo is None:
@@ -415,7 +420,7 @@ def _extraction_inputs(
                 # 外部内容(围栏里的)不跟着进 ``[task]``(review L1)。
                 conversation.add(text_before_external_content(_reply_text(opener)), "[task]")
             else:
-                user.add(typed.text, tag=_sent_date_tag(typed))
+                user.add(typed.text, tag=_sent_date_tag(typed, opener))
                 conversation.add(typed.text, "[user]")
                 if typed.images or typed.files or typed.external_blocks:
                     conversation.add(_attached_line(typed), "[attached data]")
@@ -1168,7 +1173,7 @@ _RECONCILE_SYSTEM = (
     "says the same thing as the candidate, the candidate is a NOOP, even if an existing "
     "memory from the assistant also matches it; this takes precedence over the rule below "
     "about memories from the assistant.\n"
-    'Exception: a candidate with "is_correction": true is not a NOOP for this reason; '
+    'In that case, a candidate with "is_correction": true is not a NOOP for this reason; '
     "it DELETEs the existing memory it contradicts, if there is one; otherwise it is a NOOP.\n"
     # B-300 §6.2 —— 双方都带 "source";用户后来自己说全了,旧的来自助手的版本应被取代。
     "A candidate stated in user messages that matches an existing memory from the "
@@ -1290,7 +1295,8 @@ def parse_reconcile_ops(text: str) -> dict[int, tuple[str, str | None]]:
     Tolerant — malformed entries are simply absent, and the caller
     treats an absent decision as a degraded direct ADD (CM-H4: never
     lose a memory over a parse failure). B-300 exception (11-14): a
-    correction that restates an existing user-side memory is never written
+    correction that restates an existing memory (same slot, provenance at
+    least as strong) is never written
     on a missing / failed decision — it is a NOOP (the memory is already
     there); see ``_redundant_correction_op``.
     """
@@ -1388,7 +1394,8 @@ def _identical_neighbor_ids(item: MemoryItem, neighbors: Sequence[MemoryItem]) -
 
 
 def _redundant_correction_op(op: str, target: UUID | None, identical: frozenset[UUID]) -> str:
-    """终审 MEDIUM-1 —— 带更正、又与已有用户记忆内容相同的候选,它自己不再落成新行:删掉别的
+    """终审 MEDIUM-1 —— 带更正、又与已有记忆内容相同(同格、来源不弱于它;审查 MEDIUM-3 起不只
+    用户一方的)的候选,它自己不再落成新行:删掉别的
     冲突记忆照常(判「更新」别的那条按删除处理,拦截规则照样管);其余一律 NOOP —— 新增、NOOP、
     更新 / 删除那条相同的记忆、没给决定(否则「更新」那条相同的会被第二条规则拦下按新增存下,
     「更新」来自助手的会取代出第二条用户记忆)。"""
@@ -1429,7 +1436,8 @@ async def _reconcile_and_apply(
     payload as ``"is_correction"`` per candidate so the ops LLM can bias
     UPDATE/DELETE over ADD on an explicit user correction.
 
-    B-300 11-14 —— 「每条失败路径都退回直接写入」有一个例外:带更正、又与已有用户一方记忆内容相同
+    B-300 11-14 —— 「每条失败路径都退回直接写入」有一个例外:带更正、又与已有记忆(同格、来源不弱于
+    它)内容相同
     (归一后)的候选永远不写 —— 模型没给决定、调用失败、判新增 / NOOP、改那条相同的记忆,都按 NOOP;
     只有删掉(或「更新」成删掉)别的冲突记忆会执行(``_redundant_correction_op``)。
     """

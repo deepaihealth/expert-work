@@ -84,8 +84,10 @@ def test_other_latin_languages_are_latin_script_not_english(text: str) -> None:
         "Jeg har brug for at du hjælper mig med at finde for meget tid",
         "Husk at jeg trenger hjelp for at bestillingen skal komme fram",
         "Mój numer to 12345, a to jest mój pies Burek i to wszystko",
+        "Ik had het al gezegd, het is zo, mijn been doet pijn vandaag",
+        "Het is koud en ik had geen jas",
     ],
-    ids=["da", "no", "pl"],
+    ids=["da", "no", "pl", "nl-had-been", "nl-is-had"],
 )
 def test_homographs_do_not_make_other_languages_english(text: str) -> None:
     """审查 LOW-1(11-14):for / at / to / my / we / of / or / but 一类在丹麦、挪威、波兰等语里
@@ -111,6 +113,23 @@ def test_contractions_with_curly_apostrophes_count() -> None:
     """只靠缩写判得出的英文:弯撇号(U+2019)要按直撇号算,
     否则 I\u2019m / don\u2019t 被切开、认不出。"""
     assert detect_user_language(["I\u2019m done, don\u2019t wait for me tonight"]) == "English"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I moved to Berlin last month for a new job",
+        "Please book a table for two at 7pm tomorrow",
+        "This client's annual budget is 1.2 million.",
+        "The contract is set to be signed on December 15.",
+        "Yesterday I went to Berlin",
+    ],
+    ids=["moved", "book-a-table", "this-only", "the-only", "capital-i"],
+)
+def test_short_english_sentences_are_named(text: str) -> None:
+    """复审(11-14):收紧之后评测 A 组英文写回的召回掉了 —— 短句里常常只有一个强标记(the、this、
+    please、单独大写的 I)或只有 today / tomorrow / new 这类英语实词。"""
+    assert detect_user_language([text]) == "English"
 
 
 def test_code_heavy_english_is_judged_by_its_prose() -> None:
