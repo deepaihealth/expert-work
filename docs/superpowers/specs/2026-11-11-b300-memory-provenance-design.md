@@ -252,11 +252,13 @@ answered ...". Never write it as a plain statement of fact with no source.
 What a [user] line says that can be understood on its own is recorded by another pass: do
 not record it again here — not in other words, not with a source added, and not when an
 [assistant] line repeats, confirms or uses it. A conclusion the assistant reached from what
-the user said is still recorded here; only the user's statement itself is not. What a [user]
-line says that cannot be understood without the assistant's previous message — a short
-answer, an agreement, or a short correction such as "it's Y now" or "no, it's the other
-one" — is recorded here, with its source, and with "is_correction" when it changes
-something; one line can hold both kinds, so judge each statement in it.
+the user said is still recorded here; only the user's statement itself is not. A tool result
+or record lookup that only confirms a value the user already stated is not recorded again;
+one that differs from what the user said is recorded, with its source. What a [user] line
+says that cannot be understood without the assistant's previous message — a short answer,
+an agreement, or a short correction such as "it's Y now" or "no, it's the other one" — is
+recorded here, with its source, and with "is_correction" when it changes something; one
+line can hold both kinds, so judge each statement in it.
 Something the assistant concluded that the user then rejected is not recorded as a
 conclusion on its own. Record only the two sorts above; they include what the assistant
 reports that tool results or attachments told it.
@@ -273,7 +275,7 @@ Respond with ONLY a JSON object, no prose and no code fences:
 If there is nothing worth remembering, return {"memories": []}.
 ```
 
-**用户 11-14 改**(测试验收 118.5 重跑,§10.2 第 10 条;复审后合成一段):上面「What a [user] line says that can be understood on its own …」到「… attachments told it.」一段,替换了原来那句「Do not extract something a [user] line states completely on its own; that is recorded separately.」。实测第二次提炼仍从 `[user]` 行把用户自己说全的话换个说法、加上出处又记一遍(每轮都有,对照组也有)。分界用 §6.2 的同一把尺子:单独读得懂的用户的话归第一次;离开助手上一条读不懂的(短回答、同意、「现在是 Y 了」「不对,是另一个」这种短更正)仍由这一次记、带出处,改了什么就带 `is_correction`(118.5 的 Y 就是这种)。助手从用户的话里得出的结论照记,只是用户的话本身不记;按句判、不按行判:同一行里可以两样都有(例如「选 B,因为预算在 5000 以内」—— 预算那句单独读得懂,归第一次;「选了 B」离开助手的问题读不懂,归这一次)。第二类也含「用户纠正助手才定下的」;`[user]` 标签说明改成只说「单独读得懂的」另记,免得与这一段矛盾(复审 11-14)。助手得出、用户随后否定的,不单独当结论记。「只记」的范围就是上面两类,包括「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它),没有另列一份更窄的;第二次提炼看不到工具结果,所以写的是「助手说工具 / 附件告诉它的」。只靠措辞,效果在付费评测小跑里量。
+**用户 11-14 改**(测试验收 118.5 重跑,§10.2 第 10 条;复审后合成一段):上面「What a [user] line says that can be understood on its own …」到「… attachments told it.」一段,替换了原来那句「Do not extract something a [user] line states completely on its own; that is recorded separately.」。实测第二次提炼仍从 `[user]` 行把用户自己说全的话换个说法、加上出处又记一遍(每轮都有,对照组也有)。分界用 §6.2 的同一把尺子:单独读得懂的用户的话归第一次;离开助手上一条读不懂的(短回答、同意、「现在是 Y 了」「不对,是另一个」这种短更正)仍由这一次记、带出处,改了什么就带 `is_correction`(118.5 的 Y 就是这种)。助手从用户的话里得出的结论照记,只是用户的话本身不记;按句判、不按行判:同一行里可以两样都有(例如「选 B,因为预算在 5000 以内」—— 预算那句单独读得懂,归第一次;「选了 B」离开助手的问题读不懂,归这一次)。第二类也含「用户纠正助手才定下的」;`[user]` 标签说明改成只说「单独读得懂的」另记,免得与这一段矛盾(复审 11-14)。**用户 11-14 加**(评测 A12,§10.2 第 13 条):「A tool result or record lookup that only confirms a value the user already stated is not recorded again; one that differs from what the user said is recorded, with its source.」—— 查记录 / 工具只是印证了用户在这段对话里说过的值时,不再记一条「助手查到并确认了 X」;查到的与用户说的不同,照旧记下、带出处。助手得出、用户随后否定的,不单独当结论记。「只记」的范围就是上面两类,包括「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它),没有另列一份更窄的;第二次提炼看不到工具结果,所以写的是「助手说工具 / 附件告诉它的」。只靠措辞,效果在付费评测小跑里量。
 
 ### 4.3 会丢什么、边界、副作用
 
@@ -690,6 +692,7 @@ T17、T20 随第 2 条线的 PR 跑(11-13 从 PR 1 挪出)。**T20 必须在云�
 | 10(用户 11-14,`3a4cfd3b3` 重跑 118.5 后) | 修后重跑:X 6 轮一直有效、用户一方的 X 只有 1 条、只差标点的重复 0 条、「写了几条」6/6 对,但同一件事 3 条有效记忆(X 用户说的、X 来自助手 —— 第二次提炼从 `[user]` 行复述、X+Y 来自助手),原判据「≤ 2 条」不过 | **两样都做**:① 改 118.5 判据 —— 用户原来的 X 一直有效、内容为 X 的有效用户一方行恰好 1 条、Y 带出处存下、来自助手的 X 复述允许但要数出条数;按新判据这次重跑算过;② 第二次提炼指令加一段(§4.2,复审后合成一条规则):单独读得懂的用户的话这里不再记(换说法、加出处、助手复述都不算),助手从中得出的结论照记;离开助手上一条读不懂的(短回答、同意、短更正)照记、带出处、改了就带 `is_correction`;助手得出、用户否定的不单独当结论记;「只记」的就是上面两类;它对复述条数的效果在付费评测小跑里量 | 只改判据不改指令;或程序里拦「来自助手的候选与用户说的同义」(没法不靠模型判同义) |
 | 11(用户 11-14,付费评测 A 组后) | 用户说自己的一次性读数、编号、当前状态被第一次提炼当琐事跳过(P1,30 次里 7 次) | **用户原话:「记,带上日期」**。第一次提炼的指令改为:用户说自己的、同一句里说清是什么的值要记,写明指的是哪天(程序给当天日期);只把不是用户自己事实的闲聊当琐碎(§4.2)。审查后:日期按每条消息自己的发送日期、智能体时区换算(不按重读那天),密码 / 验证码 / 卡号等秘密不记 | 照旧不记(只记稳定的事实) |
 | 12(用户 11-14,付费评测 A 组后) | 英文场景的记忆有被写成中文、葡语 / 西语一类的(第二次提炼约 24 + 10 / 157);被拦的更正型「删除」把新值丢了(P9,30 次里 7 次) | ① 语言:能认准英语就点名 English,认不出的拉丁字母语言用新的第三档「照用户自己的话的那种语言写」(§3);② 被拦的删除若候选带更正,按新增存下,与被拦的更新同样处理,计 `blocked_delete_added` / `lower_confidence_delete_added`(§6.2);与已有用户记忆内容相同的更正仍不落新行 | ① 只说「拉丁字母的语言」(评测里仍会写成别的拉丁字母语言);② 被拦的删除一律不动(新值丢失) |
+| 13(用户 11-14,评测 A12 查因后) | A12 同一件事多出的行:一是英语用户的同一件事被写成德语 / 中文(第 12 条的英语点名覆盖);二是第二次提炼记下「助手查记录确认了 X」—— X 是用户在这段对话里已经说过的 | 第二次提炼的指令加一句:查记录 / 工具只是印证用户说过的值时不再记;查到的与用户说的不同时照旧记、带出处(§4.2) | 照旧都记(同一件事多一条来自助手的复述) |
 
 ## 11. 未验证清单
 

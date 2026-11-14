@@ -254,11 +254,13 @@ answered ...". Never write it as a plain statement of fact with no source.
 What a [user] line says that can be understood on its own is recorded by another pass: do
 not record it again here — not in other words, not with a source added, and not when an
 [assistant] line repeats, confirms or uses it. A conclusion the assistant reached from what
-the user said is still recorded here; only the user's statement itself is not. What a [user]
-line says that cannot be understood without the assistant's previous message — a short
-answer, an agreement, or a short correction such as "it's Y now" or "no, it's the other
-one" — is recorded here, with its source, and with "is_correction" when it changes
-something; one line can hold both kinds, so judge each statement in it.
+the user said is still recorded here; only the user's statement itself is not. A tool result
+or record lookup that only confirms a value the user already stated is not recorded again;
+one that differs from what the user said is recorded, with its source. What a [user] line
+says that cannot be understood without the assistant's previous message — a short answer,
+an agreement, or a short correction such as "it's Y now" or "no, it's the other one" — is
+recorded here, with its source, and with "is_correction" when it changes something; one
+line can hold both kinds, so judge each statement in it.
 Something the assistant concluded that the user then rejected is not recorded as a
 conclusion on its own. Record only the two sorts above; they include what the assistant
 reports that tool results or attachments told it.
