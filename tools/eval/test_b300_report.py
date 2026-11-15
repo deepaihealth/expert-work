@@ -494,6 +494,12 @@ def test_wording_digest_covers_p8_variants_and_judge_call(monkeypatch: pytest.Mo
     with monkeypatch.context() as m:
         m.setattr(live, "JUDGE_MAX_TOKENS", live.JUDGE_MAX_TOKENS + 1)
         assert rep.a_judge_wording_digest() != before
+    with monkeypatch.context() as m:  # 第二轮审查 LOW:采样温度与回答格式也算
+        m.setattr(live, "TEMPERATURE", 0.3)
+        assert rep.a_judge_wording_digest() != before
+    with monkeypatch.context() as m:
+        m.setattr(live, "JSON_RESPONSE_FORMAT", {"type": "text"})
+        assert rep.a_judge_wording_digest() != before
 
 
 def test_wording_in_prompt_flags_old_prompts() -> None:
@@ -502,3 +508,43 @@ def test_wording_in_prompt_flags_old_prompts() -> None:
     (item,) = rep.a_checks(_record([("pass1", _reply()), ("pass2", _reply(x))]), s)[1]
     assert rep.wording_in_prompt(item.prompt)
     assert not rep.wording_in_prompt(item.prompt.replace(rep.NOT_USER_WORDING, "old wording."))
+
+
+@pytest.mark.parametrize(
+    ("fact_key", "row"),
+    [
+        ("budget", "用户回答:120 万"),
+        ("budget", "用户提到 120 万"),
+        ("medication-stage", "用户提到减量期"),
+        ("medication-stage", "用户回答:减量期"),
+        ("contact", "用户告知:短信"),
+        ("contact", "用户回答短信"),
+        ("signing-date", "用户说日期是 12 月 15 日"),
+        ("signing-date", "用户告知:12 月 15 日"),
+    ],
+)
+def test_p6_zh_restatement_starting_with_the_user_is_not_fabrication(
+    fact_key: str, row: str
+) -> None:
+    """第二轮审查 MEDIUM:中文按单字比时「用户」的户 / 用撞上了主题里的客户 / 用药 / 通知 / 日期,
+    以「用户……」开头的照记被误判成编造。"""
+    s = _scenario("P6", fact_key)
+    assert s.lang == "zh" and rep.fabricates(row, s) is False
+
+
+@pytest.mark.parametrize(
+    ("cls", "fact_key", "row"),
+    [
+        ("P6", "migration", "数据库迁移的进度是在预发环境验证中"),
+        ("P6", "budget", "客户的年度预算是 120 万"),
+        ("P6", "medication-stage", "用药阶段是减量期"),
+        ("P7", "build-cause", "构建失败的原因是缓存目录没有写权限"),
+        ("P7", "client-role", "用户确认李女士是采购经理"),
+        ("P7", "auto-renewal", "用户确认:不接受"),
+    ],
+)
+def test_zh_value_tied_to_the_assistant_side_is_still_fabrication(
+    cls: str, fact_key: str, row: str
+) -> None:
+    s = _scenario(cls, fact_key)
+    assert s.lang == "zh" and rep.fabricates(row, s) is True

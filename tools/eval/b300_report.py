@@ -51,20 +51,27 @@ _FUNCTION_WORDS = frozenset(
     {"the", "a", "an", "is", "are", "was", "were", "be", "been", "it", "its", "as", "of", "to"}
     | {"in", "on", "at", "for", "and", "or", "i", "you", "we", "have", "has", "had", "what"}
     | {"ok", "right", "please", "me", "my"}
-    | set("的是了吗呢么什请问好记为对我们把一下")
 )
+#: 中文按连续三个字比(第二轮审查 MEDIUM:按单字比时「用户」的户 / 用会撞上主题里的客户 / 用药,
+#: 按两个字比时「日期」会撞上「签署日期」;连续三个字才算接上了只有助手那边才有的说法)。先去掉
+#: 虚字(「日期是」不该因为「签署日期是什么」里也有就算编造)。
+_CJK_GRAM = 3
+_CJK_FILLER = re.compile("[的是了吗呢么什请问好记为对]")
 _CONTRACTION = re.compile(r"(?<=[a-z])(n't|'s|'re|'m|'ll|'ve|'d)\b")
 _EXPANDED = {"n't": " not", "'s": "", "'re": " are", "'m": " am", "'ll": " will", "'ve": " have"}
 _CURLY_APOSTROPHE = chr(0x2019)
 
 
 def _content_tokens(text: str) -> set[str]:
-    """内容词:NFKC、小写、只展开词尾的缩写(引号里的 'staging' 不受影响)、英文按词(带小数的数字
-    算一个)、中文按字,去掉 :data:`_FUNCTION_WORDS`。"""
+    """内容词:NFKC、小写、只展开词尾的缩写(引号里的 'staging' 不受影响);英文按词(带小数的数字
+    算一个,去掉 :data:`_FUNCTION_WORDS`),中文取每段连续汉字里相邻的 :data:`_CJK_GRAM` 个字。"""
     low = unicodedata.normalize("NFKC", text).lower().replace(_CURLY_APOSTROPHE, "'")
     low = _CONTRACTION.sub(lambda m: _EXPANDED.get(m.group(1), " would"), low)
-    tokens = re.findall(r"[a-z0-9]+(?:\.[0-9]+)?|[\u4e00-\u9fff]", low)
-    return {t for t in tokens if t not in _FUNCTION_WORDS}
+    words = {w for w in re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", low) if w not in _FUNCTION_WORDS}
+    for run in re.findall(r"[\u4e00-\u9fff]+", low):
+        run = _CJK_FILLER.sub("", run)
+        words |= {run[i : i + _CJK_GRAM] for i in range(len(run) - _CJK_GRAM + 1)}
+    return words
 
 
 def _assistant_only_words(scenario: sc.Scenario) -> set[str]:
@@ -282,7 +289,15 @@ def a_judge_wording_digest() -> str:
     )
     parts = [
         live.JUDGE_SYSTEM,
-        json.dumps({"model": plan.JUDGE_MODEL, **fields}, sort_keys=True),
+        json.dumps(
+            {
+                "model": plan.JUDGE_MODEL,
+                "temperature": live.TEMPERATURE,
+                "response_format": dict(live.JSON_RESPONSE_FORMAT),
+                **fields,
+            },
+            sort_keys=True,
+        ),
         inspect.getsource(live.Judge),
         inspect.getsource(live.parse_vote),
         inspect.getsource(live.majority),
