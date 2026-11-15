@@ -148,6 +148,13 @@ def _quote_args(p: argparse.ArgumentParser, *, stop_required: bool) -> None:
     p.add_argument("--no-compare", action="store_true", help="leave out the §8.5 count")
     p.add_argument("--pilot", action="store_true", help="the small pilot plan (its own quote)")
     p.add_argument("--a-judge-votes", type=int, choices=(1, 3), default=plan.A_JUDGE_VOTES)
+    p.add_argument(
+        "--gate-judge-votes",
+        type=int,
+        choices=(1, 3),
+        default=plan.A_JUDGE_VOTES,
+        help="judge votes in the regression gate (G); the quote prices 1 and 3 votes either way",
+    )
     p.add_argument("--embed-price", type=_price, default=None, help="yuan / M tokens, if known")
     p.add_argument(
         "--state-dir",
@@ -327,10 +334,15 @@ def _run(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     emit(f"spent on this quote ¥{guard.spent:.2f}; blocked={guard.blocked}")
 
 
-def a_votes_ready(out: Path, q: Mapping[str, Any]) -> int:
+def a_votes_ready(out: Path, q: Mapping[str, Any], phase_name: str = "") -> int:
     """A 组判官(审查 M3):按报价的票数校准过(≥ 18 / 20)才判;一票没过就要按 3 票重新报价、
-    重新校准。"""
-    votes = int(q["judge"]["a_group_votes"])
+    重新校准。回归闸门(``gate``)用报价里 G 段的票数(审查 M5)。"""
+    judge = q["judge"]
+    votes = int(
+        judge.get("gate_votes", judge["a_group_votes"])
+        if phase_name == "gate"
+        else judge["a_group_votes"]
+    )
     path = calibration_path(out, "a")
     if path.exists():
         made_with = json.loads(path.read_text(encoding="utf-8")).get("wording_digest")
@@ -349,11 +361,11 @@ def a_votes_ready(out: Path, q: Mapping[str, Any]) -> int:
     raise EvalError(f"the A-group judge is not calibrated at {votes} vote(s); `calibrate --set a`")
 
 
-def judge_votes(out: Path, q: Mapping[str, Any], phase_kind: str) -> int:
+def judge_votes(out: Path, q: Mapping[str, Any], phase_kind: str, phase_name: str = "") -> int:
     if q["pilot"]:  # 试点的判分不作数,只为量 token
         return int(q["judge"]["a_group_votes"]) if phase_kind == "extraction" else plan.JUDGE_VOTES
     if phase_kind == "extraction":
-        return a_votes_ready(out, q)
+        return a_votes_ready(out, q, phase_name)
     if not calibration_ok(out, "b", votes=plan.JUDGE_VOTES):
         raise EvalError("the judge is not calibrated (≥ 18 / 20 on the labels, §8.3); `calibrate`")
     return plan.JUDGE_VOTES
@@ -364,7 +376,7 @@ def _judge(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     with spending(args):
         q, guard = approved(args, cmd=f"judge {phase.name}", phase=phase.name)
         load_units(args.out, phase.name, q["quote_id"])
-        votes = judge_votes(args.out, q, phase.kind)
+        votes = judge_votes(args.out, q, phase.kind, phase.name)
         items, _facts = judge_items(args.out, phase)
         # 审查 M3:A 组每条判分记判官措辞;措辞对不上的旧判分重判,报告不认
         stamp = (
@@ -382,6 +394,13 @@ def _judge(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
             )
         )
     emit(f"{len(items)} items; spent on this quote ¥{guard.spent:.2f}; blocked={guard.blocked}")
+
+
+#: 每套 A 组校准要覆盖的判官题(审查 M5):闸门只判有据程度与事件日期;正式一轮另有 P2~P5 / P8。
+CALIBRATION_CHECKS = {
+    "calibration-g": frozenset({"grounded", "event_date"}),
+    "calibration-a": frozenset({"plain", "statement", "grounded", "event_date"}),
+}
 
 
 def calibration_phase(which: str, phases_arg: str | None) -> str:
@@ -402,6 +421,14 @@ def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
             raise EvalError(
                 f"labels rows {stale} were not built with the current A-group judge wording; "
                 "rebuild their prompts with the current code"
+            )
+        phase_name = calibration_phase(args.which, args.phases)
+        needed = CALIBRATION_CHECKS[phase_name]
+        have = {rep.label_check(r["prompt"]) for r in labels}
+        if needed - have:
+            raise EvalError(
+                f"the labels have no item for {sorted(needed - have)}: {phase_name} judges "
+                f"{sorted(needed)} and each needs labelled items (a new labelling batch)"
             )
     items = [rep.JudgeItem(f"cal|{i}", "calibration", r["prompt"]) for i, r in enumerate(labels)]
     args.out.mkdir(parents=True, exist_ok=True)

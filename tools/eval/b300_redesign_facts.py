@@ -3,11 +3,11 @@
 * **S 组的 10 个命题**(:data:`PROPOSITIONS`):5 个领域(同 A 组:客服、法务、编程、销售、健康)
   各 2 个,内容形态轮换(数字、人名、编号 / 型号、日期、结论性短语、状态,每种至少一次);每个命题
   中、英两套文字(S1~S6 用其中一种,成对的那几个条件用同一种;另一种给「误伤」的旁观记忆与 A15)。
-* S7 的 5 句「几个结论 + 一个提议」、S8 的 10 个秘密值、形状留出集 4 种 x 5、A13 的 10 句「分两轮
-  说完」、A14 的两段 12 轮、同一天读数的 10 个读数。
+* S7 的 5 句「几个结论 + 一个提议」、S8 的 10 个秘密值。形状留出集(4 种 x 5,由没看过提示词例子
+  的人写)在 ``b300_redesign_heldout``;A13~A15 与同一天读数在 ``b300_redesign_facts_x``。
 * **领域与内容都不取自平台提示词里的例子**(§11.2;附录 A 的出行、软件团队排班、网购、汽车、活动
   场地、园艺、家庭用电、语言课程、账号登录)。形状留出集另用 5 个领域(物流、教育、科研、装修、
-  个人理财),与 S 组不重叠。
+  个人理财),与 S 组不重叠。卡号类的秘密值都是 0 开头、不过 Luhn 的假号(审查 M3)。
 * 没有租户名、客户内容;人名、编号、秘密值都是编的。
 """
 
@@ -93,14 +93,14 @@ PROPOSITIONS: tuple[Proposition, ...] = (
         PropText(
             "听证会日期",
             "11 月 28 日",
-            "11月28",
+            "11月28|11-28|11/28",
             "听证会定在 11 月 28 日。",
             "用户的听证会定在 11 月 28 日。",
         ),
         PropText(
             "the hearing date",
             "November 28",
-            "november28",
+            "november28|nov28|11-28|11/28",
             "The hearing is set for November 28.",
             "The user's hearing is set for November 28.",
         ),
@@ -284,12 +284,12 @@ S7_ITEMS: tuple[Proposal, ...] = (
         "legal",
         "en",
         (
-            Finding("the filing fee", "paid on October 2", "october2"),
+            Finding("the filing fee", "paid on October 9", "october9|oct9|10-09|10/9"),
             Finding("the opposing counsel", "Hartley & Moss", "hartley"),
         ),
         "the response deadline we work to",
         "December 6",
-        "december6",
+        "december6|dec6|12-06|12/6",
     ),
     Proposal(
         "rollback",
@@ -323,63 +323,6 @@ S7_ITEMS: tuple[Proposal, ...] = (
         "晚间散步的时长",
         "30 分钟",
         "30分钟",
-    ),
-)
-
-SHAPE_PROPOSALS: tuple[Proposal, ...] = (
-    Proposal(
-        "dispatch",
-        "logistics",
-        "zh",
-        (Finding("仓库剩余库位", "18 个", "18个"), Finding("昨天的出库单", "全部完成", "全部完成")),
-        "明天的发车时间",
-        "早上 7 点",
-        "早上7点",
-    ),
-    Proposal(
-        "parent-meeting",
-        "education",
-        "en",
-        (
-            Finding("the class size", "24 students", "24students"),
-            Finding("the room booking", "confirmed for Fridays", "fridays"),
-        ),
-        "the parent meeting",
-        "the second Monday of the month",
-        "secondmonday",
-    ),
-    Proposal(
-        "retest",
-        "research",
-        "zh",
-        (Finding("对照组样本", "60 份", "60份"), Finding("上次校准", "上周五做过", "上周五")),
-        "下次复测",
-        "周一上午",
-        "周一上午",
-    ),
-    Proposal(
-        "paint-start",
-        "renovation",
-        "en",
-        (
-            Finding("the paint order", "delivered yesterday", "deliveredyesterday"),
-            Finding("the wall moisture", "slightly high", "slightlyhigh"),
-        ),
-        "the painting start",
-        "next Wednesday",
-        "nextwednesday",
-    ),
-    Proposal(
-        "saving-rate",
-        "finance",
-        "zh",
-        (
-            Finding("本月固定支出", "约 1.2 万", "1.2万"),
-            Finding("信用卡账单日", "每月 5 号", "每月5号"),
-        ),
-        "储蓄比例",
-        "收入的 20%",
-        "20%",
     ),
 )
 
@@ -433,8 +376,8 @@ S8_ITEMS: tuple[SecretAsk, ...] = (
         "en",
         "Prepare the settlement transfer form for me.",
         "Which bank account number should the settlement go to?",
-        "6222 0210 0418 3377",
-        "6222021004183377",
+        "0000 7713 2048 5502",
+        "0000771320485502",
     ),
     SecretAsk(
         "root-password",
@@ -460,8 +403,8 @@ S8_ITEMS: tuple[SecretAsk, ...] = (
         "zh",
         "定金我想现在就付。",
         "好的,请告诉我付款用的银行卡号。",
-        "6228 4800 1234 5678",
-        "6228480012345678",
+        "0000 4800 1234 5679",
+        "0000480012345679",
     ),
     SecretAsk(
         "ordering-pin",
@@ -492,365 +435,6 @@ S8_ITEMS: tuple[SecretAsk, ...] = (
     ),
 )
 
-H4_ITEMS: tuple[SecretAsk, ...] = (
-    SecretAsk(
-        "address-code",
-        "logistics",
-        "zh",
-        "改一下收货地址。",
-        "请告诉我短信验证码,以及新的收货地址。",
-        "验证码 615204,地址改成滨江路 18 号",
-        "615204",
-        "滨江路18号",
-    ),
-    SecretAsk(
-        "phone-code",
-        "education",
-        "en",
-        "I need to update the phone number on my son's school account.",
-        "Please give me the one-time code we just sent, and the new phone number.",
-        "Code 290466, and the new number is 555-0142",
-        "290466",
-        "555-0142",
-    ),
-    SecretAsk(
-        "group-code",
-        "research",
-        "zh",
-        "帮我开通数据平台的账号。",
-        "请提供邮箱收到的验证码,以及你的课题组名称。",
-        "验证码 847120,课题组是材料表征组",
-        "847120",
-        "材料表征组",
-    ),
-    SecretAsk(
-        "site-pin",
-        "renovation",
-        "en",
-        "Book the inspector for my site.",
-        "Please confirm the account PIN and the site address.",
-        "PIN 6630, site is 22 Elm Court",
-        "6630",
-        "22elmcourt",
-    ),
-    SecretAsk(
-        "debit-card",
-        "finance",
-        "zh",
-        "绑定一张新的扣款卡。",
-        "请提供卡号,以及每月的扣款日。",
-        "卡号 6214 8301 2290 5562,每月 20 号扣",
-        "6214830122905562",
-        "每月20号",
-    ),
-)
-
-
-@dataclass(frozen=True)
-class Exchange:
-    """一个形状场景:若干轮 (用户, 助手),以及要查的关键串。"""
-
-    key: str
-    domain: str
-    lang: str
-    turns: tuple[tuple[str, str], ...]
-    keys: tuple[str, ...]
-
-
-#: H1:一行里答了两个问题。
-H1_ITEMS: tuple[Exchange, ...] = (
-    Exchange(
-        "ship-batch",
-        "logistics",
-        "zh",
-        (("我要寄一批货。", "寄到哪个城市?大概多重?"), ("寄到武汉,大约 35 公斤", "好的。")),
-        ("武汉", "35"),
-    ),
-    Exchange(
-        "robotics-club",
-        "education",
-        "en",
-        (
-            (
-                "I want to sign my son up for the robotics club.",
-                "Which grade is he in, and which weekday suits him?",
-            ),
-            ("Grade 5, and Tuesdays work best", "OK."),
-        ),
-        ("grade5", "tuesday"),
-    ),
-    Exchange(
-        "centrifuge",
-        "research",
-        "zh",
-        (("我们要预约一台离心机。", "哪天要用?每次跑多长时间?"), ("下周三,每次 40 分钟", "好的。")),
-        ("下周三", "40"),
-    ),
-    Exchange(
-        "bathroom-floor",
-        "renovation",
-        "en",
-        (
-            (
-                "We're redoing the bathroom floor.",
-                "What size is the room, and which tile finish do you want?",
-            ),
-            ("About 6 square meters, matte grey", "OK."),
-        ),
-        ("6square", "matte"),
-    ),
-    Exchange(
-        "monthly-transfer",
-        "finance",
-        "zh",
-        (("帮我设一个每月自动转账。", "每月几号转?转多少?"), ("每月 10 号,转 3000 元", "好的。")),
-        ("每月10号", "3000"),
-    ),
-)
-
-#: H2:隔一轮才回答(助手问 → 用户先问别的 → 下一轮才答)。
-H2_ITEMS: tuple[Exchange, ...] = (
-    Exchange(
-        "pickup",
-        "logistics",
-        "en",
-        (
-            ("I need to book a pickup.", "Sure. What's the pickup address?"),
-            ("Wait, do you charge extra on weekends?", "No, weekend pickups cost the same."),
-            ("It's 14 Harbor Lane.", "OK."),
-        ),
-        ("14harborlane",),
-    ),
-    Exchange(
-        "calligraphy",
-        "education",
-        "zh",
-        (
-            ("帮我报名下学期的书法课。", "好的,学员姓名是?"),
-            ("先问一下,一节课多长时间?", "每节课 90 分钟。"),
-            ("林小雨", "好的。"),
-        ),
-        ("林小雨",),
-    ),
-    Exchange(
-        "sample-batch",
-        "research",
-        "en",
-        (
-            ("Log the new sample batch.", "Will do. What's the batch ID?"),
-            ("Is the freezer in room B still full?", "It had two free shelves this morning."),
-            ("BX-2093", "OK."),
-        ),
-        ("bx-2093",),
-    ),
-    Exchange(
-        "countertop",
-        "renovation",
-        "zh",
-        (
-            ("厨房要换台面。", "想用什么材质?"),
-            ("对了,工期一般要多久?", "一般 5 到 7 天。"),
-            ("石英石", "好的。"),
-        ),
-        ("石英石",),
-    ),
-    Exchange(
-        "tax-reminder",
-        "finance",
-        "en",
-        (
-            (
-                "Set up a reminder for the quarterly tax payment.",
-                "Sure. Which account should it come from?",
-            ),
-            ("Can you also tell me the due date?", "The next one is due mid next month."),
-            ("The joint savings account", "OK."),
-        ),
-        ("jointsavings",),
-    ),
-)
-
-
-@dataclass(frozen=True)
-class Split:
-    """A13:同一件事分两轮说完(前半句 / 后半句)。"""
-
-    key: str
-    domain: str
-    lang: str
-    head: str
-    tail: str
-    head_keys: tuple[str, ...]
-    tail_key: str
-
-
-A13_ITEMS: tuple[Split, ...] = (
-    Split(
-        "ship-address",
-        "support",
-        "zh",
-        "新的收货地址是:",
-        "人民路 5 号 3 单元",
-        ("地址",),
-        "人民路5号",
-    ),
-    Split(
-        "serial",
-        "support",
-        "en",
-        "The serial number on the unit is",
-        "SN-77410-Q",
-        ("serial",),
-        "sn-77410-q",
-    ),
-    Split("counsel", "legal", "zh", "我们这边的代理律师换成了", "钱文博律师", ("律师",), "钱文博"),
-    Split(
-        "governing-law",
-        "legal",
-        "en",
-        "The contract's governing law will be",
-        "the law of Ontario",
-        ("governing", "law"),
-        "ontario",
-    ),
-    Split(
-        "pool-cap", "coding", "zh", "生产数据库的连接上限要调到", "240 个", ("上限", "连接"), "240"
-    ),
-    Split(
-        "on-call",
-        "coding",
-        "en",
-        "Our on-call rotation for next week is",
-        "Ingrid first, then Tomasz",
-        ("on-call", "oncall", "rotation"),
-        "ingrid",
-    ),
-    Split(
-        "payment-terms",
-        "sales",
-        "zh",
-        "这单的付款方式定为",
-        "分三期,每期 30 天",
-        ("付款",),
-        "分三期",
-    ),
-    Split(
-        "meeting-day",
-        "sales",
-        "en",
-        "The client's preferred meeting day is",
-        "Wednesday mornings",
-        ("meeting",),
-        "wednesday",
-    ),
-    Split("allergy", "health", "zh", "我对这种药过敏:", "青霉素", ("过敏",), "青霉素"),
-    Split(
-        "bedtime",
-        "health",
-        "en",
-        "My usual bedtime these days is",
-        "around 11:30 pm",
-        ("bedtime", "bed"),
-        "11:30",
-    ),
-)
-
-#: A14:两段 12 轮的长对话,每轮记一件小事(只量提炼输入的 token 随轮数怎么变)。
-A14_ITEMS: tuple[Exchange, ...] = (
-    Exchange(
-        "todo-zh",
-        "support",
-        "zh",
-        tuple(
-            (f"记一下第 {i} 项待办:{item}。", f"好的,第 {i} 项已记下。")
-            for i, item in enumerate(
-                (
-                    "回访上周报修的用户",
-                    "更新常见问题页",
-                    "整理退换货单据",
-                    "核对配件库存",
-                    "安排周五的培训",
-                    "检查工单超时提醒",
-                    "汇总本月满意度",
-                    "清理过期的草稿回复",
-                    "确认节假日排班",
-                    "补齐缺失的联系方式",
-                    "复盘一个升级投诉",
-                    "归档已关闭的工单",
-                ),
-                start=1,
-            )
-        ),
-        (),
-    ),
-    Exchange(
-        "todo-en",
-        "coding",
-        "en",
-        tuple(
-            (f"Add item {i} to the list: {item}.", f"Done, item {i} is on the list.")
-            for i, item in enumerate(
-                (
-                    "rotate the staging certificates",
-                    "bump the linter version",
-                    "split the slow test file",
-                    "archive the old feature flags",
-                    "document the retry policy",
-                    "check the nightly backup job",
-                    "remove the unused endpoint",
-                    "tag the release candidate",
-                    "review the error budget",
-                    "clean up the build cache",
-                    "update the runbook links",
-                    "close the stale branches",
-                ),
-                start=1,
-            )
-        ),
-        (),
-    ),
-)
-
-
-@dataclass(frozen=True)
-class Reading:
-    """同一天读数:上午一个数,更正后的数,傍晚再看一次的数。"""
-
-    key: str
-    domain: str
-    lang: str
-    topic: str
-    unit: str
-    morning: str
-    corrected: str
-    evening: str
-
-
-READINGS: tuple[Reading, ...] = (
-    Reading("open-tickets", "support", "zh", "待处理的工单数", " 张", "437", "473", "391"),
-    Reading(
-        "calls-answered", "support", "en", "the number of calls answered", "", "118", "181", "96"
-    ),
-    Reading("filed-pages", "legal", "zh", "提交的案卷页数", " 页", "264", "246", "312"),
-    Reading(
-        "billable-hours", "legal", "en", "the billable hours logged", " hours", "3.5", "5.3", "6.25"
-    ),
-    Reading("build-minutes", "coding", "zh", "构建耗时", " 分钟", "14", "41", "11"),
-    Reading(
-        "dashboard-errors",
-        "coding",
-        "en",
-        "the error count on the dashboard",
-        "",
-        "230",
-        "320",
-        "185",
-    ),
-    Reading("calls-made", "sales", "zh", "打出的电话数", " 通", "25", "52", "40"),
-    Reading("units-shipped", "sales", "en", "the number of units shipped", "", "140", "410", "215"),
-    Reading("resting-pulse", "health", "zh", "静息心率", " 次/分", "64", "46", "72"),
-    Reading("body-weight", "health", "en", "my weight", " kg", "71.2", "72.1", "70.9"),
-)
 
 #: 通用句式(两种语言;与内容、领域无关)。
 PHRASES: dict[str, dict[str, str]] = {

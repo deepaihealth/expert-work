@@ -20,14 +20,16 @@ import hashlib
 import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 import b300_redesign_facts as rf
+import b300_redesign_facts_x as rfx
+import b300_redesign_heldout as rh
 from b300_facts import DOMAINS
-from b300_redesign_facts import S_FORMS, SHAPE_DOMAINS
 from b300_scenarios import Scenario, Seed, Turn
 
-__all__ = ["SHAPE_DOMAINS", "S_FORMS"]
+S_FORMS = rf.S_FORMS
+SHAPE_DOMAINS = rf.SHAPE_DOMAINS
 
 S_CLASSES = ("S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8")
 SHAPE_CLASSES = ("H1", "H2", "H3", "H4")
@@ -73,6 +75,8 @@ class Spec:
     secret: str = ""
     bystander_key: str = ""
     seed_keys: Mapping[str, str] = field(default_factory=dict)
+    #: 形状留出集:每种来源期望出现的值(各值用 ``|`` 带几种写法)。
+    expected: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 _SPECS: dict[str, Spec] = {}
@@ -270,31 +274,44 @@ def _proposal_scenario(cls: str, group: str, item: rf.Proposal) -> Scenario:
 # --------------------------------------------------------------------------- 形状留出集
 
 
+def _held_out_turns(case: rh.HeldOut) -> list[Turn]:
+    """(角色, 文字) → 每轮一个 ``Turn``:用户一句开轮,工具结果挂在这一轮,助手的话是这一轮的回答。"""
+    turns: list[Turn] = []
+    for role, text in case.turns:
+        if role == "user":
+            turns.append(Turn(text))
+        elif role == "tool":
+            last = turns[-1]
+            turns[-1] = replace(last, tool_calls=(*last.tool_calls, ("lookup_record", text)))
+        else:
+            turns[-1] = replace(turns[-1], reply=text)
+    return turns
+
+
 def build_shapes() -> list[Scenario]:
+    """形状留出集(§11.2,只报数):用另一位没看过提示词例子的人写的 20 个场景。"""
     out: list[Scenario] = []
-    for ex in rf.H1_ITEMS:
-        turns = [Turn(u, a) for u, a in ex.turns]
-        sp = Spec(1, ex.turns[1][0], 1, "user_answer", other_keys=ex.keys[1:])
-        out.append(
-            _scenario("H1", "H", ex.key, ex.domain, "shape", ex.lang, turns, sp, x_key=ex.keys[0])
+    for case in rh.HELD_OUT:
+        expected = {
+            "user_confirmed": case.user_confirmed,
+            "user_stated": case.user_stated,
+            "assistant_derived": case.assistant_derived,
+        }
+        sp = Spec(
+            secret=case.must_not_store[0] if case.must_not_store else "",
+            expected=expected,
         )
-    for ex in rf.H2_ITEMS:
-        turns = [Turn(u, a) for u, a in ex.turns]
-        sp = Spec(2, ex.turns[2][0], 2, "user_answer")
-        out.append(
-            _scenario("H2", "H", ex.key, ex.domain, "shape", ex.lang, turns, sp, x_key=ex.keys[0])
-        )
-    for item in rf.SHAPE_PROPOSALS:
-        out.append(_proposal_scenario("H3", "H", item))
-    for ask in rf.H4_ITEMS:
-        turns = [
-            Turn(ask.user_open, ask.assistant_ask),
-            Turn(ask.user_answer, _ph(ask.lang, "ack")),
-        ]
-        sp = Spec(1, ask.user_answer, 1, "user_answer", secret=ask.secret)
         out.append(
             _scenario(
-                "H4", "H", ask.key, ask.domain, "shape", ask.lang, turns, sp, x_key=ask.plain_key
+                f"H{case.shape}",
+                "H",
+                case.key,
+                case.domain,
+                "shape",
+                case.lang,
+                _held_out_turns(case),
+                sp,
+                x_key=case.user_confirmed[0],
             )
         )
     return out
@@ -305,7 +322,7 @@ def build_shapes() -> list[Scenario]:
 
 def build_x() -> list[Scenario]:
     out: list[Scenario] = []
-    for sp_item in rf.A13_ITEMS:
+    for sp_item in rfx.A13_ITEMS:
         lang = sp_item.lang
         turns = [Turn(sp_item.head, _ph(lang, "go_on")), Turn(sp_item.tail, _ph(lang, "noted"))]
         sp = Spec(content_round=1, other_keys=sp_item.head_keys)
@@ -322,14 +339,14 @@ def build_x() -> list[Scenario]:
                 x_key=sp_item.tail_key,
             )
         )
-    for ex in rf.A14_ITEMS:
+    for ex in rfx.A14_ITEMS:
         turns = [Turn(u, a) for u, a in ex.turns]
         out.append(
             _scenario("A14", "X", ex.key, ex.domain, "long", ex.lang, turns, Spec(), x_key="")
         )
     for item in rf.S7_ITEMS:
         out.append(_a15(item))
-    for reading in rf.READINGS:
+    for reading in rfx.READINGS:
         out += _same_day(reading)
     return out
 
@@ -367,7 +384,7 @@ def _a15(item: rf.Proposal) -> Scenario:
     )
 
 
-def _same_day(r: rf.Reading) -> list[Scenario]:
+def _same_day(r: rfx.Reading) -> list[Scenario]:
     lang = r.lang
     first = Turn(_ph(lang, "morning", topic=r.topic, v=r.morning, unit=r.unit), _ph(lang, "noted"))
     sd1 = [

@@ -254,13 +254,15 @@ def test_room_gate_waits_for_in_flight_instead_of_stopping() -> None:
         order: list[str] = []
 
         async def one(name: str) -> None:
-            assert await gate.acquire(2.0)
+            slot = await gate.acquire(2.0)
+            assert slot is not None
+            gate.consume(slot, 2.0)
             call = g.reserve(item=name, model="m", cap=2.0, phase="a-judge")
             order.append(f"start {name}")
             await asyncio.sleep(0)
             g.settle(call, item=name, model="m", phase="a-judge", cost=0.1)
             order.append(f"end {name}")
-            await gate.release()
+            await gate.release(slot)
 
         await asyncio.gather(one("a"), one("b"))
         return order
@@ -273,10 +275,10 @@ def test_room_gate_waits_for_in_flight_instead_of_stopping() -> None:
 def test_room_gate_gives_up_only_when_nothing_is_in_flight() -> None:
     g = _guard(10.0, {"A-judge": 1.0})
 
-    async def main() -> bool:
+    async def main() -> spend.Slot | None:
         return await spend.RoomGate(g, "a-judge", limit=4).acquire(2.0)
 
-    assert asyncio.run(main()) is False and g.blocked is None
+    assert asyncio.run(main()) is None and g.blocked is None
 
 
 def test_judge_reserves_by_the_prompt_size_not_the_40k_default() -> None:

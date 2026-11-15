@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -136,6 +136,11 @@ GATE_PHASE = "gate"
 # --------------------------------------------------------------------------- 报告
 
 
+def _unjudged(verdicts: Mapping[str, Any], key: str) -> str:
+    """没有判分可用的原因:还没判(``judge_missing``)/ 判了但没有多数(``judge_split``)。"""
+    return "judge_missing" if verdicts.get(key) is None else "judge_split"
+
+
 def _bad(verdicts: Mapping[str, Any], key: str) -> bool | None:
     row = verdicts.get(key)
     return None if row is None else row.get("verdict")
@@ -186,7 +191,7 @@ def collect_outcomes(
                 continue
             bad = _bad(verdicts, f"{key}|answer")
             if bad is None:
-                counts[name]["judge_split_or_missing"] += 1
+                counts[name][_unjudged(verdicts, f"{key}|answer")] += 1
                 continue
             if phase.baseline:
                 red_rows.append((r["scenario_id"], bad))
@@ -253,7 +258,7 @@ def _c5_summaries(
         clustered = True  # 没凑成簇的上面已经记成「未测到」
         bad = _bad(verdicts, f"{r['user']}|summary") if info.get("summaries") else False
         if bad is None:
-            counts["judge_split_or_missing"] += 1
+            counts[_unjudged(verdicts, f"{r['user']}|summary")] += 1
             continue
         rows.append((r["scenario_id"], r["domain"], bool(bad), clustered))
     return rows
@@ -301,9 +306,10 @@ def _a_outcomes(
         if metric in _INFO_KEYS:
             continue
         if value is None:
-            verdict = _bad(verdicts, f"{key}|{_ITEM_CHECK.get(metric, metric)}")
+            row = verdicts.get(f"{key}|{_ITEM_CHECK.get(metric, metric)}")
+            verdict = None if row is None else row.get("verdict")
             if verdict is None:
-                counts["judge_split_or_missing"] += 1
+                counts["judge_missing" if row is None else "judge_split"] += 1
                 continue
             bad = not verdict if metric in good_metrics else bool(verdict)
         else:
@@ -315,7 +321,7 @@ def _a_outcomes(
         counts[f"{cls}.{name}"] += int(n)
     if cls == "A10":
         counts["a10_user_version"] += bool(checks.get("user_version"))
-        counts["a10_original_superseded"] += bool(checks.get("original_superseded"))
+        counts["a10_original_superseded"] += bool(checks.get("original_superseded"))  # 也在线里
     if cls == "A12":  # 用户 11-14:来自助手的复述允许,计数报出
         counts["a12_assistant_restatements"] += int(checks.get("assistant_restatements", 0))
         counts["a12_user_side_zero"] += checks.get("user_side_rows") == 0  # 不算违规,单列
@@ -377,12 +383,26 @@ REDESIGN_DISCLOSURES = (
     "新指令,不能直接比;以回归闸门那一次为新基线,旧数只说明问题存在。",
     "回归闸门(§11.1 第 2 步)按原文只设总数线(空列表各 ≤ 2 / 30、用户确认且有据各 ≥ 24 / 30),"
     "不设逐领域;它用 A 组原样的 P6 / P7 单元(只在最后一轮写回一次)。",
-    "形状留出集只报数;它由写评测脚本的人写成,写的人看过提示词的例子(设计要的是没看过的人写)。",
+    "形状留出集只报数;它由另一位没看过提示词例子的人写(20 个,4 种形状 x 5 个领域,中英各 10),"
+    "脚本只转成数据结构、给期望值补了几种写法,并把一个卡号的首位改成 0。",
     "误伤只在种了旁观记忆的 S 组上量(每个 S 场景一条同领域、无关的用户说的记忆);A 组原样不动,"
     "没有旁观记忆。",
-    "切片起点按参数名 start_message_count 传给写回入口;被测代码不收这个参数时 A14 报 incomplete,"
+    "切片起点按参数名 start_message_count 传给写回入口;被测代码不收这个参数时 A13、A14 报 "
+    "incomplete,"
     "其余各段照整段重抽量。",
 )
+
+
+def votes_disclosures(out: Path) -> list[str]:
+    """审查 M5:报告写明每段判官实际用了几票(按判分行里的票数数,不按假设)。"""
+    lines = []
+    for name in PHASES:
+        rows = read_jsonl(out / name / "verdicts.jsonl")
+        per = Counter(len(r.get("votes") or []) for r in rows if r.get("votes"))
+        if per:
+            shown = "、".join(f"{v} 票 {n} 条" for v, n in sorted(per.items()))
+            lines.append(f"{name}:判官每条 {shown}(B / C 组按拍板 3 票;A 组与闸门按报价)。")
+    return lines
 
 
 def report(out: Path, q: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -420,6 +440,7 @@ def report(out: Path, q: Mapping[str, Any] | None) -> dict[str, Any]:
         baseline=baseline,
         missing=missing,
     )
+    body["disclosures"] += votes_disclosures(out)
     if any(name in REDESIGN_PHASES for name in meta) or any(
         (out / name).exists() for name in REDESIGN_PHASES
     ):

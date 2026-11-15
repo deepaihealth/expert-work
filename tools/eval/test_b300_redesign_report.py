@@ -106,8 +106,8 @@ def test_a10_still_only_user_stated_and_the_original_is_replaced() -> None:
     x = sc.fact("budget").texts[s.lang].x
     seeded = {"x": "seed"}
     calls = [("pass1", _reply(x))]
-    replaced = [
-        _row(x, "assistant_derived", live=False, rid="seed"),
+    replaced = [  # 审查 M6:被取代 = superseded_by 指向一条有效的 user_stated
+        {**_row(x, "assistant_derived", live=False, rid="seed"), "superseded_by": "n"},
         _row(x, "user_stated", rid="n"),
     ]
     checks, _ = rep.a_checks(_record(calls, replaced, seeded=seeded), s)

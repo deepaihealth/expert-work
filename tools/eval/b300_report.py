@@ -37,6 +37,8 @@ APPROVED_SHORT = "已拍板(§10.2 第 1 条)"
 DESIGN_A = "设计 §8.2 所列(本文安排)"
 APPROVED_A12 = "已拍板(用户 11-14,§10.2 第 10 条)"
 PENDING = "待用户确认(§8.7)"
+#: A10 的线:设计没给数(原设计 §8.2 只写「出现用户说的版本」),本脚本提 ≥ 24 / 30,待用户确认。
+PENDING_A10 = "待用户确认(A10 的数设计没给,本脚本提出)"
 APPROVED_REDESIGN = "已拍板(用户 11-15,重做设计 §11.1 / §11.3 按建议定)"
 #: 同 ``expert_work.persistence.memory.base.USER_SIDE_ORIGINS``(评测脚本不 import 平台包);重做
 #: 设计 §6.3 把 ``user_confirmed`` 加进用户一方。
@@ -241,10 +243,15 @@ def a_checks(
         checks["user_version"] = bool(p1_x) and (
             "user_stated" in origins or (origins <= {None} and bool(origins))
         )
-        seeded = result.get("seeded", {}).get("x")
-        checks["original_superseded"] = not any(
-            m["id"] == seeded and m.get("live") for m in result.get("memories", [])
+        # 审查 M6:「被取代」= 种下的那条的 superseded_by 指向一条有效的 user_stated 行(只是失效、或
+        # 被别的来源取代都不算);它和「出现用户说的版本」一起进 A10 的线。
+        rows = {str(m["id"]): m for m in result.get("memories", [])}
+        seed = rows.get(str(result.get("seeded", {}).get("x")), {})
+        replacement = rows.get(str(seed.get("superseded_by")), {})
+        checks["original_superseded"] = bool(
+            replacement.get("live") and replacement.get("origin") == "user_stated"
         )
+        checks["replaced_by_user_stated"] = checks["user_version"] and checks["original_superseded"]
     elif cls == "A11":
         seeded = result.get("seeded", {}).get("x")
         checks["user_memory_lost"] = not any(
@@ -340,6 +347,19 @@ def _redesign_prompts() -> list[str]:
         record = _digest_record([], s.x_key)
         out += [i.prompt for i in chk.checks(record, s)[1]]
     return out
+
+
+def label_check(prompt: str) -> str | None:
+    """一条判官题是哪一种(校准标注要覆盖这一段要判的每一种,审查 M5);认不出 = ``None``。"""
+    if base.GROUNDED_WORDING in prompt:
+        return "grounded"
+    if base.EVENT_DATE_WORDING in prompt:
+        return "event_date"
+    if f"{SOURCE_WORDING} {NOT_USER_WORDING}" in prompt:
+        return "plain"
+    if "it is not a statement." in prompt:
+        return "statement"
+    return None
 
 
 def wording_in_prompt(prompt: str) -> bool:
@@ -536,6 +556,7 @@ LINES: tuple[PassLine, ...] = (
     PassLine("P8", "pass1_statement", "max", 0, None, DESIGN_A, _A_N),
     PassLine("P9", "confirmed_correction", "min", 24, None, APPROVED_REDESIGN, _A_N),
     PassLine("P9", "y_valid", "min", 24, None, APPROVED_SHORT, _A_N),
+    PassLine("A10", "replaced_by_user_stated", "min", 24, None, PENDING_A10, _A_N),
     PassLine("A11", "user_memory_lost", "max", 0, None, DESIGN_A, _A_N),
     PassLine("A12", "user_side_duplicate", "max", 0, None, APPROVED_A12, _A_N),
     *(
@@ -585,7 +606,9 @@ def judge_line(
     if verdict == "incomplete" and missing:
         why = ", ".join(f"{k}: {v} units" for k, v in sorted(missing.items()))
         verdict = f"incomplete (the platform under test lacks {why})"
-    if line.status == PENDING and verdict in {"pass", "fail"}:
+    if verdict == "incomplete" and n == 0 and not missing:
+        verdict = "incomplete (nothing measured yet)"
+    if line.status.startswith("待用户确认") and verdict in {"pass", "fail"}:
         # 待用户确认的线:只说按提出的线会怎样,不作验收依据。
         verdict = f"would {verdict} on the proposed line (待用户确认, not an acceptance result)"
     return {
@@ -633,9 +656,6 @@ def build_report(
     disclosures.append(
         "C 组样本小:每家每类 15 次、每领域 3 次,只挡得住明显的问题,挡不住低比例的偶发(§8.7)。"
     )
-    disclosures.append(
-        "A 组判官每条判 1 票(设计 §8.6 没给 A 组算判官钱,本脚本安排);B / C 组 3 票取多数。"
-    )
     return {
         "lines": dict(lines_out),
         "counts": counts,
@@ -650,6 +670,7 @@ def build_report(
                 "同一件事连写 5 轮后有效的用户一方同类记忆不重复(≥ 2 条为违规);来自助手的复述只计数"
             ),
             PENDING: "C 组提出的线,报用户定之前不作验收依据",
+            PENDING_A10: "A10:出现用户说的版本、且种下的那条被它取代;数是本脚本提的,不作验收依据",
             APPROVED_REDESIGN: (
                 "重做设计 §11.1 回归闸门与 §11.3 各线,用户 11-15 按建议定;字段缺了报 incomplete"
             ),

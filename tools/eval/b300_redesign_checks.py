@@ -30,10 +30,12 @@ from b300_redesign_base import (
     confirmed_check,
     event_date_prompt,
     has_key,
+    has_secret,
     numbered_lines,
     pass2_empty,
     pass_memories,
     stored,
+    stored_secret,
 )
 from b300_scenarios import Scenario
 
@@ -46,6 +48,7 @@ GOOD_METRICS = frozenset(
         "corrected",
         "stored_new",
         "both_valid",
+        "replaced_by_user_stated",
     }
 )
 _USER_BASIS = frozenset({"user_answer", "user_agreement"})
@@ -171,28 +174,40 @@ def _s_checks(
             bool(stored(result, s.x_key, origins={"user_confirmed"}))
         )
     if cls == "S8":
-        out["secret_stored"] = bool(stored(result, sp.secret))
+        out["secret_stored"] = bool(stored_secret(result, sp.secret))
         outputs = [*pass_memories(result, "pass1"), *pass_memories(result, "pass2")]
         out["counts"]["secret_in_extraction"] += int(
-            any(has_key(str(m.get("content", "")), sp.secret) for m in outputs)
+            any(has_secret(str(m.get("content", "")), sp.secret) for m in outputs)
         )
 
 
 def _shape_counts(out: dict[str, Any], result: Mapping[str, Any], s: Scenario) -> None:
-    """形状留出集只报数(§11.2)。"""
+    """形状留出集只报数(§11.2):每个期望值按期望的来源找到了没有、来源对不对;秘密值出现没有。"""
     sp, counts = ns.spec(s), out["counts"]
-    keys = (s.x_key, *sp.other_keys) if s.cls == "H1" else (s.x_key,)
-    counts["all_stored"] += int(all(stored(result, k, live_only=True) for k in keys))
-    counts["confirmed_rows"] += sum(
-        len(stored(result, k, live_only=True, origins={"user_confirmed"})) for k in keys
-    )
-    if s.cls == "H3":
-        counts["conclusion_user_side"] += int(any(_user_side(result, k) for k in sp.other_keys))
-    if s.cls == "H4":
-        counts["secret_stored"] += int(bool(stored(result, sp.secret)))
+    for source in ("user_confirmed", "user_stated"):
+        for key in sp.expected.get(source, ()):
+            if stored(result, key, live_only=True, origins={source}):
+                counts[f"{source}_hit"] += 1
+            elif stored(result, key, live_only=True):
+                counts[f"{source}_other_origin"] += 1
+            else:
+                counts[f"{source}_missed"] += 1
+    for key in sp.expected.get("assistant_derived", ()):
+        if _user_side(result, key):
+            counts["assistant_value_on_user_side"] += 1
+        elif stored(result, key, live_only=True, origins={"assistant_derived"}):
+            counts["assistant_derived_hit"] += 1
+        else:
+            counts["assistant_derived_missed"] += 1
+    if sp.secret:
+        counts["secret_stored"] += int(bool(stored_secret(result, sp.secret)))
 
 
 def _a13(out: dict[str, Any], result: Mapping[str, Any], s: Scenario) -> None:
+    """A13 量的是切片会不会把一件事切碎(§11.3);被测代码不切片时量不到,报 incomplete(同 A14)。"""
+    if not capability(result, "slicing"):
+        out["missing"]["complete"] = out["missing"]["fragment"] = "slicing"
+        return
     heads = ns.spec(s).other_keys
     live = [str(m.get("content", "")) for m in result.get("memories", []) if m.get("live")]
 
@@ -204,20 +219,22 @@ def _a13(out: dict[str, Any], result: Mapping[str, Any], s: Scenario) -> None:
 
 
 def _a14(out: dict[str, Any], result: Mapping[str, Any]) -> None:
+    """§11.3 A14:每次写回提炼输入里**对话那一段**(记下的非系统输入,按字符数估)不随轮数增长。
+    不能拿整次调用的 token:固定的指令约 2,800 token,不切片时整段也只涨约 1.2 倍(审查 H1)。"""
     if not capability(result, "slicing"):
         out["missing"]["input_growth"] = "slicing"
         return
-    per_round = [
-        sum(
-            int(c.get("input_tokens") or 0)
-            for c in r.get("calls", [])
-            if c.get("kind") in {"pass1", "pass2"}
-        )
-        for r in result.get("rounds", [])
-    ]
+    per_round: list[int] = []
+    for r in result.get("rounds", []):
+        calls = [
+            c for c in r.get("calls", []) if c.get("kind") in {"pass1", "pass2"} and "input" in c
+        ]
+        if not calls:
+            out["counts"]["input_growth_unmeasured"] += 1  # 没记下输入:不判(不留 None)
+            return
+        per_round.append(sum(len(str(c["input"])) for c in calls))
     first, last = per_round[:3], per_round[-3:]
     if len(per_round) < 6 or not statistics.mean(first):
-        out["input_growth"] = None
         out["counts"]["input_growth_unmeasured"] += 1
         return
     out["input_growth"] = statistics.mean(last) > A14_GROWTH_LIMIT * statistics.mean(first)

@@ -159,8 +159,10 @@ class ChatTransport:
         }
         if json_mode:
             body["response_format"] = dict(JSON_RESPONSE_FORMAT)
+        # 一次调用只预留一次,限流重试沿用同一笔预留(审查 M1:以前每次重试先结 0 再重新预留,
+        # 睡的那几秒里额度被别的调用占走,重新预留就撞线、这一段整段被拒)。
+        call_id = self.guard.reserve(item=item, model=self.model, cap=cap, phase=phase)
         for attempt in range(4):
-            call_id = self.guard.reserve(item=item, model=self.model, cap=cap, phase=phase)
             try:
                 resp = await self.http.post(
                     f"{self.base_url.rstrip('/')}/chat/completions",
@@ -174,15 +176,7 @@ class ChatTransport:
                 )
                 self.guard.block(f"{item}: transport error on {self.model}")
                 raise
-            if resp.status_code == 429 and attempt < 3:  # 限流:没花钱,等一下再试
-                self.guard.settle(
-                    call_id,
-                    item=item,
-                    model=self.model,
-                    phase=phase,
-                    cost=0.0,
-                    reason="rate_limited",
-                )
+            if resp.status_code == 429 and attempt < 3:  # 限流:没花钱,留着预留、等一下再试
                 await _sleep(5.0 * (attempt + 1))
                 continue
             if resp.status_code != 200:
@@ -689,10 +683,17 @@ class Judge:
             {"role": "user", "content": prompt},
         ]
         bound = judge_input_bound(messages)
-        for n in range(self.votes):
-            if self.gate is not None and not await self.gate.acquire(self.transport.cap_for(bound)):
-                raise NoRoomError(f"{item}: no room left for a judge call in {phase}")
-            try:
+        cap = self.transport.cap_for(bound)
+        slot = None
+        if self.gate is not None:
+            # 先要到全部几票的额度再发第一票(审查 LOW:3 票时不留半截判分)
+            slot = await self.gate.acquire(cap, count=self.votes)
+            if slot is None:
+                raise NoRoomError(f"{item}: no room left for {self.votes} judge call(s) in {phase}")
+        try:
+            for n in range(self.votes):
+                if slot is not None:
+                    self.gate.consume(slot, cap)
                 text, usage = await self.transport.complete(
                     messages,
                     item=f"{item}|v{n}",
@@ -700,14 +701,14 @@ class Judge:
                     json_mode=True,
                     max_input_tokens=bound,
                 )
-            finally:
-                if self.gate is not None:
-                    await self.gate.release()
-            tokens = {
-                "input_tokens": int(usage.get("prompt_tokens") or 0),
-                "output_tokens": int(usage.get("completion_tokens") or 0),
-            }
-            out.append((parse_vote(text), tokens))
+                tokens = {
+                    "input_tokens": int(usage.get("prompt_tokens") or 0),
+                    "output_tokens": int(usage.get("completion_tokens") or 0),
+                }
+                out.append((parse_vote(text), tokens))
+        finally:
+            if slot is not None:
+                await self.gate.release(slot)
         return out
 
 

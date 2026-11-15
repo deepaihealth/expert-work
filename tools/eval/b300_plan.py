@@ -221,6 +221,7 @@ def lines_for(
     single_vendor: str | None = None,
     include_compare: bool = True,
     a_votes: int = A_JUDGE_VOTES,
+    gate_votes: int = A_JUDGE_VOTES,
 ) -> list[Line]:
     """全部调用。``cuts`` 是 §8.6 的删减编号;②③ 只跑一家时用 ``single_vendor``(没定就按最贵的
     那家算,偏保守)。"""
@@ -271,7 +272,7 @@ def lines_for(
             n = 2 * len(sc.FACTS)  # 20 段跨领域带工具的对话(§8.5:15~20 段)
             lines += _writebacks("D-compare", v, n, extract=EXTRACT_PER_WRITEBACK)
             lines += _writebacks("D-compare", v, n, extract=OLD_EXTRACT_PER_WRITEBACK)
-        lines += _redesign_lines(v, a_votes)
+        lines += _redesign_lines(v, a_votes, gate_votes)
     # C5 ①:整理只在一个型号上(15 次)+ 判官判汇总行。
     sweeps = c_n * RERUN_FACTOR
     lines += [
@@ -336,8 +337,8 @@ def lines_for(
             "judge",
             JUDGE_MODEL,
             "judge",
-            CALIBRATION_ITEMS * a_votes,
-            CALIBRATION_ITEMS * a_votes,
+            CALIBRATION_ITEMS * gate_votes,
+            CALIBRATION_ITEMS * gate_votes,
         )
     )
     # A 组判官另有一套校准(审查 M3):A 组的判法与 B 组不同,用 A 组的票数校。
@@ -359,7 +360,7 @@ REDESIGN_GROUNDED = ("S2", "S3", "S4")
 GROUNDED_SHARE = (0.8, 1.0)
 
 
-def _redesign_lines(v: Vendor, a_votes: int) -> list[Line]:
+def _redesign_lines(v: Vendor, a_votes: int, gate_votes: int) -> list[Line]:
     """§11.7 ①:S 组、形状留出集、A13~A15、同一天读数(组 ``S``,A 段)与回归闸门(组 ``gate``,G 段)。
     每个场景每轮写回一次;判官:有据程度(S2~S4、闸门的 P6 / P7)、事件日期误标(每个单元至多按
     一条带事件日期的记忆估,低档只算同一天读数那几类)。A 组原有的单元另加事件日期那一项。"""
@@ -390,10 +391,10 @@ def _redesign_lines(v: Vendor, a_votes: int) -> list[Line]:
             v.provider,
             JUDGE_MODEL,
             "judge",
-            gate_units * GROUNDED_SHARE[0] * a_votes,
-            gate_units * GROUNDED_SHARE[1] * a_votes,
+            gate_units * GROUNDED_SHARE[0] * gate_votes,
+            gate_units * GROUNDED_SHARE[1] * gate_votes,
         ),
-        Line("gate", v.provider, JUDGE_MODEL, "judge_event", 0.0, gate_units * a_votes),
+        Line("gate", v.provider, JUDGE_MODEL, "judge_event", 0.0, gate_units * gate_votes),
     ]
     return lines
 
@@ -794,6 +795,7 @@ def choose_cuts(
     a_votes: int = A_JUDGE_VOTES,
     phases: Sequence[str] = BUDGET_ORDER,
     remaining_for: RemainingFor | None = None,
+    gate_votes: int = A_JUDGE_VOTES,
 ) -> tuple[list[int], dict[str, Any], str]:
     """按 §8.6 的顺序删,直到「已花 + 本次高档」≤ 上限;三步都删完仍超 → ``stop_and_ask``。"""
     cap = CAP_YUAN if cap is None else cap
@@ -801,7 +803,12 @@ def choose_cuts(
     one = single_vendor or most_expensive(vendors, prices)
     while True:
         lines = lines_for(
-            vendors, cuts=cuts, single_vendor=one, include_compare=include_compare, a_votes=a_votes
+            vendors,
+            cuts=cuts,
+            single_vendor=one,
+            include_compare=include_compare,
+            a_votes=a_votes,
+            gate_votes=gate_votes,
         )
         remaining = remaining_for(cuts, one)[0] if remaining_for is not None else None
         summary = summarize(select_lines(lines, phases, remaining), prices, tokens)
@@ -830,12 +837,13 @@ def quote(
     allocation: Mapping[str, float] | None = None,
     remaining_for: RemainingFor | None = None,
     progress_digest: str | None = None,
+    gate_votes: int = A_JUDGE_VOTES,
 ) -> dict[str, Any]:
     """报价:不删时的全量、按顺序删后的计划、状态、止损线、报价编号(内容哈希)。"""
     cap = CAP_YUAN if cap is None else cap
     one = single_vendor or most_expensive(vendors, prices)
-    if a_votes not in (1, JUDGE_VOTES):
-        raise PlanError(f"A-group judge votes must be 1 or {JUDGE_VOTES}")
+    if a_votes not in (1, JUDGE_VOTES) or gate_votes not in (1, JUDGE_VOTES):
+        raise PlanError(f"A-group / gate judge votes must be 1 or {JUDGE_VOTES}")
     if pilot:
         full = summarize(pilot_lines(vendors, single_vendor=one, a_votes=a_votes), prices, tokens)
         cuts, planned = [], full
@@ -844,7 +852,11 @@ def quote(
         )
     else:
         lines = lines_for(
-            vendors, single_vendor=one, include_compare=include_compare, a_votes=a_votes
+            vendors,
+            single_vendor=one,
+            include_compare=include_compare,
+            a_votes=a_votes,
+            gate_votes=gate_votes,
         )
         start = remaining_for([], one)[0] if remaining_for is not None else None
         full = summarize(select_lines(lines, phases, start), prices, tokens)
@@ -859,22 +871,36 @@ def quote(
             a_votes=a_votes,
             phases=phases,
             remaining_for=remaining_for,
+            gate_votes=gate_votes,
         )
     shares, counts = remaining_for(cuts, one) if remaining_for is not None else ({}, {})
-    planned_lines = (
-        pilot_lines(vendors, single_vendor=one, a_votes=a_votes)
-        if pilot
-        else select_lines(
+
+    def chosen_lines(a: int, g: int) -> list[Line]:
+        return select_lines(
             lines_for(
                 vendors,
                 cuts=cuts,
                 single_vendor=one,
                 include_compare=include_compare,
-                a_votes=a_votes,
+                a_votes=a,
+                gate_votes=g,
             ),
             phases,
             shares or None,
         )
+
+    planned_lines = (
+        pilot_lines(vendors, single_vendor=one, a_votes=a_votes)
+        if pilot
+        else chosen_lines(a_votes, gate_votes)
+    )
+    # 审查 M5:A / G 两段的判官票数写明;同一份计划按 1 票、3 票各报一个价,批的时候由用户选。
+    cost_by_votes = (
+        {}
+        if pilot
+        else {
+            str(v): summarize(chosen_lines(v, v), prices, tokens)["total"] for v in (1, JUDGE_VOTES)
+        }
     )
     if stop_line is None:
         # 试点的止损线默认取它自己的高档估计(审查 M-c),正式报价默认 ¥400。
@@ -904,7 +930,14 @@ def quote(
             k: {"low": v[0], "high": v[1], "source": _token_source(k, tokens)}
             for k, v in tokens.items()
         },
-        "judge": {"model": JUDGE_MODEL, "votes": JUDGE_VOTES, "a_group_votes": a_votes},
+        "judge": {
+            "model": JUDGE_MODEL,
+            "votes": JUDGE_VOTES,
+            "a_group_votes": a_votes,
+            "gate_votes": gate_votes,
+            "votes_by_segment": {"A": a_votes, "G": gate_votes},
+            "cost_by_votes": cost_by_votes,
+        },
         "pilot": pilot,
         "scenario_digest": scenario_digest,
         "languages": language_mix(),

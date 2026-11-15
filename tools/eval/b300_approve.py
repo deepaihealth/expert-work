@@ -63,6 +63,7 @@ def make_quote(args: argparse.Namespace, *, exclude: str | None = None) -> dict[
         include_compare=not args.no_compare,
         tokens=token_table(args.tokens),
         a_votes=args.a_judge_votes,
+        gate_votes=args.gate_judge_votes,
         pilot=args.pilot,
         embed_price=args.embed_price,
         phases=phases_covered,

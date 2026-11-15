@@ -218,14 +218,15 @@ def test_a13_complete_and_fragments() -> None:
 
 
 def test_a14_growth_needs_slicing() -> None:
+    """量的是记下的对话输入(按字符数),不是整次调用的 token(审查 H1)。"""
     s = _s("A14")
-    flat = _rec(s, tokens=[100] * 12)
+    flat = _rec(s, inputs=["x" * 100] * 12)
     assert chk.checks(flat, s)[0]["input_growth"] is False
-    growing = _rec(s, tokens=[100, 100, 100, *([200] * 9)])
+    growing = _rec(s, inputs=["x" * 100] * 3 + ["x" * 200] * 9)
     assert chk.checks(growing, s)[0]["input_growth"] is True  # 200 > 1.5 x 100
-    edge = _rec(s, tokens=[100, 100, 100, *([150] * 9)])
+    edge = _rec(s, inputs=["x" * 100] * 3 + ["x" * 150] * 9)
     assert chk.checks(edge, s)[0]["input_growth"] is False  # 正好 1.5 倍算过
-    unsliced = _rec(s, tokens=[100] * 12, caps={**ALL, "slicing": False})
+    unsliced = _rec(s, inputs=["x" * 100] * 12, caps={**ALL, "slicing": False})
     assert chk.checks(unsliced, s)[0]["missing"]["input_growth"] == "slicing"
 
 

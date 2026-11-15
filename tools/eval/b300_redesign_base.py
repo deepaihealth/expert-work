@@ -1,8 +1,10 @@
 """B-300 重做(设计 ``docs/superpowers/specs/2026-11-15-b300-extraction-redesign-design.md`` §11)
 评测的共用判法。纯函数,不调模型、不 import 平台包。
 
-* 关键串(:func:`has_key`):去空白、小写、全角半角折叠后做包含;**纯数字的关键串按数字边界比**
-  (「42」不撞「142」)—— 读数、数量类的场景靠它。
+* 关键串(:func:`has_key`):去空白、小写、全角半角折叠后做包含;``|`` 分开几种写法(日期、
+  数字的几种写法),任一种出现就算;千分位逗号不算;**纯数字的关键串按数字边界比**,并先去掉文字里
+  的日期片段(「42」不撞「142」,「11」不撞「2026-11-15」「11月」)。秘密值(:func:`has_secret`)
+  去掉一切非字母数字再比(卡号写成带横线、带空格的也认)。
 * 库里存下的行(:func:`stored`)与平台字段在不在(:func:`capability`):重做加的字段
   (``user_confirmed``、证据指针、事件日期、确认日期、切片起点)在老代码上没有,依赖它们的指标
   报「incomplete」,不当成 0 或失败(回归闸门要先在老代码上跑出基线)。
@@ -38,21 +40,45 @@ USER_SIDE = frozenset({"user_stated", "user_confirmed", "user_corrected"})
 #: 重做加的平台字段(设计 §9.1 / §8)→ 记录里 ``capabilities`` 的键。
 CAPABILITIES = ("user_confirmed", "evidence_pointer", "event_date", "confirmed_at", "slicing")
 
-_NUMERIC = re.compile(r"^[0-9]+(?:[.,][0-9]+)*$")
+_NUMERIC = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+#: 关键串里分开几种写法的符号。
+KEY_SEP = "|"
+_THOUSANDS = re.compile(r"(?<=[0-9]),(?=[0-9]{3}(?![0-9]))")
+#: 数字关键串比之前先去掉的日期片段(规范化之后,没有空白):2026-11-15、2026年11月15日、11月15日、
+#: 11月、15日 / 15号、11/28。
+_DATE_FRAGMENTS = re.compile(
+    r"[0-9]{4}[-/.年][0-9]{1,2}[-/.月][0-9]{1,2}[日号]?"
+    r"|[0-9]{1,2}月[0-9]{1,2}[日号]?|[0-9]{1,2}月|[0-9]{1,2}[日号]"
+    r"|(?<![0-9])[0-9]{1,2}/[0-9]{1,2}(?![0-9])"
+)
+_NOT_ALNUM = re.compile(r"[^0-9a-z\u4e00-\u9fff]")
 
 
 def _norm(text: str) -> str:
-    return "".join(unicodedata.normalize("NFKC", text).split()).lower()
+    return _THOUSANDS.sub("", "".join(unicodedata.normalize("NFKC", text).split()).lower())
 
 
 def has_key(text: str, key: str) -> bool:
-    """``key`` 出现在 ``text`` 里(规范化后);纯数字的 ``key`` 前后不能紧挨数字或小数点。"""
-    if not key:
-        return False
-    body, needle = _norm(text), _norm(key)
-    if _NUMERIC.match(needle):
-        return re.search(rf"(?<![0-9.]){re.escape(needle)}(?![0-9]|\.[0-9])", body) is not None
-    return needle in body
+    """``key``(``|`` 分开的任一种写法)出现在 ``text`` 里(规范化后)。纯数字的写法按数字边界比,
+    文字里的日期片段先去掉。"""
+    body = _norm(text)
+    for variant in (v for v in key.split(KEY_SEP) if v.strip()):
+        needle = _norm(variant)
+        if _NUMERIC.match(needle):
+            plain = _DATE_FRAGMENTS.sub(" ", body)
+            pattern = rf"(?<![0-9.]){re.escape(needle)}(?![0-9]|\.[0-9])"
+            if re.search(pattern, plain):
+                return True
+        elif needle in body:
+            return True
+    return False
+
+
+def has_secret(text: str, secret: str) -> bool:
+    """秘密值出现在 ``text`` 里:两边都去掉一切非字母数字再比(「6222-0210」「6222 0210」都认)。"""
+    needle = _NOT_ALNUM.sub("", unicodedata.normalize("NFKC", secret).lower())
+    body = _NOT_ALNUM.sub("", unicodedata.normalize("NFKC", text).lower())
+    return bool(needle) and needle in body
 
 
 def capability(result: Mapping[str, Any], name: str) -> bool | None:
@@ -81,6 +107,11 @@ def stored(
         and (not live_only or m.get("live"))
         and (allowed is None or m.get("origin") in allowed)
     ]
+
+
+def stored_secret(result: Mapping[str, Any], secret: str) -> list[dict[str, Any]]:
+    """库里含这个秘密值的行(含已失效的)。"""
+    return [m for m in result.get("memories", []) if has_secret(str(m.get("content", "")), secret)]
 
 
 def round_calls(result: Mapping[str, Any], round_index: int) -> list[dict[str, Any]] | None:
