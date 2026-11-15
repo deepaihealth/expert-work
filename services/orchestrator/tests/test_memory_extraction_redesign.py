@@ -44,6 +44,8 @@ _DIM = 32
 _TENANT = UUID("00000000-0000-4000-8000-0000000000a7")
 _USER = UUID("00000000-0000-4000-8000-0000000000b7")
 
+_TODAY = date(2026, 3, 2)
+
 PASS1_MARK = "The other side of the conversation is not shown."
 PASS2_MARK = "Each line starts with its number in brackets and a tag:"
 
@@ -651,20 +653,63 @@ async def test_a_null_event_date_is_not_counted(checks: list[tuple[str, str]]) -
     assert [c for c in checks if c[1] == "event_date_dropped"] == []
 
 
-async def test_a_line_without_a_date_only_checks_the_format() -> None:
+async def test_a_line_without_a_date_checks_the_format_and_today(
+    checks: list[tuple[str, str]],
+) -> None:
+    """那一行没有日期:只查格式,以及不晚于智能体时区的「今天」(审查 L3)。"""
     llm = _ByPassLLM(
         conversation_reply=_reply(
-            {
-                "kind": "fact",
-                "content": "读数",
-                "basis": "assistant",
-                "turn": 2,
-                "event_date": "2030-01-01",
-            }
+            {"kind": "fact", "content": "读数", "basis": "assistant", "turn": 2,
+             "event_date": "2026-03-01"},
+            {"kind": "fact", "content": "将来的读数", "basis": "assistant", "turn": 2,
+             "event_date": "2030-01-01"},
+        )
+    )  # fmt: skip
+    _, store = await _flush([_user("看一下"), _assistant("读数是 5")], llm)
+    rows = await _rows(store)
+    assert rows["读数"].occurred_on == date(2026, 3, 1)
+    assert rows["将来的读数"].occurred_on is None
+    assert checks.count(("conversation", "event_date_dropped")) == 1
+
+
+async def test_an_unresolved_turn_still_checks_today(checks: list[tuple[str, str]]) -> None:
+    llm = _ByPassLLM(
+        user_reply=_reply(
+            {"kind": "fact", "content": "过去的读数", "turn": 99, "event_date": "2026-03-01"},
+            {"kind": "fact", "content": "将来的读数", "turn": 99, "event_date": "2030-01-01"},
         )
     )
-    _, store = await _flush([_user("看一下"), _assistant("读数是 5")], llm)
-    assert (await _rows(store))["读数"].occurred_on == date(2030, 1, 1)
+    _, store = await _flush(_qa(), llm)
+    rows = await _rows(store)
+    assert rows["过去的读数"].occurred_on == date(2026, 3, 1)
+    assert rows["将来的读数"].occurred_on is None
+    assert checks.count(("user", "event_date_dropped")) == 1
+
+
+def test_the_today_guard_uses_the_given_day() -> None:
+    undated = [ExtractionLine(text="读数是 5")]
+    today = date(2026, 3, 2)
+    kept = memory_lines.settle_user_text(1, "2026-03-02", undated, today=today)
+    late = memory_lines.settle_user_text(1, "2026-03-03", undated, today=today)
+    assert kept.event_date == date(2026, 3, 2)
+    assert (late.event_date, late.checks) == (None, ("event_date_dropped",))
+
+
+async def test_the_line_date_boundary_follows_the_agent_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """17:30Z 在上海已是第二天:那一行的日子按智能体时区算(审查 L5)。"""
+    monkeypatch.setenv("EXPERT_WORK_TIMEZONE", "Asia/Shanghai")
+    llm = _ByPassLLM(
+        user_reply=_reply(
+            {"kind": "fact", "content": "当天", "turn": 1, "event_date": "2026-03-02"},
+            {"kind": "fact", "content": "次日", "turn": 1, "event_date": "2026-03-03"},
+        )
+    )
+    _, store = await _flush([_user("今天的读数", "2026-03-01T17:30:00+00:00")], llm)
+    rows = await _rows(store)
+    assert rows["当天"].occurred_on == date(2026, 3, 2)
+    assert rows["次日"].occurred_on is None
 
 
 # ─── 交给去重合并的三样:line_at、in_new_segment、事件日期 ─────────────
@@ -850,6 +895,21 @@ async def test_a_slice_keeps_the_message_id_but_not_its_position() -> None:
     assert (row.evidence_message_id, row.evidence_message_index) == ("u2", None)
 
 
+async def test_after_the_cap_a_turn_maps_to_the_kept_line() -> None:
+    """总量上限丢掉最早的行、重新从 1 编号之后,``turn`` = 2 指向留下的第 2 行那条消息(审查 L5)。"""
+    messages: list[BaseMessage] = [
+        _user(f"M{i:02d}" + "字" * 897, msg_id=f"m{i:02d}") for i in range(50)
+    ]
+    llm = _ByPassLLM(user_reply=_reply({"kind": "fact", "content": "第二行", "turn": 2}))
+    _, store = await _flush(messages, llm)
+    second = llm.input_of("user").splitlines()[2]
+    assert second.startswith("[2] M")
+    label = second[len("[2] M") : len("[2] M") + 2]
+    assert label != "01"  # 确实丢了前面的行
+    row = (await _rows(store))["第二行"]
+    assert (row.evidence_message_id, row.evidence_message_index) == (f"m{label}", int(label))
+
+
 def test_the_cap_counts_the_numbers_and_the_mark() -> None:
     """三行正文合起来不到上限,带上编号与标记就超了:最早的一行要丢。"""
     lines = [ExtractionLine(text=f"line-{i}-xxx") for i in range(3)]  # 每行 10 字
@@ -876,15 +936,61 @@ async def test_a_context_line_is_neither_confirmed_nor_pointed_at(
         ExtractionLine(text="18号", tag="[user]", context=True, message_index=1),
         ExtractionLine(text="好的", tag="[assistant]", message_index=2),
     ]
-    settled = memory_lines.settle_conversation("user_answer", 2, None, lines)
+    settled = memory_lines.settle_conversation("user_answer", 2, None, lines, today=_TODAY)
     assert settled.origin == "assistant_derived"
     assert (settled.evidence_message_id, settled.evidence_message_index) == (None, None)
     assert settled.checks == ("downgraded_context_line", "pointer_missing")
     # 上一行可以是上下文行(问题常在上一轮末尾)。
     asked = [lines[0], ExtractionLine(text="18号", tag="[user]", message_id="u", message_index=1)]
-    settled = memory_lines.settle_conversation("user_answer", 2, None, asked)
+    settled = memory_lines.settle_conversation("user_answer", 2, None, asked, today=_TODAY)
     assert (settled.origin, settled.evidence_message_id, settled.checks) == (
         "user_confirmed",
         "u",
         (),
     )
+
+
+# ─── 去重合并材料里的日期:按智能体时区的日子(审查 L2)───────────────────
+
+
+async def test_reconcile_material_days_follow_the_agent_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """候选那一行与邻居的日期都按智能体时区显示,与事件日期同一口径;比先后仍在 UTC。"""
+    monkeypatch.setenv("EXPERT_WORK_TIMEZONE", "Asia/Shanghai")
+    [vec] = await FakeEmbedder(dim=_DIM).embed(["电表读数"], tenant_id=_TENANT)
+
+    def item(content: str, **extra: Any) -> MemoryItem:
+        return MemoryItem.model_validate(
+            {"id": uuid4(), "tenant_id": _TENANT, "user_id": _USER, "kind": "fact",
+             "content": content, "embedding": vec, "origin": "user_stated", **extra}
+        )  # fmt: skip
+
+    store = InMemoryMemoryStore()
+    await store.write(
+        [item("电表读数 18342", created_at=datetime(2026, 11, 14, 18, 0, tzinfo=UTC))]
+    )
+    candidate = memory_module._Candidate(
+        item("电表读数 18350", occurred_on=date(2026, 11, 15)),
+        line_at=datetime(2026, 11, 14, 17, 30, tzinfo=UTC),
+        in_new_segment=True,
+    )
+    calls: list[list[BaseMessage]] = []
+
+    async def llm(*, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
+        del tools
+        calls.append(list(messages))
+        return AIMessage(content=json.dumps({"ops": [{"index": 0, "op": "ADD"}]}))
+
+    await memory_module._reconcile_and_apply(
+        [candidate],
+        agent_name="agent-x",
+        positions={candidate.item.id: 0},
+        memory_store=store,
+        llm_caller=llm,
+        token=CancellationToken(),
+        log_label="test",
+    )
+    [material] = json.loads(str(calls[0][1].content))["candidates"]
+    assert (material["date"], material["event_date"]) == ("2026-11-15", "2026-11-15")
+    assert material["existing"][0]["date"] == "2026-11-15"

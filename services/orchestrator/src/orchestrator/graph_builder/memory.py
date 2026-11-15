@@ -105,7 +105,6 @@ from expert_work.runtime.tokens import CharTokenEstimator, TokenEstimator
 from orchestrator.agent_timezone import resolve_agent_timezone
 from orchestrator.context.memory_render import (
     as_utc,
-    line_date,
     origin_label,
     recorded_date,
     restated_at,
@@ -258,8 +257,9 @@ _USER_TEXT_EXTRACTION_SYSTEM = _USER_TEXT_EXTRACTION_HEADER + "\n" + _SCORING_TA
 # B-300 重做 —— 第二次提炼:整段对话(设计 2026-11-15 附录 A 最终英文原文,含 9 个例子,一字不改;
 # 评测脚本靠 "Each line starts with its number in brackets and a tag:" 认出这是第二次)。只写要记
 # 什么:原来那几句「不要记 X」全部删掉,重复交给去重合并;唯一保留的「不记」是秘密值(用户 11-14 定
-# 的既定规矩)。来源不由模型定:程序按 ``basis`` + ``turn`` 核对(``memory_lines``)。回归闸门里
-# 空列表若回升,先怀疑例子 9(验证码 → 空列表,设计 §11.1)。
+# 的既定规矩)。来源由程序写:「用户确认」跟着模型给的 ``basis``,程序只把它锚定到一条真实的用户
+# 输入行(挂不上就降为「来自助手」,``memory_lines``)。回归闸门里空列表若回升,先怀疑例子 9
+# (验证码 → 空列表,设计 §11.1)。
 _CONVERSATION_EXTRACTION_SYSTEM = """You are a memory extraction module. The input is part of a conversation, one message per
 line. Each line starts with its number in brackets and a tag:
 - [user] — text the user typed, followed by the date it was sent.
@@ -1672,6 +1672,13 @@ def _day(value: date | None) -> str | None:
     return (value.date() if isinstance(value, datetime) else value).isoformat()
 
 
+def _agent_day_text(ts: datetime | None) -> str | None:
+    """材料里显示的日期:按智能体时区的那一天(与事件日期、提炼行里的日期同一口径;审查 L2)。
+    只用于显示;比先后仍在 UTC(:func:`as_utc` / :func:`restated_at`)。"""
+    day = _agent_day(as_utc(ts)) if ts is not None else None
+    return day.isoformat() if day is not None else None
+
+
 def _reconcile_material(pending: Sequence[_Pending], ids: Mapping[UUID, str]) -> dict[str, Any]:
     """附录 B 的材料:候选与它的邻居都带类型、来源、日期、事件日期;邻居用短编号。"""
     return {
@@ -1681,7 +1688,7 @@ def _reconcile_material(pending: Sequence[_Pending], ids: Mapping[UUID, str]) ->
                 "kind": entry.candidate.item.kind,
                 "content": entry.candidate.item.content,
                 "source": origin_label(entry.candidate.item),
-                "date": _day(entry.candidate.line_at),
+                "date": _agent_day_text(entry.candidate.line_at),
                 "is_correction": entry.candidate.is_correction,
                 "event_date": _day(entry.candidate.item.occurred_on),
                 "existing": [
@@ -1690,7 +1697,7 @@ def _reconcile_material(pending: Sequence[_Pending], ids: Mapping[UUID, str]) ->
                         "kind": n.kind,
                         "content": n.content,
                         "source": origin_label(n),
-                        "date": line_date(n),
+                        "date": _agent_day_text(restated_at(n)),
                         "event_date": _day(n.occurred_on),
                     }
                     for n in entry.neighbors
@@ -2108,14 +2115,16 @@ async def _apply_delete(
 
 
 def _settled(
-    pass_name: str, memory: ExtractedMemory, lines: Sequence[ExtractionLine]
+    pass_name: str, memory: ExtractedMemory, lines: Sequence[ExtractionLine], today: date
 ) -> ExtractedMemory:
     """B-300 重做 §4 / §5.4 —— 程序按 ``turn`` 那一行定来源、置信度上限、证据指针、事件日期、
     那一行的发送时间与在不在新段;降级、指针留空、事件日期置空各计一次。"""
     if pass_name == _CONVERSATION_EXTRACTION:
-        settled = settle_conversation(memory.basis, memory.turn, memory.claimed_event_date, lines)
+        settled = settle_conversation(
+            memory.basis, memory.turn, memory.claimed_event_date, lines, today=today
+        )
     else:
-        settled = settle_user_text(memory.turn, memory.claimed_event_date, lines)
+        settled = settle_user_text(memory.turn, memory.claimed_event_date, lines, today=today)
     for check in settled.checks:
         record_memory_extraction_check(pass_name=pass_name, check=check)
     confidence = memory.confidence
@@ -2158,7 +2167,9 @@ async def _extract_pass(
     record_memory_extraction(pass_name=pass_name, outcome=outcome)
     # B-300 ② / 重做 §5.4 —— 第一次只看得到用户输入的文字:一律「用户消息里说的」;第二次由程序
     # 按 basis + turn 定「用户确认」(≤ 0.8)或「来自助手」(≤ 0.6),无论模型给多少。
-    return [_settled(pass_name, m, lines) for m in parsed or []]
+    # 事件日期不能晚于智能体时区的「今天」(审查 L3)。
+    today = datetime.now(UTC).astimezone(resolve_agent_timezone()).date()
+    return [_settled(pass_name, m, lines, today) for m in parsed or []]
 
 
 def _pass_lines(pass_name: str, pass_input: _PassInput) -> list[ExtractionLine]:

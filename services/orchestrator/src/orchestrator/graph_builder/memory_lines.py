@@ -115,13 +115,16 @@ def _line_of(turn: object, lines: Sequence[ExtractionLine]) -> ExtractionLine | 
     return lines[turn - 1]
 
 
-def _event_date(claimed: object, line: ExtractionLine | None) -> date | None:
-    """能解析成 ``YYYY-MM-DD``、且不晚于那一行的发送日期(那一行没有日期时只查格式)。"""
+def _event_date(claimed: object, line: ExtractionLine | None, today: date) -> date | None:
+    """能解析成 ``YYYY-MM-DD``、不晚于那一行的发送日期(那一行没有日期时不查这一条),且不晚于
+    智能体时区的「今天」(``turn`` 挂不上、那一行没日期时也查;审查 L3)。"""
     if not isinstance(claimed, str) or _ISO_DAY.fullmatch(claimed) is None:
         return None
     try:
         day = date.fromisoformat(claimed)
     except ValueError:  # 形状对、日子不存在(2 月 30 日)
+        return None
+    if day > today:
         return None
     if line is not None and line.sent_day is not None and day > line.sent_day:
         return None
@@ -150,12 +153,13 @@ def _settle(
     turn: object,
     claimed_event_date: object,
     lines: Sequence[ExtractionLine],
+    today: date,
     downgraded: tuple[str, ...] = (),
 ) -> Settled:
     line = _line_of(turn, lines)
     new_line = line if line is not None and not line.context else None
     pointer = evidence_pointer(new_line)
-    event_date = _event_date(claimed_event_date, line)
+    event_date = _event_date(claimed_event_date, line, today)
     checks = (
         *downgraded,
         *(("pointer_missing",) if new_line is None else ()),
@@ -174,14 +178,19 @@ def _settle(
 
 
 def settle_user_text(
-    turn: object, claimed_event_date: object, lines: Sequence[ExtractionLine]
+    turn: object, claimed_event_date: object, lines: Sequence[ExtractionLine], *, today: date
 ) -> Settled:
     """第一次提炼:来源永远是 ``user_stated``(第一次只看得到用户的字),与 ``turn`` 对不对无关。"""
-    return _settle("user_stated", None, turn, claimed_event_date, lines)
+    return _settle("user_stated", None, turn, claimed_event_date, lines, today)
 
 
 def settle_conversation(
-    basis: object, turn: object, claimed_event_date: object, lines: Sequence[ExtractionLine]
+    basis: object,
+    turn: object,
+    claimed_event_date: object,
+    lines: Sequence[ExtractionLine],
+    *,
+    today: date,
 ) -> Settled:
     """第二次提炼:``basis`` 为用户回答 / 同意且挂得上 → ``user_confirmed``(≤ 0.8);其余一律
     ``assistant_derived``(≤ 0.6),挂不上的计一次降级与原因。"""
@@ -190,7 +199,12 @@ def settle_conversation(
         reason = _downgrade_reason(turn, lines)
         if reason is None:
             return _settle(
-                "user_confirmed", USER_CONFIRMED_MAX_CONFIDENCE, turn, claimed_event_date, lines
+                "user_confirmed",
+                USER_CONFIRMED_MAX_CONFIDENCE,
+                turn,
+                claimed_event_date,
+                lines,
+                today,
             )
         downgraded = (f"downgraded_{reason}",)
     return _settle(
@@ -199,5 +213,6 @@ def settle_conversation(
         turn,
         claimed_event_date,
         lines,
+        today,
         downgraded,
     )
