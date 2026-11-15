@@ -24,6 +24,7 @@ from typing import Any
 import b300_redesign_scenarios as ns
 from b300_live import parse_extraction
 from b300_redesign_base import (
+    NEW_MARKER,
     USER_SIDE,
     JudgeItem,
     capability,
@@ -199,8 +200,8 @@ def _shape_counts(out: dict[str, Any], result: Mapping[str, Any], s: Scenario) -
             counts["assistant_derived_hit"] += 1
         else:
             counts["assistant_derived_missed"] += 1
-    if sp.secret:
-        counts["secret_stored"] += int(bool(stored_secret(result, sp.secret)))
+    for secret in sp.expected.get("must_not_store", ()):
+        counts["secret_stored"] += int(bool(stored_secret(result, secret)))
 
 
 def _a13(out: dict[str, Any], result: Mapping[str, Any], s: Scenario) -> None:
@@ -218,13 +219,30 @@ def _a13(out: dict[str, Any], result: Mapping[str, Any], s: Scenario) -> None:
     out["fragment"] = any(has_key(t, s.x_key) != head(t) for t in live)
 
 
+#: 设计 §8.2:上下文第一次给最近 2 条用户输入,第二次给最近 4 行。
+CONTEXT_CAP = {"pass1": 2, "pass2": 4}
+
+
+def _split_input(text: str) -> tuple[list[str], str]:
+    """提炼输入 → (分隔行之上的上下文行, 新段)。没有分隔行 = 整段都是新段(不切片的代码)。"""
+    if NEW_MARKER not in text:
+        return [], text
+    above, below = text.split(NEW_MARKER, 1)
+    return [ln for ln in above.splitlines() if ln.strip()], below
+
+
 def _a14(out: dict[str, Any], result: Mapping[str, Any]) -> None:
-    """§11.3 A14:每次写回提炼输入里**对话那一段**(记下的非系统输入,按字符数估)不随轮数增长。
-    不能拿整次调用的 token:固定的指令约 2,800 token,不切片时整段也只涨约 1.2 倍(审查 H1)。"""
+    """§11.3 A14:提炼输入里**新段**(分隔行以下,按字符数估)不随轮数增长;上下文行数另查,不超过
+    设计的 2 / 4 行(``context_over_cap``)。
+
+    不量整次调用的 token(固定指令约 2,800,不切片也只涨约 1.2 倍,审查 H1);也不把上下文算进来
+    —— 切片正确时上下文从 0 行热身到上限,前 3 轮天然偏短,「后 3 轮 ≤ 前 3 轮 x 1.5」会被它
+    撑到 1.5 上下(审查二 HIGH)。"""
     if not capability(result, "slicing"):
-        out["missing"]["input_growth"] = "slicing"
+        out["missing"]["input_growth"] = out["missing"]["context_over_cap"] = "slicing"
         return
     per_round: list[int] = []
+    over = False
     for r in result.get("rounds", []):
         calls = [
             c for c in r.get("calls", []) if c.get("kind") in {"pass1", "pass2"} and "input" in c
@@ -232,7 +250,13 @@ def _a14(out: dict[str, Any], result: Mapping[str, Any]) -> None:
         if not calls:
             out["counts"]["input_growth_unmeasured"] += 1  # 没记下输入:不判(不留 None)
             return
-        per_round.append(sum(len(str(c["input"])) for c in calls))
+        size = 0
+        for c in calls:
+            context, new = _split_input(str(c["input"]))
+            size += len(new)
+            over = over or len(context) > CONTEXT_CAP[str(c["kind"])]
+        per_round.append(size)
+    out["context_over_cap"] = over
     first, last = per_round[:3], per_round[-3:]
     if len(per_round) < 6 or not statistics.mean(first):
         out["counts"]["input_growth_unmeasured"] += 1

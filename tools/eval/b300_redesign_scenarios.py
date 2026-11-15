@@ -296,6 +296,7 @@ def build_shapes() -> list[Scenario]:
             "user_confirmed": case.user_confirmed,
             "user_stated": case.user_stated,
             "assistant_derived": case.assistant_derived,
+            "must_not_store": case.must_not_store,
         }
         sp = Spec(
             secret=case.must_not_store[0] if case.must_not_store else "",

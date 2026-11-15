@@ -122,6 +122,14 @@ def openai_usage_cost(usage: Mapping[str, Any], price: Price) -> float:
     return ((prompt - cached) * price.input + cached * price.cache_read + out * price.output) / 1e6
 
 
+#: 限流(429)之后最多再试几次(间隔 5、10、15 秒)。
+RATE_LIMIT_RETRIES = 3
+
+
+class RateLimitedError(RuntimeError):
+    """连续被限流:这一项没花钱(按 0 结),只让这一项失败,续跑时再试。"""
+
+
 @dataclass
 class ChatTransport:
     """一个 OpenAI 兼容 ``/chat/completions`` 端点;每次调用先预留后发送。"""
@@ -162,7 +170,8 @@ class ChatTransport:
         # 一次调用只预留一次,限流重试沿用同一笔预留(审查 M1:以前每次重试先结 0 再重新预留,
         # 睡的那几秒里额度被别的调用占走,重新预留就撞线、这一段整段被拒)。
         call_id = self.guard.reserve(item=item, model=self.model, cap=cap, phase=phase)
-        for attempt in range(4):
+        attempt = 0
+        while True:
             try:
                 resp = await self.http.post(
                     f"{self.base_url.rstrip('/')}/chat/completions",
@@ -176,9 +185,21 @@ class ChatTransport:
                 )
                 self.guard.block(f"{item}: transport error on {self.model}")
                 raise
-            if resp.status_code == 429 and attempt < 3:  # 限流:没花钱,留着预留、等一下再试
-                await _sleep(5.0 * (attempt + 1))
-                continue
+            if resp.status_code == 429:  # 限流:没花钱
+                if attempt < RATE_LIMIT_RETRIES:  # 留着预留、等一下再试
+                    attempt += 1
+                    await _sleep(5.0 * attempt)
+                    continue
+                # 连续限流:这一项按 0 结、只让这一项失败,不按上限结、不停整份报价(审查二)
+                self.guard.settle(
+                    call_id,
+                    item=item,
+                    model=self.model,
+                    phase=phase,
+                    cost=0.0,
+                    reason="rate_limited",
+                )
+                raise RateLimitedError(f"{item}: {self.model} still rate limited after retries")
             if resp.status_code != 200:
                 self.guard.settle_cap(
                     call_id, item=item, model=self.model, phase=phase, reason="cap_error"
@@ -203,7 +224,6 @@ class ChatTransport:
             choices = data.get("choices") or [{}]
             content = (choices[0].get("message") or {}).get("content")
             return (content if isinstance(content, str) else ""), usage
-        raise SpendStopError(f"{item}: still rate limited after retries")
 
 
 def request_fields(provider: str, model: str, *, max_tokens: int) -> dict[str, Any]:

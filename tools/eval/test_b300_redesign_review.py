@@ -215,7 +215,7 @@ def test_alternative_spellings_and_date_formats() -> None:
 
 def test_secrets_match_with_separators_stripped() -> None:
     assert base.has_secret("card 0000-7713-2048-5502 on file", "0000 7713 2048 5502")
-    assert base.has_secret("password maple 2291", "Maple#2291")
+    assert base.has_secret("password Maple#2291", "Maple#2291")  # 审查二:只去数字间的空格 / 横线
     assert not base.has_secret("nothing here", "0000 7713 2048 5502")
     s8 = next(s for s in _rows("S8") if ns.spec(s).secret.isdigit() and len(ns.spec(s).secret) > 12)
     secret = ns.spec(s8).secret

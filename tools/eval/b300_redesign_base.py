@@ -51,7 +51,12 @@ _DATE_FRAGMENTS = re.compile(
     r"|[0-9]{1,2}月[0-9]{1,2}[日号]?|[0-9]{1,2}月|[0-9]{1,2}[日号]"
     r"|(?<![0-9])[0-9]{1,2}/[0-9]{1,2}(?![0-9])"
 )
-_NOT_ALNUM = re.compile(r"[^0-9a-z\u4e00-\u9fff]")
+#: 秘密值比较前只去掉数字之间的空格和横线(卡号、验证码的分组写法)。
+_DIGIT_GAPS = re.compile(r"(?<=[0-9])[\s\-]+(?=[0-9])")
+#: 重做后提炼输入里分开上下文与新段的那一行(设计 §5.1 / §8.2)。
+NEW_MARKER = "=== new ==="
+#: ``~`` 开头的写法按整词比(短的英文词,免得「theo」撞「theory」)。
+WORD_PREFIX = "~"
 
 
 def _norm(text: str) -> str:
@@ -63,6 +68,12 @@ def has_key(text: str, key: str) -> bool:
     文字里的日期片段先去掉。"""
     body = _norm(text)
     for variant in (v for v in key.split(KEY_SEP) if v.strip()):
+        if variant.startswith(WORD_PREFIX):
+            word = re.escape(unicodedata.normalize("NFKC", variant[1:]).lower().strip())
+            spaced = unicodedata.normalize("NFKC", text).lower()
+            if re.search(rf"(?<![0-9a-z]){word}(?![0-9a-z])", spaced):
+                return True
+            continue
         needle = _norm(variant)
         if _NUMERIC.match(needle):
             plain = _DATE_FRAGMENTS.sub(" ", body)
@@ -75,10 +86,18 @@ def has_key(text: str, key: str) -> bool:
 
 
 def has_secret(text: str, secret: str) -> bool:
-    """秘密值出现在 ``text`` 里:两边都去掉一切非字母数字再比(「6222-0210」「6222 0210」都认)。"""
-    needle = _NOT_ALNUM.sub("", unicodedata.normalize("NFKC", secret).lower())
-    body = _NOT_ALNUM.sub("", unicodedata.normalize("NFKC", text).lower())
-    return bool(needle) and needle in body
+    """秘密值出现在 ``text`` 里:两边只去掉数字之间的空格和横线(「0000-7713」「0000 7713」都认),
+    纯数字的按数字边界比(「PIN 88, 41 left」不算 8841);其余去掉空白后做包含。"""
+
+    def prep(value: str) -> str:
+        return _DIGIT_GAPS.sub("", unicodedata.normalize("NFKC", value).lower())
+
+    needle, body = prep(secret).strip(), prep(text)
+    if not needle:
+        return False
+    if needle.isdigit():
+        return re.search(rf"(?<![0-9]){needle}(?![0-9])", body) is not None
+    return "".join(needle.split()) in "".join(body.split())
 
 
 def capability(result: Mapping[str, Any], name: str) -> bool | None:

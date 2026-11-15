@@ -435,7 +435,13 @@ def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     phase = calibration_phase(args.which, args.phases)
     with spending(args):
         q, guard = approved(args, cmd=f"calibrate {args.which}", phase=phase)
-        votes = plan.JUDGE_VOTES if args.which == "b" else int(q["judge"]["a_group_votes"])
+        judge = q["judge"]
+        if args.which == "b":
+            votes = plan.JUDGE_VOTES
+        elif phase == "calibration-g":  # 审查二:闸门的校准按闸门的票数(报价就按它算的)
+            votes = int(judge.get("gate_votes", judge["a_group_votes"]))
+        else:
+            votes = int(judge["a_group_votes"])
         out_file = args.out / f"{phase}-votes-{votes}.jsonl"
         # 换了标注文件或判官措辞,旧的投票不再沿用(以前同一个序号会直接跳过、拿旧票对新标注)
         prompts = "\n\0".join(r["prompt"] for r in labels)

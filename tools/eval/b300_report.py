@@ -40,6 +40,8 @@ PENDING = "待用户确认(§8.7)"
 #: A10 的线:设计没给数(原设计 §8.2 只写「出现用户说的版本」),本脚本提 ≥ 24 / 30,待用户确认。
 PENDING_A10 = "待用户确认(A10 的数设计没给,本脚本提出)"
 APPROVED_REDESIGN = "已拍板(用户 11-15,重做设计 §11.1 / §11.3 按建议定)"
+#: 重做设计 §8.2 写的上下文行数(第一次 2 条、第二次 4 行),本脚本据此设线。
+DESIGN_SLICE = "设计 §8.2 的上下文行数(本脚本据此设线)"
 #: 同 ``expert_work.persistence.memory.base.USER_SIDE_ORIGINS``(评测脚本不 import 平台包);重做
 #: 设计 §6.3 把 ``user_confirmed`` 加进用户一方。
 _USER_SIDE_ORIGINS = base.USER_SIDE
@@ -534,6 +536,7 @@ REDESIGN_LINES: tuple[PassLine, ...] = (
     _r("A13", "complete", "min", 24, _A_N),
     _r("A13", "fragment", "max", 3, _A_N),
     _r("A14", "input_growth", "max", 0, 6),
+    PassLine("A14", "context_over_cap", "max", 0, None, DESIGN_SLICE, 6),
     _r("A15", "synonym_added", "max", 1, 15),
     _r("A15", "user_seed_lost", "max", 0, 15),
     _r("A15", "assistant_seed_upgraded", "max", 0, 15),
@@ -670,6 +673,7 @@ def build_report(
                 "同一件事连写 5 轮后有效的用户一方同类记忆不重复(≥ 2 条为违规);来自助手的复述只计数"
             ),
             PENDING: "C 组提出的线,报用户定之前不作验收依据",
+            DESIGN_SLICE: "A14:每次提炼的上下文不超过第一次 2 条、第二次 4 行",
             PENDING_A10: "A10:出现用户说的版本、且种下的那条被它取代;数是本脚本提的,不作验收依据",
             APPROVED_REDESIGN: (
                 "重做设计 §11.1 回归闸门与 §11.3 各线,用户 11-15 按建议定;字段缺了报 incomplete"
