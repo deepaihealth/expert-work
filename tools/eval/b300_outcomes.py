@@ -392,9 +392,8 @@ REDESIGN_DISCLOSURES = (
     "一起量会让切片正确时也在 1.5 上下(审查二);上下文另查不超过第一次 2 条、第二次 4 行。",
     "形状留出集的 H2(隔一轮才回答):按 §5.4 这种回答会被降成来自助手,所以 H2 的 "
     "user_confirmed_other_origin 是预期的,不算漏记。",
-    "切片起点按参数名 start_message_count 传给写回入口;被测代码不收这个参数时 A13、A14 报 "
-    "incomplete,"
-    "其余各段照整段重抽量。",
+    "切片起点按 PR S 的参数 segment(SegmentStart(message_index=上一次写回时的消息条数))传给写回"
+    "入口;被测代码不收这个参数时 A13、A14 报 incomplete,其余各段照整段重抽量。",
 )
 
 

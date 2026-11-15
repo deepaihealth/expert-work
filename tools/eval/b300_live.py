@@ -80,9 +80,10 @@ RECONCILE_MARK = "You reconcile newly extracted memories"
 #: 重做(设计 2026-11-15 附录 A / B)换了第二次与去重合并指令的开头;第一次的那句(附录 C)不变。
 REDESIGN_PASS2_MARK = "Each line starts with its number in brackets and a tag:"
 REDESIGN_RECONCILE_MARK = "You compare newly extracted memories"
-#: 切片起点(重做设计 §8.1:同一对话前一个任务的 ``message_count``)传给写回入口的参数名。设计没有
-#: 给参数名,这里按它的说法取;PR S 用了别的名字就同步改这一个常量(同 ``USER_TEXT_PARAM`` 的做法)。
-SLICE_START_PARAM = "start_message_count"
+#: 切片起点(重做设计 §8.1:同一对话前一个任务的 ``message_count``)传给写回入口的参数名 —— PR S 的
+#: ``flush_messages_with_outcome(segment=SegmentStart(message_index=...))``。入口不收它(PR S 之前的
+#: 代码,回归闸门的基线)时照整段重抽,A13 / A14 报 incomplete。
+SLICE_START_PARAM = "segment"
 
 
 #: 睡眠的间接层(测试换掉,不碰全局的 ``asyncio.sleep``;同 ``b302_live``)。
@@ -343,6 +344,14 @@ def platform_capabilities() -> dict[str, bool]:
     }
 
 
+def slice_start(message_count: int) -> dict[str, Any]:
+    """写回入口的切片参数:从这条消息起的整轮是新段(上一次写回结束时的消息条数;第一次是 0)。
+    只在 :func:`platform_capabilities` 认出切片时调用 —— 老代码里没有 ``SegmentStart``。"""
+    from orchestrator.graph_builder.memory_slice import SegmentStart
+
+    return {SLICE_START_PARAM: SegmentStart(message_index=message_count)}
+
+
 def _with_ids(messages: Sequence[Any], turn: int) -> list[Any]:
     """每条消息一个 id(证据指针指向它;没 id 的补一个)。不进提示词,不改提炼的输入。"""
     out = []
@@ -435,7 +444,7 @@ async def run_extraction(
         if index not in scenario.writebacks:
             continue
         caller = GuardedCaller(transport, f"{item}|wb{index}", phase)
-        slice_arg: dict[str, Any] = {SLICE_START_PARAM: start} if caps["slicing"] else {}
+        slice_arg: dict[str, Any] = slice_start(start) if caps["slicing"] else {}
         outcome = await memory_module.flush_messages_with_outcome(
             list(messages),
             memory_store=store,

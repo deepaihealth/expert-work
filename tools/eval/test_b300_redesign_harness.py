@@ -16,6 +16,7 @@ import b300_live as live
 import b300_phases as phases
 import b300_plan as plan
 import b300_redesign_base as base
+import b300_redesign_checks as chk
 import b300_redesign_scenarios as ns
 import b300_report as rep
 import b300_runs as runs
@@ -404,15 +405,27 @@ def test_capabilities_reflect_the_code_under_test(name: str) -> None:
     assert caps[name] is _PROBES[name](), name
 
 
+def test_the_probe_sees_pr_s_slicing() -> None:
+    """PR S 的写回入口收 ``segment``(``SegmentStart``):探针认得出,A13 / A14 才会被量。"""
+    from orchestrator.graph_builder.memory_slice import SegmentStart
+
+    entry = inspect.signature(
+        __import__("orchestrator.graph_builder.memory", fromlist=["x"]).flush_messages_with_outcome
+    ).parameters
+    assert live.SLICE_START_PARAM == "segment" and "segment" in entry
+    assert live.platform_capabilities()["slicing"] is True
+    assert live.slice_start(7) == {"segment": SegmentStart(message_index=7)}
+
+
 def test_slice_start_is_passed_only_when_the_entry_takes_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from orchestrator.graph_builder import memory as mem
 
-    starts: list[int] = []
+    starts: list[int | None] = []
 
-    async def fake(messages: Any, *, start_message_count: int = 0, **_: Any) -> Any:
-        starts.append(start_message_count)
+    async def fake(messages: Any, *, segment: Any = None, **_: Any) -> Any:
+        starts.append(segment.message_index)
         return mem.FlushOutcome(0, False)
 
     monkeypatch.setattr(mem, "flush_messages_with_outcome", fake)
@@ -438,6 +451,38 @@ def test_slice_start_is_passed_only_when_the_entry_takes_it(
     ]
     assert all(r["sliced"] for r in result["rounds"])
     assert inspect.signature(fake).parameters[live.SLICE_START_PARAM]
+
+
+def test_old_code_without_the_segment_parameter_keeps_whole_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """回归闸门的基线跑在 PR S 之前的代码上:写回入口不收 ``segment`` → 不传切片参数(整段重抽),
+    记录里 ``sliced`` 为假,A13 / A14 报 incomplete。"""
+    from orchestrator.graph_builder import memory as mem
+
+    seen: list[dict[str, Any]] = []
+
+    async def old_entry(messages: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return mem.FlushOutcome(0, False)
+
+    monkeypatch.setattr(mem, "flush_messages_with_outcome", old_entry)
+    assert live.platform_capabilities()["slicing"] is False
+    s = next(x for x in ns.build_redesign() if x.cls == "S2")
+    guard = spend.Guard(stop_line=5.0, prices={"mem": Price(1, 1, 1, "t")})
+
+    async def main() -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda r: httpx.Response(500))
+        ) as http:
+            t = live.ChatTransport("mem", "https://v", "k", guard, http, 500, provider="deepseek")
+            return await live.run_extraction(
+                s, transport=t, embedder=KeywordEmbedder(), item="u", phase="s"
+            )
+
+    result = asyncio.run(main())
+    assert seen and all(live.SLICE_START_PARAM not in kwargs for kwargs in seen)
+    assert not any(r["sliced"] for r in result["rounds"])
 
 
 def test_run_extraction_records_what_the_redesign_measures() -> None:
@@ -489,10 +534,55 @@ def test_run_extraction_records_what_the_redesign_measures() -> None:
     assert all(not r["failed"] for r in result["rounds"])
     assert result["capabilities"] == live.platform_capabilities()
     assert len(result["user_message_ids"]) == len(s.turns) and all(result["user_message_ids"])
+    sliced = live.platform_capabilities()["slicing"]
     for r in result["rounds"]:
-        assert isinstance(r["live_after"], list) and "message_count" in r and r["sliced"] is False
+        assert isinstance(r["live_after"], list) and "message_count" in r and r["sliced"] is sliced
         assert all("input" in c for c in r["calls"] if c["kind"] in {"pass1", "pass2"})
     row = result["memories"][0]
     for field in ("superseded_by", "evidence_message_id", "evidence_message_index", "occurred_on"):
         assert field in row
     assert set(result["seeded"]) == {ns.BYSTANDER}
+
+
+def test_a14_with_pr_s_extracts_only_the_rounds_since_the_previous_writeback() -> None:
+    """A14 在 PR S 上真的切片:每次写回,第二次提炼的输入里 ``=== new ===`` 之下只有上一次写回之后
+    的那几轮,更早的轮次最多作为上下文出现在标记之上(不再整段重抽)。"""
+    s = next(x for x in ns.build_redesign() if x.cls == "A14")
+    inputs: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        system = " ".join(m["content"] for m in body["messages"] if m["role"] == "system")
+        if live.classify_call(system) == "pass2":
+            inputs.append(next(m["content"] for m in body["messages"] if m["role"] == "user"))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": json.dumps({"memories": []})}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    guard = spend.Guard(stop_line=5.0, prices={"mem": Price(1, 1, 1, "t")})
+
+    async def main() -> dict[str, Any]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            t = live.ChatTransport("mem", "https://v", "k", guard, http, 500, provider="deepseek")
+            return await live.run_extraction(
+                s, transport=t, embedder=KeywordEmbedder(), item="u", phase="x"
+            )
+
+    result = asyncio.run(main())
+    writebacks = sorted(s.writebacks)
+    assert len(writebacks) >= 3 and len(inputs) == len(writebacks)
+    assert all(r["sliced"] for r in result["rounds"])
+    previous = -1
+    for wb, rendered in zip(writebacks, inputs, strict=True):
+        below = rendered.split("=== new ===")[1]
+        for i, turn in enumerate(s.turns[: wb + 1]):
+            assert (turn.user in below) is (i > previous), (wb, i)
+        previous = wb
+    # 记录交给 A14 的检查:切片被认出,两项都量到了(不是 incomplete),新段不随轮数增长。
+    out, _items = chk.checks({"key": "u", "result": result}, s)
+    assert out["missing"] == {}
+    assert (out["input_growth"], out["context_over_cap"]) == (False, False)
