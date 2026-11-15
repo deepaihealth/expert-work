@@ -496,6 +496,8 @@ class InMemoryMemoryStore(MemoryStore):
                 and row.tenant_id == tenant_id
                 and row.user_id == user_id
                 and row.deleted_at is None
+                and row.invalid_at is None
+                and row.expired_at is None
                 and effective_origin(row) in USER_SIDE_ORIGINS
             ):
                 stamps = [ts for ts in (row.confirmed_at, confirmed_at) if ts is not None]

@@ -503,8 +503,9 @@ class MemoryStore(abc.ABC):
         self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID, confirmed_at: datetime
     ) -> bool:
         """B-300 redesign §7.1 row 8 — the user side said this memory again: move its
-        ``confirmed_at`` to ``confirmed_at`` (never backwards). Only a live row whose
-        effective origin is on the user's side is changed; returns whether it was."""
+        ``confirmed_at`` to ``confirmed_at`` (never backwards). Only a row that is not
+        deleted, superseded or expired and whose effective origin is on the user's
+        side is changed; returns whether it was."""
 
     @abc.abstractmethod
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:

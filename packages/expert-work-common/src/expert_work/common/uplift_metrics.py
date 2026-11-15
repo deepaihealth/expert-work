@@ -507,7 +507,9 @@ def record_memory_reconcile(*, op: str) -> None:
     recalled through, written instead; ``noop_refreshed`` = a NOOP that moved the
     user-side target's confirmed date. ``degraded`` now only means the model gave no
     usable decision for that candidate (or the UPDATE / DELETE target was already
-    gone): reconcile failures raise instead of falling back to a direct ADD.
+    gone). ``reconcile_failed_direct`` = one reconcile call failed inside (lookup,
+    model, unusable reply, store error): the candidates of that batch not written yet
+    were written directly with their own fields (once per failed call).
     """
     _memory_reconcile_total.labels(op=op).inc()
 

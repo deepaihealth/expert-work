@@ -753,6 +753,8 @@ class SqlMemoryStore(MemoryStore):
                 MemoryItemRow.tenant_id == tenant_id,
                 MemoryItemRow.user_id == user_id,
                 MemoryItemRow.deleted_at.is_(None),
+                MemoryItemRow.invalid_at.is_(None),
+                MemoryItemRow.expired_at.is_(None),
                 _USER_SIDE_ROW,
             )
             # GREATEST skips NULL: only ever moves forward.

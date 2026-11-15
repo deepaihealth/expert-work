@@ -9,12 +9,14 @@
   的确认日期刷新为那一行的发送时间,确定性「重复」同样;
 * 层级拦截:用户确认改不动用户说的;用户说的可以改用户确认的;
 * 两段合并:第二次提炼的候选能取到第一段刚写的行;
-* 去重合并内部出错一律抛给调用方,不再退回直接写入。
+* 去重合并内部出错抛 ``ReconcileFailedError``,只带「还没写的」;S 之前写回把它们原样直接写入
+  (只新增、不碰已有行),不进失败队列。
 """
 
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -23,6 +25,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from prometheus_client import REGISTRY
 
 from expert_work.common.user_input import user_input_kwargs
 from expert_work.persistence import InMemoryMemoryStore
@@ -32,6 +35,7 @@ from orchestrator.graph_builder import memory as memory_module
 from orchestrator.graph_builder.memory import (
     _RECONCILE_SYSTEM,
     ExtractedMemory,
+    ReconcileFailedError,
     ReconcileReplyError,
     _Candidate,
     _reconcile_and_apply,
@@ -139,7 +143,8 @@ class _LLM:
         return reply
 
     def payload(self, call: int = 0) -> dict[str, Any]:
-        return json.loads(str(self.calls[call][1].content))
+        payload: dict[str, Any] = json.loads(str(self.calls[call][1].content))
+        return payload
 
 
 def _ops(*rows: tuple[int, str, str | None]) -> str:
@@ -591,56 +596,78 @@ async def test_identical_text_noop_follows_the_tiers() -> None:
     assert len(llm2.calls) == 1
 
 
-# ─── 失败语义:一律抛错,不退回直接写入 ─────────────────────────────────
+# ─── 失败语义:去重合并内部出错 → 抛 ReconcileFailedError,带着「还没写的」──────────
+#
+# 协调人 11-15(审查 MEDIUM-1/2):S 合入之前,写回接住它、把 ``.unwritten`` 原样(带全部字段)
+# 直接写入;已落库的、已判重复的、被层级拦下丢弃的都不在里面。S 再改成抛给任务重试。
 
 
 class _FailingStore(InMemoryMemoryStore):
-    def __init__(self, fail: str) -> None:
+    def __init__(self, *fails: str, fail_on: UUID | None = None) -> None:
         super().__init__()
-        self.fail = fail
+        self.fails = set(fails)
+        #: 取代 / 作废只在改这一条时出错(``None`` = 每次都出错)。
+        self.fail_on = fail_on
+
+    def _boom(self, what: str, target: UUID | None = None) -> None:
+        if what in self.fails and (self.fail_on is None or target in (None, self.fail_on)):
+            raise ConnectionError("db down")
 
     async def retrieve(self, **kwargs: Any) -> list[MemoryItem]:
-        if self.fail == "retrieve":
-            raise ConnectionError("db down")
+        self._boom("retrieve")
         return await super().retrieve(**kwargs)
 
     async def supersede(self, **kwargs: Any) -> MemoryItem | None:
-        if self.fail == "supersede":
-            raise ConnectionError("db down")
+        self._boom("supersede", kwargs["old_id"])
         return await super().supersede(**kwargs)
 
     async def expire(self, **kwargs: Any) -> bool:
-        if self.fail == "expire":
-            raise ConnectionError("db down")
+        self._boom("expire", kwargs["memory_id"])
         return await super().expire(**kwargs)
 
     async def origin_standing(self, **kwargs: Any) -> Any:
-        if self.fail == "origin_standing":
-            raise ConnectionError("db down")
+        self._boom("origin_standing")
         return await super().origin_standing(**kwargs)
 
     async def refresh_confirmed_at(self, **kwargs: Any) -> bool:
-        if self.fail == "refresh":
-            raise ConnectionError("db down")
+        self._boom("refresh")
         return await super().refresh_confirmed_at(**kwargs)
+
+    async def write(self, items: Sequence[MemoryItem]) -> Any:
+        self._boom("write")
+        return await super().write(items)
+
+
+async def _failed(store: InMemoryMemoryStore, llm: Any, *candidates: _Candidate) -> Any:
+    with pytest.raises(ReconcileFailedError) as raised:
+        await _reconcile(store, llm, *candidates)
+    return raised.value
 
 
 @pytest.mark.parametrize(
-    ("fail", "op"),
-    [("retrieve", "ADD"), ("supersede", "UPDATE"), ("expire", "DELETE"), ("refresh", "NOOP")],
+    ("fail", "op", "kept"),
+    [
+        ("retrieve", "ADD", True),
+        ("supersede", "UPDATE", True),
+        ("expire", "DELETE", True),
+        # 判成重复、只是刷新确认日期失败:候选本来就不写。
+        ("refresh", "NOOP", False),
+    ],
 )
 @pytest.mark.asyncio
-async def test_store_errors_inside_reconcile_raise(fail: str, op: str) -> None:
+async def test_store_errors_inside_reconcile_raise_with_what_is_unwritten(
+    fail: str, op: str, kept: bool
+) -> None:
     c = _Ctx()
     store = _FailingStore(fail)
     target = c.mem("speaks French", _at(0.95), origin="user_stated")
     await store.write([target])
     cand = c.mem("speaks French well", origin="user_stated", confidence=0.9)
-    with pytest.raises(ConnectionError):
-        await _reconcile(
-            store, _LLM([_ops((0, op, "e0"))]),
-            _Candidate(cand, line_at=_LINE, in_new_segment=True),
-        )  # fmt: skip
+    error = await _failed(
+        store, _LLM([_ops((0, op, "e0"))]), _Candidate(cand, line_at=_LINE, in_new_segment=True)
+    )
+    assert isinstance(error.__cause__, ConnectionError)
+    assert [m.id for m in error.unwritten] == ([cand.id] if kept else [])
     assert len(store._rows) == 1
 
 
@@ -650,8 +677,10 @@ async def test_a_failed_standing_lookup_for_a_summary_target_raises() -> None:
     store = _FailingStore("origin_standing")
     summary = c.mem("summary", _at(0.95)).model_copy(update={"consolidated_from": [uuid4()]})
     await store.write([summary])
-    with pytest.raises(ConnectionError):
-        await _reconcile(store, _LLM([_ops((0, "UPDATE", "e0"))]), _Candidate(c.mem("x")))
+    cand = c.mem("x")
+    error = await _failed(store, _LLM([_ops((0, "UPDATE", "e0"))]), _Candidate(cand))
+    assert isinstance(error.__cause__, ConnectionError)
+    assert [m.id for m in error.unwritten] == [cand.id]
 
 
 class _BrokenLLM:
@@ -660,16 +689,14 @@ class _BrokenLLM:
 
 
 @pytest.mark.asyncio
-async def test_a_failed_model_call_raises() -> None:
+async def test_a_failed_model_call_raises_with_the_candidate_unwritten() -> None:
     c = _Ctx()
     store = InMemoryMemoryStore()
     await store.write([c.mem("likes tea", _at(0.95))])
-    with pytest.raises(TimeoutError):
-        await _reconcile_and_apply(
-            [_Candidate(c.mem("likes coffee"))], agent_name=_AGENT, positions={},
-            memory_store=store, llm_caller=_BrokenLLM(),  # type: ignore[arg-type]
-            token=CancellationToken(), log_label="test",
-        )  # fmt: skip
+    cand = c.mem("likes coffee")
+    error = await _failed(store, _BrokenLLM(), _Candidate(cand))
+    assert isinstance(error.__cause__, TimeoutError)
+    assert [m.id for m in error.unwritten] == [cand.id]
 
 
 @pytest.mark.parametrize(("reply", "truncated"), [("not json at all", False), (_ops(), True)])
@@ -678,13 +705,77 @@ async def test_an_unusable_or_truncated_reply_raises(reply: str, truncated: bool
     c = _Ctx()
     store = InMemoryMemoryStore()
     await store.write([c.mem("likes tea", _at(0.95))])
-    with pytest.raises(ReconcileReplyError):
-        await _reconcile(
-            store, _LLM([reply], truncated=truncated), _Candidate(c.mem("likes coffee"))
-        )
+    cand = c.mem("likes coffee")
+    error = await _failed(store, _LLM([reply], truncated=truncated), _Candidate(cand))
+    assert isinstance(error.__cause__, ReconcileReplyError)
+    assert [m.id for m in error.unwritten] == [cand.id]
 
 
-# ─── 写回整体:两段合并、出错不直接写 ───────────────────────────────────
+def _deg(deg: float) -> tuple[float, ...]:
+    return (math.cos(math.radians(deg)), math.sin(math.radians(deg)), 0.0, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_a_mid_batch_failure_hands_back_only_the_unwritten() -> None:
+    """审查 MEDIUM-2:a1 已取代成功、b 被层级拦下丢弃、a2 取代时库出错、a3 判重复(还没轮到)、
+    d 判新增(还没轮到)—— 交回的只有 a2 与 d。已落库的、重复的、被拦下的都不在里面。"""
+    c = _Ctx()
+    r0, r1 = c.mem("lives north", _deg(0)), c.mem("lives east", _deg(40))
+    user_row = c.mem("works nights", _deg(80), origin="user_stated", confidence=0.9)
+    store = _FailingStore("supersede", fail_on=r1.id)
+    await store.write([r0, r1, user_row])
+    a1 = c.mem("a1", _deg(0), origin="user_stated", confidence=0.9)
+    b = c.mem("b", _deg(80), origin="assistant_derived", confidence=0.6)
+    a2 = c.mem("a2", _deg(40), origin="user_stated", confidence=0.9)
+    a3 = c.mem("a3", _deg(0), origin="user_stated", confidence=0.9)
+    d = c.mem("d", _deg(20), origin="user_stated", confidence=0.9)
+    ops = _ops(
+        (0, "UPDATE", "e0"), (1, "UPDATE", "e2"), (2, "UPDATE", "e1"), (3, "NOOP", "e0"),
+        (4, "ADD", None),
+    )  # fmt: skip
+    error = await _failed(store, _LLM([ops]), *(_Candidate(m) for m in (a1, b, a2, a3, d)))
+    assert [m.id for m in error.unwritten] == [a2.id, d.id]
+    assert error.superseded == 1
+    assert not _untouched(store, r0)
+    assert _untouched(store, r1) and _untouched(store, user_row)
+
+
+@pytest.mark.asyncio
+async def test_a_short_id_of_another_candidates_neighbour_is_no_decision() -> None:
+    """短编号在一次调用内全局编,但每条候选只能指向自己的邻居;指向别人的 → 按没给决定写候选。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+
+    rows = [c.mem(f"row {d}", _deg(d)) for d in (0, 10, 20, 30, 40, 50)]
+    await store.write(rows)
+    first, second = c.mem("first", _deg(-5)), c.mem("second", _deg(55))
+    llm = _LLM([_ops((0, "UPDATE", "e5"), (1, "ADD", None))])
+    result = await _reconcile(store, llm, _Candidate(first), _Candidate(second))
+    [cand0, cand1] = llm.payload()["candidates"]
+    assert "e5" not in {e["id"] for e in cand0["existing"]}
+    assert {e["id"]: e["content"] for e in cand1["existing"]}["e5"] == "row 50"
+    assert {m.id for m in result.direct} == {first.id, second.id}
+    assert all(_untouched(store, r) for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_naive_line_time_is_read_as_utc() -> None:
+    """时间比较不因有没有时区报错:没有时区的按 UTC 读。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    recorded = _T0 + timedelta(days=5)
+    target = c.mem("lives north", _at(0.95), origin="user_stated", created_at=recorded)
+    await store.write([target])
+    cand = c.mem("lives south", origin="user_stated", confidence=0.9)
+    naive_older = (recorded - timedelta(hours=1)).replace(tzinfo=None)
+    result = await _reconcile(
+        store, _LLM([_ops((0, "UPDATE", "e0"))]), _Candidate(cand, line_at=naive_older)
+    )
+    assert [m.id for m in result.direct] == [cand.id]
+    assert _untouched(store, target)
+
+
+# ─── 写回整体:两段合并、出错时只直接写还没写的 ───────────────────────────────────
 
 PASS1_MARK = "The other side of the conversation is not shown."
 PASS2_MARK = "Every line starts with a tag:"
@@ -723,16 +814,18 @@ def _memories(content: str) -> str:
     return json.dumps({"memories": [{"kind": "fact", "content": content}]})
 
 
-async def _flush(store: InMemoryMemoryStore, llm: _RoutingLLM, c: _Ctx) -> Any:
-    text = "I like tea"
-    user = HumanMessage(
+def _user_message(text: str) -> HumanMessage:
+    return HumanMessage(
         content=text,
         additional_kwargs=user_input_kwargs(text=text, images=0, files=0, external_blocks=0),
     )
+
+
+async def _flush(store: InMemoryMemoryStore, llm: _RoutingLLM, c: _Ctx) -> Any:
     return await flush_messages_with_outcome(
-        [user, AIMessage(content="noted")],
+        [_user_message("I like tea"), AIMessage(content="noted")],
         memory_store=store,
-        embedder=_Embedder({"likes tea": _E, "the user likes tea": _at(0.97)}),  # type: ignore[arg-type]
+        embedder=_Embedder({"likes tea": _E, "the user likes tea": _at(0.97)}),
         llm_caller=llm,  # type: ignore[arg-type]
         tenant_id=c.tenant,
         user_id=c.user,
@@ -760,15 +853,88 @@ async def test_the_second_pass_is_reconciled_against_what_the_first_just_wrote()
     assert (outcome.written, outcome.failed) == (1, False)
 
 
+@dataclass
+class _RecordingDLQ:
+    enqueued: list[list[tuple[str, str]]] = field(default_factory=list)
+
+    async def enqueue(self, **kwargs: Any) -> None:
+        self.enqueued.append(list(kwargs["extracted"]))
+
+
+def _reconcile_count(op: str) -> float:
+    value = REGISTRY.get_sample_value("expert_work_cm_memory_reconcile_total", {"op": op})
+    return value or 0.0
+
+
+async def _flush_with_dlq(
+    store: InMemoryMemoryStore,
+    llm: _RoutingLLM,
+    c: _Ctx,
+    embeddings: dict[str, tuple[float, ...]],
+    dlq: _RecordingDLQ,
+) -> Any:
+    return await flush_messages_with_outcome(
+        [_user_message("my words"), AIMessage(content="noted")],
+        memory_store=store,
+        embedder=_Embedder(embeddings),
+        llm_caller=llm,  # type: ignore[arg-type]
+        tenant_id=c.tenant,
+        user_id=c.user,
+        thread_id=uuid4(),
+        token=CancellationToken(),
+        reconcile=True,
+        agent_name=_AGENT,
+        dlq=dlq,  # type: ignore[arg-type]
+    )
+
+
+def _user_memories(*rows: tuple[str, float]) -> str:
+    return json.dumps(
+        {"memories": [{"kind": "fact", "content": t, "confidence": conf} for t, conf in rows]}
+    )
+
+
 @pytest.mark.asyncio
-async def test_a_reconcile_failure_writes_nothing_directly() -> None:
-    """去重合并的模型调用失败:不再退回直接写入(第二段那条不落库)。"""
+async def test_a_reconcile_failure_writes_the_candidate_directly_with_its_fields() -> None:
+    """审查 MEDIUM-1(协调人定,S 之前):去重合并的模型超时 —— 用户说的候选照样以「用户说的」、
+    它自己的置信度直接写下(只新增,不碰已有的行),不进失败队列(失败队列重建的行没有来源)。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
-    llm = _RoutingLLM(_memories("likes tea"), _memories("the user likes tea"), [])
-    outcome = await _flush(store, llm, c)
+    old = c.mem("lives in the north", _E)
+    await store.write([old])
+    llm = _RoutingLLM(_user_memories(("lives in the south", 0.9)), '{"memories": []}', [])
+    dlq = _RecordingDLQ()
+    before = _reconcile_count("reconcile_failed_direct")
+    outcome = await _flush_with_dlq(store, llm, c, {"lives in the south": _at(0.9)}, dlq)
+    assert len(llm.reconcile_calls) == 1
+    [row] = [r for r in store._rows if r.content == "lives in the south"]
+    assert (row.origin, row.confidence) == ("user_stated", 0.9)
+    assert _untouched(store, old)
+    assert dlq.enqueued == []
+    assert (outcome.written, outcome.failed) == (1, False)
+    assert _reconcile_count("reconcile_failed_direct") == before + 1
+
+
+@pytest.mark.asyncio
+async def test_after_a_reconcile_failure_the_dlq_gets_only_the_unwritten() -> None:
+    """审查 MEDIUM-2,失败队列接上:a1 已取代、a2 取代出错、a3 判重复;之后直接写入也失败 ——
+    失败队列只收到 a2(已落库的 a1、重复的 a3 不会被重建成新行)。"""
+    c = _Ctx()
+    r0, r1 = c.mem("lives north", _deg(0)), c.mem("lives east", _deg(40))
+    store = _FailingStore(fail_on=r1.id)
+    await store.write([r0, r1])
+    store.fails = {"supersede", "write"}
+    ops = _ops((0, "UPDATE", "e0"), (1, "UPDATE", "e1"), (2, "NOOP", "e0"))
+    llm = _RoutingLLM(
+        _user_memories(("a1", 0.9), ("a2", 0.9), ("a3", 0.9)), '{"memories": []}', [ops]
+    )
+    dlq = _RecordingDLQ()
+    outcome = await _flush_with_dlq(
+        store, llm, c, {"a1": _deg(0), "a2": _deg(40), "a3": _deg(0)}, dlq
+    )
     assert outcome.failed
-    assert sorted(r.content for r in _live(store)) == ["likes tea"]
+    assert dlq.enqueued == [[("fact", "a2")]]
+    assert not _untouched(store, r0)
 
 
 @pytest.mark.asyncio
@@ -802,7 +968,7 @@ async def test_extraction_hooks_reach_the_reconcile_and_the_row(
     outcome = await flush_messages_with_outcome(
         [HumanMessage(content="x"), AIMessage(content="y")],
         memory_store=store,
-        embedder=embedder,  # type: ignore[arg-type]
+        embedder=embedder,
         llm_caller=llm,  # type: ignore[arg-type]
         tenant_id=c.tenant,
         user_id=c.user,

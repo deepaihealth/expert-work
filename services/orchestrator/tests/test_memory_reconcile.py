@@ -2,11 +2,11 @@
 
 ``flush_messages_to_memory(reconcile=True)`` checks each extracted memory
 against similar existing ones and applies an explicit ADD / UPDATE /
-DELETE / NOOP decision instead of writing blindly. B-300 redesign §7.6: a
-reconcile failure no longer degrades to a direct ADD (that bypassed the source
-guard and the dedup) — it fails the write-back; ``reconcile=False`` is the
-pre-CM-7 direct write. Existing memories reach the model under short ids
-(``e0``, ``e1``, …, redesign §7.1 row 3).
+DELETE / NOOP decision instead of writing blindly. A reconcile failure
+degrades to a direct ADD of the candidates not written yet, with all their
+fields (B-300 redesign, until PR S makes it a task retry); ``reconcile=False``
+is the pre-CM-7 direct write. Existing memories reach the model under short
+ids (``e0``, ``e1``, …, redesign §7.1 row 3).
 """
 
 from __future__ import annotations
@@ -172,9 +172,7 @@ async def test_delete_retracts_existing_without_storing_candidate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_malformed_ops_reply_writes_nothing_directly() -> None:
-    # B-300 redesign §7.6 — an unusable reply is a reconcile failure: no direct ADD
-    # past the guard and the dedup (the write-back fails; the job retries in PR S).
+async def test_malformed_ops_reply_degrades_to_add() -> None:
     store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
     await _seed(store, tenant, user, "likes light roast")
@@ -182,8 +180,12 @@ async def test_malformed_ops_reply_writes_nothing_directly() -> None:
         responses=[_extraction("likes dark roast"), AIMessage(content="not json at all")]
     )
     written = await _flush(store, llm, _MapEmbedder({"likes dark roast": _NEAR_EAST}), tenant, user)
-    assert written == 0
-    assert await _live_contents(store, tenant, user) == ["likes light roast"]
+    # Never lose a memory over a parse failure — both rows live.
+    assert written == 1
+    assert await _live_contents(store, tenant, user) == [
+        "likes dark roast",
+        "likes light roast",
+    ]
 
 
 @pytest.mark.asyncio

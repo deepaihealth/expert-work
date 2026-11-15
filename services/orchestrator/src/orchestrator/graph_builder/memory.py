@@ -31,7 +31,7 @@ import math
 import unicodedata
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from typing import Any, Literal, NamedTuple, cast
 from uuid import UUID, uuid4
@@ -104,9 +104,11 @@ from expert_work.runtime.cancellation import CancellationToken, RunCancelledErro
 from expert_work.runtime.tokens import CharTokenEstimator, TokenEstimator
 from orchestrator.agent_timezone import resolve_agent_timezone
 from orchestrator.context.memory_render import (
+    as_utc,
     line_date,
     origin_label,
     recorded_date,
+    restated_at,
     select_memory_lines,
 )
 from orchestrator.graph_builder._config import (
@@ -1211,6 +1213,27 @@ class ReconcileReplyError(RuntimeError):
     与调用失败一样抛给调用方,不退回直接写入(那会绕过拦截规则与去重)。"""
 
 
+class ReconcileFailedError(RuntimeError):
+    """B-300 重做 §7.6 —— 去重合并内部出错(原因在 ``__cause__``)。带着这一批里**还没写的**
+    候选(``unwritten``:判了要写但还没写的,加上还没轮到决定的;已落库的、已判重复的、被拦截规则
+    拦下丢弃的都不在里面),以及出错前已经取代的条数与被写入扫描拦下的那几条,调用方据此收尾。
+
+    协调人 11-15(审查 MEDIUM-1/2):PR S 之前,写回接住它、把 ``unwritten`` 原样(来源、置信度、
+    智能体名都在)直接写入 —— 只新增、不碰已有行,拦截规则不会被绕过;S 再改成抛给任务重试。"""
+
+    def __init__(
+        self,
+        unwritten: Sequence[MemoryItem],
+        *,
+        superseded: int,
+        blocked: Sequence[_BlockedWrite],
+    ) -> None:
+        super().__init__(f"reconcile failed; {len(unwritten)} candidate(s) not written")
+        self.unwritten = list(unwritten)
+        self.superseded = superseded
+        self.blocked = list(blocked)
+
+
 @dataclass(frozen=True)
 class _Candidate:
     """去重合并的一条候选,连同程序给它的、模型看不到也改不了的几样。
@@ -1332,7 +1355,7 @@ class _BlockedWrite:
 
 #: 句末标点:只在全文**末尾**去掉(反复)。全角的句号 / 叹号 / 分号先经宽度折叠成半角,
 #: 只剩中文句号(U+3002)要单列。问号不去:问句和陈述句意思不同(终审 LOW-1)。
-_TRAILING_SENTENCE_PUNCTUATION = frozenset(".!;。")
+_TRAILING_SENTENCE_PUNCTUATION = frozenset(".!;\u3002")
 
 
 def _fold_width(ch: str) -> str:
@@ -1394,15 +1417,6 @@ def _in_recall_scope(item: MemoryItem, target: MemoryItem) -> bool:
     return item.kind == "episodic" and target.agent_name == item.agent_name
 
 
-def _record_time(item: MemoryItem) -> datetime | None:
-    """目标的记录时间:记录日期;用户一方的行若有确认日期取两者里晚的(与材料里给的日期同一个口径)。"""
-    stamps = [item.created_at]
-    if effective_origin(item) in USER_SIDE_ORIGINS:
-        stamps.append(item.confirmed_at)
-    known = [ts for ts in stamps if ts is not None]
-    return max(known) if known else None
-
-
 def _event_dates_allow(candidate: _Candidate, target: MemoryItem) -> bool:
     """重做 §7.1 第 7 行 —— 两边都没有事件日期 → 照常;事件日期相同、且候选带更正 → 可以
     (同一次的更正);相同但不是更正(同一天又量了一次)、不同、只有一边有 → 不可以。"""
@@ -1423,12 +1437,13 @@ def _refusal(op: str, pending: _Pending, target: MemoryItem) -> str | None:
         return "rank"
     if not _event_dates_allow(candidate, target):
         return "event_date"
-    recorded = _record_time(target)
+    # 目标的记录时间与材料里给的日期同一个口径;没有时区的按 UTC 读。
+    recorded = restated_at(target)
     if (
         op == "UPDATE"
         and candidate.line_at is not None
         and recorded is not None
-        and candidate.line_at < recorded
+        and as_utc(candidate.line_at) < recorded
     ):
         return "older_line"
     return None
@@ -1596,7 +1611,8 @@ async def _reconcile_and_apply(
     one the program refuses to apply as decided, is written as new.
 
     重做 §7.6 —— 去重合并内部出错(取邻居、模型调用、回复用不了、拦截预判的查询、执行更新 /
-    删除 / 刷新时库出错)一律原样抛给调用方,不再退回直接写入:直接写入会绕过拦截规则与去重。
+    删除 / 刷新时库出错)抛 :class:`ReconcileFailedError`(原因在 ``__cause__``),只带这一批里
+    还没写的候选;取消原样抛出。
 
     B-300 D2 —— 被判「更新」、但新内容被写入扫描拦下的候选:不落库、旧记忆不被作废,也**不**退回
     直接写入;交回 ``blocked`` 由调用方发审计(``positions`` = 候选在本次提炼结果里的序号)。
@@ -1606,34 +1622,99 @@ async def _reconcile_and_apply(
     记忆会执行(``_redundant_correction_op``)。
     """
     deps = _ReconcileDeps(memory_store, token, log_label, before_store)
-    direct: list[MemoryItem] = []
-    pending: list[_Pending] = []
+    progress = _Progress()
+    try:
+        await _reconcile_into(progress, candidates, agent_name, positions, llm_caller, deps)
+    except RunCancelledError:
+        raise
+    except Exception as exc:
+        unwritten = progress.unwritten(candidates)
+        logger.warning(
+            "%s_reconcile_failed — %d candidate(s) not written", log_label, len(unwritten),
+            exc_info=True,
+        )  # fmt: skip
+        raise ReconcileFailedError(
+            unwritten, superseded=progress.superseded, blocked=progress.blocked
+        ) from exc
+    return _Reconciled(progress.direct, progress.blocked, progress.superseded)
+
+
+@dataclass
+class _Progress:
+    """去重合并走到哪了;出错时据此算出这一批里还没写的候选(审查 MEDIUM-2)。"""
+
+    direct: list[MemoryItem] = field(default_factory=list)
+    pending: list[_Pending] = field(default_factory=list)
+    blocked: list[_BlockedWrite] = field(default_factory=list)
+    superseded: int = 0
+    #: 已取过邻居(并处理完确定性 NOOP)的候选数。
+    looked_up: int = 0
+    #: 模型的决定;``None`` = 还没拿到。
+    ops: dict[int, tuple[str, str | None]] | None = None
+    by_short_id: dict[str, UUID] = field(default_factory=dict)
+    #: 已落完决定的待决候选数(出错的那一条不算)。
+    applied: int = 0
+
+    def unwritten(self, candidates: Sequence[_Candidate]) -> list[MemoryItem]:
+        """判了要写但还没写的 + 还没轮到决定的。已落库的、已判重复的、被拦截规则拦下丢弃的、
+        与已有记忆相同的更正都不在里面;出错的那一条若是判重复(只是刷新确认日期失败)也不在。"""
+        out = list(self.direct)
+        if self.ops is None:
+            out += [p.candidate.item for p in self.pending if not p.identical]
+            return out + [c.item for c in candidates[self.looked_up :]]
+        for idx in range(self.applied, len(self.pending)):
+            entry = self.pending[idx]
+            op, short = self.ops.get(idx, ("", None))
+            if _would_write(entry, op, short, self.by_short_id):
+                out.append(entry.candidate.item)
+        return out
+
+
+def _would_write(
+    entry: _Pending, op: str, short: str | None, by_short_id: Mapping[str, UUID]
+) -> bool:
+    """还没落完的一条候选,收尾时要不要写:与已有记忆相同的更正永远不写;判成召回范围内的重复
+    不写;其余(新增、没给决定、还没执行的更新 / 删除)按新增写。"""
+    if entry.identical:
+        return False
+    op, target = _resolve_target(entry, op, short, by_short_id)
+    in_scope = target is not None and _in_recall_scope(entry.candidate.item, target)
+    return not (op == "NOOP" and in_scope)
+
+
+async def _reconcile_into(
+    progress: _Progress,
+    candidates: Sequence[_Candidate],
+    agent_name: str | None,
+    positions: Mapping[UUID, int],
+    llm_caller: LLMCaller,
+    deps: _ReconcileDeps,
+) -> None:
     for candidate in candidates:
         neighbors = await _neighbors_of(candidate, agent_name, deps)
+        progress.looked_up += 1
         identical = _identical_neighbors(candidate.item, neighbors)
         if identical and not candidate.is_correction:
             # 11-14 重跑 118.5 —— 内容相同(归一后)、层级不低的已有记忆:不问模型,直接 NOOP。
             # 带更正的候选照旧问模型(审查 MEDIUM):它可能要删掉旁边一条与之冲突的记忆。
-            logger.debug("%s_reconcile_identical_noop", log_label)
+            logger.debug("%s_reconcile_identical_noop", deps.log_label)
             await _noop(candidate, identical[0], deps)
         elif neighbors:
             ids = frozenset(n.id for n in identical)
-            pending.append(_Pending(candidate, tuple(neighbors), ids))
+            progress.pending.append(_Pending(candidate, tuple(neighbors), ids))
         else:
             record_memory_reconcile(op="add")
-            direct.append(candidate.item)
-    if not pending:
-        return _Reconciled(direct, [])
-    ops, by_short_id = await _decide(pending, llm_caller, deps)
-    blocked: list[_BlockedWrite] = []
-    superseded = 0
-    for idx, entry in enumerate(pending):
-        op, short = ops.get(idx, ("", None))
-        outcome = await _apply_decision(entry, op, short, by_short_id, positions, deps)
-        direct.extend(outcome.direct)
-        blocked.extend(outcome.blocked)
-        superseded += outcome.superseded
-    return _Reconciled(direct, blocked, superseded)
+            progress.direct.append(candidate.item)
+    if not progress.pending:
+        return
+    progress.ops, progress.by_short_id = await _decide(progress.pending, llm_caller, deps)
+    for idx, entry in enumerate(progress.pending):
+        op, short = progress.ops.get(idx, ("", None))
+        outcome = await _apply_decision(entry, op, short, progress.by_short_id, positions, deps)
+        progress.direct.extend(outcome.direct)
+        progress.blocked.extend(outcome.blocked)
+        progress.superseded += outcome.superseded
+        progress.applied += 1
 
 
 def _resolve_target(
@@ -2037,8 +2118,10 @@ async def flush_messages_with_outcome(
     flush stays a direct write (latency-sensitive, inside a turn). B-300
     redesign §7.1 row 9: two stages — the first pass's output is reconciled
     and written first, then the second pass's, which can then see it. A
-    reconcile failure (§7.6) no longer falls back to a direct write; it lands
-    in the failure branch below like any other error.
+    reconcile failure (§7.6) writes only that stage's candidates that were not
+    written yet, directly and with all their fields (ADD only, no existing row
+    touched); until PR S makes it a task retry. The DLQ, if a later step fails,
+    only ever gets what was not written.
 
     ``run_id`` (P5b provenance) is stamped on every written item; the
     DLQ-retry path now carries run_id (P5b-2a) too — the enqueue call
@@ -2143,16 +2226,23 @@ async def flush_messages_with_outcome(
             retry_pairs = [(str(c.item.kind), c.item.content) for c in stage] + later
             to_write = [c.item for c in stage]
             if reconcile and stage:
-                done = await _reconcile_and_apply(
-                    stage,
-                    agent_name=agent_name,
-                    positions=position,
-                    memory_store=memory_store,
-                    llm_caller=llm_caller,
-                    token=token,
-                    log_label=log_label,
-                    before_store=before_store,
-                )
+                try:
+                    done = await _reconcile_and_apply(
+                        stage,
+                        agent_name=agent_name,
+                        positions=position,
+                        memory_store=memory_store,
+                        llm_caller=llm_caller,
+                        token=token,
+                        log_label=log_label,
+                        before_store=before_store,
+                    )
+                except ReconcileFailedError as exc:
+                    # 协调人 11-15(审查 MEDIUM-1):PR S 之前,还没写的候选原样(来源、置信度、
+                    # 智能体名都在)直接写入 —— 只新增、不碰已有行;进失败队列会被重建成「来源
+                    # 未记录」的行,反倒让来自助手的候选能改它。S 改成抛给任务重试。
+                    record_memory_reconcile(op="reconcile_failed_direct")
+                    done = _Reconciled(exc.unwritten, exc.blocked, exc.superseded)
                 to_write, written = done.direct, written + done.superseded
                 blocked.extend(done.blocked)
                 # 审查 LOW-1 —— 去重合并之后,失败重试只该重建本来要写的这几条:被拦下丢弃的

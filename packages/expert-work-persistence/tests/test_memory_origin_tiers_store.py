@@ -358,6 +358,27 @@ async def test_refresh_confirmed_at_only_moves_a_user_side_row_forward(store: Me
 
 
 @pytest.mark.asyncio
+async def test_refresh_confirmed_at_leaves_superseded_and_expired_rows_alone(
+    store: MemoryStore,
+) -> None:
+    """已被取代(``invalid_at``)、已作废(``expired_at``)的行不再是有效记忆,不刷新。"""
+    t, u = uuid4(), uuid4()
+    replaced, retracted = (
+        _item(t, u, "old", origin="user_stated"),
+        _item(t, u, "gone", origin="user_stated"),
+    )
+    await store.write([replaced, retracted])
+    new = _item(t, u, "new", origin="user_stated")
+    assert await store.supersede(tenant_id=t, user_id=u, old_id=replaced.id, new_item=new)
+    assert await store.expire(tenant_id=t, user_id=u, memory_id=retracted.id)
+    for row in (replaced, retracted):
+        assert not await store.refresh_confirmed_at(
+            tenant_id=t, user_id=u, memory_id=row.id, confirmed_at=_T0
+        )
+        assert (await _row(store, t, u, row.id)).confirmed_at is None
+
+
+@pytest.mark.asyncio
 async def test_supersede_drops_a_confirmed_date_on_a_non_user_side_new_row(
     store: MemoryStore,
 ) -> None:
