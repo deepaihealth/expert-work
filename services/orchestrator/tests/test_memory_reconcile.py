@@ -2,13 +2,16 @@
 
 ``flush_messages_to_memory(reconcile=True)`` checks each extracted memory
 against similar existing ones and applies an explicit ADD / UPDATE /
-DELETE / NOOP decision instead of writing blindly. Every failure path
-degrades to a direct ADD (never lose a memory); ``reconcile=False`` is
-the pre-CM-7 direct write.
+DELETE / NOOP decision instead of writing blindly. B-300 redesign §7.6: a
+reconcile failure no longer degrades to a direct ADD (that bypassed the source
+guard and the dedup) — it fails the write-back; ``reconcile=False`` is the
+pre-CM-7 direct write. Existing memories reach the model under short ids
+(``e0``, ``e1``, …, redesign §7.1 row 3).
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from uuid import UUID, uuid4
@@ -56,7 +59,7 @@ def _extraction(content: str) -> AIMessage:
     return AIMessage(content=f'{{"memories": [{{"kind": "fact", "content": "{content}"}}]}}')
 
 
-def _ops(op: str, target: UUID | None = None) -> AIMessage:
+def _ops(op: str, target: str | UUID | None = None) -> AIMessage:
     target_part = f', "target_id": "{target}"' if target is not None else ""
     return AIMessage(content=f'{{"ops": [{{"index": 0, "op": "{op}"{target_part}}}]}}')
 
@@ -98,15 +101,17 @@ async def _live_contents(store: InMemoryMemoryStore, tenant: UUID, user: UUID) -
 
 @pytest.mark.asyncio
 async def test_no_neighbor_adds_directly_without_ops_llm() -> None:
+    # B-300 redesign §7.1 row 2 — no similarity gate: only an empty recall scope
+    # skips the model (a distant neighbour still goes to it,
+    # test_memory_reconcile_redesign).
     store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
-    await _seed(store, tenant, user, "lives in Paris")  # _EAST
     llm = _RecordingLLM(responses=[_extraction("likes jazz")])
     written = await _flush(store, llm, _MapEmbedder({"likes jazz": _NORTH}), tenant, user)
     assert written == 1
     # Only the extraction call happened — no neighbours, no ops LLM.
     assert len(llm.calls) == 1
-    assert await _live_contents(store, tenant, user) == ["likes jazz", "lives in Paris"]
+    assert await _live_contents(store, tenant, user) == ["likes jazz"]
 
 
 @pytest.mark.asyncio
@@ -117,14 +122,15 @@ async def test_update_supersedes_existing_memory() -> None:
     store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
     old = await _seed(store, tenant, user, "likes light roast")
-    llm = _RecordingLLM(responses=[_extraction("likes dark roast"), _ops("UPDATE", old.id)])
+    llm = _RecordingLLM(responses=[_extraction("likes dark roast"), _ops("UPDATE", "e0")])
     written = await _flush(store, llm, _MapEmbedder({"likes dark roast": _NEAR_EAST}), tenant, user)
     # B-300 D12 — applied via store.supersede (no direct write), and the row it
     # wrote counts: "written" is the rows that actually landed.
     assert written == 1
     assert len(llm.calls) == 2
-    # The ops prompt carried the existing memory for the decision.
-    assert str(old.id) in str(llm.calls[1][1].content)
+    # The ops prompt carried the existing memory for the decision, under its short id.
+    [existing] = json.loads(str(llm.calls[1][1].content))["candidates"][0]["existing"]
+    assert (existing["id"], existing["content"]) == ("e0", "likes light roast")
     assert await _live_contents(store, tenant, user) == ["likes dark roast"]
     # Append-only trail: old row kept + invalidated (not overwritten), new
     # row versioned onto it.
@@ -141,7 +147,7 @@ async def test_noop_stores_nothing() -> None:
     store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
     await _seed(store, tenant, user, "likes coffee")
-    llm = _RecordingLLM(responses=[_extraction("enjoys coffee"), _ops("NOOP")])
+    llm = _RecordingLLM(responses=[_extraction("enjoys coffee"), _ops("NOOP", "e0")])
     written = await _flush(store, llm, _MapEmbedder({"enjoys coffee": _NEAR_EAST}), tenant, user)
     assert written == 0
     assert await _live_contents(store, tenant, user) == ["likes coffee"]
@@ -154,7 +160,7 @@ async def test_delete_retracts_existing_without_storing_candidate() -> None:
     store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
     old = await _seed(store, tenant, user, "works at Acme")
-    llm = _RecordingLLM(responses=[_extraction("no longer works at Acme"), _ops("DELETE", old.id)])
+    llm = _RecordingLLM(responses=[_extraction("no longer works at Acme"), _ops("DELETE", "e0")])
     written = await _flush(
         store, llm, _MapEmbedder({"no longer works at Acme": _NEAR_EAST}), tenant, user
     )
@@ -166,7 +172,9 @@ async def test_delete_retracts_existing_without_storing_candidate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_malformed_ops_reply_degrades_to_add() -> None:
+async def test_malformed_ops_reply_writes_nothing_directly() -> None:
+    # B-300 redesign §7.6 — an unusable reply is a reconcile failure: no direct ADD
+    # past the guard and the dedup (the write-back fails; the job retries in PR S).
     store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
     await _seed(store, tenant, user, "likes light roast")
@@ -174,12 +182,8 @@ async def test_malformed_ops_reply_degrades_to_add() -> None:
         responses=[_extraction("likes dark roast"), AIMessage(content="not json at all")]
     )
     written = await _flush(store, llm, _MapEmbedder({"likes dark roast": _NEAR_EAST}), tenant, user)
-    # Never lose a memory over a parse failure — both rows live.
-    assert written == 1
-    assert await _live_contents(store, tenant, user) == [
-        "likes dark roast",
-        "likes light roast",
-    ]
+    assert written == 0
+    assert await _live_contents(store, tenant, user) == ["likes light roast"]
 
 
 @pytest.mark.asyncio

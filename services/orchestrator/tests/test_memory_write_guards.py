@@ -158,7 +158,7 @@ async def test_blocked_update_keeps_the_old_memory_current() -> None:
         embedding=_VECTOR,
     )
     await store.write([old])
-    reconcile_reply = json.dumps({"ops": [{"index": 0, "op": "UPDATE", "target_id": str(old.id)}]})
+    reconcile_reply = json.dumps({"ops": [{"index": 0, "op": "UPDATE", "target_id": "e0"}]})
     node = make_memory_writeback_node(
         memory_store=store,
         embedder=_SameVectorEmbedder(),
@@ -220,9 +220,7 @@ class _FoldingReconcileLLM:
             source_hashes={m.id: hash_content(m.content) for m in members},
         )
         return AIMessage(
-            content=json.dumps(
-                {"ops": [{"index": 0, "op": "UPDATE", "target_id": str(self.target.id)}]}
-            )
+            content=json.dumps({"ops": [{"index": 0, "op": "UPDATE", "target_id": "e0"}]})
         )
 
 

@@ -82,7 +82,7 @@ _SYSTEM_MARKERS = (
     ("You are a memory relevance filter", "verify"),
     ("You rewrite the user's latest message", "rewrite"),
     ("You are a memory extraction module", "extract"),
-    ("You reconcile newly extracted memories", "reconcile"),
+    ("You compare newly extracted memories", "reconcile"),
 )
 _REPLIES = {
     "planner": '{"goal": "g", "steps": ["s1"]}',
@@ -91,7 +91,7 @@ _REPLIES = {
     "verify": "[0]",
     "rewrite": "tea preference",
     "extract": '{"memories": [{"kind": "fact", "content": "user likes tea"}]}',
-    "reconcile": '{"operations": []}',
+    "reconcile": '{"ops": []}',
 }
 
 

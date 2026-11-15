@@ -29,10 +29,10 @@ import json
 import logging
 import math
 import unicodedata
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Literal, NamedTuple, cast
 from uuid import UUID, uuid4
 
@@ -58,6 +58,7 @@ from expert_work.common.uplift_metrics import (
     record_memory_extraction_message_truncated,
     record_memory_mmr,
     record_memory_reconcile,
+    record_memory_reconcile_target,
     record_memory_redacted,
     record_memory_rerank,
     record_memory_retrieval,
@@ -77,9 +78,12 @@ from expert_work.persistence.memory.base import (
     USER_SIDE_ORIGINS,
     BlockedMemory,
     MemoryInjectionBlockedError,
+    OriginStanding,
     SupersedeTargetChangedError,
     UserSideHigherConfidenceError,
     UserSideTargetError,
+    origin_tier,
+    outranks,
 )
 from expert_work.persistence.rls import (
     bypass_rls_var,
@@ -100,6 +104,7 @@ from expert_work.runtime.cancellation import CancellationToken, RunCancelledErro
 from expert_work.runtime.tokens import CharTokenEstimator, TokenEstimator
 from orchestrator.agent_timezone import resolve_agent_timezone
 from orchestrator.context.memory_render import (
+    line_date,
     origin_label,
     recorded_date,
     select_memory_lines,
@@ -480,6 +485,13 @@ class ExtractedMemory:
     # B-300 ② — set by the program from WHICH extraction pass produced it (never
     # read from the reply): pass 1 → ``user_stated``, pass 2 → ``assistant_derived``.
     origin: MemoryOrigin | None = None
+    # B-300 redesign — hooks the reconcile reads; extraction (PR X) fills them from the
+    # line ``turn`` points at. Until then they stay unknown: no event date, no line
+    # time (an UPDATE is not re-judged by age), not in the new segment (a NOOP never
+    # refreshes the confirmed date).
+    event_date: date | None = None
+    line_at: datetime | None = None
+    in_new_segment: bool = False
 
 
 #: Stream RT-2 PR-2 (review HIGH) — ceiling for extraction-scored confidence.
@@ -1144,75 +1156,82 @@ def make_memory_recall_node(
     return memory_recall_node
 
 
-#: Stream CM-7 (Mini-ADR CM-H4) — neighbours below this cosine similarity
-#: are not "the same memory" candidates; the new item is ADDed without an
-#: LLM decision (the cheap majority path).
-_RECONCILE_SIM_THRESHOLD = 0.80
-_RECONCILE_NEIGHBOR_LIMIT = 3
+#: B-300 重做 §7.1 —— 每条候选按向量取召回范围内最近的 5 条已有记忆交给模型,不设相似度门槛
+#: (相似度只用来找候选、排名次,不能证明是同一件事;mem0 / OpenViking 同为 5、无门槛)。
+_RECONCILE_NEIGHBOR_LIMIT = 5
+#: §7.1 第 6 行 —— 更新 / 删除的目标必须是同一格里按余弦最近的前几条之一(审查 H4)。
+_RECONCILE_TARGET_TOP = 2
 
-_RECONCILE_SYSTEM = (
-    "You reconcile newly extracted memories against similar existing "
-    "ones. For each candidate decide exactly one operation:\n"
-    '- "ADD": genuinely new information\n'
-    '- "UPDATE": supersedes or corrects ONE existing memory (set '
-    "target_id; the existing memory is rewritten to the candidate)\n"
-    '- "DELETE": the candidate retracts ONE existing memory (set '
-    "target_id; the existing memory is removed and the candidate "
-    "itself is NOT stored)\n"
-    '- "NOOP": duplicate of an existing memory; store nothing\n'
-    'A candidate with "is_correction": true is the user explicitly '
-    "correcting earlier info — strongly prefer UPDATE (or DELETE) against "
-    "the matching existing memory over ADD, so the old value is superseded "
-    "rather than left to coexist.\n"
-    # 审查(11-14)MEDIUM-4 / LOW-3 —— 带新值的更正是「更新」;不同日子的读数是新的一条。
-    "A correction that carries a new value is an UPDATE of the memory it replaces, not a "
-    "DELETE; DELETE only when the candidate retracts an existing memory without giving a "
-    "new value.\n"
-    "A reading, measurement or status that refers to a different date or time than an "
-    "existing one is a new memory (ADD), not an UPDATE of the earlier one.\n"
-    # 11-14 重跑 118.5 —— 已有同样内容的用户一方记忆时一律 NOOP,先于下一句(否则候选同时对上
-    # 一条相同的用户记忆和一条来自助手的,模型会去「更新」后者,多出一条重复的)。
-    "When an existing memory stated in user messages or corrected by the user already "
-    "says the same thing as the candidate, the candidate is a NOOP, even if an existing "
-    "memory from the assistant also matches it; this takes precedence over the rule below "
-    "about memories from the assistant.\n"
-    'In that case, a candidate with "is_correction": true is not a NOOP for this reason; '
-    "it DELETEs the existing memory it contradicts, if there is one; otherwise it is a NOOP.\n"
-    # B-300 §6.2 —— 双方都带 "source";用户后来自己说全了,旧的来自助手的版本应被取代。
-    "A candidate stated in user messages that matches an existing memory from the "
-    "assistant is an UPDATE, not a NOOP.\n"
-    # 用户 11-14 —— 另一个方向(验收 118.5 第 5 轮:来自助手的同义候选被判成 ADD)。
-    "A candidate from the assistant that matches an existing memory stated in user "
-    "messages or corrected by the user is a NOOP, not an ADD.\n"
-    "Respond with ONLY a JSON object, no prose and no code fences:\n"
-    '{"ops": [{"index": <candidate index>, "op": "ADD", '
-    '"target_id": "<existing id, only for UPDATE/DELETE>"}]}'
-)
+#: 附录 B(最终英文原文)。指令里没写的规则由程序执行:层级拦截、同一格、余弦前 2 名、召回范围、
+#: 事件日期、候选那一行早于目标的记录时间。
+_RECONCILE_SYSTEM = """\
+You compare newly extracted memories ("candidates") with existing memories about the same
+user and decide what to store. Each candidate comes with up to five existing memories that
+are closest to it in meaning. Every existing memory has a short id (e0, e1, ...), its kind,
+its source, its date, and "event_date" when it is about something that happened on one day.
+Each candidate also has the date of the line it was taken from.
+For each candidate choose one operation:
+- "NOOP": an existing memory already says the same thing; the candidate only rephrases it
+  or says less. Set "target_id" to that memory.
+- "UPDATE": the candidate is about the same subject or the same occasion as one existing
+  memory and brings newer or fuller information. The candidate replaces that memory's text,
+  so choose UPDATE only when the candidate still says everything in it that remains true;
+  otherwise choose ADD. Set "target_id".
+- "DELETE": the candidate says that one existing memory is no longer true and gives
+  nothing to put in its place. Set "target_id".
+- "ADD": anything else. A memory that is only related — the same topic but another subject,
+  person, item or occasion — is not a target; the candidate is an ADD.
+UPDATE and DELETE apply only to an existing memory of the same kind.
+Two memories with different event dates are different occasions: ADD. A memory with an
+"event_date" is changed only by a candidate with "is_correction": true about the same day;
+any other candidate about that day is a NOOP when it says the same thing and an ADD
+otherwise. A reading, count or status that refers to a different date or time than an
+existing memory is a new memory (ADD), not an UPDATE of the earlier one.
+A candidate with "is_correction": true changes something said earlier: when an existing
+memory still says the earlier value, the candidate is an UPDATE of that memory.
+A candidate's "is_correction" says what the candidate does, not where it comes from; its
+source is given in "source".
+Sources, from strongest to weakest: "corrected by the user", "stated in user messages",
+"confirmed by the user", then "from the assistant" and "source not recorded" (equal).
+- When an existing memory whose source is at least as strong as the candidate's says the
+  same thing, the candidate is a NOOP of that memory, even if a memory with a weaker source
+  also matches.
+- When the candidate says the same thing as an existing memory with a weaker source, it is
+  an UPDATE of that memory.
+- When a candidate with "is_correction": true says the same thing as an existing memory
+  whose source is at least as strong, and another existing memory still says the earlier
+  value, DELETE that other memory; otherwise the candidate is a NOOP.
+Respond with ONLY a JSON object, no prose and no code fences:
+{"ops": [{"index": <candidate index>, "op": "ADD" | "UPDATE" | "DELETE" | "NOOP",
+"target_id": "<short id of the existing memory; omit for ADD>"}]}"""
 
 
-async def _protects_user_side(
-    memory_store: MemoryStore, target: MemoryItem, token: CancellationToken, log_label: str
-) -> bool:
-    """B-300 §6.2 拦截规则的预判:目标的有效来源是用户消息里说的 / 用户更正的,或者它是
-    一条成员里有这种记忆的汇总行(审查 MEDIUM-3)。
+class ReconcileReplyError(RuntimeError):
+    """B-300 重做 §7.6 —— 去重合并的回复用不了(没有 ``{"ops": [...]}``,或被输出上限截断)。
+    与调用失败一样抛给调用方,不退回直接写入(那会绕过拦截规则与去重)。"""
 
-    预判用的是读邻居时的那份目标;真正改库时 ``supersede`` / ``expire`` 还会在锁里重判
-    (审查 MEDIUM-1)。所以查汇总成员失败时这里按「不受保护」放过,由锁里那道兜底。"""
-    if effective_origin(target) in USER_SIDE_ORIGINS:
-        return True
-    if not target.consolidated_from:
-        return False
-    try:
-        return await token.run_cancellable(
-            memory_store.user_side_protected(
-                tenant_id=target.tenant_id, user_id=target.user_id, memory_id=target.id
-            )
-        )
-    except RunCancelledError:
-        raise
-    except Exception:
-        logger.warning("%s_protection_lookup_failed id=%s", log_label, target.id, exc_info=True)
-        return False
+
+@dataclass(frozen=True)
+class _Candidate:
+    """去重合并的一条候选,连同程序给它的、模型看不到也改不了的几样。
+
+    ``line_at`` / ``in_new_segment`` 由提炼(PR X)按 ``turn`` 指向的那一行填:那一行的发送时间,
+    以及它在不在本任务的新段里(不是上下文行)。没填(``None`` / ``False``)= 不知道 —— 「更新」
+    不按先后改判、「重复」不刷新确认日期。"""
+
+    item: MemoryItem
+    is_correction: bool = False
+    line_at: datetime | None = None
+    in_new_segment: bool = False
+
+
+@dataclass(frozen=True)
+class _Pending:
+    """要问模型的一条候选:按余弦从近到远排好的邻居、与它内容相同的同格记忆(只对更正算)。"""
+
+    candidate: _Candidate
+    neighbors: tuple[MemoryItem, ...]
+    identical: frozenset[UUID]
 
 
 def _blocked_by_user_side(
@@ -1224,8 +1243,8 @@ def _blocked_by_user_side(
     什么都不做。计数 ``{prefix}_update_added`` / ``_update_dropped`` / ``_delete_added`` /
     ``_delete``。
 
-    ``lower_confidence``(用户 11-14)= 拦下的是置信度更低的「用户消息里说的」候选,处理相同,
-    计数用 ``lower_confidence_*`` 标签,与来自助手的 ``blocked_*`` 分开。"""
+    ``lower_confidence`` = 拦下的是同一层级、置信度更低的用户一方候选(用户 11-14),处理相同,
+    计数用 ``lower_confidence_*`` 标签;层级更低的(重做 §6.3)用 ``blocked_*``。"""
     prefix = "lower_confidence" if lower_confidence else "blocked"
     verb = "update" if op == "UPDATE" else "delete"
     if is_correction:
@@ -1235,50 +1254,20 @@ def _blocked_by_user_side(
     return None
 
 
-async def _user_side_confidence(
-    memory_store: MemoryStore, target: MemoryItem, token: CancellationToken, log_label: str
-) -> float | None:
-    """用户 11-14 第二条拦截规则的预判口径(审查 11-14):不是汇总行 → 用户一方的就是它自己的
-    置信度;汇总行 → 成员里最高的用户一方置信度(存储里查,查不完按 1.0)。查失败按「不受保护」
-    放过,由 ``supersede`` / ``expire`` 锁里那道兜底(同 :func:`_protects_user_side`)。"""
+async def _target_standing(
+    memory_store: MemoryStore, target: MemoryItem, token: CancellationToken
+) -> OriginStanding:
+    """拦截预判用的目标层级(重做 §6.3):不是汇总行 → 它自己的;汇总行 → 存储按成员算。
+    查失败原样抛(§7.6);真正改库时 ``supersede`` / ``expire`` 还会在锁里重判。"""
+    own = OriginStanding(origin_tier(target), target.confidence)
     if not target.consolidated_from:
-        return target.confidence if effective_origin(target) in USER_SIDE_ORIGINS else None
-    try:
-        return await token.run_cancellable(
-            memory_store.user_side_confidence(
-                tenant_id=target.tenant_id, user_id=target.user_id, memory_id=target.id
-            )
+        return own
+    got = await token.run_cancellable(
+        memory_store.origin_standing(
+            tenant_id=target.tenant_id, user_id=target.user_id, memory_id=target.id
         )
-    except RunCancelledError:
-        raise
-    except Exception:
-        logger.warning("%s_confidence_lookup_failed id=%s", log_label, target.id, exc_info=True)
-        return None
-
-
-async def _refused_before_apply(
-    memory_store: MemoryStore,
-    target: MemoryItem,
-    *,
-    guarded: bool,
-    above: float | None,
-    token: CancellationToken,
-    log_label: str,
-) -> bool:
-    """去重合并改库前的预判:来自助手的候选碰用户一方的(第一条);用户消息里说的候选碰比它更确定的
-    用户一方的(第二条)。"""
-    if guarded:
-        return await _protects_user_side(memory_store, target, token, log_label)
-    if above is None:
-        return False
-    confidence = await _user_side_confidence(memory_store, target, token, log_label)
-    return confidence is not None and confidence > above
-
-
-def _lower_confidence_guard(item: MemoryItem) -> float | None:
-    """用户 11-14 —— 「用户消息里说的」候选只能改置信度不高于它的用户一方记忆:返回要交给
-    ``supersede`` / ``expire`` 的 ``refuse_user_side_above``(候选的置信度);别的候选 ``None``。"""
-    return item.confidence if item.origin == "user_stated" else None
+    )
+    return got if got is not None else own
 
 
 def _reconcile_cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -1292,26 +1281,20 @@ def _reconcile_cosine(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def parse_reconcile_ops(text: str) -> dict[int, tuple[str, str | None]]:
-    """Parse the reconcile LLM reply into ``{index: (op, target_id)}``.
-
-    Tolerant — malformed entries are simply absent, and the caller
-    treats an absent decision as a degraded direct ADD (CM-H4: never
-    lose a memory over a parse failure). B-300 exception (11-14): a
-    correction that restates an existing memory (same slot, provenance at
-    least as strong) is never written
-    on a missing / failed decision — it is a NOOP (the memory is already
-    there); see ``_redundant_correction_op``.
-    """
+def _parse_reconcile_reply(text: str) -> dict[int, tuple[str, str | None]] | None:
+    """:func:`parse_reconcile_ops`,但回复里没有可用的 ``{"ops": [...]}`` 时是 ``None``
+    (重做 §7.6:整条回复用不了算出错,不是「每条都没给决定」)。"""
     raw = _extract_json_object(text)
     if raw is None:
-        return {}
+        return None
     try:
         rows = json.loads(raw)["ops"]
     except (json.JSONDecodeError, KeyError, TypeError):
-        return {}
+        return None
+    if not isinstance(rows, list):
+        return None
     out: dict[int, tuple[str, str | None]] = {}
-    for row in rows if isinstance(rows, list) else []:
+    for row in rows:
         if not isinstance(row, dict):
             continue
         op = str(row.get("op", "")).strip().upper()
@@ -1321,6 +1304,17 @@ def parse_reconcile_ops(text: str) -> dict[int, tuple[str, str | None]]:
         target = row.get("target_id")
         out[index] = (op, str(target) if target is not None else None)
     return out
+
+
+def parse_reconcile_ops(text: str) -> dict[int, tuple[str, str | None]]:
+    """Parse the reconcile LLM reply into ``{index: (op, target_id)}``.
+
+    Tolerant — malformed entries are simply absent; an unusable reply is ``{}``.
+    ``target_id`` is the short id (``e0``, ``e1``, …) the material gave the model
+    (B-300 redesign §7.1 row 3); the caller maps it back. The write-back itself
+    raises on an unusable reply (:class:`ReconcileReplyError`).
+    """
+    return _parse_reconcile_reply(text) or {}
 
 
 @dataclass(frozen=True)
@@ -1336,15 +1330,9 @@ class _BlockedWrite:
     target_id: UUID | None = None
 
 
-def _provenance_rank(item: MemoryItem) -> int:
-    """11-14 重跑 118.5 —— 内容相同(按 :func:`_normalized_text`)时比来源强弱:用户一方
-    (用户消息里说的 / 用户更正)最强,来自助手与来源未记录同一档(都不是用户确认过的)。"""
-    return 1 if effective_origin(item) in USER_SIDE_ORIGINS else 0
-
-
 #: 句末标点:只在全文**末尾**去掉(反复)。全角的句号 / 叹号 / 分号先经宽度折叠成半角,
 #: 只剩中文句号(U+3002)要单列。问号不去:问句和陈述句意思不同(终审 LOW-1)。
-_TRAILING_SENTENCE_PUNCTUATION = frozenset(".!;\u3002")
+_TRAILING_SENTENCE_PUNCTUATION = frozenset(".!;。")
 
 
 def _fold_width(ch: str) -> str:
@@ -1367,33 +1355,24 @@ def _normalized_text(text: str) -> str:
     return out
 
 
-def _has_identical_neighbor(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> bool:
-    """候选与某条有效邻居内容相同(按 :func:`_normalized_text` 归一后)、在同一格(同 kind、同
-    agent_name —— 比写入去重严:SQL 唯一索引那一格是 (tenant, user, content_hash, agent_name),
-    不含 kind)、且那条的来源不弱于候选 → 候选什么也不带来,确定性 NOOP:
-    用户一方的候选只对上用户一方的;其余候选对上任何来源的。来源更弱的相同内容(用户说的候选对上
-    来自助手 / 未记录的)照旧交给模型(升格成用户说的)。"""
-    return bool(_identical_neighbors(item, neighbors))
+def _same_cell(a: MemoryItem, b: MemoryItem) -> bool:
+    """「格」= 类型 + 智能体名(与确定性「重复」、更新 / 删除的目标限制同一个口径)。"""
+    return a.kind == b.kind and a.agent_name == b.agent_name
 
 
 def _identical_neighbors(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> list[MemoryItem]:
-    """:func:`_has_identical_neighbor` 认的那几条:同一格、来源不弱于候选、归一后内容相同。"""
+    """候选与之内容相同(按 :func:`_normalized_text` 归一后)、在同一格(同 kind、同 agent_name ——
+    比写入去重严:SQL 唯一索引那一格是 (tenant, user, content_hash, agent_name),不含 kind)、来源
+    层级不低于候选(重做 §6.3,:func:`origin_tier`)的有效邻居。不带更正的候选碰上这样的邻居 →
+    确定性 NOOP,不问模型;层级更低的相同内容(用户说的候选对上用户确认 / 来自助手的)照旧交给模型
+    (应更新、升格)。"""
     text = _normalized_text(item.content)
-    rank = _provenance_rank(item)
+    tier = origin_tier(item)
     return [
         n
         for n in neighbors
-        if n.kind == item.kind
-        and n.agent_name == item.agent_name
-        and _provenance_rank(n) >= rank
-        and _normalized_text(n.content) == text
+        if _same_cell(n, item) and origin_tier(n) >= tier and _normalized_text(n.content) == text
     ]
-
-
-def _identical_neighbor_ids(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> frozenset[UUID]:
-    """带更正的候选与之内容相同、来源不弱于它的同格记忆(终审 MEDIUM-1 只认用户一方的;审查
-    MEDIUM-3 起任何来源都算,与确定性 NOOP 同一个判断)。这样的候选自己永远不落新行。"""
-    return frozenset(n.id for n in _identical_neighbors(item, neighbors))
 
 
 def _redundant_correction_op(op: str, target: UUID | None, identical: frozenset[UUID]) -> str:
@@ -1407,6 +1386,109 @@ def _redundant_correction_op(op: str, target: UUID | None, identical: frozenset[
     return "NOOP"
 
 
+def _in_recall_scope(item: MemoryItem, target: MemoryItem) -> bool:
+    """重做 §7.1 第 5 行 —— 「重复」的目标必须是候选能被召回到的:事实候选只能与事实重复(否则
+    别的智能体召回不到这件事);经历候选可与事实或本智能体的经历重复。"""
+    if target.kind == "fact":
+        return True
+    return item.kind == "episodic" and target.agent_name == item.agent_name
+
+
+def _record_time(item: MemoryItem) -> datetime | None:
+    """目标的记录时间:记录日期;用户一方的行若有确认日期取两者里晚的(与材料里给的日期同一个口径)。"""
+    stamps = [item.created_at]
+    if effective_origin(item) in USER_SIDE_ORIGINS:
+        stamps.append(item.confirmed_at)
+    known = [ts for ts in stamps if ts is not None]
+    return max(known) if known else None
+
+
+def _event_dates_allow(candidate: _Candidate, target: MemoryItem) -> bool:
+    """重做 §7.1 第 7 行 —— 两边都没有事件日期 → 照常;事件日期相同、且候选带更正 → 可以
+    (同一次的更正);相同但不是更正(同一天又量了一次)、不同、只有一边有 → 不可以。"""
+    ours, theirs = candidate.item.occurred_on, target.occurred_on
+    if ours is None and theirs is None:
+        return True
+    return ours == theirs and candidate.is_correction
+
+
+def _refusal(op: str, pending: _Pending, target: MemoryItem) -> str | None:
+    """更新 / 删除在层级拦截之前的程序拒绝(重做 §7.1 第 6、7、11 行);``None`` = 放行。"""
+    candidate = pending.candidate
+    item = candidate.item
+    if not _same_cell(item, target):
+        return "cross_cell"
+    same_cell = [n.id for n in pending.neighbors if _same_cell(n, item)]
+    if same_cell.index(target.id) >= _RECONCILE_TARGET_TOP:
+        return "rank"
+    if not _event_dates_allow(candidate, target):
+        return "event_date"
+    recorded = _record_time(target)
+    if (
+        op == "UPDATE"
+        and candidate.line_at is not None
+        and recorded is not None
+        and candidate.line_at < recorded
+    ):
+        return "older_line"
+    return None
+
+
+def _record_target(op: str, pending: _Pending, target: MemoryItem) -> None:
+    item = pending.candidate.item
+    same_cell = [n.id for n in pending.neighbors if _same_cell(n, item)]
+    rank = same_cell.index(target.id) + 1 if target.id in same_cell else None
+    record_memory_reconcile_target(
+        op=op.lower(), rank=rank, similarity=_reconcile_cosine(item.embedding, target.embedding)
+    )
+
+
+def _short_ids(pending: Sequence[_Pending]) -> dict[UUID, str]:
+    """本次调用内的短编号(重做 §7.1 第 3 行):按出现先后 ``e0, e1, …``,同一条已有记忆在几条
+    候选下用同一个编号。"""
+    ids: dict[UUID, str] = {}
+    for entry in pending:
+        for n in entry.neighbors:
+            ids.setdefault(n.id, f"e{len(ids)}")
+    return ids
+
+
+def _day(value: date | None) -> str | None:
+    """``YYYY-MM-DD``;``datetime`` 取它自己的日子。"""
+    if value is None:
+        return None
+    return (value.date() if isinstance(value, datetime) else value).isoformat()
+
+
+def _reconcile_material(pending: Sequence[_Pending], ids: Mapping[UUID, str]) -> dict[str, Any]:
+    """附录 B 的材料:候选与它的邻居都带类型、来源、日期、事件日期;邻居用短编号。"""
+    return {
+        "candidates": [
+            {
+                "index": idx,
+                "kind": entry.candidate.item.kind,
+                "content": entry.candidate.item.content,
+                "source": origin_label(entry.candidate.item),
+                "date": _day(entry.candidate.line_at),
+                "is_correction": entry.candidate.is_correction,
+                "event_date": _day(entry.candidate.item.occurred_on),
+                "existing": [
+                    {
+                        "id": ids[n.id],
+                        "kind": n.kind,
+                        "content": n.content,
+                        "source": origin_label(n),
+                        "date": line_date(n),
+                        "event_date": _day(n.occurred_on),
+                    }
+                    for n in entry.neighbors
+                ],
+            }
+            for idx, entry in enumerate(pending)
+        ]
+    }
+
+
 class _Reconciled(NamedTuple):
     direct: list[MemoryItem]
     blocked: list[_BlockedWrite]
@@ -1414,233 +1496,280 @@ class _Reconciled(NamedTuple):
     superseded: int = 0
 
 
+@dataclass(frozen=True)
+class _ReconcileDeps:
+    memory_store: MemoryStore
+    token: CancellationToken
+    log_label: str
+    before_store: BeforeStore | None
+
+
+async def _refresh_if_restated(
+    candidate: _Candidate, target: MemoryItem, deps: _ReconcileDeps
+) -> bool:
+    """重做 §7.1 第 8 行 —— 判成「重复」时,只有候选与目标都是用户一方、且候选那一行在新段里,
+    才把目标的确认日期刷新为那一行的发送时间。来自助手的候选不刷新(助手再得出一次不算用户又说了
+    一次);上下文行、不知道是哪一行的也不刷新(一句旧话不能被反复算成「又说了一次」)。"""
+    if not (
+        candidate.in_new_segment
+        and candidate.line_at is not None
+        and effective_origin(candidate.item) in USER_SIDE_ORIGINS
+        and effective_origin(target) in USER_SIDE_ORIGINS
+    ):
+        return False
+    if deps.before_store is not None:
+        await deps.before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
+    item = candidate.item
+    return await deps.token.run_cancellable(
+        deps.memory_store.refresh_confirmed_at(
+            tenant_id=item.tenant_id,
+            user_id=item.user_id,
+            memory_id=target.id,
+            confirmed_at=candidate.line_at,
+        )
+    )
+
+
+async def _noop(candidate: _Candidate, target: MemoryItem, deps: _ReconcileDeps) -> None:
+    refreshed = await _refresh_if_restated(candidate, target, deps)
+    record_memory_reconcile(op="noop_refreshed" if refreshed else "noop")
+
+
+async def _neighbors_of(
+    candidate: _Candidate, agent_name: str | None, deps: _ReconcileDeps
+) -> list[MemoryItem]:
+    """召回范围内(共享的事实 + 本智能体的经历,重做 §7.1 第 4 行)按向量最近的 5 条,按余弦
+    从近到远重排(检索的顺序乘了衰减、频次、重要度)。取失败原样抛(§7.6)。"""
+    item = candidate.item
+    found = await deps.token.run_cancellable(
+        deps.memory_store.retrieve(
+            tenant_id=item.tenant_id,
+            user_id=item.user_id,
+            query_embedding=item.embedding,
+            agent_name=agent_name,
+            limit=_RECONCILE_NEIGHBOR_LIMIT,
+        )
+    )
+    return sorted(found, key=lambda n: _reconcile_cosine(item.embedding, n.embedding), reverse=True)
+
+
+async def _decide(
+    pending: Sequence[_Pending], llm_caller: LLMCaller, deps: _ReconcileDeps
+) -> tuple[dict[int, tuple[str, str | None]], dict[str, UUID]]:
+    """一次模型调用;返回各候选的决定与短编号 → id。调用失败、回复用不了、被截断都抛(§7.6)。"""
+    ids = _short_ids(pending)
+    material = _reconcile_material(pending, ids)
+    with expert_work_span(ExpertWorkComponent.MEMORY, "reconcile"):
+        reply = await deps.token.run_cancellable(
+            llm_caller(
+                messages=[
+                    SystemMessage(content=_RECONCILE_SYSTEM),
+                    HumanMessage(content=json.dumps(material, ensure_ascii=False)),
+                ],
+                tools=[],
+            )
+        )
+    if isinstance(reply, AIMessage) and is_truncated(reply):
+        raise ReconcileReplyError("reconcile reply was cut off by the output cap")
+    ops = _parse_reconcile_reply(_message_text(reply))
+    if ops is None:
+        raise ReconcileReplyError("reconcile reply carries no usable ops")
+    return ops, {short: uid for uid, short in ids.items()}
+
+
 async def _reconcile_and_apply(
-    items: list[MemoryItem],
+    candidates: Sequence[_Candidate],
     *,
-    corrections: Sequence[bool],
+    agent_name: str | None,
+    positions: Mapping[UUID, int],
     memory_store: MemoryStore,
     llm_caller: LLMCaller,
     token: CancellationToken,
     log_label: str,
     before_store: BeforeStore | None = None,
 ) -> _Reconciled:
-    """Stream CM-7 (Mini-ADR CM-H4) — Mem0-style extract→update.
+    """Stream CM-7 Mem0-style extract→update, B-300 redesign §7.
 
-    Returns the items to write directly; UPDATE / DELETE are applied
-    in place against the store. Best-effort throughout: every failure
-    path degrades to keeping the candidate in the direct-write list
-    (never lose a memory), and only cancellation propagates.
+    Returns the items to write directly; UPDATE / DELETE / confirmed-date refreshes are
+    applied in place against the store. Every candidate with at least one neighbour in
+    recall scope goes to one model call (no similarity gate); a candidate with none, or
+    one the program refuses to apply as decided, is written as new.
 
-    B-300 D2 —— 被判「更新」、但新内容被写入扫描拦下的候选:不落库、旧记忆不被作废,
-    也**不**退回直接写入(那样会再拦一次、再记一条审计);交回 ``blocked`` 由调用方发审计。
+    重做 §7.6 —— 去重合并内部出错(取邻居、模型调用、回复用不了、拦截预判的查询、执行更新 /
+    删除 / 刷新时库出错)一律原样抛给调用方,不再退回直接写入:直接写入会绕过拦截规则与去重。
 
-    P5b-2b ⑧ — ``corrections[i]`` aligns 1:1 with ``items[i]`` (the LLM's
-    ``is_correction`` extraction flag); it rides along into the reconcile
-    payload as ``"is_correction"`` per candidate so the ops LLM can bias
-    UPDATE/DELETE over ADD on an explicit user correction.
+    B-300 D2 —— 被判「更新」、但新内容被写入扫描拦下的候选:不落库、旧记忆不被作废,也**不**退回
+    直接写入;交回 ``blocked`` 由调用方发审计(``positions`` = 候选在本次提炼结果里的序号)。
 
-    B-300 11-14 —— 「每条失败路径都退回直接写入」有一个例外:带更正、又与已有记忆(同格、来源不弱于
-    它)内容相同
-    (归一后)的候选永远不写 —— 模型没给决定、调用失败、判新增 / NOOP、改那条相同的记忆,都按 NOOP;
-    只有删掉(或「更新」成删掉)别的冲突记忆会执行(``_redundant_correction_op``)。
+    B-300 11-14 —— 带更正、又与已有记忆(同格、层级不低于它)内容相同(归一后)的候选永远不写:
+    模型没给决定、判新增 / NOOP、改那条相同的记忆,都按 NOOP;只有删掉(或「更新」成删掉)别的冲突
+    记忆会执行(``_redundant_correction_op``)。
     """
+    deps = _ReconcileDeps(memory_store, token, log_label, before_store)
     direct: list[MemoryItem] = []
-    pending: list[tuple[MemoryItem, list[MemoryItem], bool, frozenset[UUID]]] = []
-    for idx, item in enumerate(items):
-        is_corr = corrections[idx] if idx < len(corrections) else False
-        try:
-            neighbors = await token.run_cancellable(
-                memory_store.retrieve(
-                    tenant_id=item.tenant_id,
-                    user_id=item.user_id,
-                    query_embedding=item.embedding,
-                    limit=_RECONCILE_NEIGHBOR_LIMIT,
-                )
-            )
-        except RunCancelledError:
-            raise
-        except Exception:
-            logger.warning("%s_reconcile_recall_failed — direct add", log_label, exc_info=True)
-            record_memory_reconcile(op="degraded")
-            direct.append(item)
-            continue
-        if not is_corr and _has_identical_neighbor(item, neighbors):
-            # 11-14 重跑 118.5 —— 内容相同(归一后)、来源不弱的已有记忆:不问模型,直接 NOOP。
+    pending: list[_Pending] = []
+    for candidate in candidates:
+        neighbors = await _neighbors_of(candidate, agent_name, deps)
+        identical = _identical_neighbors(candidate.item, neighbors)
+        if identical and not candidate.is_correction:
+            # 11-14 重跑 118.5 —— 内容相同(归一后)、层级不低的已有记忆:不问模型,直接 NOOP。
             # 带更正的候选照旧问模型(审查 MEDIUM):它可能要删掉旁边一条与之冲突的记忆。
             logger.debug("%s_reconcile_identical_noop", log_label)
-            record_memory_reconcile(op="noop")
-            continue
-        similar = [
-            n
-            for n in neighbors
-            if _reconcile_cosine(item.embedding, n.embedding) >= _RECONCILE_SIM_THRESHOLD
-        ]
-        # 审查 MEDIUM-3(11-14):任何来源不弱于候选、内容相同的同格邻居都算(不只用户一方的),
-        # 否则来自助手的同一个更正每轮被拦后都按新增再存一条。
-        identical = _identical_neighbor_ids(item, neighbors) if is_corr else frozenset()
-        if similar:
-            pending.append((item, similar, is_corr, identical))
-        elif identical:
-            record_memory_reconcile(op="noop")  # 终审 MEDIUM-1:没有可删的,也不新增
+            await _noop(candidate, identical[0], deps)
+        elif neighbors:
+            ids = frozenset(n.id for n in identical)
+            pending.append(_Pending(candidate, tuple(neighbors), ids))
         else:
             record_memory_reconcile(op="add")
-            direct.append(item)
+            direct.append(candidate.item)
     if not pending:
         return _Reconciled(direct, [])
-
-    payload = {
-        "candidates": [
-            {
-                "index": idx,
-                "kind": item.kind,
-                "content": item.content,
-                "source": origin_label(item),
-                "is_correction": is_corr,
-                "existing": [
-                    {"id": str(n.id), "content": n.content, "source": origin_label(n)}
-                    for n in similar
-                ],
-            }
-            for idx, (item, similar, is_corr, _identical) in enumerate(pending)
-        ]
-    }
-    ops: dict[int, tuple[str, str | None]] = {}
-    try:
-        with expert_work_span(ExpertWorkComponent.MEMORY, "reconcile"):
-            reply = await token.run_cancellable(
-                llm_caller(
-                    messages=[
-                        SystemMessage(content=_RECONCILE_SYSTEM),
-                        HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
-                    ],
-                    tools=[],
-                )
-            )
-        ops = parse_reconcile_ops(_message_text(reply))
-    except RunCancelledError:
-        raise
-    except Exception:
-        logger.warning("%s_reconcile_llm_failed — direct add all", log_label, exc_info=True)
-
-    position = {item.id: idx for idx, item in enumerate(items)}
+    ops, by_short_id = await _decide(pending, llm_caller, deps)
     blocked: list[_BlockedWrite] = []
     superseded = 0
-    for idx, (item, similar, is_corr, identical) in enumerate(pending):
-        op, target_raw = ops.get(idx, ("", None))
-        valid = {str(n.id): n for n in similar}
-        target_item = valid.get(target_raw) if target_raw is not None else None
-        target = target_item.id if target_item is not None else None
-        # 被拦时带更正的候选按新增存下 —— 与已有用户记忆内容相同的那种除外(它永远不落新行)。
-        adds_when_blocked = is_corr and not identical
-        if identical:
-            rewritten = _redundant_correction_op(op, target, identical)
-            logger.debug(
-                "%s_reconcile_identical_correction op=%s target=%s rewritten=%s",
-                log_label,
-                op or "-",
-                target,
-                rewritten,
-            )
-            op = rewritten
-        # B-300 §6.2 拦截规则:来自助手的候选不得更新 / 删除用户一方的记忆;用户 11-14 加一条:
-        # 「用户消息里说的」候选,置信度低于目标时同样不得(汇总行按成员里最高的用户一方置信度比)。
-        guarded = item.origin == "assistant_derived"
-        above = _lower_confidence_guard(item)
-        if (
-            op in ("UPDATE", "DELETE")
-            and target_item is not None
-            and await _refused_before_apply(
-                memory_store,
-                target_item,
-                guarded=guarded,
-                above=above,
-                token=token,
-                log_label=log_label,
-            )
-        ):
-            kept = _blocked_by_user_side(
-                op, item, is_correction=adds_when_blocked, lower_confidence=not guarded
-            )
-            direct.extend([kept] if kept is not None else [])
-        elif op == "NOOP":
-            record_memory_reconcile(op="noop")
-        elif op == "UPDATE" and target is not None:
-            try:
-                updated = await _apply_update(
-                    item,
-                    target,
-                    memory_store=memory_store,
-                    token=token,
-                    before_store=before_store,
-                    refuse_user_side=guarded,
-                    refuse_user_side_above=above,
-                )
-            except UserSideTargetError as exc:
-                # 审查 MEDIUM-1 —— 读邻居之后目标变成了用户一方的(例如用户这时点了更正);
-                # 用户 11-14 —— 或者目标此刻比这条用户候选更确定。
-                kept = _blocked_by_user_side(
-                    op,
-                    item,
-                    is_correction=adds_when_blocked,
-                    lower_confidence=isinstance(exc, UserSideHigherConfidenceError),
-                )
-                direct.extend([kept] if kept is not None else [])
-                continue
-            except MemoryInjectionBlockedError as exc:
-                blocked.extend(
-                    _BlockedWrite(b, "reconcile_update", position[item.id], target)
-                    for b in exc.blocked
-                )
-                continue
-            except SupersedeTargetChangedError:
-                # B-300 D1 —— 判的这段时间里目标被整理汇总 / 过期了:不动它,新内容按新增
-                # 写入(照样过写入扫描),用户的新事实不丢。汇总行里可能仍是旧说法,由步 8
-                # 的汇总行复查处理。
-                logger.info("%s_update_target_changed id=%s — written as new", log_label, target)
-                record_memory_reconcile(op="target_changed")
-                direct.append(item)
-                continue
-            record_memory_reconcile(op="update" if updated else "degraded")
-            if updated:
-                superseded += 1
-            else:
-                direct.append(item)
-        elif op == "DELETE" and target is not None:
-            try:
-                deleted = await _apply_delete(
-                    item,
-                    target,
-                    memory_store=memory_store,
-                    token=token,
-                    before_store=before_store,
-                    refuse_user_side=guarded,
-                    refuse_user_side_above=above,
-                )
-            except UserSideTargetError as exc:
-                kept = _blocked_by_user_side(  # 目标不动;带更正的候选按新增存下
-                    op,
-                    item,
-                    is_correction=adds_when_blocked,
-                    lower_confidence=isinstance(exc, UserSideHigherConfidenceError),
-                )
-                direct.extend([kept] if kept is not None else [])
-                continue
-            if adds_when_blocked:
-                # 审查 MEDIUM-4(11-14):带新值的更正被判成「删除」—— 旧的作废,新值照样存下,
-                # 不能两样都没了(删除没成也存:不丢新值)。
-                record_memory_reconcile(op="delete_added" if deleted else "degraded")
-                direct.append(item)
-                continue
-            # The candidate is the retraction event — not stored.
-            record_memory_reconcile(op="delete" if deleted else "degraded")
-        elif op == "ADD":
-            record_memory_reconcile(op="add")
-            direct.append(item)
-        else:
-            # Missing / malformed decision — never lose the memory.
-            record_memory_reconcile(op="degraded")
-            direct.append(item)
+    for idx, entry in enumerate(pending):
+        op, short = ops.get(idx, ("", None))
+        outcome = await _apply_decision(entry, op, short, by_short_id, positions, deps)
+        direct.extend(outcome.direct)
+        blocked.extend(outcome.blocked)
+        superseded += outcome.superseded
     return _Reconciled(direct, blocked, superseded)
+
+
+def _resolve_target(
+    entry: _Pending, op: str, short: str | None, by_short_id: Mapping[str, UUID]
+) -> tuple[str, MemoryItem | None]:
+    """短编号 → 这条候选自己的邻居(别的候选下的、不认识的、原始 id 都按没给);带更正又与已有
+    记忆相同的候选按 :func:`_redundant_correction_op` 改判,判成 NOOP 时目标落在那条相同的上。"""
+    own = {n.id: n for n in entry.neighbors}
+    uid = by_short_id.get(short) if short is not None else None
+    target = own.get(uid) if uid is not None else None
+    if not entry.identical:
+        return op, target
+    rewritten = _redundant_correction_op(op, target.id if target else None, entry.identical)
+    if rewritten == "NOOP" and (target is None or target.id not in entry.identical):
+        target = next(n for n in entry.neighbors if n.id in entry.identical)
+    return rewritten, target
+
+
+async def _apply_decision(
+    entry: _Pending,
+    op: str,
+    short: str | None,
+    by_short_id: Mapping[str, UUID],
+    positions: Mapping[UUID, int],
+    deps: _ReconcileDeps,
+) -> _Reconciled:
+    """一条候选按模型的决定落库(重做 §7.3);程序拒绝的一律改为新增。"""
+    candidate = entry.candidate
+    item = candidate.item
+    op, target = _resolve_target(entry, op, short, by_short_id)
+    # 被拦 / 被拒时候选按新增存下 —— 与已有记忆内容相同的更正除外(它永远不落新行)。
+    keep = [] if entry.identical else [item]
+    if target is None or op not in ("NOOP", "UPDATE", "DELETE"):
+        record_memory_reconcile(op="add" if op == "ADD" else "degraded")
+        return _Reconciled(keep, [])
+    _record_target(op, entry, target)
+    if op == "NOOP":
+        if not _in_recall_scope(item, target):
+            record_memory_reconcile(op="noop_out_of_scope")
+            return _Reconciled([item], [])
+        await _noop(candidate, target, deps)
+        return _Reconciled([], [])
+    refusal = _refusal(op, entry, target)
+    if refusal is not None:
+        logger.info("%s_reconcile_refused op=%s reason=%s", deps.log_label, op, refusal)
+        record_memory_reconcile(op=f"refused_{refusal}")
+        return _Reconciled(keep, [])
+    adds_when_blocked = candidate.is_correction and not entry.identical
+    standing = OriginStanding(origin_tier(item), item.confidence)
+    target_standing = await _target_standing(deps.memory_store, target, deps.token)
+    if outranks(target_standing, standing):
+        kept = _blocked_by_user_side(
+            op,
+            item,
+            is_correction=adds_when_blocked,
+            lower_confidence=target_standing.tier == standing.tier,
+        )
+        return _Reconciled([kept] if kept is not None else [], [])
+    if op == "UPDATE":
+        return await _update(entry, target.id, standing, positions, deps)
+    return await _delete(entry, target.id, standing, deps)
+
+
+async def _update(
+    entry: _Pending,
+    target: UUID,
+    standing: OriginStanding,
+    positions: Mapping[UUID, int],
+    deps: _ReconcileDeps,
+) -> _Reconciled:
+    item = entry.candidate.item
+    adds_when_blocked = entry.candidate.is_correction and not entry.identical
+    try:
+        updated = await _apply_update(
+            item,
+            target,
+            memory_store=deps.memory_store,
+            token=deps.token,
+            before_store=deps.before_store,
+            candidate_standing=standing,
+        )
+    except UserSideTargetError as exc:
+        # 审查 MEDIUM-1 —— 读邻居之后目标变得更强了(例如用户这时点了更正)。
+        kept = _blocked_by_user_side(
+            "UPDATE",
+            item,
+            is_correction=adds_when_blocked,
+            lower_confidence=isinstance(exc, UserSideHigherConfidenceError),
+        )
+        return _Reconciled([kept] if kept is not None else [], [])
+    except MemoryInjectionBlockedError as exc:
+        blocked = [
+            _BlockedWrite(b, "reconcile_update", positions.get(item.id, 0), target)
+            for b in exc.blocked
+        ]
+        return _Reconciled([], blocked)
+    except SupersedeTargetChangedError:
+        # B-300 D1 —— 判的这段时间里目标被整理汇总 / 过期了:不动它,新内容按新增写入(照样过
+        # 写入扫描),用户的新事实不丢。
+        logger.info("%s_update_target_changed id=%s — written as new", deps.log_label, target)
+        record_memory_reconcile(op="target_changed")
+        return _Reconciled([item], [])
+    record_memory_reconcile(op="update" if updated else "degraded")
+    return _Reconciled([] if updated else [item], [], 1 if updated else 0)
+
+
+async def _delete(
+    entry: _Pending, target: UUID, standing: OriginStanding, deps: _ReconcileDeps
+) -> _Reconciled:
+    item = entry.candidate.item
+    adds_when_blocked = entry.candidate.is_correction and not entry.identical
+    try:
+        deleted = await _apply_delete(
+            item,
+            target,
+            memory_store=deps.memory_store,
+            token=deps.token,
+            before_store=deps.before_store,
+            candidate_standing=standing,
+        )
+    except UserSideTargetError as exc:
+        kept = _blocked_by_user_side(  # 目标不动;带更正的候选按新增存下
+            "DELETE",
+            item,
+            is_correction=adds_when_blocked,
+            lower_confidence=isinstance(exc, UserSideHigherConfidenceError),
+        )
+        return _Reconciled([kept] if kept is not None else [], [])
+    if adds_when_blocked:
+        # 审查 MEDIUM-4(11-14):带新值的更正被判成「删除」—— 旧的作废,新值照样存下,
+        # 不能两样都没了(删除没成也存:不丢新值)。
+        record_memory_reconcile(op="delete_added" if deleted else "degraded")
+        return _Reconciled([item], [])
+    # The candidate is the retraction event — not stored.
+    record_memory_reconcile(op="delete" if deleted else "degraded")
+    return _Reconciled([], [])
 
 
 async def _apply_update(
@@ -1650,40 +1779,26 @@ async def _apply_update(
     memory_store: MemoryStore,
     token: CancellationToken,
     before_store: BeforeStore | None = None,
-    refuse_user_side: bool = False,
-    refuse_user_side_above: float | None = None,
+    candidate_standing: OriginStanding | None = None,
 ) -> bool:
     """Stream P5b — append-only UPDATE: supersede ``target`` with ``item``
     (close old row + open new versioned row) instead of overwriting in place.
 
-    B-300 D2 —— 新内容被写入扫描拦下时 ``MemoryInjectionBlockedError`` 原样抛给调用方
-    (什么都没改);目标已被汇总 / 过期时 ``SupersedeTargetChangedError`` 也原样抛给调用方;
-    ``refuse_user_side`` 时目标在锁里重判成用户一方的,``UserSideTargetError`` 原样抛
-    (审查 MEDIUM-1;``refuse_user_side_above`` 同理,抛它的子类,用户 11-14);别的失败照旧
-    返回 ``False``、由调用方退回直接写入。"""
+    ``False`` = the target was unknown / already superseded (nothing written). Every
+    error — the strict-scan block (B-300 D2), a target folded / expired meanwhile
+    (D1), a target that outranks the candidate under the lock (redesign §6.3) and,
+    since redesign §7.6, any store error — propagates to the caller."""
     if before_store is not None:
         await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
-    try:
-        written = await token.run_cancellable(
-            memory_store.supersede(
-                tenant_id=item.tenant_id,
-                user_id=item.user_id,
-                old_id=target,
-                new_item=item,
-                refuse_user_side=refuse_user_side,
-                refuse_user_side_above=refuse_user_side_above,
-            )
+    written = await token.run_cancellable(
+        memory_store.supersede(
+            tenant_id=item.tenant_id,
+            user_id=item.user_id,
+            old_id=target,
+            new_item=item,
+            candidate_standing=candidate_standing,
         )
-    except (
-        RunCancelledError,
-        MemoryInjectionBlockedError,
-        SupersedeTargetChangedError,
-        UserSideTargetError,
-    ):
-        raise
-    except Exception:
-        logger.warning("memory.reconcile_update_failed id=%s", target, exc_info=True)
-        return False
+    )
     return written is not None
 
 
@@ -1694,32 +1809,24 @@ async def _apply_delete(
     memory_store: MemoryStore,
     token: CancellationToken,
     before_store: BeforeStore | None = None,
-    refuse_user_side: bool = False,
-    refuse_user_side_above: float | None = None,
+    candidate_standing: OriginStanding | None = None,
 ) -> bool:
     """Stream P5b — retraction: expire ``target`` (world no longer true, no
     successor) instead of soft-deleting it (which means user-forget).
 
-    B-300 审查 MEDIUM-1 —— ``refuse_user_side`` 时目标在锁里重判成用户一方的:
-    ``UserSideTargetError`` 原样抛给调用方(什么都没改);``refuse_user_side_above`` 同理
-    (用户 11-14)。"""
+    ``False`` = unknown target. A target that outranks the candidate under the lock
+    raises :class:`UserSideTargetError`; since redesign §7.6 any store error
+    propagates too."""
     if before_store is not None:
         await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
-    try:
-        return await token.run_cancellable(
-            memory_store.expire(
-                tenant_id=item.tenant_id,
-                user_id=item.user_id,
-                memory_id=target,
-                refuse_user_side=refuse_user_side,
-                refuse_user_side_above=refuse_user_side_above,
-            )
+    return await token.run_cancellable(
+        memory_store.expire(
+            tenant_id=item.tenant_id,
+            user_id=item.user_id,
+            memory_id=target,
+            candidate_standing=candidate_standing,
         )
-    except (RunCancelledError, UserSideTargetError):
-        raise
-    except Exception:
-        logger.warning("memory.reconcile_delete_failed id=%s", target, exc_info=True)
-        return False
+    )
 
 
 async def _extract_pass(
@@ -1927,7 +2034,11 @@ async def flush_messages_with_outcome(
     items are reconciled against similar existing memories
     (ADD / UPDATE / DELETE / NOOP) before persisting instead of written
     blindly. Only the run-end write-back sets it; the CM-3 pre-compaction
-    flush stays a direct write (latency-sensitive, inside a turn).
+    flush stays a direct write (latency-sensitive, inside a turn). B-300
+    redesign §7.1 row 9: two stages — the first pass's output is reconciled
+    and written first, then the second pass's, which can then see it. A
+    reconcile failure (§7.6) no longer falls back to a direct write; it lands
+    in the failure branch below like any other error.
 
     ``run_id`` (P5b provenance) is stamped on every written item; the
     DLQ-retry path now carries run_id (P5b-2a) too — the enqueue call
@@ -2007,31 +2118,54 @@ async def flush_messages_with_outcome(
                 # B-300 ② —— 来源由提炼次序决定;向量模型名。
                 origin=mem.origin,
                 embedding_model=embedding_model,
+                # B-300 重做 —— 事件日期(提炼给了才有,PR X)。
+                occurred_on=mem.event_date,
             )
             for mem, vector in zip(extracted, vectors, strict=True)
         ]
         position = {item.id: idx for idx, item in enumerate(items)}
-        if reconcile:
-            items, blocked, written = await _reconcile_and_apply(
-                items,
-                corrections=[m.is_correction for m in extracted],
-                memory_store=memory_store,
-                llm_caller=llm_caller,
-                token=token,
-                log_label=log_label,
-                before_store=before_store,
-            )
-            # 审查 LOW-1 —— 去重合并之后,失败重试只该重建本来要写的这几条:被拦下丢弃的
-            # 更新、删除事件、跳过的重复都不进失败队列(已经取代 / 作废的也已落库)。
-            retry_pairs = [(str(item.kind), item.content) for item in items]
-        if items:
-            if before_store is not None:
-                await before_store()
-            result = await memory_store.write(items)
-            blocked.extend(
-                _BlockedWrite(b, "writeback", position[b.item_id]) for b in result.blocked
-            )
-            written += result.written
+        candidates = [
+            _Candidate(item, mem.is_correction, mem.line_at, mem.in_new_segment)
+            for item, mem in zip(items, extracted, strict=True)
+        ]
+        # 重做 §7.1 第 9 行 —— 两段:先合并、写入第一次提炼的产出,再合并第二次的(这时第一段
+        # 刚写的已经能被取成邻居);不去重合并时一段直写。
+        stages = (
+            [
+                [c for c in candidates if c.item.origin == "user_stated"],
+                [c for c in candidates if c.item.origin != "user_stated"],
+            ]
+            if reconcile
+            else [candidates]
+        )
+        for number, stage in enumerate(stages):
+            later = [(str(c.item.kind), c.item.content) for s in stages[number + 1 :] for c in s]
+            retry_pairs = [(str(c.item.kind), c.item.content) for c in stage] + later
+            to_write = [c.item for c in stage]
+            if reconcile and stage:
+                done = await _reconcile_and_apply(
+                    stage,
+                    agent_name=agent_name,
+                    positions=position,
+                    memory_store=memory_store,
+                    llm_caller=llm_caller,
+                    token=token,
+                    log_label=log_label,
+                    before_store=before_store,
+                )
+                to_write, written = done.direct, written + done.superseded
+                blocked.extend(done.blocked)
+                # 审查 LOW-1 —— 去重合并之后,失败重试只该重建本来要写的这几条:被拦下丢弃的
+                # 更新、删除事件、跳过的重复都不进失败队列(已经取代 / 作废的也已落库)。
+                retry_pairs = [(str(item.kind), item.content) for item in to_write] + later
+            if to_write:
+                if before_store is not None:
+                    await before_store()
+                result = await memory_store.write(to_write)
+                blocked.extend(
+                    _BlockedWrite(b, "writeback", position[b.item_id]) for b in result.blocked
+                )
+                written += result.written
     except RunCancelledError:
         raise
     except Exception as exc:

@@ -253,9 +253,7 @@ async def test_memory_reconcile_emits_named_span(exporter: InMemorySpanExporter)
     llm = _ScriptedLLM(
         responses=[
             AIMessage(content='{"memories": [{"kind": "fact", "content": "likes dark roast"}]}'),
-            AIMessage(
-                content=f'{{"ops": [{{"index": 0, "op": "UPDATE", "target_id": "{old.id}"}}]}}'
-            ),
+            AIMessage(content='{"ops": [{"index": 0, "op": "UPDATE", "target_id": "e0"}]}'),
         ]
     )
     await flush_messages_to_memory(

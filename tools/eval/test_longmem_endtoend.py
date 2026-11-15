@@ -78,7 +78,7 @@ class _ScriptedCaller:
                 return AIMessage(content="Their favorite editor is expert_work.")
             return AIMessage(content="The information is not available.")
         # Reconcile (or any other) call — deliberately unparseable so the
-        # CM-7 degrade-to-direct-ADD path is what gets exercised.
+        # reconcile failure path is what gets exercised.
         return AIMessage(content="unparseable")
 
 
@@ -107,9 +107,10 @@ async def test_end_to_end_fixture_pipeline() -> None:
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_reconcile_degrades_to_add() -> None:
-    """reconcile=True with an unparseable reconcile reply must still
-    write memories (CM-7: every reconcile failure degrades to ADD)."""
+async def test_end_to_end_reconcile_failure_writes_nothing_directly() -> None:
+    """reconcile=True with an unparseable reconcile reply: B-300 redesign §7.6 —
+    a reconcile failure no longer degrades to a direct ADD. The first session
+    has no neighbour (written without asking); the second one fails."""
     instances = [
         i
         for i in load_longmemeval(FIXTURES / "longmemeval_mini.json")
@@ -124,8 +125,7 @@ async def test_end_to_end_reconcile_degrades_to_add() -> None:
         judge=ScriptedTextJudge({"expert_work": "yes"}),
         config=EndToEndConfig(reconcile=True),
     )
-    assert report.memories_written == 2
-    assert report.accuracy == 1.0
+    assert report.memories_written == 1
 
 
 @pytest.mark.asyncio

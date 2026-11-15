@@ -40,7 +40,9 @@ def test_classify_call() -> None:
     assert live.classify_call("x The other side of the conversation is not shown. y") == "pass1"
     assert live.classify_call("Every line starts with a tag:\n- [user]") == "pass2"
     assert live.classify_call(live.OLD_EXTRACT_MARK + " durable") == "extract_old"
-    assert live.classify_call("You reconcile newly extracted memories against") == "reconcile"
+    # B-300 重做附录 B 的开头一句。
+    opening = 'You compare newly extracted memories ("candidates") with existing memories'
+    assert live.classify_call(opening) == "reconcile"
     assert live.classify_call("something else") == "other"
 
 
@@ -142,7 +144,8 @@ async def test_run_extraction_end_to_end_with_fakes() -> None:
                 "is_correction": True,
             }
             return _chat(json.dumps({"memories": [memory]}))
-        return _chat(json.dumps({"operations": []}))
+        # B-300 重做 §7.6:去重合并的回复用不了会让写回失败,这里回一个合法的「都没给决定」。
+        return _chat(json.dumps({"ops": []}))
 
     guard = _guard()
     async with _client(handler) as http:

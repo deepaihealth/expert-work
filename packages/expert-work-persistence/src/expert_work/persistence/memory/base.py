@@ -15,12 +15,12 @@ import abc
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Literal, NamedTuple
 from uuid import UUID
 
 from expert_work.common.threat_patterns import ThreatFinding, scan_for_threats
 from expert_work.protocol import MemoryItem
-from expert_work.protocol.memory_item import MemoryOrigin, effective_origin
+from expert_work.protocol.memory_item import EffectiveOrigin, MemoryOrigin, effective_origin
 
 #: B-300 —— 不是用户更正的行(汇总行、别人改写过的行)置信度的上限:1.0 只留给用户更正
 #: (更正接口独占的哨兵值)。
@@ -33,13 +33,45 @@ USER_CONFIRMED_MAX_CONFIDENCE = 0.8
 #: 有效来源里算「用户一方」的三种(拦截规则、混合簇判断、召回行的确认日期共用)。
 USER_SIDE_ORIGINS = frozenset({"user_stated", "user_corrected", "user_confirmed"})
 
+#: B-300 重做 §6.2 —— 来源层级:拦截规则、确定性「重复」、混合簇判断共用这一张表。
+_ORIGIN_TIERS: Mapping[EffectiveOrigin, int] = {
+    "user_corrected": 3,
+    "user_stated": 2,
+    "user_confirmed": 1,
+    "assistant_derived": 0,
+    "unrecorded": 0,
+}
+
+
+def origin_tier(item: MemoryItem) -> int:
+    """一条记忆自己的来源层级(不看汇总成员):用户更正 3 > 用户说的 2 > 用户确认 1 >
+    来自助手 = 未记录 0。"""
+    return _ORIGIN_TIERS[effective_origin(item)]
+
+
+class OriginStanding(NamedTuple):
+    """拦截规则比的两样:层级,以及同层(用户一方)时比的置信度。"""
+
+    tier: int
+    confidence: float
+
+
+def outranks(target: OriginStanding, candidate: OriginStanding) -> bool:
+    """B-300 重做 §6.3 —— 候选不得更新 / 删除目标:候选层级低于目标;或同一层级、是用户一方、
+    目标的置信度高于候选。来自助手与未记录同为 0 层,彼此不比置信度。"""
+    if target.tier != candidate.tier:
+        return target.tier > candidate.tier
+    return target.tier > 0 and target.confidence > candidate.confidence
+
 
 def is_mixed_origin(members: Sequence[MemoryItem]) -> bool:
-    """B-300 §6.2 —— 一组记忆里既有「来自助手」,又有用户消息里说的 / 用户更正的。
+    """B-300 §6.2 —— 一组记忆里既有「来自助手」,又有用户一方的;重做 §6.3 起,用户一方里
+    层级不同的成员同簇也算(一条可能误标的用户确认不借汇总拿到用户说的保护)。
 
     来源未记录的不算哪一边。整理时这样的簇不汇总。"""
     origins = {effective_origin(m) for m in members}
-    return "assistant_derived" in origins and bool(origins & USER_SIDE_ORIGINS)
+    user_tiers = {origin_tier(m) for m in members if effective_origin(m) in USER_SIDE_ORIGINS}
+    return len(user_tiers) > 1 or ("assistant_derived" in origins and bool(user_tiers))
 
 
 @dataclass(frozen=True)
@@ -86,46 +118,21 @@ MAX_SUMMARY_DEPTH = 8
 MemberLoader = Callable[[Sequence[UUID]], Awaitable[Sequence[MemoryItem]]]
 
 
-async def is_user_side_protected(item: MemoryItem, load: MemberLoader) -> bool:
-    """B-300 §6.2 拦截规则保护的对象(审查 MEDIUM-3,用户 11-13 定「补上保护」):
-
-    * 有效来源是用户消息里说的 / 用户更正的那一条;
-    * 一条汇总行(来源为空),它的成员 —— 一层层往下,成员本身是汇总的接着查它的成员 ——
-      里有任何一条是用户一方的。成员早已被汇总、取代或过期,照样算(汇总句里还有它的内容)。
-
-    ``visited`` 防环;``MAX_SUMMARY_DEPTH`` 层之后还有没查的成员 → 受保护。"""
-    if effective_origin(item) in USER_SIDE_ORIGINS:
-        return True
-    visited = {item.id}
-    frontier = [sid for sid in item.consolidated_from if sid not in visited]
-    for _depth in range(MAX_SUMMARY_DEPTH):
-        if not frontier:
-            return False
-        visited.update(frontier)
-        members = await load(frontier)
-        if any(effective_origin(m) in USER_SIDE_ORIGINS for m in members):
-            return True
-        frontier = list(
-            dict.fromkeys(sid for m in members for sid in m.consolidated_from if sid not in visited)
-        )
-    return bool(frontier)
+#: 汇总成员查不完时按这个算(保守方向:等于用户更正,任何提炼出的候选都改不动它)。
+FAIL_CLOSED_STANDING = OriginStanding(tier=3, confidence=1.0)
 
 
-#: 汇总成员查不完时按这个置信度算(保守方向:等于用户更正,任何提炼出的候选都低于它)。
-FAIL_CLOSED_CONFIDENCE = 1.0
+async def origin_standing(item: MemoryItem, load: MemberLoader) -> OriginStanding:
+    """B-300 重做 §6.3 —— 拦截规则看的目标层级与置信度。
 
+    * 不是汇总行:它自己的层级与置信度;
+    * 汇总行:它自己与成员 —— 一层层往下,成员本身是汇总的接着查它的成员 —— 里最高的层级,
+      置信度取这一层里成员的最高值(不用汇总行自己那一行的成员最小值,否则一条用户更正 1.0
+      和未记录的成员汇在一起,就会被置信度一般的用户候选取代)。成员早已被汇总、取代或过期,
+      照样算(汇总句里还有它的内容)。
 
-async def user_side_confidence(item: MemoryItem, load: MemberLoader) -> float | None:
-    """B-300 用户 11-14(审查 11-14)—— 第二条拦截规则拿来与候选比的置信度;``None`` = 目标
-    不是用户一方的(与 :func:`is_user_side_protected` 同一个判定)。
-
-    * 不是汇总行:用户一方的就是它自己的置信度;
-    * 汇总行:它自己(若是用户一方的)与成员里一层层往下所有用户一方记忆的置信度取**最高**——
-      不用汇总行自己那一行(成员最小值),否则一条用户更正(1.0)和来源未记录的成员汇在一起,
-      就会被置信度一般的用户候选取代;
-    * 遍历同 :func:`is_user_side_protected`(``visited`` 防环、``MAX_SUMMARY_DEPTH`` 层);
-      查到上限还有没查的成员 → :data:`FAIL_CLOSED_CONFIDENCE`。"""
-    found = [item.confidence] if effective_origin(item) in USER_SIDE_ORIGINS else []
+    ``visited`` 防环;``MAX_SUMMARY_DEPTH`` 层之后还有没查的成员 → :data:`FAIL_CLOSED_STANDING`。"""
+    found = [OriginStanding(origin_tier(item), item.confidence)]
     visited = {item.id}
     frontier = [sid for sid in item.consolidated_from if sid not in visited]
     for _depth in range(MAX_SUMMARY_DEPTH):
@@ -133,48 +140,46 @@ async def user_side_confidence(item: MemoryItem, load: MemberLoader) -> float | 
             break
         visited.update(frontier)
         members = await load(frontier)
-        found.extend(m.confidence for m in members if effective_origin(m) in USER_SIDE_ORIGINS)
+        found.extend(OriginStanding(origin_tier(m), m.confidence) for m in members)
         frontier = list(
             dict.fromkeys(sid for m in members for sid in m.consolidated_from if sid not in visited)
         )
     if frontier:
-        return FAIL_CLOSED_CONFIDENCE
-    return max(found) if found else None
+        return FAIL_CLOSED_STANDING
+    top = max(s.tier for s in found)
+    return OriginStanding(top, max(s.confidence for s in found if s.tier == top))
 
 
 class UserSideTargetError(RuntimeError):
-    """B-300 审查 MEDIUM-1 —— 带保护的 ``supersede`` / ``expire``(``refuse_user_side``)
-    在锁里重读目标,发现它(或它汇总的成员)是用户一方的:什么都没改。
+    """B-300 审查 MEDIUM-1 —— 带保护的 ``supersede`` / ``expire``(``candidate_standing``)
+    在锁里重读目标,发现它(或它汇总的成员)的来源层级高于候选:什么都没改。
 
     去重合并读邻居与真正改库之间隔着一次模型调用,用户可能恰好在这几秒里「更正」了这一条;
     调用方按拦截规则处理(被拦的更新带更正 → 按新增,否则丢弃;被拦的删除 → 不动)。"""
 
 
 class UserSideHigherConfidenceError(UserSideTargetError):
-    """B-300 用户 11-14 —— ``refuse_user_side_above``:锁里重读的目标是用户一方的、且它此刻的
-    置信度高于调用方给的值(候选的置信度):什么都没改。是 :class:`UserSideTargetError` 的子类,
-    同一条处理路径接得住;调用方据类型分开计数。"""
+    """B-300 用户 11-14 —— 锁里重读的目标与候选同在用户一方的同一层级、且它此刻的置信度高于
+    候选:什么都没改。是 :class:`UserSideTargetError` 的子类,同一条处理路径接得住;调用方据
+    类型分开计数。"""
 
 
-async def refuse_if_user_side(
-    row: MemoryItem, load: MemberLoader, *, refuse: bool, above: float | None
+async def refuse_if_outranked(
+    row: MemoryItem, load: MemberLoader, candidate: OriginStanding | None
 ) -> None:
-    """两个存储实现在行锁里共用的重判(行已由调用方锁住 / 重读,成员只读):
-
-    * ``refuse``(来自助手的候选):目标是用户一方的 → :class:`UserSideTargetError`;
-    * ``above``(用户消息里说的候选的置信度)::func:`user_side_confidence` 高于它 →
-      :class:`UserSideHigherConfidenceError`(汇总行按成员里最高的用户一方置信度比)。"""
-    if refuse:
-        if await is_user_side_protected(row, load):
-            msg = f"memory item {row.id} is on the user's side; not changing it"
-            raise UserSideTargetError(msg)
+    """两个存储实现在行锁里共用的重判(行已由调用方锁住 / 重读,成员只读),与写回的预判是
+    同一个 :func:`outranks`:目标层级更高 → :class:`UserSideTargetError`;同层、用户一方、
+    目标更确定 → :class:`UserSideHigherConfidenceError`。``candidate`` 为 ``None`` 不判。"""
+    if candidate is None:
         return
-    if above is None:
+    target = await origin_standing(row, load)
+    if not outranks(target, candidate):
         return
-    confidence = await user_side_confidence(row, load)
-    if confidence is not None and confidence > above:
-        msg = f"memory item {row.id} is on the user's side and more certain; not changing it"
-        raise UserSideHigherConfidenceError(msg)
+    if target.tier > candidate.tier:
+        msg = f"memory item {row.id} has a stronger source; not changing it"
+        raise UserSideTargetError(msg)
+    msg = f"memory item {row.id} is on the user's side and more certain; not changing it"
+    raise UserSideHigherConfidenceError(msg)
 
 
 @dataclass(frozen=True)
@@ -394,6 +399,9 @@ class MemoryStore(abc.ABC):
         correction keeps it — its effective source is the 1.0 confidence).
         ``max_confidence`` caps the row's confidence as stored (review
         MEDIUM-2: someone else's edit takes the row out of the 1.0 sentinel).
+        B-300 redesign — ``clear_origin`` also clears ``confirmed_at`` (the row is
+        no longer on the user's side); the evidence pointer and event date stay
+        (they say where the memory came from and which day it is about).
 
         The caller must re-embed before calling — the store does not
         own an embedder. Soft-deleted rows are not updatable; returns
@@ -435,8 +443,7 @@ class MemoryStore(abc.ABC):
         user_id: UUID,
         old_id: UUID,
         new_item: MemoryItem,
-        refuse_user_side: bool = False,
-        refuse_user_side_above: float | None = None,
+        candidate_standing: OriginStanding | None = None,
     ) -> MemoryItem | None:
         """P5b — append-only UPDATE. Atomically close ``old_id`` (set
         ``invalid_at=now``, ``superseded_by=new_item.id``) and insert
@@ -457,15 +464,14 @@ class MemoryStore(abc.ABC):
         picked it, :class:`SupersedeTargetChangedError` is raised and nothing
         changes (``None`` keeps meaning unknown / deleted / already superseded).
 
-        B-300 review MEDIUM-1 — ``refuse_user_side`` (the write-back passes it for
-        an assistant-derived candidate): under the same row lock, a target that
-        is :func:`is_user_side_protected` raises :class:`UserSideTargetError` and
-        nothing changes.
+        B-300 redesign §6.3 — ``candidate_standing`` (the write-back passes the
+        candidate's tier and confidence): under the same row lock, a target that
+        :func:`outranks` it raises :class:`UserSideTargetError` (a higher tier) or
+        :class:`UserSideHigherConfidenceError` (same user-side tier, more certain)
+        and nothing changes (:func:`refuse_if_outranked`).
 
-        B-300 user 11-14 — ``refuse_user_side_above`` (the write-back passes the
-        candidate's confidence for a user-stated candidate): under the same row
-        lock, a user-side target whose confidence is above it raises
-        :class:`UserSideHigherConfidenceError` and nothing changes."""
+        B-300 redesign §9.2 — ``confirmed_at`` exists only on user-side rows: a new
+        row whose effective origin is not on the user's side is written without it."""
 
     @abc.abstractmethod
     async def expire(
@@ -474,8 +480,7 @@ class MemoryStore(abc.ABC):
         tenant_id: UUID,
         user_id: UUID,
         memory_id: UUID,
-        refuse_user_side: bool = False,
-        refuse_user_side_above: float | None = None,
+        candidate_standing: OriginStanding | None = None,
     ) -> bool:
         """P5b — retraction: stamp ``expired_at=now`` on a fact that stopped
         being true in the world with NO successor (orthogonal to ``supersede``'s
@@ -484,21 +489,22 @@ class MemoryStore(abc.ABC):
         Tenant- AND user-scoped.
 
         B-300 review MEDIUM-1 — the target row is locked (``FOR UPDATE``) before
-        it is changed; with ``refuse_user_side`` a :func:`is_user_side_protected`
-        target raises :class:`UserSideTargetError` and nothing changes;
-        ``refuse_user_side_above`` as in :meth:`supersede`."""
+        it is changed; ``candidate_standing`` as in :meth:`supersede`."""
 
     @abc.abstractmethod
-    async def user_side_protected(self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID) -> bool:
-        """B-300 review MEDIUM-3 — :func:`is_user_side_protected` for one row, its
-        summary members read whatever their current validity. Unknown id → False."""
-
-    @abc.abstractmethod
-    async def user_side_confidence(
+    async def origin_standing(
         self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID
-    ) -> float | None:
-        """B-300 user 11-14 — :func:`user_side_confidence` for one row (members read
-        the same way as :meth:`user_side_protected`). Unknown id → None."""
+    ) -> OriginStanding | None:
+        """B-300 redesign §6.3 — :func:`origin_standing` for one row, its summary
+        members read whatever their current validity. Unknown id → None."""
+
+    @abc.abstractmethod
+    async def refresh_confirmed_at(
+        self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID, confirmed_at: datetime
+    ) -> bool:
+        """B-300 redesign §7.1 row 8 — the user side said this memory again: move its
+        ``confirmed_at`` to ``confirmed_at`` (never backwards). Only a live row whose
+        effective origin is on the user's side is changed; returns whether it was."""
 
     @abc.abstractmethod
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
@@ -671,8 +677,10 @@ class MemoryStore(abc.ABC):
     ) -> list[MemoryItem]:
         """Sprint #7 SUB-PASS 2 candidate fetch — return live transient
         items older than ``min_age_days`` that have never been retrieved
-        (``access_count == 0``) and have never been
-        reviewed (``last_reviewed_at IS NULL``).
+        (``access_count == 0``), have never been
+        reviewed (``last_reviewed_at IS NULL``) and that the user never said
+        again (``confirmed_at IS NULL``, B-300 redesign — a restated memory is
+        not noise).
 
         Oldest first, capped at ``limit``. The 3 filters together are
         Mini-ADR U-37's purge protections."""
