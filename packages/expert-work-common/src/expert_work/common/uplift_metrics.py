@@ -139,6 +139,15 @@ _memory_extraction_total = expert_work_counter(
         "outcome",
     ),  # extracted | empty | truncated | parse_failed | error
 )
+# B-300 redesign §4 / §5.4 — what the program changed after checking a reply's ``basis`` /
+# ``turn`` / ``event_date``: ``downgraded_<reason>`` (a user answer / agreement that does
+# not anchor on a user line, so it is stored as from the assistant), ``pointer_missing``
+# (no evidence pointer), ``event_date_dropped``.
+_memory_extraction_check_total = expert_work_counter(
+    "expert_work_memory_extraction_check_total",
+    "Extraction results the program changed after checking them, by pass and check (B-300).",
+    label_names=("extraction_pass", "check"),
+)
 _memory_extraction_input_capped_total = expert_work_counter(
     "expert_work_memory_extraction_input_capped_total",
     "Extraction inputs that went over the total character cap; oldest lines dropped (B-300).",
@@ -545,6 +554,14 @@ def record_memory_extraction(*, pass_name: str, outcome: str) -> None:
     _memory_extraction_total.labels(extraction_pass=pass_name, outcome=outcome).inc()
 
 
+def record_memory_extraction_check(*, pass_name: str, check: str) -> None:
+    """Bump ``expert_work_memory_extraction_check_total{extraction_pass, check}`` (B-300
+    redesign §5.4): ``downgraded_out_of_range`` / ``downgraded_context_line`` /
+    ``downgraded_not_user_line`` / ``downgraded_previous_not_assistant``,
+    ``pointer_missing``, ``event_date_dropped``."""
+    _memory_extraction_check_total.labels(extraction_pass=pass_name, check=check).inc()
+
+
 def record_memory_extraction_input_capped(*, pass_name: str) -> None:
     """Bump ``expert_work_memory_extraction_input_capped_total{extraction_pass}`` (B-300 D3)."""
     _memory_extraction_input_capped_total.labels(extraction_pass=pass_name).inc()
@@ -795,6 +812,7 @@ __all__ = [
     "record_memory_consolidated",
     "record_memory_drift",
     "record_memory_extraction",
+    "record_memory_extraction_check",
     "record_memory_extraction_input_capped",
     "record_memory_extraction_message_truncated",
     "record_memory_inject_mode",

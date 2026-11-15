@@ -1056,7 +1056,7 @@ async def test_writeback_trajectory_omits_agent_system_prompt() -> None:
     [(_extract_sys, human)] = llm.calls
     trajectory = str(human.content)
     assert "help" not in trajectory  # agent system-prompt body gone
-    assert trajectory == "what timezone am I in"  # real turn kept
+    assert trajectory == "=== new ===\n[1] what timezone am I in"  # real turn kept
 
 
 @pytest.mark.asyncio
@@ -1084,7 +1084,10 @@ async def test_writeback_trajectory_omits_hidden_scaffolding() -> None:
     )
     # B-300 —— 两次提炼:第一次只有用户的话,第二次是带标签的对话。
     inputs = sorted(str(call[1].content) for call in llm.calls)
-    assert inputs == ["[user] what timezone am I in\n[assistant] UTC+8", "what timezone am I in"]
+    assert inputs == [
+        "=== new ===\n[1] [user] what timezone am I in\n[2] [assistant] UTC+8",
+        "=== new ===\n[1] what timezone am I in",
+    ]
     assert all("PLATFORM-INPUTS-BLOCK" not in text for text in inputs)
 
 

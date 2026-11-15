@@ -672,7 +672,7 @@ async def test_summariser_and_memory_flush_never_see_the_attached_advisory() -> 
     assert all(RECOVERY_ADVISORY_OPEN not in s for s in summaries)
     extraction = _extraction_inputs(middle, ())
     assert all(
-        RECOVERY_ADVISORY_OPEN not in line
+        RECOVERY_ADVISORY_OPEN not in line.text
         for line in [*extraction.user.lines, *extraction.conversation.lines]
     )
 

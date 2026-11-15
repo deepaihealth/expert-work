@@ -44,6 +44,22 @@ def test_classify_call() -> None:
     assert live.classify_call("something else") == "other"
 
 
+def _production_prompt(which: str) -> str:
+    from orchestrator.graph_builder.memory import _RECONCILE_SYSTEM, _extract_system
+
+    return _RECONCILE_SYSTEM if which == "reconcile" else _extract_system(which, None)
+
+
+@pytest.mark.parametrize(
+    ("which", "expected"),
+    [("user", "pass1"), ("conversation", "pass2"), ("reconcile", "reconcile")],
+)
+def test_classify_call_recognises_the_production_prompts(which: str, expected: str) -> None:
+    """B-300 重做:认法跟着生产的原文走(两次提炼 = 附录 C / A,去重合并 = 附录 B),指令开头
+    再改时这里先红,不会悄悄全归成 ``other``。"""
+    assert live.classify_call(_production_prompt(which)) == expected
+
+
 def test_vendor_env_reads_only_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("EXPERT_WORK_EVAL_QWEN_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="EXPERT_WORK_EVAL_QWEN_"):
