@@ -24,7 +24,9 @@
   的增删改可能做两次。为此不做跨进程的写入事务:窗口只有一次库写入那么长。
 * **清除**(设计稿 §3.6):用户被清除 / 会话被删除时任务行被删,``still_held`` 随即为 False。
 * **收尾**:处理器正常返回 → ``finish``(``done``,结果记在行上);处理器抛错 / 超时 →
-  ``fail_attempt``(未到上限退回 ``pending``,到上限 ``failed``)。
+  ``fail_attempt``(未到上限退回 ``pending``,到上限 ``failed``)。退回 ``pending`` 时带最早可领
+  时间(B-300 重做 §7.6,``retry_delays_s``:第 1 次失败后 30 秒、第 2 次失败后 5 分钟)——
+  否则每 2 秒一轮询,3 次尝试几秒内就用完,一次 30 秒的限流就丢掉那一段。
 * **关机**:先停止领新任务,再等手上这几条做完,最多 ``stop_timeout_s``;做不完就取消,
   租约过期后别的副本接手。
 """
@@ -80,6 +82,10 @@ _backlog = expert_work_gauge(
     "Pending + running background memory writeback jobs (all tenants), "
     "sampled by each replica's worker when idle.",
 )
+
+
+#: B-300 重做 §7.6 —— 第 n 次尝试失败后,隔多久才能再领(超出的按最后一个)。
+RETRY_DELAYS_S: tuple[float, ...] = (30.0, 300.0)
 
 
 @dataclass(frozen=True)
@@ -155,6 +161,7 @@ class MemoryWritebackWorker:
         concurrency: int = 4,
         stop_timeout_s: float = 300.0,
         renew_every_s: float | None = None,
+        retry_delays_s: tuple[float, ...] = RETRY_DELAYS_S,
     ) -> None:
         if interval_s <= 0 or lease_s <= 0 or max_attempts <= 0 or concurrency <= 0:
             msg = "interval_s, lease_s, max_attempts and concurrency must be positive"
@@ -171,6 +178,10 @@ class MemoryWritebackWorker:
         self._concurrency = concurrency
         self._stop_timeout_s = stop_timeout_s
         self._renew_every_s = renew
+        if not retry_delays_s or min(retry_delays_s) < 0:
+            msg = "retry_delays_s must be a non-empty tuple of non-negative delays"
+            raise ValueError(msg)
+        self._retry_delays_s = retry_delays_s
         #: 最后一次续租之后、租约到期之前收手 —— 不在别的副本可能接手的时候还在写。
         self._attempt_timeout_s = lease_s - renew
         self._task: asyncio.Task[None] | None = None
@@ -350,12 +361,15 @@ class MemoryWritebackWorker:
 
     async def _fail(self, job: MemoryWritebackJob, exc: BaseException) -> None:
         error = f"{type(exc).__name__}: {exc}"[:2000]
+        now = _utcnow()
+        delay = self._retry_delays_s[min(job.attempts, len(self._retry_delays_s)) - 1]
         status = await self._store.fail_attempt(
             job_id=job.id,
             attempt=job.attempts,
             error=error,
             max_attempts=self._max_attempts,
-            now=_utcnow(),
+            now=now,
+            retry_at=now + timedelta(seconds=delay),
         )
         outcome = {"pending": "retry", "failed": "failed"}.get(status or "", "lost")
         _jobs.labels(outcome=outcome).inc()

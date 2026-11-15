@@ -58,6 +58,7 @@ async def _enqueue(
     at: datetime,
     thread_id: UUID | None = None,
     run_id: UUID | None = None,
+    message_count: int | None = 4,
 ) -> UUID:
     return await store.enqueue(
         tenant_id=tenant_id,
@@ -68,7 +69,7 @@ async def _enqueue(
         run_id=run_id or uuid4(),
         trace_id="0" * 31 + "1",
         checkpoint_id="ckpt-1",
-        message_count=4,
+        message_count=message_count,
         now=at,
     )
 
@@ -442,7 +443,132 @@ async def still_held_is_the_fencing_check(store: MemoryWritebackJobStore) -> Non
     assert not await store.still_held(job_id=b1, attempt=1)
 
 
+async def _finish(store: MemoryWritebackJobStore, job_id: UUID, attempt: int, at: datetime) -> None:
+    assert await store.finish(
+        job_id=job_id,
+        attempt=attempt,
+        written_count=0,
+        failed=False,
+        queued_ms=0,
+        exec_ms=0,
+        error=None,
+        now=at,
+    )
+
+
+async def a_failed_attempt_waits_before_its_retry(store: MemoryWritebackJobStore) -> None:
+    """B-300 重做 §7.6 —— 退回 ``pending`` 时带最早可领时间(``lease_until``):到点前领不到,
+    到点就领;新落的任务 ``lease_until`` 为空,立刻可领。"""
+    tenant, user = uuid4(), uuid4()
+    a1 = await _enqueue(store, tenant_id=tenant, user_id=user, at=_T0)
+    first = await _claim(store, _T0)  # lease_until 为空的新任务立刻可领
+    assert first is not None and first.id == a1
+    retry_at = _T0 + timedelta(seconds=30)
+    status = await store.fail_attempt(
+        job_id=a1, attempt=1, error="rate limited", max_attempts=_MAX, now=_T0, retry_at=retry_at
+    )
+    assert status == "pending"
+    assert await _claim(store, retry_at - timedelta(seconds=1)) is None
+    again = await _claim(store, retry_at)
+    assert again is not None and again.id == a1 and again.attempts == 2
+
+
+async def a_job_waiting_to_retry_blocks_only_its_own_conversation(
+    store: MemoryWritebackJobStore,
+) -> None:
+    """等待重试的任务只挡同一对话里更晚的任务,不挡同一用户别的对话;「同一用户有租约有效的
+    running 就不领」照旧。"""
+    tenant, user, thread_x, thread_y = uuid4(), uuid4(), uuid4(), uuid4()
+    x1 = await _enqueue(store, tenant_id=tenant, user_id=user, at=_T0, thread_id=thread_x)
+    x2 = await _enqueue(
+        store, tenant_id=tenant, user_id=user, at=_T0 + timedelta(seconds=1), thread_id=thread_x
+    )
+    y1 = await _enqueue(
+        store, tenant_id=tenant, user_id=user, at=_T0 + timedelta(seconds=2), thread_id=thread_y
+    )
+    now = _T0 + timedelta(seconds=3)
+    assert (await _claim(store, now)).id == x1  # type: ignore[union-attr]
+    retry_at = now + timedelta(seconds=30)
+    await store.fail_attempt(
+        job_id=x1, attempt=1, error="e", max_attempts=_MAX, now=now, retry_at=retry_at
+    )
+    other = await _claim(store, now)
+    assert other is not None and other.id == y1  # x2 waits behind x1, y1 does not
+    # y1 runs under a live lease: x1 is not claimed at its retry time meanwhile.
+    assert await _claim(store, retry_at) is None
+    await _finish(store, y1, 1, retry_at)
+    assert await _claim(store, now) is None  # x1 still waiting, x2 behind it
+    back = await _claim(store, retry_at)
+    assert back is not None and back.id == x1
+    await _finish(store, x1, 2, retry_at)
+    nxt = await _claim(store, retry_at)
+    assert nxt is not None and nxt.id == x2
+
+
+async def previous_job_is_by_message_count_in_the_same_conversation(
+    store: MemoryWritebackJobStore,
+) -> None:
+    """B-176 M2-1 / 重做 §8.1 —— 起点 = 同一对话里 ``message_count`` 比自己小的任务中最大的那个,
+    不看创建时间、不看成没成功,跳过 ``message_count`` 为空的;同一 ``message_count`` 已有 ``done``
+    的别的任务才算「已做完」(``failed`` 的不算)。"""
+    tenant, user, thread, lone_thread = uuid4(), uuid4(), uuid4(), uuid4()
+
+    async def settled(mc: int | None, at: datetime, *, fail: bool, on: UUID = thread) -> None:
+        job_id = await _enqueue(
+            store, tenant_id=tenant, user_id=user, at=at, thread_id=on, message_count=mc
+        )
+        claimed = await _claim(store, at)
+        assert claimed is not None and claimed.id == job_id
+        if fail:
+            await store.fail_attempt(job_id=job_id, attempt=1, error="e", max_attempts=1, now=at)
+        else:
+            await _finish(store, job_id, 1, at)
+
+    await settled(6, _T0, fail=True, on=lone_thread)  # a failed twin is not "already done"
+    lone = await store.previous_job(
+        tenant_id=tenant, thread_id=lone_thread, job_id=uuid4(), message_count=6
+    )
+    assert (lone.message_count, lone.same_count_done) == (None, False)
+
+    await settled(4, _T0, fail=False)
+    await settled(8, _T0 + timedelta(seconds=20), fail=True)  # failed still counts as previous
+    await settled(None, _T0 + timedelta(seconds=21), fail=False)  # NULL is skipped
+    await settled(12, _T0 + timedelta(seconds=22), fail=False)  # a done twin at the same count
+    # Ours: created EARLIER than the 8 one (replica clock skew) — order is by message_count.
+    ours = await _enqueue(
+        store,
+        tenant_id=tenant,
+        user_id=user,
+        at=_T0 + timedelta(seconds=5),
+        thread_id=thread,
+        message_count=12,
+    )
+    await _enqueue(
+        store, tenant_id=tenant, user_id=user, at=_T0 + timedelta(seconds=30), thread_id=thread,
+        message_count=16,
+    )  # fmt: skip
+    await _enqueue(
+        store, tenant_id=tenant, user_id=user, at=_T0, thread_id=uuid4(), message_count=10
+    )  # another conversation
+    previous = await store.previous_job(
+        tenant_id=tenant, thread_id=thread, job_id=ours, message_count=12
+    )
+    assert (previous.message_count, previous.same_count_done) == (8, True)
+
+    first = await store.previous_job(
+        tenant_id=tenant, thread_id=thread, job_id=ours, message_count=4
+    )
+    assert (first.message_count, first.same_count_done) == (None, True)
+    other_tenant = await store.previous_job(
+        tenant_id=uuid4(), thread_id=thread, job_id=ours, message_count=12
+    )
+    assert (other_tenant.message_count, other_tenant.same_count_done) == (None, False)
+
+
 _SCENARIOS: tuple[Callable[[MemoryWritebackJobStore], Awaitable[None]], ...] = (
+    a_failed_attempt_waits_before_its_retry,
+    a_job_waiting_to_retry_blocks_only_its_own_conversation,
+    previous_job_is_by_message_count_in_the_same_conversation,
     a_repeated_enqueue_for_the_same_turn_is_a_no_op,
     enqueue_then_claim_round_trips_the_pointer,
     one_user_runs_one_job_at_a_time,

@@ -994,28 +994,19 @@ async def test_inline_writeback_is_skipped_too(key: str) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("key", [LONG_TERM_MEMORY_WRITE_OFF_KEY, "child_run"])
 async def test_pre_compaction_flush_is_skipped_too(key: str) -> None:
+    """B-300 重做 PR S —— 抢存不再提炼:子运行 / 草稿试跑里不写,普通 run 里也不写。"""
     from orchestrator.graph_builder.memory import make_pre_compaction_flush
 
-    store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
-    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
-    flush = make_pre_compaction_flush(
-        memory_store=store, embedder=FakeEmbedder(dim=_DIM), llm_caller=llm
-    )
-    written = await flush(
-        [_typed("I like tea")],
-        {"configurable": {"tenant_id": str(tenant), "user_id": str(user), key: True}},
-        CancellationToken(),
-    )
-    assert written == 0
-    assert llm.calls == []
-    # 同一个回调在普通 run 里照常写(对照)。
-    written = await flush(
-        [_typed("I like tea")],
-        {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
-        CancellationToken(),
-    )
-    assert written == 1
+    flush = make_pre_compaction_flush()
+    for configurable in (
+        {"tenant_id": str(tenant), "user_id": str(user), key: True},
+        {"tenant_id": str(tenant), "user_id": str(user)},
+    ):
+        written = await flush(
+            [_typed("I like tea")], {"configurable": configurable}, CancellationToken()
+        )
+        assert written == 0
 
 
 @pytest.mark.asyncio

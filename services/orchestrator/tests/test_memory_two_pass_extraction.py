@@ -502,10 +502,11 @@ def extraction_counts(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
         "record_memory_extraction",
         lambda *, pass_name, outcome: seen["outcome"].append((pass_name, outcome)),
     )
+    # PR S —— 上限按整轮丢(两次用同一批轮次),计数换成写回段事件。
     monkeypatch.setattr(
         memory_module,
-        "record_memory_extraction_input_capped",
-        lambda *, pass_name: seen["capped"].append(pass_name),
+        "record_memory_writeback_segment",
+        lambda *, event, count=1: seen["capped"].append((event, count)),
     )
     monkeypatch.setattr(
         memory_module,
@@ -528,7 +529,12 @@ async def test_total_input_cap_keeps_the_most_recent(
     assert len(first) <= memory_module._EXTRACT_INPUT_CHAR_CAP
     assert first.splitlines()[-1].startswith("M49")
     assert "M00" not in first
-    assert extraction_counts["capped"] == ["user"]
+    # 丢掉的整轮里最近的几行作上下文留在标记之上;新段只有留下的整轮。
+    [call] = llm.calls_of("user")
+    new = str(call[1].content).split("=== new ===")[1]
+    dropped = sum(f"M{i:02d}" not in new for i in range(50))
+    assert 0 < dropped < 50
+    assert extraction_counts["capped"] == [("turns_over_cap_dropped", dropped)]
     assert extraction_counts["truncated"] == []
 
 

@@ -9,8 +9,8 @@
   的确认日期刷新为那一行的发送时间,确定性「重复」同样;
 * 层级拦截:用户确认改不动用户说的;用户说的可以改用户确认的;
 * 两段合并:第二次提炼的候选能取到第一段刚写的行;
-* 去重合并内部出错抛 ``ReconcileFailedError``,只带「还没写的」;S 之前写回把它们原样直接写入
-  (只新增、不碰已有行),不进失败队列。
+* 去重合并内部出错抛 ``ReconcileFailedError``,只带「还没写的」;PR S 起写回不再直接写入,抛给
+  任务重试,只有最后一次尝试才把「还没写的」交给失败队列。
 """
 
 from __future__ import annotations
@@ -739,7 +739,8 @@ async def test_a_mid_batch_failure_hands_back_only_the_unwritten() -> None:
     assert not _untouched(store, r0)
     assert _untouched(store, r1) and _untouched(store, user_row)
 
-    # 写回返回的条数:出错前已取代落库的那条照算(D12),加上直接写下的 a2;a3 是重复,不算。
+    # PR S(§7.6)—— 写回不再直接写下 a2:没有任务重试的这一次(本轮内写回)等于最后一次尝试,
+    # 失败队列只收 a2(已取代落库的 a1、重复的 a3 不重建);出错走失败分支,条数是 0、failed 为真。
     c2 = _Ctx()
     s0, s1 = c2.mem("lives north", _deg(0)), c2.mem("lives east", _deg(40))
     store2 = _FailingStore("supersede", fail_on=s1.id)
@@ -752,8 +753,8 @@ async def test_a_mid_batch_failure_hands_back_only_the_unwritten() -> None:
     dlq = _RecordingDLQ()
     embeddings = {"a1": _deg(0), "a2": _deg(40), "a3": _deg(0)}
     outcome = await _flush_with_dlq(store2, llm, c2, embeddings, dlq)
-    assert (outcome.written, outcome.failed, dlq.enqueued) == (2, False, [])
-    assert sorted(r.content for r in _live(store2)) == ["a1", "a2", "lives east"]
+    assert (outcome.written, outcome.failed, dlq.enqueued) == (0, True, [[("fact", "a2")]])
+    assert sorted(r.content for r in _live(store2)) == ["a1", "lives east"]
 
 
 @pytest.mark.asyncio
@@ -911,24 +912,45 @@ def _user_memories(*rows: tuple[str, float]) -> str:
 
 
 @pytest.mark.asyncio
-async def test_a_reconcile_failure_writes_the_candidate_directly_with_its_fields() -> None:
-    """审查 MEDIUM-1(协调人定,S 之前):去重合并的模型超时 —— 用户说的候选照样以「用户说的」、
-    它自己的置信度直接写下(只新增,不碰已有的行),不进失败队列(失败队列重建的行没有来源)。"""
+async def test_a_reconcile_failure_raises_to_the_retry_and_dlqs_only_on_the_last_attempt() -> None:
+    """PR S(§7.6,替换 R 的过渡做法)—— 去重合并的模型超时:不再直接写入。后台任务的非最后一次
+    尝试抛给任务重试(什么都不写、不进失败队列);最后一次尝试(给了失败队列)把还没写的交给失败
+    队列,``failed`` 为真。旧行一直不动。(过渡做法下,一条还没执行的纯「删除」会被当成新增写下;
+    抛错之后这个问题也随之消失。)"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     old = c.mem("lives in the north", _E)
     await store.write([old])
-    llm = _RoutingLLM(_user_memories(("lives in the south", 0.9)), '{"memories": []}', [])
+    embeddings = {"lives in the south": _at(0.9)}
+    before = _reconcile_count("reconcile_failed")
+
+    async def flush(dlq: _RecordingDLQ | None) -> Any:
+        llm = _RoutingLLM(_user_memories(("lives in the south", 0.9)), '{"memories": []}', [])
+        return await flush_messages_with_outcome(
+            [_user_message("my words"), AIMessage(content="noted")],
+            memory_store=store,
+            embedder=_Embedder(embeddings),
+            llm_caller=llm,  # type: ignore[arg-type]
+            tenant_id=c.tenant,
+            user_id=c.user,
+            thread_id=uuid4(),
+            token=CancellationToken(),
+            reconcile=True,
+            agent_name=_AGENT,
+            dlq=dlq,  # type: ignore[arg-type]
+            raise_on_failure=True,
+        )
+
+    with pytest.raises(ReconcileFailedError):
+        await flush(None)
+    assert [r.content for r in _live(store)] == ["lives in the north"]
     dlq = _RecordingDLQ()
-    before = _reconcile_count("reconcile_failed_direct")
-    outcome = await _flush_with_dlq(store, llm, c, {"lives in the south": _at(0.9)}, dlq)
-    assert len(llm.reconcile_calls) == 1
-    [row] = [r for r in store._rows if r.content == "lives in the south"]
-    assert (row.origin, row.confidence) == ("user_stated", 0.9)
+    outcome = await flush(dlq)
+    assert (outcome.written, outcome.failed) == (0, True)
+    assert dlq.enqueued == [[("fact", "lives in the south")]]
+    assert [r.content for r in _live(store)] == ["lives in the north"]
     assert _untouched(store, old)
-    assert dlq.enqueued == []
-    assert (outcome.written, outcome.failed) == (1, False)
-    assert _reconcile_count("reconcile_failed_direct") == before + 1
+    assert _reconcile_count("reconcile_failed") == before + 2
 
 
 @pytest.mark.asyncio

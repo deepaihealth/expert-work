@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 import pytest
 from prometheus_client import REGISTRY
 
+from control_plane.memory import writeback_worker
 from control_plane.memory.writeback_worker import MemoryWritebackWorker, WritebackOutcome
 from expert_work.persistence.memory import (
     InMemoryMemoryWritebackJobStore,
@@ -87,8 +88,28 @@ async def test_run_once_processes_and_finishes_a_job() -> None:
     assert await worker.run_once() is False
 
 
+class _Clock:
+    """``writeback_worker._utcnow`` 的替身:测试里拨表。"""
+
+    def __init__(self) -> None:
+        self.now = datetime.now(UTC)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    fake = _Clock()
+    monkeypatch.setattr(writeback_worker, "_utcnow", fake)
+    return fake
+
+
 @pytest.mark.asyncio
-async def test_raising_processor_retries_then_fails() -> None:
+async def test_raising_processor_retries_then_fails(clock: _Clock) -> None:
     """(b) —— 处理器抛错:未到上限退回 pending,到上限 failed。"""
     store = InMemoryMemoryWritebackJobStore()
     await _enqueue(store)
@@ -103,10 +124,38 @@ async def test_raising_processor_retries_then_fails() -> None:
     assert (job.status, job.attempts) == ("pending", 1)
     assert job.last_error is not None and "provider down" in job.last_error
 
+    clock.advance(30)
     assert await worker.run_once() is True
     job = _only(store)
     assert (job.status, job.attempts) == ("failed", 2)
     assert await worker.run_once() is False
+
+
+@pytest.mark.asyncio
+async def test_retries_wait_30_seconds_then_5_minutes(clock: _Clock) -> None:
+    """B-300 重做 §7.6 —— 第 1 次失败后 30 秒、第 2 次失败后 5 分钟才再领;到点前领不到。"""
+    store = InMemoryMemoryWritebackJobStore()
+    await _enqueue(store)
+    attempts: list[int] = []
+
+    async def boom(job: MemoryWritebackJob, *, still_held: StillHeld) -> WritebackOutcome:
+        attempts.append(job.attempts)
+        raise RuntimeError("rate limited")
+
+    worker = MemoryWritebackWorker(store=store, processor=boom, max_attempts=3)
+    assert await worker.run_once() is True
+    assert _only(store).lease_until == clock.now + timedelta(seconds=30)
+    clock.advance(29)
+    assert await worker.run_once() is False
+    clock.advance(1)
+    assert await worker.run_once() is True
+    assert _only(store).lease_until == clock.now + timedelta(seconds=300)
+    clock.advance(299)
+    assert await worker.run_once() is False
+    clock.advance(1)
+    assert await worker.run_once() is True
+    assert attempts == [1, 2, 3]
+    assert _only(store).status == "failed"
 
 
 @pytest.mark.asyncio

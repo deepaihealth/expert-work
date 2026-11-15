@@ -1983,8 +1983,8 @@ def create_app(
                     # RRF order when rerank is unconfigured.
                     reranker=reranker,
                 )
-                # B-168 —— 记忆后台写回 worker,只在 ``background`` 模式下建(默认
-                # ``inline`` 不起,run 的行为不变)。它要的依赖(记忆库 / 嵌入 / DLQ、平台
+                # B-168 —— 记忆后台写回 worker,只在 ``background`` 模式下建(这是默认;
+                # ``inline`` 是逃生口,不起 worker)。它要的依赖(记忆库 / 嵌入 / DLQ、平台
                 # 凭据、共享 HTTP、全局限流、检查点)都只在这个分支里有。
                 if resolved_settings.memory_writeback_mode == "background":
                     _memory_template_resolver = _platform_template_resolver
@@ -2006,6 +2006,10 @@ def create_app(
                                 rate_limiter_factory=llm_rate_limiter_factory,
                             ),
                             usage_store=resolved_token_usage,
+                            # B-300 重做 PR S —— 起点从同一对话的前一个任务算;最后一次尝试才
+                            # 交失败队列(与 worker 同一个上限)。
+                            jobs=resolved_memory_writeback_jobs,
+                            max_attempts=resolved_settings.memory_writeback_max_attempts,
                             resolve_spec=_resolve_memory_spec,
                             audit_logger=resolved_audit,
                         ),

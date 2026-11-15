@@ -10,13 +10,15 @@
 
 **领取规则**(:meth:`MemoryWritebackJobStore.claim_next`,内存版与 SQL 版逐字同义):
 
-* 可领 = ``pending``,或 ``running`` 但租约已过期(``lease_until <= now``)且
-  ``attempts < max_attempts``(领取者崩了,别的副本接手)。
+* 可领 = ``pending`` 且 ``lease_until`` 为空或已到点(B-300 重做 §7.6:失败退回 ``pending``
+  时 ``lease_until`` 记最早可领时间;新落的任务它为空,立刻可领),或 ``running`` 但租约已过期
+  (``lease_until <= now``)且 ``attempts < max_attempts``(领取者崩了,别的副本接手)。
 * 同一 (租户, 用户) 串行:该用户有别的 ``running`` 且租约未过期的任务时不领;该用户有
   更早的(按 ``(created_at, id)``)``pending`` / ``running`` 任务时也不领 —— 只有每个
   用户最早的那条未完成任务可领,所以失败重试的那条仍排在后来的任务前面。按用户而不是
   按会话:事实类记忆跨该用户所有智能体共享,两条去重合并同时跑会对同一批旧记忆各做一次
-  增删改。
+  增删改。例外(§7.6):**正在等待重试**(``pending`` 且 ``lease_until`` 在将来)的更早任务
+  只挡**同一对话**里的任务 —— 它并没在跑,「同一用户同一时间只跑一条」的理由对它不成立。
 * 每次领取先把「租约过期且已到上限」的 ``running`` 收成 ``failed``,否则它永远挡着
   同一用户后面的任务。
 * SQL 版只靠语句快照挡不住交错的领取者:A 已把 J1 改成 running 但未提交时,B 的快照里
@@ -37,7 +39,11 @@
 * :meth:`finish` —— 处理器跑完了(包括记忆写回自己报「没写成」:那种情况抽取出的内容
   已经交给 DLQ 重试,或是被注入扫描拦下、重试也一样),一律 ``done``,结果记在行上。
 * :meth:`fail_attempt` —— 处理器抛错(取配置 / 建路由 / 读检查点失败、超时)。未到上限
-  退回 ``pending`` 等下一次领取;到上限收成 ``failed``。
+  退回 ``pending`` 等下一次领取(``retry_at`` 给了就到那时才可领);到上限收成 ``failed``。
+
+**起点**(B-176 M2-1,重做 §8.1)::meth:`previous_job` 给处理器算本段从哪条消息起 —— 同一
+对话里 ``message_count`` 比自己小的任务中最大的那个,以及同一 ``message_count`` 是否已有
+别的任务做完。不加列。
 """
 
 from __future__ import annotations
@@ -48,7 +54,19 @@ from datetime import datetime, timedelta
 from typing import Any, Final
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, case, delete, func, or_, select, text, update
+from sqlalchemy import (
+    DateTime,
+    and_,
+    case,
+    cast,
+    delete,
+    func,
+    literal,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -90,6 +108,18 @@ class MemoryWritebackJob:
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+
+
+@dataclass(frozen=True)
+class PreviousJob:
+    """:meth:`MemoryWritebackJobStore.previous_job` 的结果。
+
+    ``message_count``:同一对话里 ``message_count`` 比本任务小的任务中最大的那个(不看状态,
+    跳过为空的);``None`` = 没有更早的任务。``same_count_done``:同一 ``message_count`` 已有别的
+    任务状态为 ``done``(落任务超时的窗口里可能出现两条;``failed`` 的不算)。"""
+
+    message_count: int | None
+    same_count_done: bool
 
 
 def _row_to_job(row: MemoryWritebackJobRow) -> MemoryWritebackJob:
@@ -203,10 +233,21 @@ class MemoryWritebackJobStore(abc.ABC):
         error: str,
         max_attempts: int,
         now: datetime,
+        retry_at: datetime | None = None,
     ) -> str | None:
         """Record a raised attempt: back to ``pending`` while ``attempts <
         max_attempts``, else ``failed``. Returns the new status, ``None`` when
-        the job is not held."""
+        the job is not held. ``retry_at`` (B-300 redesign §7.6) is stored in
+        ``lease_until`` of the ``pending`` row: not claimable before it."""
+
+    @abc.abstractmethod
+    async def previous_job(
+        self, *, tenant_id: UUID, thread_id: UUID, job_id: UUID, message_count: int
+    ) -> PreviousJob:
+        """B-176 M2-1 —— where this job's segment starts (:class:`PreviousJob`):
+        among the conversation's other jobs, the largest ``message_count`` below
+        ``message_count`` (any status, NULL skipped), and whether another job at
+        exactly ``message_count`` is ``done``."""
 
     @abc.abstractmethod
     async def get_by_run(self, *, tenant_id: UUID, run_id: UUID) -> MemoryWritebackJob | None:
@@ -299,14 +340,28 @@ class InMemoryMemoryWritebackJobStore(MemoryWritebackJobStore):
         return job.status == RUNNING and job.lease_until is not None and job.lease_until > now
 
     @staticmethod
+    def _backing_off(job: MemoryWritebackJob, now: datetime) -> bool:
+        return job.status == PENDING and job.lease_until is not None and job.lease_until > now
+
+    @staticmethod
     def _claimable_self(job: MemoryWritebackJob, now: datetime, max_attempts: int) -> bool:
         if job.status == PENDING:
-            return True
+            return job.lease_until is None or job.lease_until <= now
         return (
             job.status == RUNNING
             and job.lease_until is not None
             and job.lease_until <= now
             and job.attempts < max_attempts
+        )
+
+    def _waiting(self, job: MemoryWritebackJob, now: datetime) -> bool:
+        """它所在的对话正在等重试:同一对话里有不晚于它、等待重试的任务(含它自己)。"""
+        return any(
+            w.tenant_id == job.tenant_id
+            and w.thread_id == job.thread_id
+            and self._backing_off(w, now)
+            and (w.created_at, w.id) <= (job.created_at, job.id)
+            for w in self._rows.values()
         )
 
     def _blocked(self, job: MemoryWritebackJob, now: datetime) -> bool:
@@ -318,9 +373,10 @@ class InMemoryMemoryWritebackJobStore(MemoryWritebackJobStore):
                 continue
             if self._live(other, now):
                 return True
-            if other.status in _UNFINISHED and (other.created_at, other.id) < (
-                job.created_at,
-                job.id,
+            if (
+                other.status in _UNFINISHED
+                and (other.created_at, other.id) < (job.created_at, job.id)
+                and (other.thread_id == job.thread_id or not self._waiting(other, now))
             ):
                 return True
         return False
@@ -414,6 +470,7 @@ class InMemoryMemoryWritebackJobStore(MemoryWritebackJobStore):
         error: str,
         max_attempts: int,
         now: datetime,
+        retry_at: datetime | None = None,
     ) -> str | None:
         job = self._held(job_id, attempt)
         if job is None:
@@ -423,8 +480,25 @@ class InMemoryMemoryWritebackJobStore(MemoryWritebackJobStore):
                 job, status=FAILED, lease_until=None, last_error=error, finished_at=now
             )
             return FAILED
-        self._rows[job_id] = replace(job, status=PENDING, lease_until=None, last_error=error)
+        self._rows[job_id] = replace(job, status=PENDING, lease_until=retry_at, last_error=error)
         return PENDING
+
+    async def previous_job(
+        self, *, tenant_id: UUID, thread_id: UUID, job_id: UUID, message_count: int
+    ) -> PreviousJob:
+        counts = [
+            (j.message_count, j.status)
+            for j in self._rows.values()
+            if j.tenant_id == tenant_id
+            and j.thread_id == thread_id
+            and j.id != job_id
+            and j.message_count is not None
+        ]
+        below = [count for count, _ in counts if count < message_count]
+        return PreviousJob(
+            message_count=max(below) if below else None,
+            same_count_done=(message_count, DONE) in counts,
+        )
 
     async def get_by_run(self, *, tenant_id: UUID, run_id: UUID) -> MemoryWritebackJob | None:
         rows = [j for j in self._rows.values() if j.tenant_id == tenant_id and j.run_id == run_id]
@@ -483,7 +557,7 @@ _Job = MemoryWritebackJobRow
 
 def _claimable_self(now: datetime, max_attempts: int) -> Any:
     return or_(
-        _Job.status == PENDING,
+        and_(_Job.status == PENDING, or_(_Job.lease_until.is_(None), _Job.lease_until <= now)),
         and_(
             _Job.status == RUNNING,
             _Job.lease_until <= now,
@@ -497,8 +571,26 @@ def _blocked(now: datetime) -> Any:
 
     与 ``InMemoryMemoryWritebackJobStore._blocked`` 逐字同义(契约场景钉住)。
     「更早」按 ``(created_at, id)``,并列时靠 id 定先后,同 B-139 ``_earlier_busy_exists``。
+    B-300 重做 §7.6:所在对话正在等重试的(同一对话里有不晚于它、``pending`` 且 ``lease_until``
+    在将来的任务,含它自己)只挡同一对话 —— 排在等待重试那条后面的同对话任务也一样,否则它会
+    替那条挡住这个用户别的对话。
     """
     other = aliased(MemoryWritebackJobRow)
+    waiter = aliased(MemoryWritebackJobRow)
+    waiting = (
+        select(waiter.id)
+        .where(
+            waiter.tenant_id == other.tenant_id,
+            waiter.thread_id == other.thread_id,
+            waiter.status == PENDING,
+            waiter.lease_until > now,
+            or_(
+                waiter.created_at < other.created_at,
+                and_(waiter.created_at == other.created_at, waiter.id <= other.id),
+            ),
+        )
+        .exists()
+    )
     return (
         select(other.id)
         .where(
@@ -513,6 +605,7 @@ def _blocked(now: datetime) -> Any:
                         other.created_at < _Job.created_at,
                         and_(other.created_at == _Job.created_at, other.id < _Job.id),
                     ),
+                    or_(other.thread_id == _Job.thread_id, ~waiting),
                 ),
             ),
         )
@@ -706,6 +799,7 @@ class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
         error: str,
         max_attempts: int,
         now: datetime,
+        retry_at: datetime | None = None,
     ) -> str | None:
         exhausted = _Job.attempts >= max_attempts
         async with self._sf() as session:
@@ -716,7 +810,15 @@ class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
                     .values(
                         # SET 里的 ``attempts`` 读的是本行更新前的值。
                         status=case((exhausted, FAILED), else_=PENDING),
-                        lease_until=None,
+                        # 退回 pending 时记最早可领时间(§7.6);收成 failed 时清空。
+                        lease_until=(
+                            None
+                            if retry_at is None
+                            else case(
+                                (exhausted, None),
+                                else_=cast(literal(retry_at), DateTime(timezone=True)),
+                            )
+                        ),
                         last_error=error,
                         finished_at=case((exhausted, now), else_=None),
                     )
@@ -725,6 +827,28 @@ class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
             ).scalar_one_or_none()
             await session.commit()
         return str(new_status) if new_status is not None else None
+
+    async def previous_job(
+        self, *, tenant_id: UUID, thread_id: UUID, job_id: UUID, message_count: int
+    ) -> PreviousJob:
+        same_thread = and_(
+            _Job.tenant_id == tenant_id, _Job.thread_id == thread_id, _Job.id != job_id
+        )
+        below = select(func.max(_Job.message_count)).where(
+            same_thread, _Job.message_count < message_count
+        )
+        done = (
+            select(_Job.id)
+            .where(same_thread, _Job.message_count == message_count, _Job.status == DONE)
+            .exists()
+        )
+        async with self._sf() as session:
+            previous = await session.scalar(below)
+            same_count_done = await session.scalar(select(done))
+        return PreviousJob(
+            message_count=int(previous) if previous is not None else None,
+            same_count_done=bool(same_count_done),
+        )
 
     async def get_by_run(self, *, tenant_id: UUID, run_id: UUID) -> MemoryWritebackJob | None:
         stmt = (
@@ -782,5 +906,6 @@ __all__ = [
     "InMemoryMemoryWritebackJobStore",
     "MemoryWritebackJob",
     "MemoryWritebackJobStore",
+    "PreviousJob",
     "SqlMemoryWritebackJobStore",
 ]

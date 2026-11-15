@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Sequence
 from copy import deepcopy
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -23,6 +24,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from control_plane.memory import MemoryWritebackWorker
 from control_plane.memory.writeback_processor import MemoryWritebackProcessor
 from control_plane.transcript import read_messages
+from expert_work.common.message_stamp import stamp_message
 from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
 from expert_work.persistence.memory import (
     InMemoryMemoryStore,
@@ -212,7 +214,16 @@ class _Harness:
                 record=record,
                 graph=self.graph,
                 graph_input={
-                    "messages": [SystemMessage(content="help"), HumanMessage(content=text)],
+                    # 同 ``api/runs.py``:用户消息写入时盖时间戳与 run 归属(B-300 PR S 的切片
+                    # 按开轮消息的写入时间判「最近 30 天」)。
+                    "messages": [
+                        SystemMessage(content="help"),
+                        stamp_message(
+                            HumanMessage(content=text),
+                            run_id=str(record.run_id),
+                            now=datetime.now(UTC),
+                        ),
+                    ],
                     "step_count": 0,
                     "max_steps": 5,
                     **({"plan": plan} if plan is not None else {}),
@@ -258,6 +269,7 @@ class _Harness:
                 checkpointer=self.checkpointer,
                 caller_factory=factory,
                 usage_store=None,
+                jobs=self.jobs,
             ),
         )
 

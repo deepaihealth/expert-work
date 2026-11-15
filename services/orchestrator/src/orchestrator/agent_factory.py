@@ -3067,14 +3067,8 @@ def _build_memory_nodes(
         else None
     )
     pre_compaction_flush = (
-        make_pre_compaction_flush(
-            memory_store=env.store,
-            embedder=env.embedder,
-            llm_caller=llm_caller,
-            dlq=env.dlq,
-            agent_name=agent_name,
-            write_min_importance=long_term.write_min_importance,  # M-2 write-filter
-        )
+        # B-300 重做 PR S —— 抢存不再提炼(回调只记一次计数),轮末写回的切片覆盖被折掉的中段。
+        make_pre_compaction_flush()
         if long_term.write_back and spec.spec.policies.context_compression.flush_before_compaction
         else None
     )

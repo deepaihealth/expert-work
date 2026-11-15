@@ -38,6 +38,7 @@ from orchestrator.graph_builder.memory import (
     flush_messages_with_outcome,
 )
 from orchestrator.graph_builder.memory_lines import ExtractionLine, evidence_pointer
+from orchestrator.graph_builder.memory_slice import SegmentStart, Turn, plan_slice
 from orchestrator.llm import FakeEmbedder
 
 _DIM = 32
@@ -443,14 +444,17 @@ async def test_user_text_lines_are_numbered_with_the_date_after_the_number() -> 
 
 
 async def test_the_total_cap_numbers_the_kept_lines_from_one() -> None:
+    """PR S —— 上限按整轮丢最早的;丢掉的整轮里最近的两条用户输入作上下文留在标记之上,编号从 1 起、
+    上下文与新行连续。"""
     messages: list[BaseMessage] = [_user(f"M{i:02d}" + "字" * 897) for i in range(50)]
     llm = _ByPassLLM()
     await _flush(messages, llm)
     first = llm.input_of("user")
     assert len(first) <= memory_module._EXTRACT_INPUT_CHAR_CAP
     lines = first.splitlines()
-    assert lines[0] == "=== new ==="
-    assert lines[1].startswith("[1] M")
+    assert lines[0].startswith("[1] M") and lines[1].startswith("[2] M")
+    assert lines[2] == "=== new ==="
+    assert lines[3].startswith("[3] M")
     assert lines[-1].startswith(f"[{len(lines) - 1}] M49")
     assert "M00" not in first
 
@@ -715,21 +719,24 @@ async def test_the_line_date_boundary_follows_the_agent_timezone(
 # ─── 交给去重合并的三样:line_at、in_new_segment、事件日期 ─────────────
 
 
-async def _extracted(messages: Sequence[BaseMessage], llm: _ByPassLLM) -> list[ExtractedMemory]:
+async def _extracted(
+    messages: Sequence[BaseMessage], llm: _ByPassLLM, segment: SegmentStart | None = None
+) -> list[ExtractedMemory]:
     out, failed = await memory_module._extract_two_passes(
         messages,
         user_text_messages=(),
         llm_caller=llm,
         token=CancellationToken(),
         log_label="test",
+        segment=segment,
     )
     assert not failed
     return out
 
 
 async def test_line_time_and_new_segment_follow_the_turn_line() -> None:
-    """切片之前,整段对话都交给模型(标记在最上面);「新段」= 本次写回负责的那一轮 —— 最后一轮。
-    更早轮次的行每次写回都会被重抽,它们再被判成「重复」不能算用户又说了一次。"""
+    """PR S —— 「新段」= 不是上下文行:从第二轮起切片,第一轮的行在标记之上(上下文),它们再被判成
+    「重复」不能算用户又说了一次。"""
     llm = _ByPassLLM(
         user_reply=_reply(
             {"kind": "fact", "content": "早先说的", "turn": 1},
@@ -740,7 +747,9 @@ async def test_line_time_and_new_segment_follow_the_turn_line() -> None:
             {"kind": "fact", "content": "本轮的回答", "basis": "user_answer", "turn": 3},
         ),
     )
-    by_content = {m.content: m for m in await _extracted(_qa(), llm)}
+    by_content = {
+        m.content: m for m in await _extracted(_qa(), llm, segment=SegmentStart(message_index=2))
+    }
     assert by_content["早先说的"].line_at == datetime(2026, 3, 2, 1, 0, tzinfo=UTC)
     assert by_content["早先说的"].in_new_segment is False
     assert by_content["本轮说的"].line_at == datetime(2026, 3, 2, 1, 1, tzinfo=UTC)
@@ -872,51 +881,46 @@ def test_the_pointer_refuses_a_negative_index() -> None:
     )
 
 
-async def test_a_slice_keeps_the_message_id_but_not_its_position() -> None:
-    """压缩前抢存拿到的是对话中段:序号是中段里的,不是整段对话里的 —— 不写序号,id 照写。"""
-    llm = _ByPassLLM(
-        conversation_reply=_reply(
-            {"kind": "fact", "content": "回程 18 号", "basis": "user_answer", "turn": 3}
-        )
-    )
-    store = InMemoryMemoryStore()
-    await memory_module.flush_messages_to_memory(
-        _qa(),
-        memory_store=store,
-        embedder=FakeEmbedder(dim=_DIM),
-        llm_caller=llm,
-        tenant_id=_TENANT,
-        user_id=_USER,
-        thread_id=uuid4(),
-        token=CancellationToken(),
-        whole_conversation=False,
-    )
-    row = (await _rows(store))["回程 18 号"]
-    assert (row.evidence_message_id, row.evidence_message_index) == ("u2", None)
-
-
 async def test_after_the_cap_a_turn_maps_to_the_kept_line() -> None:
-    """总量上限丢掉最早的行、重新从 1 编号之后,``turn`` = 2 指向留下的第 2 行那条消息(审查 L5)。"""
+    """总量上限丢掉最早的整轮、重新从 1 编号之后(上面两行是上下文),``turn`` = 3 指向留下的第一条
+    新行那条消息,序号是整段对话里的(审查 L5)。"""
     messages: list[BaseMessage] = [
         _user(f"M{i:02d}" + "字" * 897, msg_id=f"m{i:02d}") for i in range(50)
     ]
-    llm = _ByPassLLM(user_reply=_reply({"kind": "fact", "content": "第二行", "turn": 2}))
+    llm = _ByPassLLM(user_reply=_reply({"kind": "fact", "content": "第三行", "turn": 3}))
     _, store = await _flush(messages, llm)
-    second = llm.input_of("user").splitlines()[2]
-    assert second.startswith("[2] M")
-    label = second[len("[2] M") : len("[2] M") + 2]
-    assert label != "01"  # 确实丢了前面的行
-    row = (await _rows(store))["第二行"]
+    third = llm.input_of("user").splitlines()[3]
+    assert third.startswith("[3] M")
+    label = third[len("[3] M") : len("[3] M") + 2]
+    assert label != "02"  # 确实丢了前面的轮次
+    row = (await _rows(store))["第三行"]
     assert (row.evidence_message_id, row.evidence_message_index) == (f"m{label}", int(label))
 
 
-def test_the_cap_counts_the_numbers_and_the_mark() -> None:
-    """三行正文合起来不到上限,带上编号与标记就超了:最早的一行要丢。"""
-    lines = [ExtractionLine(text=f"line-{i}-xxx") for i in range(3)]  # 每行 10 字
-    kept, capped = memory_lines.cap_lines(lines, 50)
-    assert capped
-    assert [line.text for line in kept] == ["line-1-xxx", "line-2-xxx"]
-    assert len(memory_lines.render_lines(kept)) <= 50
+def test_the_cap_counts_the_numbers_the_mark_and_the_context() -> None:
+    """三轮正文合起来 30 字,远不到上限 55;带上编号、标记、丢掉的轮次作上下文的那几行,三轮
+    (56 字)、两轮(56 字)都超了,只留最近的一轮(最近的一轮总是留下)。"""
+    turns = [
+        Turn(
+            user=(),
+            conversation=(ExtractionLine(text=f"line-{i}-xxx", message_index=i),),
+            has_reply=True,
+            first_index=i,
+            last_index=i,
+            opened_at=None,
+        )
+        for i in range(3)
+    ]  # 每行 10 字
+    plan = plan_slice(turns, None, cap=55, halves=False)
+    [chunk] = plan.chunks
+    assert plan.dropped_over_cap == 2
+    assert [(line.text, line.context) for line in chunk.conversation] == [
+        ("line-0-xxx", True),
+        ("line-1-xxx", True),
+        ("line-2-xxx", False),
+    ]
+    assert len(memory_lines.render_lines(chunk.conversation)) == 56
+    assert plan_slice(turns, None, cap=56, halves=False).dropped_over_cap == 0
 
 
 def test_rendering_puts_context_above_the_mark() -> None:

@@ -55,7 +55,6 @@ from expert_work.common.uplift_metrics import (
     record_memory_drift,
     record_memory_extraction,
     record_memory_extraction_check,
-    record_memory_extraction_input_capped,
     record_memory_extraction_message_truncated,
     record_memory_mmr,
     record_memory_reconcile,
@@ -65,6 +64,7 @@ from expert_work.common.uplift_metrics import (
     record_memory_retrieval,
     record_memory_rewrite,
     record_memory_verify,
+    record_memory_writeback_segment,
 )
 from expert_work.common.user_input import (
     UserInput,
@@ -121,11 +121,11 @@ from orchestrator.graph_builder.memory_lines import (
     ASSISTANT_TAG,
     USER_TAG,
     ExtractionLine,
-    cap_lines,
     render_lines,
     settle_conversation,
     settle_user_text,
 )
+from orchestrator.graph_builder.memory_slice import Chunk, SegmentStart, SlicePlan, Turn, plan_slice
 from orchestrator.graph_builder.retrieval_query import (
     RetrievalQuery,
     build_retrieval_query,
@@ -483,12 +483,11 @@ def _one_line(text: str) -> tuple[str, bool]:
 
 @dataclass(frozen=True)
 class _LineSource:
-    """一行来自哪条消息(证据指针)、何时发送、在不在本次写回负责的轮次里。"""
+    """一行来自哪条消息(证据指针)、何时发送。"""
 
     message_id: str | None = None
     message_index: int | None = None
     sent_at: datetime | None = None
-    fresh: bool = False
 
 
 @dataclass
@@ -513,18 +512,9 @@ class _PassInput:
                 sent_day=_agent_day(sent_at),
                 message_id=source.message_id,
                 message_index=source.message_index,
-                fresh=source.fresh,
             )
         )
         self.truncated += int(cut)
-
-
-@dataclass(frozen=True)
-class _ExtractionInputs:
-    user: _PassInput
-    conversation: _PassInput
-    #: 有没有至少一轮助手的最终回答(没有就不做第二次)。
-    has_reply: bool
 
 
 def _attached_line(typed: UserInput) -> str:
@@ -568,19 +558,56 @@ def _typed_input(message: HumanMessage, explicit: set[int]) -> UserInput | None:
 
 
 def _source(
-    message: BaseMessage, positions: Mapping[int, int], sent_at: datetime | None, fresh: bool
+    message: BaseMessage, positions: Mapping[int, int], sent_at: datetime | None = None
 ) -> _LineSource:
     message_id = message.id if isinstance(message.id, str) and message.id else None
-    return _LineSource(message_id, positions.get(id(message)), sent_at, fresh)
+    return _LineSource(message_id, positions.get(id(message)), sent_at)
+
+
+def _turn(segment: Sequence[BaseMessage], explicit: set[int], positions: Mapping[int, int]) -> Turn:
+    """一轮在两次提炼里的行(:func:`_extraction_inputs` 的表)。"""
+    user = _PassInput(lines=[])
+    conversation = _PassInput(lines=[])
+    opener = segment[0]
+    if isinstance(opener, HumanMessage):
+        typed = _typed_input(opener, explicit)
+        if typed is None:
+            # 外部内容(围栏里的)不跟着进 ``[task]``(review L1)。
+            text = text_before_external_content(_reply_text(opener))
+            conversation.add(text, "[task]", source=_source(opener, positions))
+        else:
+            asked = _source(opener, positions, _user_sent_at(typed, opener))
+            user.add(typed.text, source=asked, dated=True)
+            conversation.add(typed.text, USER_TAG, source=asked, dated=True)
+            if typed.images or typed.files or typed.external_blocks:
+                conversation.add(_attached_line(typed), "[attached data]", source=asked)
+    replies = [m for m in segment if isinstance(m, AIMessage)]
+    callers = [m for m in replies if m.tool_calls]
+    tools = [str(call.get("name") or "") for m in callers for call in m.tool_calls]
+    if tools:
+        conversation.add(_activity_line(tools), "[activity]", source=_source(callers[0], positions))
+    finals = [m for m in replies if not m.tool_calls and _reply_text(m).strip()]
+    if finals:
+        final = finals[-1]
+        stamped = _parse_stamp(final.additional_kwargs.get(STAMP_CREATED_AT))
+        replied = _source(final, positions, stamped)
+        conversation.add(_reply_text(final), ASSISTANT_TAG, source=replied, dated=True)
+    return Turn(
+        user=tuple(user.lines),
+        conversation=tuple(conversation.lines),
+        has_reply=bool(finals),
+        first_index=positions[id(opener)],
+        last_index=positions[id(segment[-1])],
+        opened_at=_parse_stamp(opener.additional_kwargs.get(STAMP_CREATED_AT)),
+        user_truncated=user.truncated,
+        conversation_truncated=conversation.truncated,
+    )
 
 
 def _extraction_inputs(
-    messages: Sequence[BaseMessage],
-    explicit_user_text: Sequence[BaseMessage],
-    *,
-    whole_conversation: bool = True,
-) -> _ExtractionInputs:
-    """B-300 ① —— 两次提炼各看到什么(设计 §4.1 的表)。
+    messages: Sequence[BaseMessage], explicit_user_text: Sequence[BaseMessage]
+) -> list[Turn]:
+    """B-300 ① —— 两次提炼各看到什么(设计 §4.1 的表),按轮。
 
     * 第一次:只有白名单里用户输入的文字(``_build_human_message`` 记下的那一段,或调用方经
       ``user_text_messages`` 显式声明的整条消息),一条一行,带发送日期;
@@ -589,48 +616,15 @@ def _extraction_inputs(
       工具 ``[activity]`` 与助手的最终回答 ``[assistant]``(该轮最后一条不带工具调用的助手消息,
       只取文字段)。工具结果、助手的中间消息、思考段两次都不给。
 
-    B-300 重做(PR X)—— 每行记下它来自哪条消息:id,以及在 ``messages`` 里的序号
-    (``whole_conversation`` 为假时不记序号 —— 压缩前抢存拿到的是中段,序号不是整段对话里的);
-    ``[activity]`` 行指向该轮第一条调工具的助手消息,``[attached data]`` 行指向那条用户消息。
-    ``fresh``(交给去重合并的 ``in_new_segment``)= 这一行属于本次写回负责的轮次。切片(PR S)之前
-    每次写回整段重抽,只有最后一轮(落这个写回任务的那一轮)是第一次被提炼的:更早轮次的行再被判成
-    「重复」不能算用户又说了一次。
+    B-300 重做(PR X)—— 每行记下它来自哪条消息:id,以及在 ``messages`` 里的序号;``[activity]``
+    行指向该轮第一条调工具的助手消息,``[attached data]`` 行指向那条用户消息。
+
+    PR S —— 整段对话切轮、编序号,哪些轮是新段由 :func:`~orchestrator.graph_builder.memory_slice.
+    plan_slice` 再按起点挑(不能先截再切:``_segments`` 会丢第一个开轮消息之前的半轮,序号也会错)。
     """
     explicit = {id(m) for m in explicit_user_text}
-    positions = {id(m): idx for idx, m in enumerate(messages)} if whole_conversation else {}
-    user = _PassInput(lines=[])
-    conversation = _PassInput(lines=[])
-    has_reply = False
-    segments = _segments(messages)
-    for number, segment in enumerate(segments):
-        fresh = number == len(segments) - 1
-        opener = segment[0]
-        if isinstance(opener, HumanMessage):
-            typed = _typed_input(opener, explicit)
-            if typed is None:
-                # 外部内容(围栏里的)不跟着进 ``[task]``(review L1)。
-                text = text_before_external_content(_reply_text(opener))
-                conversation.add(text, "[task]", source=_source(opener, positions, None, fresh))
-            else:
-                asked = _source(opener, positions, _user_sent_at(typed, opener), fresh)
-                user.add(typed.text, source=asked, dated=True)
-                conversation.add(typed.text, USER_TAG, source=asked, dated=True)
-                if typed.images or typed.files or typed.external_blocks:
-                    conversation.add(_attached_line(typed), "[attached data]", source=asked)
-        replies = [m for m in segment if isinstance(m, AIMessage)]
-        callers = [m for m in replies if m.tool_calls]
-        tools = [str(call.get("name") or "") for m in callers for call in m.tool_calls]
-        if tools:
-            activity = _source(callers[0], positions, None, fresh)
-            conversation.add(_activity_line(tools), "[activity]", source=activity)
-        finals = [m for m in replies if not m.tool_calls and _reply_text(m).strip()]
-        if finals:
-            final = finals[-1]
-            stamped = _parse_stamp(final.additional_kwargs.get(STAMP_CREATED_AT))
-            replied = _source(final, positions, stamped, fresh)
-            conversation.add(_reply_text(final), ASSISTANT_TAG, source=replied, dated=True)
-            has_reply = True
-    return _ExtractionInputs(user=user, conversation=conversation, has_reply=has_reply)
+    positions = {id(m): idx for idx, m in enumerate(messages)}
+    return [_turn(segment, explicit, positions) for segment in _segments(messages)]
 
 
 def _extract_json_object(text: str) -> str | None:
@@ -2149,8 +2143,10 @@ async def _extract_pass(
     language: str | None,
     llm_caller: LLMCaller,
     token: CancellationToken,
+    strict: bool = False,
 ) -> list[ExtractedMemory]:
-    """一次提炼:一次模型调用 + 解析;结果按四种计数(B-300 D3)。调用失败原样抛给调用方。"""
+    """一次提炼:一次模型调用 + 解析;结果按四种计数(B-300 D3)。调用失败原样抛给调用方;``strict``
+    (后台任务)时回复用不了或被截断也抛(:class:`ExtractionReplyError`)。"""
     prompt = [
         SystemMessage(content=_extract_system(pass_name, language)),
         HumanMessage(content=render_lines(lines)),
@@ -2165,6 +2161,8 @@ async def _extract_pass(
     else:
         outcome = "extracted" if parsed else "empty"
     record_memory_extraction(pass_name=pass_name, outcome=outcome)
+    if strict and outcome in ("truncated", "parse_failed"):
+        raise ExtractionReplyError(f"{pass_name} extraction reply {outcome.replace('_', ' ')}")
     # B-300 ② / 重做 §5.4 —— 第一次只看得到用户输入的文字:一律「用户消息里说的」;第二次由程序
     # 按 basis + turn 定「用户确认」(≤ 0.8)或「来自助手」(≤ 0.6),无论模型给多少。
     # 事件日期不能晚于智能体时区的「今天」(审查 L3)。
@@ -2172,14 +2170,65 @@ async def _extract_pass(
     return [_settled(pass_name, m, lines, today) for m in parsed or []]
 
 
-def _pass_lines(pass_name: str, pass_input: _PassInput) -> list[ExtractionLine]:
-    """一次提炼的输入行:总量上限内的最近几行;顺带记两个 D3 计数。"""
-    if pass_input.truncated:
-        record_memory_extraction_message_truncated(pass_name=pass_name, count=pass_input.truncated)
-    lines, capped = cap_lines(pass_input.lines, _EXTRACT_INPUT_CHAR_CAP)
-    if capped:
-        record_memory_extraction_input_capped(pass_name=pass_name)
-    return lines
+class ExtractionReplyError(RuntimeError):
+    """B-300 重做 §7.6 —— 后台写回里一次提炼的回复用不了(没有 ``{"memories": [...]}``,或被输出
+    上限截断):抛给任务重试(第 2 次起按整轮对半分块),不当成「没什么可记」。"""
+
+
+def _record_plan(plan: SlicePlan) -> None:
+    if plan.straddling:
+        record_memory_writeback_segment(event="straddling_turn_skipped", count=plan.straddling)
+    if plan.dropped_over_cap:
+        record_memory_writeback_segment(event="turns_over_cap_dropped", count=plan.dropped_over_cap)
+    if plan.halved:
+        record_memory_writeback_segment(event="halved")
+    if not plan.chunks:
+        record_memory_writeback_segment(event="empty")
+
+
+def _chunk_calls(chunk: Chunk) -> list[tuple[str, list[ExtractionLine]]]:
+    """一块要做的提炼:新段里有用户输入才做第一次,有助手的最终回答才做第二次;顺带记截断计数。"""
+    calls: list[tuple[str, list[ExtractionLine]]] = []
+    if chunk.has_new_user_text:
+        calls.append((_USER_TEXT_EXTRACTION, list(chunk.user)))
+    if chunk.has_reply:
+        calls.append((_CONVERSATION_EXTRACTION, list(chunk.conversation)))
+    truncated = {
+        _USER_TEXT_EXTRACTION: sum(t.user_truncated for t in chunk.turns),
+        _CONVERSATION_EXTRACTION: sum(t.conversation_truncated for t in chunk.turns),
+    }
+    for name, _lines in calls:
+        if truncated[name]:
+            record_memory_extraction_message_truncated(pass_name=name, count=truncated[name])
+    return calls
+
+
+async def _run_passes(
+    calls: Sequence[tuple[str, list[ExtractionLine]]],
+    *,
+    language: str | None,
+    llm_caller: LLMCaller,
+    token: CancellationToken,
+    strict: bool,
+) -> list[list[ExtractedMemory] | Exception]:
+    """一块里的两次提炼并发;普通失败交回来,取消原样抛出(TaskGroup 随即取消另一次,review L3)。"""
+
+    async def guarded(name: str, lines: list[ExtractionLine]) -> list[ExtractedMemory] | Exception:
+        try:
+            return await _extract_pass(
+                name, lines, language=language, llm_caller=llm_caller, token=token, strict=strict
+            )
+        except RunCancelledError:
+            raise
+        except Exception as exc:
+            return exc
+
+    try:
+        async with asyncio.TaskGroup() as group:
+            tasks = [group.create_task(guarded(name, lines)) for name, lines in calls]
+    except* RunCancelledError as cancelled:
+        raise cancelled.exceptions[0] from None
+    return [task.result() for task in tasks]
 
 
 async def _extract_two_passes(
@@ -2189,55 +2238,47 @@ async def _extract_two_passes(
     llm_caller: LLMCaller,
     token: CancellationToken,
     log_label: str,
-    whole_conversation: bool = True,
+    segment: SegmentStart | None = None,
+    halves: bool = False,
+    raise_on_failure: bool = False,
 ) -> tuple[list[ExtractedMemory], bool]:
     """B-300 ① —— 两次提炼(并发),产出合在一起:第一次的在前,同内容只留一条。
 
-    返回 ``(产出, 是否有一次调用失败)``。一次的普通失败只丢那一次;取消原样抛出,并先取消另一次。"""
-    inputs = _extraction_inputs(messages, user_text_messages, whole_conversation=whole_conversation)
-    plan: list[tuple[str, list[ExtractionLine]]] = []
-    if inputs.user.lines:
-        plan.append((_USER_TEXT_EXTRACTION, _pass_lines(_USER_TEXT_EXTRACTION, inputs.user)))
-    if inputs.has_reply:
-        lines = _pass_lines(_CONVERSATION_EXTRACTION, inputs.conversation)
-        plan.append((_CONVERSATION_EXTRACTION, lines))
-    if not plan:
-        return [], False
-    # 语言只按用户输入的文字判(附件、外部内容、助手的话都不算,B-300 ④)。
-    language = detect_user_language([line.text for line in inputs.user.lines])
+    PR S —— 只提炼 ``segment`` 之后的整轮(:func:`plan_slice`;``None`` = 整段),新段之前几行作上下文;
+    ``halves``(第 2 次起的尝试)按整轮对半切成至多两块、依次提炼。语言按整段对话里用户的文字判。
 
-    async def guarded(name: str, lines: list[ExtractionLine]) -> list[ExtractedMemory] | Exception:
-        # 普通失败交回来(只丢这一次);取消原样抛出,TaskGroup 随即取消另一次(review L3)。
-        try:
-            return await _extract_pass(
-                name, lines, language=language, llm_caller=llm_caller, token=token
-            )
-        except RunCancelledError:
-            raise
-        except Exception as exc:
-            return exc
-
-    try:
-        async with asyncio.TaskGroup() as group:
-            tasks = [group.create_task(guarded(name, lines)) for name, lines in plan]
-    except* RunCancelledError as cancelled:
-        raise cancelled.exceptions[0] from None
-    results = [task.result() for task in tasks]
+    返回 ``(产出, 是否有一次调用失败)``。``raise_on_failure``(后台任务)为假时,一次的普通失败只丢
+    那一次;为真时调用失败原样抛出、回复用不了或被截断抛 :class:`ExtractionReplyError`,交给任务重试。
+    取消一律原样抛出。"""
+    turns = _extraction_inputs(messages, user_text_messages)
+    plan = plan_slice(turns, segment, cap=_EXTRACT_INPUT_CHAR_CAP, halves=halves)
+    _record_plan(plan)
+    # 语言只按用户输入的文字判(附件、外部内容、助手的话都不算,B-300 ④);切片后看整段对话,
+    # 否则新段只有一句「18 号」时判不出(§8.3)。
+    language = detect_user_language([line.text for turn in turns for line in turn.user])
     extracted: list[ExtractedMemory] = []
     seen: set[str] = set()
     failed = False
-    for (name, _lines), result in zip(plan, results, strict=True):
-        if isinstance(result, Exception):
-            logger.warning(
-                "%s_extract_failed pass=%s — other pass kept", log_label, name, exc_info=result
-            )
-            record_memory_extraction(pass_name=name, outcome="error")
-            failed = True
-            continue
-        for memory in result:
-            if memory.content not in seen:
-                seen.add(memory.content)
-                extracted.append(memory)
+    for chunk in plan.chunks:
+        calls = _chunk_calls(chunk)
+        results = await _run_passes(
+            calls, language=language, llm_caller=llm_caller, token=token, strict=raise_on_failure
+        )
+        for (name, _lines), result in zip(calls, results, strict=True):
+            if isinstance(result, Exception):
+                if not isinstance(result, ExtractionReplyError):
+                    record_memory_extraction(pass_name=name, outcome="error")
+                if raise_on_failure:
+                    raise result
+                logger.warning(
+                    "%s_extract_failed pass=%s — other pass kept", log_label, name, exc_info=result
+                )
+                failed = True
+                continue
+            for memory in result:
+                if memory.content not in seen:
+                    seen.add(memory.content)
+                    extracted.append(memory)
     return extracted, failed
 
 
@@ -2270,9 +2311,8 @@ async def flush_messages_to_memory(
     write_min_importance: float = 0.0,
     audit_logger: AuditLogger | None = None,
     user_text_messages: Sequence[BaseMessage] | None = None,
-    whole_conversation: bool = True,
 ) -> int:
-    """:func:`flush_messages_with_outcome` 只取写入条数 —— 压缩前抢存与评测脚本用。"""
+    """:func:`flush_messages_with_outcome` 只取写入条数(整段对话)—— 评测脚本用。"""
     outcome = await flush_messages_with_outcome(
         messages,
         memory_store=memory_store,
@@ -2290,7 +2330,6 @@ async def flush_messages_to_memory(
         write_min_importance=write_min_importance,
         audit_logger=audit_logger,
         user_text_messages=user_text_messages,
-        whole_conversation=whole_conversation,
     )
     return outcome.written
 
@@ -2314,12 +2353,15 @@ async def flush_messages_with_outcome(
     before_store: BeforeStore | None = None,
     audit_logger: AuditLogger | None = None,
     user_text_messages: Sequence[BaseMessage] | None = None,
-    whole_conversation: bool = True,
+    segment: SegmentStart | None = None,
+    halves: bool = False,
+    raise_on_failure: bool = False,
 ) -> FlushOutcome:
     """Extract durable memories from ``messages``, embed, and persist them.
 
-    The shared extraction core behind both the run-end ``memory_writeback``
-    node and the Stream CM-3 pre-compaction flush. Makes one LLM extraction
+    The extraction core behind the run-end ``memory_writeback`` node and the
+    background write-back job (the CM-3 pre-compaction flush no longer extracts,
+    redesign PR S). Makes one LLM extraction
     call, embeds the produced pairs, and writes :class:`MemoryItem`\\s tagged
     with ``source_thread_id``. Returns how many memories were written
     (``0`` on empty extraction / blocked content / any handled failure) and
@@ -2346,10 +2388,9 @@ async def flush_messages_with_outcome(
     flush stays a direct write (latency-sensitive, inside a turn). B-300
     redesign §7.1 row 9: two stages — the first pass's output is reconciled
     and written first, then the second pass's, which can then see it. A
-    reconcile failure (§7.6) writes only that stage's candidates that were not
-    written yet, directly and with all their fields (ADD only, no existing row
-    touched); until PR S makes it a task retry. The DLQ, if a later step fails,
-    only ever gets what was not written.
+    reconcile failure (§7.6) is a failure like any other (``raise_on_failure``
+    below); nothing of that stage is written directly, and the DLQ only ever
+    gets what was not written.
 
     ``run_id`` (P5b provenance) is stamped on every written item; the
     DLQ-retry path now carries run_id (P5b-2a) too — the enqueue call
@@ -2370,7 +2411,14 @@ async def flush_messages_with_outcome(
     白名单标记。
 
     B-300 重做(PR X)—— 每条记忆带证据指针(``turn`` 那一行的消息 id + 在 ``messages`` 里的序号)
-    与事件日期;``whole_conversation`` 为假(压缩前抢存:``messages`` 是对话中段)时不写序号。
+    与事件日期。
+
+    B-300 重做 PR S(B-176 M2-1,§8)—— ``segment``:只提炼这个起点之后的整轮,之前的几行作上下文
+    (``None`` = 整段,内联写回模式的逃生口);``halves``:第 2 次起的尝试,按整轮对半切成至多两块。
+    ``raise_on_failure``(后台任务,§7.6):模型调用出错、回复用不了、被截断、向量化 / 去重合并 /
+    写库失败一律抛给任务重试;只有同时给了 ``dlq``(最后一次尝试)、且提炼已经成功时,坏在之后的才
+    交给失败队列、回 ``failed``(用户 11-15「留一半」)。为假时(本轮内写回 —— 它每次都等于最后一次
+    尝试)提炼出错只记日志,提炼成功之后出错进失败队列。
 
     B-300 D12 —— 返回的条数是实际落库的条数(与库里已有同内容的、被拦的都不算;去重合并里
     「更新」由 ``supersede`` 取代出来的新行要算,「删除」只作废旧行、不算)。出错走失败分支时
@@ -2389,7 +2437,9 @@ async def flush_messages_with_outcome(
             llm_caller=llm_caller,
             token=token,
             log_label=log_label,
-            whole_conversation=whole_conversation,
+            segment=segment,
+            halves=halves,
+            raise_on_failure=raise_on_failure,
         )
         # Stream Memory-Enhance (M-2) — write-filter: drop low-value memories
         # before embedding (saves embed cost on dropped items). Applied here,
@@ -2472,11 +2522,11 @@ async def flush_messages_with_outcome(
                         before_store=before_store,
                     )
                 except ReconcileFailedError as exc:
-                    # 协调人 11-15(审查 MEDIUM-1):PR S 之前,还没写的候选原样(来源、置信度、
-                    # 智能体名都在)直接写入 —— 只新增、不碰已有行;进失败队列会被重建成「来源
-                    # 未记录」的行,反倒让来自助手的候选能改它。S 改成抛给任务重试。
-                    record_memory_reconcile(op="reconcile_failed_direct")
-                    done = _Reconciled(exc.unwritten, exc.blocked, exc.superseded)
+                    # 重做 §7.6(PR S)—— 不再直接写入:抛给任务重试(重试会完整地再做一遍拦截与
+                    # 去重);最后一次尝试 / 本轮内写回时,失败队列只收这一批还没写的与后面几段的。
+                    record_memory_reconcile(op="reconcile_failed")
+                    retry_pairs = [(str(item.kind), item.content) for item in exc.unwritten] + later
+                    raise
                 to_write, written = done.direct, written + done.superseded
                 blocked.extend(done.blocked)
                 # 审查 LOW-1 —— 去重合并之后,失败重试只该重建本来要写的这几条:被拦下丢弃的
@@ -2493,6 +2543,10 @@ async def flush_messages_with_outcome(
     except RunCancelledError:
         raise
     except Exception as exc:
+        # 重做 §7.6 —— 后台任务:出错抛给任务重试;只有最后一次尝试(给了 ``dlq``)、提炼已经
+        # 成功(``extracted`` 非空 —— 提炼本身出错时它还是空的)才往下走、进失败队列。
+        if raise_on_failure and (dlq is None or not extracted):
+            raise
         # Stream K.K7 — don't lose the work the LLM already did. If the
         # extraction produced pairs, hand them to the DLQ for a retry
         # sweep; otherwise (parse / cancel-shaped failures below the
@@ -2593,23 +2647,13 @@ PreCompactionFlush = Callable[
 ]
 
 
-def make_pre_compaction_flush(
-    *,
-    memory_store: MemoryStore,
-    embedder: Embedder,
-    llm_caller: LLMCaller,
-    dlq: MemoryWritebackDLQ | None = None,
-    agent_name: str | None = None,
-    write_min_importance: float = 0.0,
-) -> PreCompactionFlush:
-    """Build the Stream CM-3 pre-compaction flush callback.
+def make_pre_compaction_flush() -> PreCompactionFlush:
+    """Build the Stream CM-3 pre-compaction flush callback — which no longer extracts.
 
-    Resolves the run's per-user scope from ``config`` (no-op returning 0
-    when absent — long-term memory is per-user) and hands the about-to-be-
-    discarded middle slice to :func:`flush_messages_to_memory`, tagged as a
-    ``memory.precompaction_flush`` so logs distinguish it from the run-end
-    write-back. Shares the same store / embedder / DLQ as the write-back
-    node, so flushed memories are indistinguishable downstream.
+    B-300 重做 PR S(§8.4,用户 11-15 定):压缩只改当次提示词,检查点里的消息不变,轮末写回的新段
+    本来就包含被折掉的中段;抢存直写不走去重合并,切片之后它只会制造重复。所以回调直接回 0、记一次
+    计数(``precompaction_flush_skipped``),不调模型。回调本身留着:压缩节点照旧按它记
+    ``expert_work_cm_precompaction_flush_total``。这也消掉了「抢存与后台写回并发」的窗口。
     """
 
     async def flush(
@@ -2617,31 +2661,9 @@ def make_pre_compaction_flush(
         config: RunnableConfig,
         token: CancellationToken,
     ) -> int:
-        tenant_id = configurable_uuid(config, "tenant_id")
-        user_id = configurable_uuid(config, "user_id")
-        if tenant_id is None or user_id is None or long_term_memory_writes_off(config):
-            # B-300 —— 委派出去的子运行、草稿试跑都不写长期记忆(与写回节点同一个判断)。
-            return 0
-        thread_id = configurable_uuid(config, "thread_id")
-        run_id = current_run_id(config)
-        return await flush_messages_to_memory(
-            messages,
-            memory_store=memory_store,
-            embedder=embedder,
-            llm_caller=llm_caller,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            thread_id=thread_id,
-            run_id=run_id,
-            token=token,
-            dlq=dlq,
-            log_label="memory.precompaction_flush",
-            agent_name=agent_name,
-            write_min_importance=write_min_importance,
-            audit_logger=audit_logger_from_config(config),
-            # 拿到的是对话中段:消息序号不是整段对话里的,证据指针不写序号。
-            whole_conversation=False,
-        )
+        del messages, config, token
+        record_memory_writeback_segment(event="precompaction_flush_skipped")
+        return 0
 
     return flush
 
@@ -2657,6 +2679,15 @@ _CHECKPOINT_MAP_KEY = "checkpoint_map"
 #: B-168 —— 落任务的时限。连接池耗尽时插入会一直等连接,不设限就把 ``end`` 拖住;
 #: 到时限退回 inline,本轮照旧写(比 inline 写回本身还快得多)。
 _ENQUEUE_TIMEOUT_S = 3.0
+
+
+def _this_turn(messages: Sequence[BaseMessage]) -> SegmentStart:
+    """本轮(最后一轮)的起点:它的开轮消息在整段对话里的序号;没有可提炼的轮次 → 段为空。"""
+    turns = _segments(messages)
+    if not turns:
+        return SegmentStart(message_index=len(messages))
+    opener = turns[-1][0]
+    return SegmentStart(message_index=next(i for i, m in enumerate(messages) if m is opener))
 
 
 def _turn_end_checkpoint_id(config: RunnableConfig) -> str | None:
@@ -2800,9 +2831,9 @@ def make_memory_writeback_node(
                 "memory_writeback_queued": True,
             }
         run_id = current_run_id(config)
-
+        messages = list(state["messages"])
         outcome = await flush_messages_with_outcome(
-            list(state["messages"]),
+            messages,
             memory_store=memory_store,
             embedder=embedder,
             llm_caller=llm_caller,
@@ -2817,6 +2848,10 @@ def make_memory_writeback_node(
             agent_name=agent_name,
             write_min_importance=write_min_importance,
             audit_logger=audit_logger_from_config(config),
+            # B-300 重做 PR S(§8.4)—— 配了后台却没落成任务:本轮内写回只做本轮(更早的轮次由
+            # 各自的任务负责;下一个后台任务的起点在本轮之前,会把这一轮再抽一遍)。纯内联模式
+            # 保留整段重抽(逃生口,§8.1 末)。两种都没有任务重试,出错按最后一次尝试处理。
+            segment=_this_turn(messages) if writeback_jobs is not None else None,
         )
         # B-168 —— 只回条数(不带记忆正文):空 dict 在 updates 流里是空帧,拿不到耗时,
         # 控制台轨迹画不出「记忆写回」这一行;写 0 条也要回,才看得到它花了多久。

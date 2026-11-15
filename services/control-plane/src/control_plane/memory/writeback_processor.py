@@ -16,6 +16,18 @@
    仍在本次领取手上(``still_held``,§3.6):被清除 / 被别的副本重新领走就整批放弃,回
    ``discarded``;查询本身出错也不写(fail closed),抛给 worker 记一次失败、重试。
 
+**增量切片与失败语义**(B-300 重做 PR S,B-176 M2-1,设计 §7.6、§8):
+
+* 每个任务只提炼自己那一段:起点 = 同一对话里 ``message_count`` 比本任务小的任务中最大的那个
+  (:meth:`~expert_work.persistence.memory.MemoryWritebackJobStore.previous_job`;不看它成没成功,
+  它那一段由它自己的重试负责);没有更早的任务 → 开轮时间在最近 30 天内的轮次;同一
+  ``message_count`` 已有别的任务做完 → 本段为空,不调模型。
+* 出错一律抛给任务重试(worker 退回 ``pending`` 时带 30 秒、5 分钟的间隔);第 2 次起的尝试按整轮
+  对半分块。只有**最后一次**尝试把失败队列交给写回:提炼成功、坏在向量化 / 去重合并 / 写库时进
+  失败队列(用户 11-15「留一半」)。
+* 配置类错误(智能体配置已删、记忆模型解析不出、凭据被拒)不重试:直接收尾为 ``done``、
+  ``failed`` 置真、计数 —— 重试只会在同样的错上再花两次。
+
 **记账**(§8 问题 3 拍板 (b)):后台记忆调用不归 run,按平台开销记 ——
 ``usage_kind = platform_overhead``,同重排序。run 内的记账靠 LangGraph 节点的 config
 (``usage_metering.charge_in_run``),在 run 外**静默不记**,所以这里直接调
@@ -29,12 +41,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+import httpx
 from langchain_core.messages import AIMessage, BaseMessage
 from opentelemetry import context as otel_context
 from opentelemetry import trace
@@ -43,19 +58,29 @@ from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 from control_plane.memory.writeback_worker import WritebackOutcome
 from control_plane.runtime import make_provider_key_resolver
 from control_plane.transcript import read_checkpoint_messages, read_messages
+from expert_work.common.uplift_metrics import record_memory_writeback_segment
+from expert_work.persistence import MemoryStore
 from expert_work.persistence.agent_spec import AgentSpecStore
-from expert_work.persistence.memory import MemoryWritebackJob
+from expert_work.persistence.memory import MemoryWritebackJob, MemoryWritebackJobStore
 from expert_work.persistence.token_usage_store import (
     PLATFORM_OVERHEAD_USAGE_KIND,
     TokenUsageStore,
 )
 from expert_work.protocol import AgentSpec, ModelSpec
+from expert_work.protocol.agent_spec import LongTermMemorySpec
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
+from expert_work.runtime.middleware.llm_error_handling import (
+    LLMAuthError,
+    LLMKeyUnavailableError,
+    LLMUnauthorizedError,
+)
 from orchestrator import MemoryEnv, MiddlewareEnv, build_llm_router, build_middleware_chains
 from orchestrator.agent_factory import memory_model, step_stream_timeouts
+from orchestrator.errors import PlatformNotConfiguredError
 from orchestrator.graph_builder.memory import flush_messages_with_outcome
-from orchestrator.llm import LLMCaller
+from orchestrator.graph_builder.memory_slice import SegmentStart
+from orchestrator.llm import AllProvidersExhaustedError, Embedder, LLMCaller
 from orchestrator.usage_metering import UsageIdentity, UsageMeter, chain_models, with_served_by
 
 if TYPE_CHECKING:
@@ -67,6 +92,7 @@ if TYPE_CHECKING:
     from orchestrator.llm import RateLimiterFactory
     from orchestrator.tools.registry import ToolSpec
 
+logger = logging.getLogger("expert_work.control_plane.memory.writeback_processor")
 
 #: 读不到任务指着的检查点时,再读之前依次等多久(见 ``_read_turn_end``):共 5 次、
 #: 约 2.5 秒、逐次拉长。抛错就烧掉一次真尝试、要等租约过期才重领,所以进程内多等一会儿。
@@ -77,6 +103,56 @@ _CHECKPOINT_READ_DELAYS_S: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
 CallerFactory = Callable[[AgentSpec, ModelSpec, UUID], Awaitable[LLMCaller]]
 #: 展开 ``extends``(fork 的模板继承)—— 与构建时同一取法;``None`` = 原样用存的配置。
 SpecResolver = Callable[[AgentSpec], Awaitable[AgentSpec]]
+
+#: B-300 重做 §8.1 —— 没有更早的任务时,开轮时间在这么多天内的轮次是本段(任务行做完满 30 天才
+#: 删,``0162``;更早的轮次都早已收尾)。
+RECENT_TURNS_WINDOW = timedelta(days=30)
+
+#: §7.6 —— 配置类错误:不重试。``LLMAuthError`` 是 ``LLMServerError`` 的子类(router 把它当可重试、
+#: 换下一家),所以这里按类认它,而且要在任何「服务端错误 → 重试」的判断之前;本模块除此之外一律
+#: 可重试,没有那样的判断。``PlatformNotConfiguredError`` = 记忆模型在本部署里没有凭据。
+_CONFIG_ERRORS: tuple[type[BaseException], ...] = (
+    LLMAuthError,
+    LLMUnauthorizedError,
+    LLMKeyUnavailableError,
+    PlatformNotConfiguredError,
+)
+#: 向量化没有专门的鉴权异常类:嵌入器把上游的 4xx / 5xx 原样抛成 ``httpx.HTTPStatusError``
+#: (``orchestrator.llm.embedder``),其中 401 / 403 = 凭据被拒。
+_EMBEDDER_AUTH_STATUSES = frozenset({401, 403})
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def config_error(exc: BaseException) -> BaseException | None:
+    """§7.6 —— ``exc`` 是不是配置类错误;是就回那个错误本身。沿 ``__cause__`` 往下找(去重合并
+    出错时原因在 ``ReconcileFailedError.__cause__``),``AllProvidersExhaustedError`` 拆开看它的
+    ``last_exc``。"""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, AllProvidersExhaustedError):
+            current = current.last_exc
+            continue
+        if isinstance(current, _CONFIG_ERRORS):
+            return current
+        if (
+            isinstance(current, httpx.HTTPStatusError)
+            and current.response.status_code in _EMBEDDER_AUTH_STATUSES
+        ):
+            return current
+        current = current.__cause__
+    return None
+
+
+def _config_error_outcome(error: BaseException | str) -> WritebackOutcome:
+    record_memory_writeback_segment(event="config_error")
+    reason = error if isinstance(error, str) else type(error).__name__
+    logger.warning("memory.writeback_processor.config_error reason=%s — no retry", reason)
+    return WritebackOutcome(written_count=0, failed=True, note=f"config error: {reason}")
 
 
 class _PlatformMeteredCaller:
@@ -143,10 +219,18 @@ class MemoryWritebackProcessor:
         checkpointer: BaseCheckpointSaver[Any],
         caller_factory: CallerFactory,
         usage_store: TokenUsageStore | None,
+        jobs: MemoryWritebackJobStore,
         resolve_spec: SpecResolver | None = None,
         audit_logger: AuditLogger | None = None,
+        max_attempts: int = 3,
+        clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._agents = agent_specs
+        #: B-176 M2-1 —— 起点从同一对话的前一个任务算。
+        self._jobs = jobs
+        #: 与 worker 的同一个上限:最后一次尝试才把失败队列交给写回(§7.6)。
+        self._max_attempts = max_attempts
+        self._clock = clock
         self._env = memory_env
         self._checkpointer = checkpointer
         self._caller_factory = caller_factory
@@ -162,16 +246,14 @@ class MemoryWritebackProcessor:
             tenant_id=job.tenant_id, name=job.agent_name, version=job.agent_version
         )
         if record is None:
-            return WritebackOutcome(written_count=0, failed=False, note="agent spec is gone")
+            return _config_error_outcome("agent spec is gone")
         spec = record.spec if self._resolve_spec is None else await self._resolve_spec(record.spec)
         long_term = spec.spec.memory.long_term if spec.spec.memory is not None else None
         if long_term is None or not long_term.write_back:
             return WritebackOutcome(
                 written_count=0, failed=False, note="long-term memory write-back is off"
             )
-        if self._env.store is None or self._env.embedder is None:
-            msg = "memory store / embedder not wired"
-            raise RuntimeError(msg)
+        self._wired()
 
         if job.checkpoint_id is None and job.message_count is None:
             # 表上有 CHECK、enqueue 也拒;这里再挡一道:绝不去读整个会话。
@@ -180,7 +262,57 @@ class MemoryWritebackProcessor:
         messages = await self._read_turn_end(job)
         if not messages:
             return WritebackOutcome(written_count=0, failed=False, note="no messages to read")
+        segment = await self._segment_start(job, len(messages))
+        if segment is None:
+            record_memory_writeback_segment(event="already_done")
+            return WritebackOutcome(
+                written_count=0, failed=False, note="segment already written by another job"
+            )
+        try:
+            return await self._extract(job, spec, long_term, messages, segment, still_held)
+        except Exception as exc:
+            found = config_error(exc)
+            if found is None:
+                raise
+            return _config_error_outcome(found)
 
+    async def _segment_start(self, job: MemoryWritebackJob, read: int) -> SegmentStart | None:
+        """§8.1 —— 本段从哪里起;``None`` = 同一 ``message_count`` 已有别的任务做完,本段为空。"""
+        end = job.message_count if job.message_count is not None else read
+        previous = await self._jobs.previous_job(
+            tenant_id=job.tenant_id, thread_id=job.thread_id, job_id=job.id, message_count=end
+        )
+        if previous.same_count_done:
+            return None
+        if previous.message_count is not None:
+            start = SegmentStart(message_index=previous.message_count)
+        else:
+            start = SegmentStart(opened_since=self._clock() - RECENT_TURNS_WINDOW)
+        logger.info(
+            "memory.writeback_processor.segment job_id=%s attempt=%d start=%s",
+            job.id,
+            job.attempts,
+            start,
+        )
+        return start
+
+    def _wired(self) -> tuple[MemoryStore, Embedder]:
+        store, embedder = self._env.store, self._env.embedder
+        if store is None or embedder is None:
+            msg = "memory store / embedder not wired"
+            raise RuntimeError(msg)
+        return store, embedder
+
+    async def _extract(
+        self,
+        job: MemoryWritebackJob,
+        spec: AgentSpec,
+        long_term: LongTermMemorySpec,
+        messages: list[Any],
+        segment: SegmentStart,
+        still_held: Callable[[], Awaitable[bool]],
+    ) -> WritebackOutcome:
+        store, embedder = self._wired()
         model = memory_model(spec)
         meter = UsageIdentity(
             store=self._usage_store,
@@ -214,15 +346,20 @@ class MemoryWritebackProcessor:
             with _under_run_trace(job.trace_id):
                 outcome = await flush_messages_with_outcome(
                     messages,
-                    memory_store=self._env.store,
-                    embedder=self._env.embedder,
+                    memory_store=store,
+                    embedder=embedder,
                     llm_caller=caller,
                     tenant_id=job.tenant_id,
                     user_id=job.user_id,
                     thread_id=job.thread_id,
                     run_id=str(job.run_id),
                     token=CancellationToken(),
-                    dlq=self._env.dlq,
+                    # §7.6 —— 只有最后一次尝试交失败队列(提炼成功、坏在后面时才进);别的尝试
+                    # 出错一律抛给任务重试。
+                    dlq=self._env.dlq if job.attempts >= self._max_attempts else None,
+                    raise_on_failure=True,
+                    segment=segment,
+                    halves=job.attempts >= 2,
                     log_label="memory.writeback_background",
                     reconcile=long_term.reconcile_writes,
                     agent_name=spec.metadata.name,

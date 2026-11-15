@@ -107,9 +107,12 @@ async def test_end_to_end_fixture_pipeline() -> None:
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_reconcile_degrades_to_add() -> None:
-    """reconcile=True with an unparseable reconcile reply must still
-    write memories (CM-7: every reconcile failure degrades to ADD)."""
+async def test_end_to_end_reconcile_failure_is_not_a_direct_write() -> None:
+    """reconcile=True with an unparseable reconcile reply: B-300 redesign §7.6
+    (PR S) reverses CM-H4's "every reconcile failure degrades to ADD" — a
+    failed reconcile never writes directly (that would bypass the tier guards
+    and dedup). The first session has no neighbour (direct ADD, no model
+    call); the second one's reconcile fails, so its memory is not written."""
     instances = [
         i
         for i in load_longmemeval(FIXTURES / "longmemeval_mini.json")
@@ -124,7 +127,7 @@ async def test_end_to_end_reconcile_degrades_to_add() -> None:
         judge=ScriptedTextJudge({"expert_work": "yes"}),
         config=EndToEndConfig(reconcile=True),
     )
-    assert report.memories_written == 2
+    assert report.memories_written == 1
     assert report.accuracy == 1.0
 
 

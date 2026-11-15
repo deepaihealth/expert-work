@@ -172,7 +172,10 @@ async def test_delete_retracts_existing_without_storing_candidate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_malformed_ops_reply_degrades_to_add() -> None:
+async def test_malformed_ops_reply_is_a_failure_not_a_direct_write() -> None:
+    # B-300 redesign §7.6 (PR S): an unusable reconcile reply is a reconcile failure —
+    # never a direct write that would bypass the tier guards and dedup. Without a job
+    # (in-turn write-back) and without a DLQ it is logged; the job path retries it.
     store = InMemoryMemoryStore()
     tenant, user = uuid4(), uuid4()
     await _seed(store, tenant, user, "likes light roast")
@@ -180,12 +183,8 @@ async def test_malformed_ops_reply_degrades_to_add() -> None:
         responses=[_extraction("likes dark roast"), AIMessage(content="not json at all")]
     )
     written = await _flush(store, llm, _MapEmbedder({"likes dark roast": _NEAR_EAST}), tenant, user)
-    # Never lose a memory over a parse failure — both rows live.
-    assert written == 1
-    assert await _live_contents(store, tenant, user) == [
-        "likes dark roast",
-        "likes light roast",
-    ]
+    assert written == 0
+    assert await _live_contents(store, tenant, user) == ["likes light roast"]
 
 
 @pytest.mark.asyncio

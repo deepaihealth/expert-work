@@ -223,27 +223,17 @@ async def test_written_rows_carry_the_reported_embedding_model() -> None:
     assert (await _live(plain))["u1"].embedding_model is None
 
 
-async def test_pre_compaction_flush_tags_origin_and_skips_reconcile() -> None:
+async def test_pre_compaction_flush_no_longer_extracts() -> None:
+    """B-300 重做 PR S(§8.4)—— 抢存不再提炼(它直写、不走去重合并,切片后只会添重复):不写、
+    已有的记忆不动。"""
     store = InMemoryMemoryStore()
-    seeded = await _seed(store, "kept", origin="user_stated")
-    llm = _LLM(
-        user_reply=_reply({"kind": "fact", "content": "u1"}),
-        conversation_reply=_reply({"kind": "fact", "content": "a1"}),
-        ops_reply=_ops("DELETE", seeded.id),
-    )
-    flush = make_pre_compaction_flush(
-        memory_store=store,
-        embedder=_ReportingEmbedder({"u1": _NEAR_EAST, "a1": _NEAR_EAST}),  # type: ignore[arg-type]
-        llm_caller=llm,
-    )
+    await _seed(store, "kept", origin="user_stated")
+    flush = make_pre_compaction_flush()
     config: RunnableConfig = {
         "configurable": {"tenant_id": str(_TENANT), "user_id": str(_USER), "thread_id": None}
     }
-    assert await flush(_turn(), config, CancellationToken()) == 2
-    rows = await _live(store)
-    assert (rows["u1"].origin, rows["a1"].origin) == ("user_stated", "assistant_derived")
-    assert "kept" in rows
-    assert llm.reconcile_calls() == []
+    assert await flush(_turn(), config, CancellationToken()) == 0
+    assert list(await _live(store)) == ["kept"]
 
 
 # ---------------------------------------------------------------------------
