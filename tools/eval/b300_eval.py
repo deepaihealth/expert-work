@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -326,6 +327,14 @@ def a_votes_ready(out: Path, q: Mapping[str, Any]) -> int:
     """A 组判官(审查 M3):按报价的票数校准过(≥ 18 / 20)才判;一票没过就要按 3 票重新报价、
     重新校准。"""
     votes = int(q["judge"]["a_group_votes"])
+    path = calibration_path(out, "a")
+    if path.exists():
+        made_with = json.loads(path.read_text(encoding="utf-8")).get("wording_digest")
+        if made_with != rep.a_judge_wording_digest():
+            raise EvalError(
+                "the A-group calibration was made with other judge wording "
+                f"({made_with or 'not recorded'}); run `calibrate --set a` again, then judge"
+            )
     if calibration_ok(out, "a", votes=votes):
         return votes
     if votes == 1 and calibration_path(out, "a").exists():
@@ -353,6 +362,10 @@ def _judge(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
         load_units(args.out, phase.name, q["quote_id"])
         votes = judge_votes(args.out, q, phase.kind)
         items, _facts = judge_items(args.out, phase)
+        # 审查 M3:A 组每条判分记判官措辞;措辞对不上的旧判分重判,报告不认
+        stamp = (
+            {"wording_digest": rep.a_judge_wording_digest()} if phase.kind == "extraction" else {}
+        )
         asyncio.run(
             runs.run_judge(
                 items,
@@ -361,6 +374,7 @@ def _judge(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
                 votes=votes,
                 phase=phase.name,
                 emit=emit,
+                stamp=stamp,
             )
         )
     emit(f"{len(items)} items; spent on this quote ¥{guard.spent:.2f}; blocked={guard.blocked}")
@@ -369,6 +383,13 @@ def _judge(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
 def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     labels = read_jsonl(args.labels)
     check_labels(labels)
+    if args.which == "a":  # 审查 LOW:标注文件里的判官题要是现行措辞生成的
+        stale = [i for i, r in enumerate(labels) if not rep.wording_in_prompt(r["prompt"])]
+        if stale:
+            raise EvalError(
+                f"labels rows {stale} were not built with the current A-group judge wording; "
+                "rebuild their prompts with the current code"
+            )
     items = [rep.JudgeItem(f"cal|{i}", "calibration", r["prompt"]) for i, r in enumerate(labels)]
     args.out.mkdir(parents=True, exist_ok=True)
     phase = "calibration" if args.which == "b" else "calibration-a"
@@ -376,16 +397,34 @@ def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
         q, guard = approved(args, cmd=f"calibrate {args.which}", phase=phase)
         votes = plan.JUDGE_VOTES if args.which == "b" else int(q["judge"]["a_group_votes"])
         out_file = args.out / f"{phase}-votes-{votes}.jsonl"
+        # 换了标注文件或判官措辞,旧的投票不再沿用(以前同一个序号会直接跳过、拿旧票对新标注)
+        prompts = "\n\0".join(r["prompt"] for r in labels)
+        stamp = {"labels_digest": hashlib.sha256(prompts.encode("utf-8")).hexdigest()[:16]}
+        if args.which == "a":
+            stamp["wording_digest"] = rep.a_judge_wording_digest()
         asyncio.run(
             runs.run_judge(
-                items, out_file=out_file, guard=guard, votes=votes, phase=phase, emit=emit
+                items,
+                out_file=out_file,
+                guard=guard,
+                votes=votes,
+                phase=phase,
+                emit=emit,
+                stamp=stamp,
             )
         )
-    got = latest(read_jsonl(out_file), "key")
+    rows = read_jsonl(out_file)
+    got = latest([r for r in rows if all(r.get(k) == v for k, v in stamp.items())], "key")
     agree = sum(
         got.get(f"cal|{i}", {}).get("verdict") == bool(r["label"]) for i, r in enumerate(labels)
     )
-    result = {"judge_model": plan.JUDGE_MODEL, "votes": votes, "agree": agree, "of": len(labels)}
+    result: dict[str, Any] = {
+        "judge_model": plan.JUDGE_MODEL,
+        "votes": votes,
+        "agree": agree,
+        "of": len(labels),
+    }
+    result.update(stamp)  # 审查 LOW-2:校准绑定判官措辞(A 组)与标注文件
     calibration_path(args.out, args.which).write_text(json.dumps(result), encoding="utf-8")
     emit(
         f"judge ({args.which}, {votes} vote(s)) agrees on {agree} / {len(labels)} "

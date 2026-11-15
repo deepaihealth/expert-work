@@ -127,6 +127,12 @@ def collect_outcomes(
             continue
         _items, facts = judge_items(out, phase)
         verdicts = latest(read_jsonl(out / name / "verdicts.jsonl"), "key")
+        if phase.kind == "extraction":  # 审查 M3:措辞对不上的判分不算,计数报出、要重判
+            digest = rep.a_judge_wording_digest()
+            stale = {k for k, v in verdicts.items() if v.get("wording_digest") != digest}
+            if stale:
+                counts[name]["verdicts_stale_wording_excluded"] += len(stale)
+                verdicts = {k: v for k, v in verdicts.items() if k not in stale}
         records = latest_records(out, name)
         red_rows: list[tuple[str, bool | None]] = []
         for key, info in facts.items():
@@ -232,7 +238,13 @@ def _a_outcomes(
         else:
             outcomes[(cls, metric, vendor)].append((domain, bool(bad)))
 
-    for metric in ("missed", "pass1_leak", "pass1_fabricate", "user_memory_lost", "over_two"):
+    for metric in (
+        "missed",
+        "pass1_leak",
+        "pass1_fabricate",
+        "user_memory_lost",
+        "user_side_duplicate",
+    ):
         if metric in checks:
             add(metric, checks[metric])
     if "plain" in checks:
@@ -259,6 +271,10 @@ def _a_outcomes(
             add("attributed", None if good is None else not good)
     if cls == "A10":
         counts["a10_user_version"] += bool(checks.get("user_version"))
+    if cls == "A12":  # 用户 11-14:来自助手的复述允许,计数报出
+        counts["a12_assistant_restatements"] += int(checks.get("assistant_restatements", 0))
+        counts["a12_user_side_zero"] += checks.get("user_side_rows") == 0  # 不算违规,单列
+        counts["a12_origin_unknown"] += int(checks.get("origin_unknown", 0))
 
 
 def compare_counts(out: Path) -> dict[str, Any]:

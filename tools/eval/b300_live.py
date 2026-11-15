@@ -46,6 +46,9 @@ from behavior_client import SseParser, content_type_for  # noqa: E402
 MAX_CALL_INPUT_TOKENS = 40_000
 EXTRACT_MAX_TOKENS = 4_000
 JUDGE_MAX_TOKENS = 2_000
+#: 每次调用的采样温度与 JSON 模式的回答格式(判官措辞摘要也算它们,改了要重新校准)。
+TEMPERATURE = 0.0
+JSON_RESPONSE_FORMAT: Mapping[str, str] = {"type": "json_object"}
 #: 评测智能体每次运行的 token 预算(``policies.token_budget``);一次运行的预留 = 它 x 最贵的输出价。
 RUN_TOKEN_BUDGET = 150_000
 RUN_MAX_ITERATIONS = 8
@@ -124,11 +127,11 @@ class ChatTransport:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0.0,
+            "temperature": TEMPERATURE,
             **request_fields(self.provider, self.model, max_tokens=self.max_tokens),
         }
         if json_mode:
-            body["response_format"] = {"type": "json_object"}
+            body["response_format"] = dict(JSON_RESPONSE_FORMAT)
         for attempt in range(4):
             call_id = self.guard.reserve(item=item, model=self.model, cap=cap, phase=phase)
             try:

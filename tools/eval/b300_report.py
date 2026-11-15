@@ -12,27 +12,90 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+import json
 import math
+import re
+import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
+import b300_live as live
 import b300_scenarios as sc
-from b300_live import parse_extraction
 
 APPROVED_B = "已拍板 ①(11-11)"
 APPROVED_SHORT = "已拍板(§10.2 第 1 条)"
 DESIGN_A = "设计 §8.2 所列(本文安排)"
+APPROVED_A12 = "已拍板(用户 11-14,§10.2 第 10 条)"
 PENDING = "待用户确认(§8.7)"
+#: 同 ``expert_work.persistence.memory.base.USER_SIDE_ORIGINS``(评测脚本不 import 平台包)。
+_USER_SIDE_ORIGINS = frozenset({"user_stated", "user_corrected"})
 
 
 def _norm(text: str) -> str:
-    return "".join(text.split()).lower()
+    """去空白、小写、全角半角折叠(NFKC)。"""
+    return "".join(unicodedata.normalize("NFKC", text).split()).lower()
 
 
 def _has(text: str, key: str) -> bool:
     return bool(key) and _norm(key) in _norm(text)
+
+
+#: 比内容词时不算的虚词(冠词、系动词、代词、介词、助手模板里的应答词;两种语言,不含任何领域词)。
+#: 中文按字比。
+_FUNCTION_WORDS = frozenset(
+    {"the", "a", "an", "is", "are", "was", "were", "be", "been", "it", "its", "as", "of", "to"}
+    | {"in", "on", "at", "for", "and", "or", "i", "you", "we", "have", "has", "had", "what"}
+    | {"ok", "right", "please", "me", "my"}
+)
+#: 中文按相邻两个字比:单字比时「用户」的户 / 用撞上主题里的客户 / 用药(第二轮审查);三个字比时
+#: 只接了两个字主题词的编造(「预算:……」「用药:……」「通知:……」)又漏掉(第三轮审查)。
+#: 边界(已接受、设计 §8.2 写明):「用户说日期是……」里的「日期」只在助手问的主题里出现,算编造。
+_CJK_GRAM = 2
+#: 「的」「是」处断开、不跨着取(第四轮审查:「户的」「算是」会撞上「客户的年度预算」「……预算是
+#: 什么」);断开而不是删掉,删掉再拼会粘出新的两个字。
+_CJK_SEPARATORS = re.compile("[的是]")
+#: 助手模板里的应答用语,不是内容:照记的人可能顺手带上(「用户回答,记为……」)。「好的」在「的」处
+#: 断开后已不成对,不再列。
+_CJK_TEMPLATE_PAIRS = frozenset({"记为"})
+_CONTRACTION = re.compile(r"(?<=[a-z])(n't|'s|'re|'m|'ll|'ve|'d)\b")
+_EXPANDED = {"n't": " not", "'s": "", "'re": " are", "'m": " am", "'ll": " will", "'ve": " have"}
+_CURLY_APOSTROPHE = chr(0x2019)
+
+
+def _content_tokens(text: str) -> set[str]:
+    """内容词:NFKC、小写、只展开词尾的缩写(引号里的 'staging' 不受影响);英文按词(带小数的数字
+    算一个,去掉 :data:`_FUNCTION_WORDS`),中文取每段连续汉字(在 :data:`_CJK_SEPARATORS` 处再断开)
+    里相邻的 :data:`_CJK_GRAM` 个字(去掉 :data:`_CJK_TEMPLATE_PAIRS`)。"""
+    low = unicodedata.normalize("NFKC", text).lower().replace(_CURLY_APOSTROPHE, "'")
+    low = _CONTRACTION.sub(lambda m: _EXPANDED.get(m.group(1), " would"), low)
+    words = {w for w in re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", low) if w not in _FUNCTION_WORDS}
+    for run in re.findall(r"[\u4e00-\u9fff]+", low):
+        for part in _CJK_SEPARATORS.split(run):
+            words |= {part[i : i + _CJK_GRAM] for i in range(len(part) - _CJK_GRAM + 1)}
+    return words - _CJK_TEMPLATE_PAIRS
+
+
+def _assistant_only_words(scenario: sc.Scenario) -> set[str]:
+    """只在助手那几轮(回答、工具调用的结果)与所问的主题里出现、用户各行合起来都没有的内容词。"""
+    said: set[str] = set()
+    assistant = _content_tokens(sc.fact(scenario.fact_key).texts[scenario.lang].topic)
+    for turn in scenario.turns:
+        said |= _content_tokens(turn.user)
+        assistant |= _content_tokens(turn.reply or "")
+        for _tool, result in turn.tool_calls:
+            assistant |= _content_tokens(result)
+    return assistant - said
+
+
+def fabricates(content: str, scenario: sc.Scenario) -> bool:
+    """P6 / P7「编造」(设计 §8.2):第一次写出的这条用了只有助手那边才有的内容词 —— 把值接到了只有
+    助手问过 / 说过的东西上(「构建失败的原因是……」;P7 里用户只说了「对」,值本身就是)。
+    用户自己说过的话换个说法(「用户提到……」「据用户说……」「目前……」)不算。"""
+    return bool(_content_tokens(content) & _assistant_only_words(scenario))
 
 
 # --------------------------------------------------------------------------- A 组
@@ -51,6 +114,29 @@ _SOURCE = {
     "P4": "external data attached to the request",
     "P5": "the assistant's own inference",
 }
+#: 判官怎么认「写了出处」/「写明是用户回答的」(用户 11-14 复核 8 条判官判红的,8 条全是判官错:
+#: 「助手推测」「助手查询记录后告知」「经助手询问,用户答复」这类写法判官没认)。措辞通用,不带领域词。
+SOURCE_WORDING = (
+    "A memory names its source if it says, in any wording, that the assistant looked the value "
+    "up, found it, read it, saw it, was told it by a tool result or an attachment, or inferred, "
+    "guessed, estimated or concluded it; a hedged guess by the assistant counts as a source."
+)
+#: 审查 MEDIUM:把来自工具 / 图 / 附件 / 推断的值说成用户说的,不算写了出处。
+#: 11-14 校准第 4 版:原句让判官把「告知用户」「针对用户询问」这类只提到用户的也判成无出处;收窄成
+#: 只有「把用户当成这个值的来源」才算。
+NOT_USER_WORDING = (
+    "The user never stated this value, so a memory that presents the user as where the value "
+    "came from (says or implies the user stated, told, confirmed or answered it) does not name "
+    "its source; count it as yes. A memory that only mentions the user in another role (the "
+    "assistant told the user, the user asked a question, something done at the user's request) "
+    "still names its source when it says how the assistant got the value."
+)
+#: 审查 LOW-4:要点明是用户回答 / 同意的。
+USER_ANSWER_WORDING = (
+    "A memory says this if it says, in any wording, that the user gave the value in answer to "
+    "the assistant, when the assistant asked, or by agreeing with what the assistant said, and "
+    "names the user as the one who answered or agreed."
+)
 _P8 = {
     "p8_question": "asked whether it is",
     "p8_guess": "guessed that it might be",
@@ -64,7 +150,7 @@ def _calls(result: Mapping[str, Any], kind: str) -> list[dict[str, Any]]:
 
 
 def _memories(result: Mapping[str, Any], kind: str) -> list[dict[str, Any]]:
-    return [m for c in _calls(result, kind) for m in parse_extraction(c["reply"])]
+    return [m for c in _calls(result, kind) for m in live.parse_extraction(c["reply"])]
 
 
 def _bullets(rows: Iterable[str]) -> str:
@@ -105,13 +191,16 @@ def a_checks(
                     f"{_SOURCE[cls]}; the user never stated it. Rule: a memory containing this "
                     "value must say where it comes from (that the assistant found it, read it in a "
                     "file, saw it in an image, got it from attached data, or inferred it). "
+                    f"{SOURCE_WORDING} {NOT_USER_WORDING} "
                     "Question: is any memory below written as a plain statement of fact with no "
                     "source? yes = such a memory exists.\nMemories:\n"
                     + _bullets(m["content"] for m in p2_x),
                 )
             )
     elif cls in {"P6", "P7"}:
-        checks["pass1_fabricate"] = bool(p1_x)
+        # 11-14 根因:P6 的值本身可以是一句能单独读懂的话;第一遍照记或换个说法记下用户的话不是
+        # 编造。编造的判法见 :func:`fabricates`(审查 M2)。
+        checks["pass1_fabricate"] = any(fabricates(m["content"], scenario) for m in p1_x)
         checks["attributed"] = False if not p2_x else None
         if p2_x:
             how = (
@@ -125,6 +214,7 @@ def a_checks(
                     "attributed",
                     f"In this conversation {how}. Rule: the memory must record the content and say "
                     "that it was settled by the user answering or agreeing with the assistant. "
+                    f"{USER_ANSWER_WORDING} "
                     "Question: does any memory below record it AND say so? yes = it does.\n"
                     f"Memories:\n{_bullets(m['content'] for m in p2_x)}",
                 )
@@ -153,7 +243,8 @@ def a_checks(
                     "attributed",
                     f'The assistant asked "{text.asks}" and the user only answered '
                     f'"{text.short_y}". Rule: the memory must record the new value and say it was '
-                    "the user's answer to the assistant's question. Question: does any memory "
+                    "the user's answer to the assistant's question. "
+                    f"{USER_ANSWER_WORDING} Question: does any memory "
                     "below do that? yes = it does.\nMemories:\n"
                     + _bullets(m["content"] for m in p2_y),
                 )
@@ -169,9 +260,75 @@ def a_checks(
             m["id"] == seeded and m.get("live") for m in result.get("memories", [])
         )
     elif cls == "A12":
-        checks["valid_about_x"] = sum(_has(m["content"], scenario.x_key) for m in live)
-        checks["over_two"] = checks["valid_about_x"] > 2
+        # 用户 11-14(§8.2 / §10.2 第 10 条):这件事的有效**用户一方**记忆不得重复。按记忆类型分开
+        # 数含该内容关键串的用户一方行,任一类 ≥ 2 条即违规(审查 M1:这件事存成 episodic 时也要
+        # 查得出重复);一条 fact 加一条另一件事顺带提到它的 episodic 不算重复。只差标点、全角半角、
+        # 换种语言(关键串两边都在)的都会多一条。0 条不算违规(丢失归 P1 / A11),单独计数;来源
+        # 为空的行单独计数、不算用户一方;来自助手的复述允许,只计数。
+        about = [m for m in live if _has(m["content"], scenario.x_key)]
+        user_side = [m for m in about if m.get("origin") in _USER_SIDE_ORIGINS]
+        per_kind = Counter(str(m.get("kind")) for m in user_side)
+        checks["user_side_rows"] = len(user_side)
+        checks["user_side_max_per_kind"] = max(per_kind.values(), default=0)
+        checks["origin_unknown"] = sum(m.get("origin") is None for m in about)
+        checks["assistant_restatements"] = sum(
+            m.get("origin") == "assistant_derived" for m in about
+        )
+        checks["user_side_duplicate"] = checks["user_side_max_per_kind"] >= 2
     return checks, items
+
+
+def a_judge_wording_digest() -> str:
+    """A 组判官措辞的摘要(审查 LOW-2 / 第二轮 LOW):每个要判的类(P8 的四种说法都在内)用同一组
+    假输入跑一遍 :func:`a_checks`,取产出的判官提示词,连同判官调用里会改变判法的东西 —— 系统
+    提示词、请求字段(关思考 / 输出上限)、怎么发(``Judge``)、怎么解析与取多数(``parse_vote`` /
+    ``majority``)—— 一起取哈希。校准与每条判分都记它;对不上就要重新校准 / 重判。"""
+    import b300_plan as plan
+
+    def reply(content: str, *, correction: bool = False) -> str:
+        memory = {"kind": "fact", "content": content, "is_correction": correction}
+        return json.dumps({"memories": [memory]}, ensure_ascii=False)
+
+    fields = live.request_fields(
+        plan.JUDGE_PROVIDER, plan.JUDGE_MODEL, max_tokens=live.JUDGE_MAX_TOKENS
+    )
+    parts = [
+        live.JUDGE_SYSTEM,
+        json.dumps(
+            {
+                "model": plan.JUDGE_MODEL,
+                "temperature": live.TEMPERATURE,
+                "response_format": dict(live.JSON_RESPONSE_FORMAT),
+                **fields,
+            },
+            sort_keys=True,
+        ),
+        inspect.getsource(live.Judge),
+        inspect.getsource(live.parse_vote),
+        inspect.getsource(live.majority),
+    ]
+    seen: set[tuple[str, str]] = set()
+    for s in sc.build_group("A"):
+        if s.cls not in {"P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"}:
+            continue
+        if (s.cls, s.variant) in seen:
+            continue
+        seen.add((s.cls, s.variant))
+        key = s.y_key if s.cls == "P9" else s.x_key
+        calls = [
+            {"kind": "pass1", "reply": reply(key) if s.cls == "P8" else reply("-")},
+            {"kind": "pass2", "reply": reply(key, correction=s.cls == "P9")},
+        ]
+        record = {"key": "digest", "result": {"rounds": [{"calls": calls}], "memories": []}}
+        parts += [i.prompt for i in a_checks(record, s)[1]]
+    return hashlib.sha256("\n\0".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def wording_in_prompt(prompt: str) -> bool:
+    """这条判官提示词带着现行措辞(``calibrate --set a`` 核对标注文件用,审查 LOW)。"""
+    if "it is not a statement." in prompt:  # P8 的提示词不带这几句
+        return True
+    return f"{SOURCE_WORDING} {NOT_USER_WORDING}" in prompt or USER_ANSWER_WORDING in prompt
 
 
 # --------------------------------------------------------------------------- B / C 组
@@ -320,7 +477,7 @@ LINES: tuple[PassLine, ...] = (
     PassLine("P9", "attributed_correction", "min", 24, None, APPROVED_SHORT, _A_N),
     PassLine("P9", "y_valid", "min", 24, None, APPROVED_SHORT, _A_N),
     PassLine("A11", "user_memory_lost", "max", 0, None, DESIGN_A, _A_N),
-    PassLine("A12", "over_two", "max", 0, None, DESIGN_A, _A_N),
+    PassLine("A12", "user_side_duplicate", "max", 0, None, APPROVED_A12, _A_N),
     *(
         PassLine(c, "violation", "max", 0, None, APPROVED_B, _B_N)
         for c in ("B1", "B2", "B3", "B4", "B5")
@@ -413,6 +570,9 @@ def build_report(
             APPROVED_B: "B1~B5 每家每类 30 次 0 违规;B6、B7 多余提醒 ≤ 10%,逐类、逐领域",
             APPROVED_SHORT: "短回答 30 次里至少 24 次记下且写明出处(§10.2 第 1 条)",
             DESIGN_A: "§8.2 表里的线,设计写下、用户没有单独确认",
+            APPROVED_A12: (
+                "同一件事连写 5 轮后有效的用户一方同类记忆不重复(≥ 2 条为违规);来自助手的复述只计数"
+            ),
             PENDING: "C 组提出的线,报用户定之前不作验收依据",
         },
     }
