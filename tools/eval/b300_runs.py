@@ -213,7 +213,10 @@ async def run_judge(
     votes: int,
     phase: str,
     emit: Callable[[str], None],
+    stamp: Mapping[str, str] | None = None,
 ) -> None:
+    """``stamp``(审查 M3):写进每条判分的字段(A 组:``wording_digest``);已有判分只有这些字段都
+    对得上才跳过,对不上的重判。"""
     import httpx
 
     base_url, api_key = (
@@ -222,7 +225,12 @@ async def run_judge(
     )
     if not base_url or not api_key:
         raise EvalError("set EXPERT_WORK_EVAL_JUDGE_BASE_URL and EXPERT_WORK_EVAL_JUDGE_API_KEY")
-    done = {r["key"] for r in read_jsonl(out_file)}
+    stamp = dict(stamp or {})
+    done = {
+        r["key"]
+        for r in read_jsonl(out_file)
+        if all(r.get(field) == value for field, value in stamp.items())
+    }
     sem = asyncio.Semaphore(4)
     async with httpx.AsyncClient() as http:
         judge = live.Judge(
@@ -256,6 +264,7 @@ async def run_judge(
                     "votes": votes_only,
                     "verdict": live.majority(votes_only),
                     "usage": [u for _v, u in got],
+                    **stamp,
                 },
             )
 

@@ -12,13 +12,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+import json
 import math
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
+import b300_live as live
 import b300_scenarios as sc
 from b300_live import parse_extraction
 
@@ -29,52 +34,56 @@ APPROVED_A12 = "已拍板(用户 11-14,§10.2 第 10 条)"
 PENDING = "待用户确认(§8.7)"
 #: 同 ``expert_work.persistence.memory.base.USER_SIDE_ORIGINS``(评测脚本不 import 平台包)。
 _USER_SIDE_ORIGINS = frozenset({"user_stated", "user_corrected"})
-#: A12 那件事(用户自己说全的一项内容)的记忆类型。
-A12_SUBJECT_KIND = "fact"
 
 
 def _norm(text: str) -> str:
-    return "".join(text.split()).lower()
+    """去空白、小写、全角半角折叠(NFKC)。"""
+    return "".join(unicodedata.normalize("NFKC", text).split()).lower()
 
 
 def _has(text: str, key: str) -> bool:
     return bool(key) and _norm(key) in _norm(text)
 
 
-#: 比「是不是用户自己的话」时不算内容的词:冠词、系动词、「用户说 / 回答」这类转述用语(两种语言;
-#: 不含任何领域词)。中文按字比。
-_FRAME_WORDS = frozenset(
-    {"the", "a", "an", "user", "users", "said", "says", "say", "told", "tells", "answered"}
-    | {"answers", "replied", "replies", "stated", "states", "that", "is", "are", "was", "were"}
-    | set("用户说告知回答称表示的是为了")
+#: 比内容词时不算的虚词(冠词、系动词、代词、介词、助手模板里的应答词;两种语言,不含任何领域词)。
+#: 中文按字比。
+_FUNCTION_WORDS = frozenset(
+    {"the", "a", "an", "is", "are", "was", "were", "be", "been", "it", "its", "as", "of", "to"}
+    | {"in", "on", "at", "for", "and", "or", "i", "you", "we", "have", "has", "had", "what"}
+    | {"ok", "right", "please", "me", "my"}
+    | set("的是了吗呢么什请问好记为对我们把一下")
 )
-_CONTRACTIONS: tuple[tuple[str, str], ...] = (
-    ("n't", " not"),
-    ("'re", " are"),
-    ("'m", " am"),
-    ("'ll", " will"),
-    ("'ve", " have"),
-    ("'d", " would"),
-    ("'s", ""),
-)
+_CONTRACTION = re.compile(r"(?<=[a-z])(n't|'s|'re|'m|'ll|'ve|'d)\b")
+_EXPANDED = {"n't": " not", "'s": "", "'re": " are", "'m": " am", "'ll": " will", "'ve": " have"}
 _CURLY_APOSTROPHE = chr(0x2019)
 
 
 def _content_tokens(text: str) -> set[str]:
-    """内容词:小写、展开缩写、英文按词(带小数的数字算一个)、中文按字,去掉 :data:`_FRAME_WORDS`。"""
-    low = text.lower().replace(_CURLY_APOSTROPHE, "'")
-    for short, full in _CONTRACTIONS:
-        low = low.replace(short, full)
+    """内容词:NFKC、小写、只展开词尾的缩写(引号里的 'staging' 不受影响)、英文按词(带小数的数字
+    算一个)、中文按字,去掉 :data:`_FUNCTION_WORDS`。"""
+    low = unicodedata.normalize("NFKC", text).lower().replace(_CURLY_APOSTROPHE, "'")
+    low = _CONTRACTION.sub(lambda m: _EXPANDED.get(m.group(1), " would"), low)
     tokens = re.findall(r"[a-z0-9]+(?:\.[0-9]+)?|[\u4e00-\u9fff]", low)
-    return {t for t in tokens if t not in _FRAME_WORDS}
+    return {t for t in tokens if t not in _FUNCTION_WORDS}
 
 
-def _beyond_user_words(content: str, scenario: sc.Scenario) -> bool:
-    """这条记忆有没有用户自己没说过的内容词(P6 / P7「编造」的程序判法)。"""
+def _assistant_only_words(scenario: sc.Scenario) -> set[str]:
+    """只在助手那几轮(回答、工具调用的结果)与所问的主题里出现、用户各行合起来都没有的内容词。"""
     said: set[str] = set()
+    assistant = _content_tokens(sc.fact(scenario.fact_key).texts[scenario.lang].topic)
     for turn in scenario.turns:
         said |= _content_tokens(turn.user)
-    return bool(_content_tokens(content) - said)
+        assistant |= _content_tokens(turn.reply or "")
+        for _tool, result in turn.tool_calls:
+            assistant |= _content_tokens(result)
+    return assistant - said
+
+
+def fabricates(content: str, scenario: sc.Scenario) -> bool:
+    """P6 / P7「编造」(设计 §8.2):第一次写出的这条用了只有助手那边才有的内容词 —— 把值接到了只有
+    助手问过 / 说过的东西上(「构建失败的原因是……」;P7 里用户只说了「对」,值本身就是)。
+    用户自己说过的话换个说法(「用户提到……」「据用户说……」「目前……」)不算。"""
+    return bool(_content_tokens(content) & _assistant_only_words(scenario))
 
 
 # --------------------------------------------------------------------------- A 组
@@ -177,10 +186,9 @@ def a_checks(
                 )
             )
     elif cls in {"P6", "P7"}:
-        # 11-14 根因:P6 的值本身可以是一句能单独读懂的话(「缓存目录没有写权限」);第一遍把用户
-        # 这句原话照记(或轻改:加「用户说」、冠词、句号、缩写)不是编造。编造 = 第一遍写出的含值
-        # 的那条带了用户没说过的内容词(例如接上只有助手问过的主题「构建失败的原因是……」)。
-        checks["pass1_fabricate"] = any(_beyond_user_words(m["content"], scenario) for m in p1_x)
+        # 11-14 根因:P6 的值本身可以是一句能单独读懂的话;第一遍照记或换个说法记下用户的话不是
+        # 编造。编造的判法见 :func:`fabricates`(审查 M2)。
+        checks["pass1_fabricate"] = any(fabricates(m["content"], scenario) for m in p1_x)
         checks["attributed"] = False if not p2_x else None
         if p2_x:
             how = (
@@ -240,43 +248,67 @@ def a_checks(
             m["id"] == seeded and m.get("live") for m in result.get("memories", [])
         )
     elif cls == "A12":
-        # 用户 11-14(§8.2 / §10.2 第 10 条):这件事的有效**用户一方**记忆不得重复。只数与这件事
-        # 同一类(fact)、含该内容关键串的用户一方行 —— 另一件事顺带提到它的(episodic)不算;
-        # 只差标点、全角半角、换种语言(关键串两边都在)的都会多一条。≥ 2 条才是违规;0 条不算
-        # 违规(丢失归 P1 / A11 管),单独计数。来自助手的复述允许,只计数。
+        # 用户 11-14(§8.2 / §10.2 第 10 条):这件事的有效**用户一方**记忆不得重复。按记忆类型分开
+        # 数含该内容关键串的用户一方行,任一类 ≥ 2 条即违规(审查 M1:这件事存成 episodic 时也要
+        # 查得出重复);一条 fact 加一条另一件事顺带提到它的 episodic 不算重复。只差标点、全角半角、
+        # 换种语言(关键串两边都在)的都会多一条。0 条不算违规(丢失归 P1 / A11),单独计数;来源
+        # 为空的行单独计数、不算用户一方;来自助手的复述允许,只计数。
         about = [m for m in live if _has(m["content"], scenario.x_key)]
         user_side = [m for m in about if m.get("origin") in _USER_SIDE_ORIGINS]
-        same_kind = [m for m in user_side if m.get("kind") == A12_SUBJECT_KIND]
-        checks["user_side_same_kind"] = len(same_kind)
-        checks["assistant_restatements"] = len(about) - len(user_side)
-        checks["user_side_duplicate"] = len(same_kind) >= 2
+        per_kind = Counter(str(m.get("kind")) for m in user_side)
+        checks["user_side_rows"] = len(user_side)
+        checks["user_side_max_per_kind"] = max(per_kind.values(), default=0)
+        checks["origin_unknown"] = sum(m.get("origin") is None for m in about)
+        checks["assistant_restatements"] = sum(
+            m.get("origin") == "assistant_derived" for m in about
+        )
+        checks["user_side_duplicate"] = checks["user_side_max_per_kind"] >= 2
     return checks, items
 
 
 def a_judge_wording_digest() -> str:
-    """A 组判官措辞的摘要(审查 LOW-2):每个要判的类用同一组假输入跑一遍 :func:`a_checks`,
-    把产出的判官提示词与判官的系统提示词一起取哈希。校准时记进 ``calibration-a.json``,
-    ``judge`` 发现与当前措辞不同就拒 —— 措辞改了就得重新校准。"""
-    import hashlib
-    import json
-
-    from b300_live import JUDGE_SYSTEM
+    """A 组判官措辞的摘要(审查 LOW-2 / 第二轮 LOW):每个要判的类(P8 的四种说法都在内)用同一组
+    假输入跑一遍 :func:`a_checks`,取产出的判官提示词,连同判官调用里会改变判法的东西 —— 系统
+    提示词、请求字段(关思考 / 输出上限)、怎么发(``Judge``)、怎么解析与取多数(``parse_vote`` /
+    ``majority``)—— 一起取哈希。校准与每条判分都记它;对不上就要重新校准 / 重判。"""
+    import b300_plan as plan
 
     def reply(content: str, *, correction: bool = False) -> str:
         memory = {"kind": "fact", "content": content, "is_correction": correction}
         return json.dumps({"memories": [memory]}, ensure_ascii=False)
 
-    prompts = [JUDGE_SYSTEM]
-    for cls in ("P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"):
-        s = next(s for s in sc.build_group("A") if s.cls == cls)
-        key = s.y_key if cls == "P9" else s.x_key
+    fields = live.request_fields(
+        plan.JUDGE_PROVIDER, plan.JUDGE_MODEL, max_tokens=live.JUDGE_MAX_TOKENS
+    )
+    parts = [
+        live.JUDGE_SYSTEM,
+        json.dumps({"model": plan.JUDGE_MODEL, **fields}, sort_keys=True),
+        inspect.getsource(live.Judge),
+        inspect.getsource(live.parse_vote),
+        inspect.getsource(live.majority),
+    ]
+    seen: set[tuple[str, str]] = set()
+    for s in sc.build_group("A"):
+        if s.cls not in {"P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"}:
+            continue
+        if (s.cls, s.variant) in seen:
+            continue
+        seen.add((s.cls, s.variant))
+        key = s.y_key if s.cls == "P9" else s.x_key
         calls = [
-            {"kind": "pass1", "reply": reply(key) if cls == "P8" else reply("-")},
-            {"kind": "pass2", "reply": reply(key, correction=cls == "P9")},
+            {"kind": "pass1", "reply": reply(key) if s.cls == "P8" else reply("-")},
+            {"kind": "pass2", "reply": reply(key, correction=s.cls == "P9")},
         ]
         record = {"key": "digest", "result": {"rounds": [{"calls": calls}], "memories": []}}
-        prompts += [i.prompt for i in a_checks(record, s)[1]]
-    return hashlib.sha256("\n\0".join(prompts).encode("utf-8")).hexdigest()[:16]
+        parts += [i.prompt for i in a_checks(record, s)[1]]
+    return hashlib.sha256("\n\0".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def wording_in_prompt(prompt: str) -> bool:
+    """这条判官提示词带着现行措辞(``calibrate --set a`` 核对标注文件用,审查 LOW)。"""
+    if "it is not a statement." in prompt:  # P8 的提示词不带这几句
+        return True
+    return f"{SOURCE_WORDING} {NOT_USER_WORDING}" in prompt or USER_ANSWER_WORDING in prompt
 
 
 # --------------------------------------------------------------------------- B / C 组

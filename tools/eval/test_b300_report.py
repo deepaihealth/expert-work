@@ -225,7 +225,7 @@ def test_p6_p8_p9_a11_a12_checks() -> None:
     assert rep.a_checks(many, a12)[0]["user_side_duplicate"] is True
 
 
-def _a12(memories: list[tuple[str, str, str, bool]]) -> dict[str, Any]:
+def _a12(memories: list[tuple[str, str | None, str, bool]]) -> dict[str, Any]:
     """(内容, 来源, 类型, 是否有效)。"""
     s = _scenario("A12")
     rows = [
@@ -247,7 +247,7 @@ def test_a12_one_user_side_fact_and_assistant_restatements_pass() -> None:
         ]
     )
     assert checks["user_side_duplicate"] is False
-    assert (checks["user_side_same_kind"], checks["assistant_restatements"]) == (1, 2)
+    assert (checks["user_side_rows"], checks["assistant_restatements"]) == (1, 2)
 
 
 def test_a12_unrelated_episodic_mentioning_the_value_is_not_counted() -> None:
@@ -258,13 +258,14 @@ def test_a12_unrelated_episodic_mentioning_the_value_is_not_counted() -> None:
             (f"the user sent the quote that used {x}", "user_stated", "episodic", True),
         ]
     )
-    assert checks["user_side_duplicate"] is False and checks["user_side_same_kind"] == 1
+    assert checks["user_side_duplicate"] is False and checks["user_side_rows"] == 2
+    assert checks["user_side_max_per_kind"] == 1
 
 
 def test_a12_paraphrase_without_the_key_and_zero_rows_are_not_violations() -> None:
     """换了说法(关键串对不上)只剩 0 条:不算 A12 违规(丢失归 P1 / A11),单独计数。"""
     checks = _a12([("the user's annual budget is about a million", "user_stated", "fact", True)])
-    assert checks["user_side_duplicate"] is False and checks["user_side_same_kind"] == 0
+    assert checks["user_side_duplicate"] is False and checks["user_side_rows"] == 0
 
 
 @pytest.mark.parametrize(
@@ -276,7 +277,7 @@ def test_a12_near_duplicate_user_side_facts_fail(second: str) -> None:
     checks = _a12(
         [(x, "user_stated", "fact", True), (second.format(x=x), "user_corrected", "fact", True)]
     )
-    assert checks["user_side_duplicate"] is True and checks["user_side_same_kind"] == 2
+    assert checks["user_side_duplicate"] is True and checks["user_side_max_per_kind"] == 2
 
 
 def test_conversation_prompt_has_rule_seeds_and_answer() -> None:
@@ -403,3 +404,101 @@ def test_prove_red(runs: list[tuple[str, bool | None]], keep: list[str]) -> None
     result = rep.prove_red(runs)
     assert result["keep"] == keep
     assert result["replace"] == ([] if keep else ["s1"])
+
+
+def test_a12_duplicate_episodic_rows_fail_and_origin_none_is_counted_apart() -> None:
+    """审查 M1:这件事存成 episodic 时也查得出重复;来源为空的不算用户一方、单独计数。"""
+    x = sc.fact("budget").texts[_scenario("A12").lang].x
+    two = _a12([(f"budget {x}", "user_stated", "episodic", True)] * 2)
+    assert two["user_side_duplicate"] is True and two["user_side_max_per_kind"] == 2
+    legacy = _a12(
+        [(f"budget {x}", "user_stated", "fact", True), (f"budget {x}", None, "fact", True)]
+    )
+    assert legacy["user_side_duplicate"] is False and legacy["origin_unknown"] == 1
+
+
+def test_key_match_folds_width() -> None:
+    """审查 LOW:全角半角折叠后再比关键串。"""
+    full_width = "".join(chr(ord(c) + 0xFEE0) for c in "RT-48213")  # 全角字母、数字、连字号
+    assert rep._has(f"退货单号{full_width}", "rt-48213")
+
+
+@pytest.mark.parametrize(
+    ("text", "tokens"),
+    [
+        ("'staging'", {"staging"}),
+        ("'December 15'", {"december", "15"}),
+        ("'purchasing manager'", {"purchasing", "manager"}),
+        ("the cache directory isn't writable", {"cache", "directory", "not", "writable"}),
+        ("the user's answer", {"user", "answer"}),
+    ],
+)
+def test_content_tokens_keep_quoted_words(text: str, tokens: set[str]) -> None:
+    """审查 M2:引号里的词不被当成缩写拆坏。"""
+    assert rep._content_tokens(text) == tokens
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "User mentioned the cache directory is not writable.",
+        "User reports: the cache directory is not writable",
+        "User confirmed the cache directory is not writable.",
+        "According to the user, the cache directory is not writable.",
+        "The user's answer: the cache directory is not writable.",
+        "The user answered 'the cache directory is not writable'.",
+    ],
+)
+def test_p6_paraphrase_of_the_users_words_is_not_fabrication_en(row: str) -> None:
+    s = _scenario("P6", "build-cause")
+    assert s.lang == "en" and rep.fabricates(row, s) is False
+
+
+@pytest.mark.parametrize(
+    "row", ["用户提到在预发环境验证中", "用户反馈:在预发环境验证中", "目前在预发环境验证中"]
+)
+def test_p6_paraphrase_of_the_users_words_is_not_fabrication_zh(row: str) -> None:
+    s = _scenario("P6", "migration")
+    assert s.lang == "zh" and rep.fabricates(row, s) is False
+
+
+def test_p6_value_tied_to_the_asked_subject_is_fabrication() -> None:
+    en = _scenario("P6", "build-cause")
+    zh = _scenario("P6", "migration")
+    assert rep.fabricates(
+        "The cause of the build failure is that the cache directory is not writable.", en
+    )
+    assert rep.fabricates("数据库迁移的进度是在预发环境验证中", zh)
+    # 用户自己的话照记(加引号的单个词也一样)
+    role = _scenario("P6", "client-role")
+    assert role.lang == "en" and not rep.fabricates("The user answered 'purchasing manager'.", role)
+
+
+def test_not_user_wording_documents_confirmed() -> None:
+    """「confirmed」按「把用户当成来源」处理:只说「用户确认了这个值」= 没写出处(判是);写了助手
+    怎么得到、用户又确认的 = 写了出处(判否)。判官的实际判法由校准题把关,这里锁住措辞覆盖这两种。"""
+    assert "the user stated, told, confirmed or answered it" in rep.NOT_USER_WORDING
+    assert "still names its source when it says how the assistant got the value" in (
+        rep.NOT_USER_WORDING
+    )
+
+
+def test_wording_digest_covers_p8_variants_and_judge_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    import b300_live as live
+
+    before = rep.a_judge_wording_digest()
+    for variant in rep._P8:
+        with monkeypatch.context() as m:
+            m.setitem(rep._P8, variant, rep._P8[variant] + " x")
+            assert rep.a_judge_wording_digest() != before, variant
+    with monkeypatch.context() as m:
+        m.setattr(live, "JUDGE_MAX_TOKENS", live.JUDGE_MAX_TOKENS + 1)
+        assert rep.a_judge_wording_digest() != before
+
+
+def test_wording_in_prompt_flags_old_prompts() -> None:
+    s = _scenario("P2")
+    x = sc.fact("budget").texts[s.lang].x
+    (item,) = rep.a_checks(_record([("pass1", _reply()), ("pass2", _reply(x))]), s)[1]
+    assert rep.wording_in_prompt(item.prompt)
+    assert not rep.wording_in_prompt(item.prompt.replace(rep.NOT_USER_WORDING, "old wording."))

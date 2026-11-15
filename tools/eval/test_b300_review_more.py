@@ -360,3 +360,134 @@ def test_quote_shows_language_mix_embeddings_and_unpriced(tmp_path: Path) -> Non
     priced = _quote(tmp_path, "--embed-price", "0.5")
     assert isinstance(priced["embeddings"]["yuan"], list)
     assert any("sandbox" in n for n in q["not_priced"])
+
+
+# --------------------------------------------------------------------------- 第二轮审查 M3
+
+
+def _a_p2_record(repeat: int) -> dict[str, Any]:
+    s = next(x for x in sc.build_group("A") if x.cls == "P2")
+    x = sc.fact(s.fact_key).texts[s.lang].x
+    reply = json.dumps({"memories": [{"kind": "fact", "content": x}]}, ensure_ascii=False)
+    return {
+        "key": f"k{repeat}",
+        "phase": "a",
+        "scenario_id": s.scenario_id,
+        "cls": "P2",
+        "domain": s.domain,
+        "vendor": "glm",
+        "repeat": repeat,
+        "attempt": 0,
+        "result": {
+            "rounds": [
+                {
+                    "calls": [
+                        {"kind": "pass1", "reply": json.dumps({"memories": []})},
+                        {"kind": "pass2", "reply": reply},
+                    ]
+                }
+            ],
+            "memories": [],
+        },
+    }
+
+
+def test_report_ignores_a_verdicts_made_with_other_wording(tmp_path: Path) -> None:
+    """审查 M3:A 组判分带判官措辞摘要;对不上(或没记)的不算,计数报出。"""
+    out = tmp_path / "out"
+    (out / "a").mkdir(parents=True)
+    rows = [_a_p2_record(0), _a_p2_record(1), _a_p2_record(2)]
+    (out / "a" / "records.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    digest = rep.a_judge_wording_digest()
+    verdicts = [
+        {"key": "k0|plain", "verdict": True, "wording_digest": digest},
+        {"key": "k1|plain", "verdict": True, "wording_digest": "0" * 16},
+        {"key": "k2|plain", "verdict": True},
+    ]
+    (out / "a" / "verdicts.jsonl").write_text("".join(json.dumps(v) + "\n" for v in verdicts))
+    body = cli.report(out, None)
+    assert body["counts"]["a"]["verdicts_stale_wording_excluded"] == 2
+    p2 = body["lines"]["P2.plain"]["glm"]
+    assert p2["n"] == 1 and p2["bad"] == 1  # 只有措辞对得上的那条算
+
+
+def test_run_judge_rejudges_rows_with_another_stamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """审查 M3:已有判分只有 stamp 都对得上才跳过;对不上 / 没记的重判,新判分带 stamp。"""
+    import asyncio
+
+    import b300_live as live
+
+    monkeypatch.setenv("EXPERT_WORK_EVAL_JUDGE_BASE_URL", "http://judge.invalid")
+    monkeypatch.setenv("EXPERT_WORK_EVAL_JUDGE_API_KEY", "k")
+    asked: list[str] = []
+
+    async def vote(self: Any, prompt: str, *, item: str, phase: str) -> list[Any]:
+        asked.append(item)
+        return [(True, {"input_tokens": 1, "output_tokens": 1})]
+
+    monkeypatch.setattr(live.Judge, "vote_with_usage", vote)
+
+    class Open:
+        def __init__(self) -> None:
+            self.prices = {plan.JUDGE_MODEL: Price(1.0, 1.0, 1.0, "test")}
+
+        def may_spend(self, phase: str) -> bool:
+            return True
+
+    out_file = tmp_path / "verdicts.jsonl"
+    old = [
+        {"key": "same", "verdict": False, "wording_digest": "d1"},
+        {"key": "other", "verdict": False, "wording_digest": "d0"},
+        {"key": "none", "verdict": False},
+    ]
+    out_file.write_text("".join(json.dumps(r) + "\n" for r in old))
+    items = [rep.JudgeItem(k, "plain", "p") for k in ("same", "other", "none")]
+    asyncio.run(
+        runs.run_judge(
+            items,
+            out_file=out_file,
+            guard=Open(),  # type: ignore[arg-type]
+            votes=1,
+            phase="a",
+            emit=lambda _m: None,
+            stamp={"wording_digest": "d1"},
+        )
+    )
+    assert sorted(asked) == ["none", "other"]
+    new = [json.loads(x) for x in out_file.read_text().splitlines()][3:]
+    assert {r["key"] for r in new} == {"other", "none"}
+    assert all(r["wording_digest"] == "d1" for r in new)
+
+
+def test_calibrate_a_refuses_labels_built_with_other_wording(tmp_path: Path) -> None:
+    """审查 LOW:标注文件里的判官题不是现行措辞生成的,`calibrate --set a` 不花钱就拒。"""
+    domains = sorted({s.domain for s in sc.build_group("A")})
+    labels = [
+        {"domain": d, "label": i % 2 == 0, "prompt": f"old wording {d} {i}"}
+        for d in domains
+        for i in range(4)
+    ]
+    path = tmp_path / "labels.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in labels))
+    out: list[str] = []
+    code = cli.main(
+        [
+            "calibrate",
+            "--set",
+            "a",
+            "--labels",
+            str(path),
+            "--out",
+            str(tmp_path / "o"),
+            "--stop-line",
+            "10",
+            "--approved-quote",
+            "x",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+        emit=out.append,
+    )
+    assert code == 2 and "current A-group judge wording" in out[-1]
