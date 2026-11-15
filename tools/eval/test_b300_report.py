@@ -519,7 +519,6 @@ def test_wording_in_prompt_flags_old_prompts() -> None:
         ("medication-stage", "用户回答:减量期"),
         ("contact", "用户告知:短信"),
         ("contact", "用户回答短信"),
-        ("signing-date", "用户说日期是 12 月 15 日"),
         ("signing-date", "用户告知:12 月 15 日"),
     ],
 )
@@ -548,3 +547,55 @@ def test_zh_value_tied_to_the_assistant_side_is_still_fabrication(
 ) -> None:
     s = _scenario(cls, fact_key)
     assert s.lang == "zh" and rep.fabricates(row, s) is True
+
+
+@pytest.mark.parametrize(
+    ("fact_key", "row"),
+    [
+        ("budget", "预算:120 万"),
+        ("budget", "客户预算 120 万"),
+        ("medication-stage", "用药:减量期"),
+        ("medication-stage", "阶段:减量期"),
+        ("contact", "通知:短信"),
+        ("contact", "售后用短信通知"),
+        ("signing-date", "合同于 12 月 15 日签署"),
+        ("migration", "迁移在预发环境验证中"),
+    ],
+)
+def test_p6_zh_value_tied_to_a_two_character_subject_word_is_fabrication(
+    fact_key: str, row: str
+) -> None:
+    """第三轮审查 MEDIUM:按三个字比时,只接了两个字主题词(预算 / 用药 / 通知 / 签署 / 迁移)的
+    编造漏掉了。"""
+    s = _scenario("P6", fact_key)
+    assert s.lang == "zh" and rep.fabricates(row, s) is True
+
+
+def test_zh_boundary_slot_word_from_the_question_counts_as_fabrication() -> None:
+    """第三轮审查:按两个字比的已知边界(已接受,设计 §8.2):「日期」只在助手问的主题(合同签署日期)
+    里出现,所以「用户说日期是……」算编造。"""
+    s = _scenario("P6", "signing-date")
+    assert rep.fabricates("用户说日期是 12 月 15 日", s) is True
+
+
+@pytest.mark.parametrize(
+    ("fact_key", "row"),
+    [("contact", "好的,用户回答短信"), ("contact", "用户回答,记为短信")],
+)
+def test_zh_template_pairs_are_not_content(fact_key: str, row: str) -> None:
+    """留着的两个模板用语(好的 / 记为)各一例:照记时顺手带上不算编造;去掉这一条就会误判。"""
+    s = _scenario("P6", fact_key)
+    assert rep.fabricates(row, s) is False
+
+
+def test_zh_content_characters_are_kept() -> None:
+    """以前按字去虚字会吃掉内容字(问题 / 记录 / 行为 / 偏好 / 对象);现在都留着。"""
+    for word in ("问题", "记录", "行为", "偏好", "对象"):
+        assert word in rep._content_tokens(word)
+
+
+def test_zh_boundary_synonym_of_the_subject_is_not_caught() -> None:
+    """已知漏判(按两个字比的边界):换成近义词(签约 / 签署)接上主题、又没有与助手那边相同的两个字时,
+    程序判不出来。这类交给判官 / 人工看,不靠程序线。"""
+    s = _scenario("P6", "signing-date")
+    assert rep.fabricates("签约日为 12 月 15 日", s) is False
