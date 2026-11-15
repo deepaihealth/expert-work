@@ -1,8 +1,9 @@
 """B-300 ③ ② —— 召回到的长期记忆怎么渲染(提示词里的记忆块与工作区 ``MEMORY.md`` 共用)。
 
-* 每条一行 ``- (kind · 来源 · YYYY-MM-DD) 内容``:来源是有效来源(:func:`origin_label`,四种);
-  日期是记录日期(``created_at`` 的 UTC 日期,绝对日期,一个 run 内逐字不变才命中缓存);没有
-  创建时间的不渲染日期。内容里的换行压成空格 —— 否则内容换行后可以冒充一行带前缀的记忆。
+* 每条一行 ``- (kind · 来源 · YYYY-MM-DD) 内容``:来源是有效来源(:func:`origin_label`,五种);
+  日期是记录日期(``created_at`` 的 UTC 日期,绝对日期,一个 run 内逐字不变才命中缓存);用户一方
+  的行若有确认日期(用户后来又说到它),取两者里晚的(B-300 重做附录 D,:func:`line_date`);
+  没有创建时间的不渲染日期。内容里的换行压成空格 —— 否则内容换行后可以冒充一行带前缀的记忆。
   不显示置信度数字。
 * 块后单独一节 ``## Before relying on a memory``(:func:`memory_reminder`):前三条总在;讲
   「来自助手」「来源未记录」的两条只在块里真有这种标记的条目时出现(设计 §5.1)。
@@ -16,16 +17,20 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
+from expert_work.persistence.memory.base import USER_SIDE_ORIGINS
 from expert_work.protocol import MemoryItem
 from expert_work.protocol.memory_item import EffectiveOrigin, effective_origin
 
 MEMORY_BLOCK_HEADING = "## Relevant memories from past sessions"
-MEMORY_LINE_LEGEND = "Each line: (kind · source · date recorded) content."
+MEMORY_LINE_LEGEND = (
+    "Each line: (kind · source · date recorded or last restated by the user) content."
+)
 
 #: 每种有效来源在行里、去重合并材料里显示的文字(设计 §5.1)。
 ORIGIN_LABELS: dict[EffectiveOrigin, str] = {
     "user_corrected": "corrected by the user",
     "user_stated": "stated in user messages",
+    "user_confirmed": "confirmed by the user",
     "assistant_derived": "from the assistant",
     "unrecorded": "source not recorded",
 }
@@ -38,9 +43,9 @@ _REMINDER_HEAD = (
     "- If a memory conflicts with what the user is telling you now, go with what the user "
     "says now.\n"
     "- If something you have just found or concluded yourself (from a tool result, a file, "
-    'an attachment) conflicts with a memory marked "stated in user messages" or "corrected '
-    'by the user", do not quietly adopt your new result: tell the user both and let them '
-    "decide. For other memories, prefer what you can check now.\n"
+    'an attachment) conflicts with a memory marked "stated in user messages", "confirmed '
+    'by the user" or "corrected by the user", do not quietly adopt your new result: tell '
+    "the user both and let them decide. For other memories, prefer what you can check now.\n"
     "- When two memories about the same thing disagree, a later one that records the user's "
     "own answer is not overridden by an earlier one."
 )
@@ -70,15 +75,27 @@ def recorded_date(item: MemoryItem) -> str | None:
     return item.created_at.date().isoformat()
 
 
+def line_date(item: MemoryItem) -> str | None:
+    """行里显示的日期(``YYYY-MM-DD``,UTC):记录日期;用户一方的行若有确认日期,取两者里晚的。
+
+    来自助手、来源未记录的行不看确认日期(它们不会有;万一有也不显示),免得显得被用户确认过
+    (重做设计 §9.2,审查 M4)。都没有 → ``None``。"""
+    stamps = [item.created_at]
+    if effective_origin(item) in USER_SIDE_ORIGINS:
+        stamps.append(item.confirmed_at)
+    known = [ts for ts in stamps if ts is not None]
+    return max(known).date().isoformat() if known else None
+
+
 def origin_label(item: MemoryItem) -> str:
-    """有效来源的显示文字(四种之一)。"""
+    """有效来源的显示文字(五种之一)。"""
     return ORIGIN_LABELS[effective_origin(item)]
 
 
 def memory_line(item: MemoryItem) -> str:
     """一条记忆一行:``- (kind · source · date) content``,内容里的各种换行压成空格。"""
     content = " ".join(item.content.split())
-    date = recorded_date(item)
+    date = line_date(item)
     parts = [item.kind, origin_label(item), *([date] if date else [])]
     return f"- ({' · '.join(parts)}) {content}"
 
@@ -190,6 +207,7 @@ __all__ = [
     "MEMORY_LINE_LEGEND",
     "MEMORY_TRUNCATION_MARKER",
     "ORIGIN_LABELS",
+    "line_date",
     "memory_line",
     "memory_reminder",
     "origin_label",

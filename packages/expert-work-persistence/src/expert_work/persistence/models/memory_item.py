@@ -7,11 +7,11 @@ and carrying an embedding for semantic retrieval.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import CHAR, DateTime, Float, Index, Integer, String, Text, func, text
+from sqlalchemy import CHAR, Date, DateTime, Float, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -128,5 +128,13 @@ class MemoryItemRow(Base):
     origin: Mapped[str | None] = mapped_column(Text, nullable=True)
     # embedding_model: the ``provider/model`` that computed ``embedding``; NULL = unknown.
     embedding_model: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ---- B-300 重做 PR M, migration 0190 ----
+    # Evidence pointer: which message of ``source_thread_id`` the memory was read from.
+    evidence_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_message_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Event date of a one-off value; NULL for plans, preferences, states, summaries.
+    occurred_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # When the user side last restated it; only ever set on user-side rows.
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (Index("memory_item_tenant_user_idx", "tenant_id", "user_id"),)

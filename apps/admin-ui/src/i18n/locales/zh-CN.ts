@@ -3604,6 +3604,7 @@ const zhCN: TranslationKeys = {
     col_kind: "类型",
     col_origin: "来源",
     origin_user_stated: "用户消息里说的",
+    origin_user_confirmed: "用户确认",
     origin_assistant_derived: "来自助手",
     origin_user_corrected: "用户更正",
     origin_unrecorded: "来源未记录",

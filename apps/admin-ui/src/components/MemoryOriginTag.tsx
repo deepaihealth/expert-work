@@ -1,7 +1,7 @@
 /**
- * B-300 PR 2 — one memory's source, as a tag: the same four labels the
- * agent sees in its recall block (stated in user messages / from the
- * assistant / corrected by the user / source not recorded). Shared by the
+ * B-300 PR 2 — one memory's source, as a tag: the same five labels the
+ * agent sees in its recall block (stated in user messages / confirmed by the
+ * user / from the assistant / corrected by the user / source not recorded). Shared by the
  * memory list page and the user-profile memory pane.
  */
 import { Tag } from "antd";
@@ -12,6 +12,7 @@ import { effectiveOrigin, type EffectiveOrigin, type MemoryItem } from "../api/m
 const ORIGIN_COLOR: Record<EffectiveOrigin, string> = {
   user_corrected: "green",
   user_stated: "blue",
+  user_confirmed: "cyan",
   assistant_derived: "orange",
   unrecorded: "default",
 };

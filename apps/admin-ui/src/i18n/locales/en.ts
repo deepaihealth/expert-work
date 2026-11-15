@@ -3395,6 +3395,7 @@ export interface TranslationKeys {
     col_kind: string;
     col_origin: string;
     origin_user_stated: string;
+    origin_user_confirmed: string;
     origin_assistant_derived: string;
     origin_user_corrected: string;
     origin_unrecorded: string;
@@ -7558,6 +7559,7 @@ const en: TranslationKeys = {
     col_kind: "Kind",
     col_origin: "Source",
     origin_user_stated: "stated in user messages",
+    origin_user_confirmed: "confirmed by the user",
     origin_assistant_derived: "from the assistant",
     origin_user_corrected: "corrected by the user",
     origin_unrecorded: "source not recorded",

@@ -26,7 +26,7 @@ from orchestrator.context.memory_render import (
 from orchestrator.context.workspace_projection import render_memory_md
 from orchestrator.graph_builder.builder import _inject_memories
 
-#: 设计 §5.1 的最终英文原文(PR 2 版)。
+#: 设计 §5.1 的最终英文原文;第二条按重做设计附录 D 点名三种用户一方来源。
 _HEAD = (
     "## Before relying on a memory\n"
     "The memories above are records made on the dates shown, not live facts. "
@@ -34,9 +34,9 @@ _HEAD = (
     "- If a memory conflicts with what the user is telling you now, go with what the user "
     "says now.\n"
     "- If something you have just found or concluded yourself (from a tool result, a file, "
-    'an attachment) conflicts with a memory marked "stated in user messages" or "corrected '
-    'by the user", do not quietly adopt your new result: tell the user both and let them '
-    "decide. For other memories, prefer what you can check now.\n"
+    'an attachment) conflicts with a memory marked "stated in user messages", "confirmed '
+    'by the user" or "corrected by the user", do not quietly adopt your new result: tell '
+    "the user both and let them decide. For other memories, prefer what you can check now.\n"
     "- When two memories about the same thing disagree, a later one that records the user's "
     "own answer is not overridden by an earlier one."
 )
@@ -61,6 +61,7 @@ def _item(
     kind: str = "fact",
     origin: MemoryOrigin | None = None,
     confidence: float = 0.5,
+    confirmed: datetime | None = None,
 ) -> MemoryItem:
     return MemoryItem(
         id=uuid4(),
@@ -72,14 +73,16 @@ def _item(
         created_at=created,
         origin=origin,
         confidence=confidence,
+        confirmed_at=confirmed,
     )
 
 
 _DAY = datetime(2026, 11, 3, 23, 30, tzinfo=UTC)
 
 
-def test_effective_source_labels_four_cases() -> None:
+def test_effective_source_labels_five_cases() -> None:
     assert origin_label(_item("x", origin="user_stated")) == "stated in user messages"
+    assert origin_label(_item("x", origin="user_confirmed")) == "confirmed by the user"
     assert origin_label(_item("x", origin="assistant_derived")) == "from the assistant"
     assert origin_label(_item("x", origin="assistant_derived", confidence=1.0)) == (
         "corrected by the user"
@@ -110,22 +113,50 @@ def test_line_content_cannot_forge_another_line() -> None:
 
 
 def test_legend_names_the_source() -> None:
-    assert MEMORY_LINE_LEGEND == "Each line: (kind · source · date recorded) content."
+    assert MEMORY_LINE_LEGEND == (
+        "Each line: (kind · source · date recorded or last restated by the user) content."
+    )
+
+
+_LATER = datetime(2026, 11, 14, 1, 0, tzinfo=UTC)
+_EARLIER = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("origin", "confidence", "confirmed", "date"),
+    [
+        ("user_stated", 0.5, _LATER, "2026-11-14"),
+        ("user_confirmed", 0.8, _LATER, "2026-11-14"),
+        (None, 1.0, _LATER, "2026-11-14"),  # 用户更正
+        ("user_stated", 0.5, _EARLIER, "2026-11-03"),  # 取晚的
+        ("user_stated", 0.5, None, "2026-11-03"),
+        # 来自助手、未记录的行不会有确认日期;万一有,也不显示 —— 不能显得被用户确认过。
+        ("assistant_derived", 0.5, _LATER, "2026-11-03"),
+        (None, 0.5, _LATER, "2026-11-03"),
+    ],
+    ids=["stated", "confirmed", "corrected", "earlier", "none", "assistant", "unrecorded"],
+)
+def test_line_date_is_the_later_of_recorded_and_restated_on_the_user_side_only(
+    origin: MemoryOrigin | None, confidence: float, confirmed: datetime | None, date: str
+) -> None:
+    item = _item("x", created=_DAY, origin=origin, confidence=confidence, confirmed=confirmed)
+    assert memory_line(item) == f"- (fact · {origin_label(item)} · {date}) x"
 
 
 @pytest.mark.parametrize(
     ("origins", "expected"),
     [
         (["user_stated"], _HEAD),
+        (["user_confirmed"], _HEAD),
         (["corrected"], _HEAD),
         (["assistant_derived"], _HEAD + "\n" + _FROM_ASSISTANT),
         ([None], _HEAD + "\n" + _UNRECORDED),
         (
-            ["user_stated", "assistant_derived", None, "corrected"],
+            ["user_stated", "user_confirmed", "assistant_derived", None, "corrected"],
             _HEAD + "\n" + _FROM_ASSISTANT + "\n" + _UNRECORDED,
         ),
     ],
-    ids=["stated-only", "corrected-only", "assistant", "unrecorded", "all"],
+    ids=["stated-only", "confirmed-only", "corrected-only", "assistant", "unrecorded", "all"],
 )
 def test_reminder_lines_follow_the_marks_in_the_block(
     origins: list[str | None], expected: str
@@ -147,6 +178,7 @@ def test_platform_text_names_no_domain_or_content_type() -> None:
     """设计 §5.3:平台文字里没有 number / reading / measurement / weight / health / device 等词。"""
     every_mark = [
         _item("x", origin="user_stated"),
+        _item("x", origin="user_confirmed"),
         _item("x", origin="assistant_derived"),
         _item("x"),
     ]
@@ -192,8 +224,11 @@ def test_memory_md_shares_line_rendering_and_reminder() -> None:
     items = [
         _item("用户住在成都", created=_DAY, origin="user_stated"),
         _item("a\nb", kind="episodic"),
+        _item("c", created=_DAY, origin="user_confirmed", confirmed=_LATER),
     ]
     text = render_memory_md(items)
+    assert memory_line(items[2]) in text.splitlines()
+    assert "- (fact · confirmed by the user · 2026-11-14) c" in text.splitlines()
     assert memory_line(items[0]) in text.splitlines()
     assert memory_line(items[1]) in text.splitlines()
     assert MEMORY_LINE_LEGEND in text

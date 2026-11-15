@@ -593,3 +593,32 @@ describe("MemoryAdmin — source label (B-300 PR 2)", () => {
     );
   });
 });
+
+describe("MemoryAdmin — confirmed by the user (B-300 redesign PR M)", () => {
+  it("labels user_confirmed in both locales; confidence 1.0 still wins", async () => {
+    expect(i18n.t("memory.origin_user_confirmed", { lng: "en" })).toBe("confirmed by the user");
+    expect(i18n.t("memory.origin_user_confirmed", { lng: "zh-CN" })).toBe("用户确认");
+    const rows = [
+      { ...memRow, id: "c1", content: "row one", origin: "user_confirmed", confidence: 0.8 },
+      { ...memRow, id: "c2", content: "row two", origin: "user_confirmed", confidence: 1 },
+    ];
+    installAdapter([
+      {
+        match: (u) => u.startsWith("/v1/memory"),
+        respond: () => ({
+          success: true,
+          data: { items: rows, total: rows.length, cross_tenant: false },
+          error: null,
+        }),
+      },
+    ]);
+    renderMemory();
+    await waitFor(() => expect(screen.getByText("row one")).toBeInTheDocument());
+    expect(screen.getByTestId("memory-origin-c1")).toHaveTextContent(
+      i18n.t("memory.origin_user_confirmed"),
+    );
+    expect(screen.getByTestId("memory-origin-c2")).toHaveTextContent(
+      i18n.t("memory.origin_user_corrected"),
+    );
+  });
+});

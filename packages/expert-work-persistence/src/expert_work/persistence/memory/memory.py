@@ -804,7 +804,9 @@ class InMemoryMemoryStore(MemoryStore):
         def _due_at(row: MemoryItem) -> datetime | None:
             if row.expected_valid_days is None or row.created_at is None:
                 return None
-            base = row.last_reviewed_at or row.created_at
+            # B-300 redesign §9.2 — the latest of created / reviewed / restated by the user.
+            stamps = (row.created_at, row.last_reviewed_at, row.confirmed_at)
+            base = max(ts for ts in stamps if ts is not None)
             return base + timedelta(days=row.expected_valid_days)
 
         candidates = []

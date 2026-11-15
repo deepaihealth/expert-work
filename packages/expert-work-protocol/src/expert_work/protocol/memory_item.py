@@ -8,7 +8,7 @@ Scoped to ``(tenant_id, user_id)``.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal, get_args
 from uuid import UUID
 
@@ -27,14 +27,18 @@ MemoryStatus = Literal["transient", "consolidated", "archived"]
 # B-300 ② —— 记忆的来源。提炼写入的只由「是哪一次提炼出来的」决定(模型不打标签,程序不看内容):
 #   user_stated       —— 第一次提炼的产出:只看白名单里用户输入的文字就读得出来;
 #                        另外,用户本人在控制台改写自己这一条也记它
-#   assistant_derived —— 第二次提炼的产出:助手做的、得出的、提出的,以及用户只是回答 / 同意的
+#   user_confirmed    —— B-300 重做 §6.2:第二次提炼里用户对助手上一句的回答、同意或否定,
+#                        且挂得上一条真实的用户输入行;层级低于 user_stated(模型判的、程序锚定)
+#   assistant_derived —— 第二次提炼的其它产出:助手做的、得出的、提出的(含挂不上用户行而降级的)
 # 空 = 存量、失败重试重建的、整理汇总里不全是来自助手的、别人在控制台改写过内容的
-# (那时置信度也压到 0.99 以内)。
-MemoryOrigin = Literal["user_stated", "assistant_derived"]
+# (那时置信度也压到 0.99 以内)。旧镜像不认识 user_confirmed,读成空(回滚时显示「来源未记录」)。
+MemoryOrigin = Literal["user_stated", "user_confirmed", "assistant_derived"]
 MEMORY_ORIGINS: frozenset[str] = frozenset(get_args(MemoryOrigin))
 
-#: 召回渲染与去重合并的拦截规则共用的「有效来源」(B-300 设计 §5.1)。
-EffectiveOrigin = Literal["user_corrected", "user_stated", "assistant_derived", "unrecorded"]
+#: 召回渲染与去重合并的拦截规则共用的「有效来源」(B-300 设计 §5.1;重做 §6.2 加用户确认)。
+EffectiveOrigin = Literal[
+    "user_corrected", "user_stated", "user_confirmed", "assistant_derived", "unrecorded"
+]
 
 
 class MemoryItem(BaseModel):
@@ -190,14 +194,38 @@ class MemoryItem(BaseModel):
     origin: MemoryOrigin | None = Field(
         default=None,
         description="B-300 — where the memory came from: ``user_stated`` (extracted "
-        "from what the user typed) or ``assistant_derived`` (from the transcript). "
-        "NULL = not recorded. An unknown stored value reads as NULL. Internal only.",
+        "from what the user typed), ``user_confirmed`` (the user's answer to / agreement "
+        "with the assistant's previous message) or ``assistant_derived`` (from the "
+        "transcript). NULL = not recorded. An unknown stored value reads as NULL. "
+        "Internal only.",
     )
     embedding_model: str | None = Field(
         default=None,
         description="B-300 — the embedding model (``provider/model``) that computed "
         "``embedding``; NULL for rows written before the column or by a path that "
         "cannot tell. Internal only — never on an external surface.",
+    )
+    # ---- B-300 重做 PR M(迁移 0190)----
+    evidence_message_id: str | None = Field(
+        default=None,
+        description="B-300 — evidence pointer: the id of the message in "
+        "``source_thread_id`` this memory was read from. NULL for rows written before "
+        "the column, summaries and paths that cannot tell. Internal only.",
+    )
+    evidence_message_index: int | None = Field(
+        default=None,
+        description="B-300 — evidence pointer: the position of that message in the "
+        "conversation (checkpoints only append, so it stays stable). Internal only.",
+    )
+    occurred_on: date | None = Field(
+        default=None,
+        description="B-300 — event date: the day a one-off value happened or was "
+        "observed. NULL for plans, preferences, states and summaries. Internal only.",
+    )
+    confirmed_at: datetime | None = Field(
+        default=None,
+        description="B-300 — when the user side last restated this memory; only ever "
+        "set on user-side rows. Internal only.",
     )
 
     @field_validator("origin", mode="before")
@@ -217,6 +245,8 @@ def effective_origin(item: MemoryItem) -> EffectiveOrigin:
         return "user_corrected"
     if item.origin == "user_stated":
         return "user_stated"
+    if item.origin == "user_confirmed":
+        return "user_confirmed"
     if item.origin == "assistant_derived":
         return "assistant_derived"
     return "unrecorded"

@@ -27,8 +27,11 @@ from expert_work.protocol.memory_item import MemoryOrigin, effective_origin
 NON_CORRECTION_MAX_CONFIDENCE = 0.99
 #: B-300 ② —— 来自助手的记忆置信度上限(与提炼第二次的封顶同一个数)。
 ASSISTANT_DERIVED_MAX_CONFIDENCE = 0.6
-#: 有效来源里算「用户一方」的两种(拦截规则、混合簇判断共用)。
-USER_SIDE_ORIGINS = frozenset({"user_stated", "user_corrected"})
+#: B-300 重做 §6.2 —— 用户确认的记忆置信度上限(内容是模型把两行合起来写的、来源是模型判的,
+#: 所以低于用户说的可以到的值;高于来自助手的,显示上分得开)。
+USER_CONFIRMED_MAX_CONFIDENCE = 0.8
+#: 有效来源里算「用户一方」的三种(拦截规则、混合簇判断、召回行的确认日期共用)。
+USER_SIDE_ORIGINS = frozenset({"user_stated", "user_corrected", "user_confirmed"})
 
 
 def is_mixed_origin(members: Sequence[MemoryItem]) -> bool:
