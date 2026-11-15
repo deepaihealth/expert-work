@@ -54,6 +54,7 @@ from expert_work.common.uplift_metrics import (
     record_memory_blocked,
     record_memory_drift,
     record_memory_extraction,
+    record_memory_extraction_check,
     record_memory_extraction_input_capped,
     record_memory_extraction_message_truncated,
     record_memory_mmr,
@@ -74,7 +75,6 @@ from expert_work.common.user_input import (
 from expert_work.persistence import MemoryStore
 from expert_work.persistence.memory import MemoryWritebackDLQ, MemoryWritebackJobStore
 from expert_work.persistence.memory.base import (
-    ASSISTANT_DERIVED_MAX_CONFIDENCE,
     USER_SIDE_ORIGINS,
     BlockedMemory,
     MemoryInjectionBlockedError,
@@ -117,6 +117,15 @@ from orchestrator.graph_builder._config import (
     configurable_uuid,
     current_run_id,
     long_term_memory_writes_off,
+)
+from orchestrator.graph_builder.memory_lines import (
+    ASSISTANT_TAG,
+    USER_TAG,
+    ExtractionLine,
+    cap_lines,
+    render_lines,
+    settle_conversation,
+    settle_user_text,
 )
 from orchestrator.graph_builder.retrieval_query import (
     RetrievalQuery,
@@ -189,8 +198,13 @@ _CONVERSATION_EXTRACTION = "conversation"
 # 一条,``is_correction`` 改成「同一句话自己说清改的是什么、新值是什么」(验收 118.5);评测 A 组
 # P1(用户 11-14「记,带上日期」):用户说自己的读数 / 编号 / 当前状态要记、带日期;审查后(11-14)
 # 日期按每行自己的发送日期(行首方括号)换算,不按重读那天,密码 / 验证码 / 卡号一类不记。
-_USER_TEXT_EXTRACTION_HEADER = """You are a memory extraction module. The input is every message one user typed in a
-conversation, one per line, oldest first. The other side of the conversation is not shown.
+# B-300 重做(设计 2026-11-15 附录 C,逐句):行带编号、``=== new ===`` 之上是上下文;打分段加
+# ``turn`` 与 ``event_date`` 两条(``_SCORING_TAIL`` 只有第一次用)。
+_USER_TEXT_EXTRACTION_HEADER = """You are a memory extraction module. The input is messages one user typed in a
+conversation, one per line, oldest first, each starting with its number in brackets.
+The other side of the conversation is not shown. Lines above the line "=== new ===" were
+handled earlier and are there only so you can understand the lines below it; take every
+memory from the lines below it.
 Extract durable, reusable memories worth recalling in future sessions — stable facts or
 preferences the user states ("fact"), and things the user says were done or decided
 ("episodic"). Extract nothing trivial: small talk and passing remarks that are not the
@@ -200,9 +214,9 @@ Only extract what these messages state on their own.
   what it is — a reading or measurement, an id or number, a current status — is recorded even
   though it may change, except passwords, one-time codes, bank card or bank account numbers
   and other secrets, which are never recorded. Write it with the date or time it refers to, so
-  it is not later taken for a current value: a line that starts with a date in brackets was
-  sent on that date, so turn "this morning", "yesterday" and the like in that line into a date
-  counted from it; in a line without a date, leave such words as they are.
+  it is not later taken for a current value: a date in brackets after the line number is the
+  day that line was sent, so turn "this morning", "yesterday" and the like in that line into a
+  date counted from it; in a line without a date, leave such words as they are.
 - A message that only agrees with, answers or refers to something that is not shown here
   (a bare "yes", "ok, do that", or a value or name with nothing saying what it is) states
   nothing by itself: skip it, and do not guess what it was about.
@@ -226,84 +240,208 @@ _SCORING_TAIL = (
     '- "is_correction": true ONLY when the same message itself says what is '
     "being corrected and gives the new value (e.g. the user says they moved, "
     "changed jobs, renamed a thing); otherwise false.\n"
+    '- "turn": the number of the line that states it.\n'
+    '- "event_date": only for a value that happened or was observed on one day (a '
+    "reading, a count, a payment made), that day as YYYY-MM-DD; null for anything else, "
+    "including an id, a number that names something, or a current status, even when its "
+    "date is written in the content.\n"
     "Respond with ONLY a JSON object, no prose and no code fences:\n"
     '{"memories": [{"kind": "fact" | "episodic", "content": "<one concise '
     'sentence>", "importance": <0-1>, "confidence": <0-1>, '
-    '"expected_valid_days": <int or null>, "is_correction": <bool>}]}\n'
+    '"expected_valid_days": <int or null>, "is_correction": <bool>, '
+    '"turn": <line number>, "event_date": "<YYYY-MM-DD>" or null}]}\n'
     'If there is nothing worth remembering, return {"memories": []}.'
 )
 
 _USER_TEXT_EXTRACTION_SYSTEM = _USER_TEXT_EXTRACTION_HEADER + "\n" + _SCORING_TAIL
 
-# B-300 ① —— 第二次提炼:整段对话(设计 §4.2 最终英文原文,整段自成一体,一字不改;评测脚本靠
-# "Every line starts with a tag:" 认出这是第二次)。用户 11-14(验收 118.5 重跑,复审后合成一段):
-# 单独读得懂的 [user] 行这里不再记;离开助手上一条读不懂的(短回答 / 同意 / 短更正)照记、带出处;
-# 「只记」的就是上面两类(设计 §4.2、§6.2、§10.2 第 10 条)。
-_CONVERSATION_EXTRACTION_SYSTEM = """You are a memory extraction module. The input is a conversation transcript, one message
-per line. Every line starts with a tag:
-- [user] — text the user typed. It is here for context; what a [user] line states on its
-  own is recorded separately.
+# B-300 重做 —— 第二次提炼:整段对话(设计 2026-11-15 附录 A 最终英文原文,含 9 个例子,一字不改;
+# 评测脚本靠 "Each line starts with its number in brackets and a tag:" 认出这是第二次)。只写要记
+# 什么:原来那几句「不要记 X」全部删掉,重复交给去重合并;唯一保留的「不记」是秘密值(用户 11-14 定
+# 的既定规矩)。来源不由模型定:程序按 ``basis`` + ``turn`` 核对(``memory_lines``)。回归闸门里
+# 空列表若回升,先怀疑例子 9(验证码 → 空列表,设计 §11.1)。
+_CONVERSATION_EXTRACTION_SYSTEM = """You are a memory extraction module. The input is part of a conversation, one message per
+line. Each line starts with its number in brackets and a tag:
+- [user] — text the user typed, followed by the date it was sent.
 - [task] — text that started a turn but was not typed by the user in this conversation
-  (for example a scheduled or delegated task). Context only.
-- [attached data] — a platform note that the message also carried images, files or
-  external data. Their content is not shown.
-- [assistant] — the assistant's final reply of a turn. It may rest on tool results,
-  attachments or the assistant's own inference, none of which you can see and any of which
-  can be wrong.
+  (for example a scheduled or delegated task).
+- [attached data] — a platform note that the message before it also carried images, files
+  or external data. Their content is not shown.
+- [assistant] — the assistant's final reply of a turn, followed by the date it was sent. It
+  may rest on tool results, attachments or the assistant's own inference, which you cannot
+  see and any of which can be wrong.
 - [activity] — a platform note listing the tools called in that turn.
-Extract durable, reusable memories worth recalling in future sessions, of two sorts only:
-- what the assistant did or produced, and what was decided ("episodic");
-- what the assistant found, concluded or proposed, and what was settled only because the
-  user agreed with, answered or corrected the assistant ("fact" or "episodic").
-Write each one so that it says where it comes from — for example "the assistant found ...",
-"the assistant proposed ... and the user agreed", "asked by the assistant, the user
-answered ...". Never write it as a plain statement of fact with no source.
-What a [user] line says that can be understood on its own is recorded by another pass: do
-not record it again here — not in other words, not with a source added, and not when an
-[assistant] line repeats, confirms or uses it. A conclusion the assistant reached from what
-the user said is still recorded here; only the user's statement itself is not. A tool result
-or record lookup that only confirms what the user currently says (their latest value) is not
-recorded again; one that differs from the user's latest statement is recorded, with its
-source. What a [user] line says that cannot be understood without the assistant's previous
-message — a short answer, an agreement, or a short correction such as "it's Y now" or "no,
-it's the other one" — is recorded here, with its source, and with "is_correction" when it
-changes something; one line can hold both kinds, so judge each statement in it.
-Something the assistant concluded that the user then rejected is not recorded as a
-conclusion on its own. Record only the two sorts above; they include what the assistant
-reports that tool results or attachments told it.
-When the assistant only repeats something from earlier records or memory, do not extract it
-again.
-For each memory give "importance" (0-1: how reusable it is in future sessions),
-"confidence" (0-1: how well the transcript supports it), "expected_valid_days" (a rough
-number of days it should stay valid, or null), and "is_correction": true only when the
-user, replying to the assistant, changes or rejects something stated earlier.
+Lines above the line "=== new ===" were handled earlier; they are there so you can
+understand the lines below it. Take every memory from the lines below "=== new ===".
+
+Record two sorts of durable, reusable memories:
+1. What the assistant did, produced, found, concluded or proposed. Set "basis" to
+   "assistant" and "turn" to the number of the [assistant] line that says it. In the
+   content, say that the assistant found, judged or proposed it, and keep the assistant's
+   own hedging (such as "about", "looks like", "probably").
+2. What the user settled by replying to the assistant's line just above: an answer to its
+   question ("basis": "user_answer"), or agreeing to or rejecting what it proposed or
+   reported ("basis": "user_agreement"). Set "turn" to the number of that [user] line. Read
+   the two lines together and write the whole fact they settle, the way the user would
+   state it, keeping any doubt the user expressed. A line that answers two questions gives
+   two memories. When the user agrees to one proposal in a reply that also states other
+   findings, only that proposal is the user's agreement; the findings stay the assistant's.
+When a reply changes or rejects something said earlier, set "is_correction" to true and
+write both what it was and what it is now.
+A value that happened or was observed on one day — a reading, a count, a payment made —
+gets "event_date": the day it refers to, as YYYY-MM-DD, counted from the date on its line
+when the line says "today", "this morning", "yesterday" and the like. Plans, arrangements,
+preferences and states get "event_date": null.
+Passwords, one-time codes, bank card or bank account numbers and other secrets are never
+recorded, even when the user gives one in reply to the assistant.
+Write each memory as one sentence that can be understood on its own, in the language of
+the conversation, with names, codes, numbers and units exactly as written.
+For each memory also give "kind" ("fact" for something that stays true, "episodic" for
+something done or decided), "importance" (0-1: how reusable it is in future sessions),
+"confidence" (0-1: how well the lines support it) and "expected_valid_days" (a rough number
+of days it should stay valid, or null).
+
+Examples (lines, then the output, then why):
+
+Example 1
+[1] [user] [2026-03-02] 帮我看看下周去成都的机票
+[2] [assistant] [2026-03-02] 3 月 9 日上午有两班直飞,我先按这两班比价。回程想订哪天?
+=== new ===
+[3] [user] [2026-03-02] 18号
+{"memories": [{"kind": "fact", "content": "用户的回程日期定在 2026 年 3 月 18 日",
+"basis": "user_answer", "turn": 3, "event_date": null, "importance": 0.5,
+"confidence": 0.9, "expected_valid_days": 30, "is_correction": false}]}
+Why: line 3 says nothing alone; read with line 2 it answers the assistant's question. A
+planned date is not something that happened, so event_date is null.
+
+Example 2
+=== new ===
+[1] [user] [2026-04-11] The release keeps slipping. Any idea how to fix the review step?
+[2] [activity] tools called this turn: team_calendar ×1
+[3] [assistant] [2026-04-11] Two of the reviewers are on leave this month. I suggest Priya Nair reviews every release branch until they are back.
+[4] [user] [2026-04-11] ok, do that
+{"memories": [{"kind": "fact", "content": "The assistant found that two of the reviewers
+are on leave this month.", "basis": "assistant", "turn": 3, "event_date": null,
+"importance": 0.4, "confidence": 0.7, "expected_valid_days": 30, "is_correction": false},
+{"kind": "episodic", "content": "Priya Nair reviews every release branch until the
+reviewers on leave are back.", "basis": "user_agreement", "turn": 4, "event_date": null,
+"importance": 0.7, "confidence": 0.9, "expected_valid_days": 30, "is_correction": false}]}
+Why: line 4 agrees to the proposal in line 3, so the agreed plan is recorded on line 4;
+the finding in the same reply stays the assistant's.
+
+Example 3
+=== new ===
+[1] [user] [2026-05-20] 我上周买的台灯还没到
+[2] [activity] tools called this turn: order_lookup ×1
+[3] [assistant] [2026-05-20] 查到一笔台灯订单,订单号 RX-4471-B,目前在中转站。是这一笔吗?
+[4] [user] [2026-05-20] 对
+{"memories": [{"kind": "fact", "content": "用户上周买的台灯订单号是 RX-4471-B",
+"basis": "user_agreement", "turn": 4, "event_date": null, "importance": 0.6,
+"confidence": 0.9, "expected_valid_days": 60, "is_correction": false},
+{"kind": "episodic", "content": "助手查到这笔台灯订单在 2026-05-20 时还在中转站",
+"basis": "assistant", "turn": 3, "event_date": null, "importance": 0.3,
+"confidence": 0.6, "expected_valid_days": 7, "is_correction": false}]}
+Why: line 4 confirms the order number the assistant looked up; where the parcel is stays
+the assistant's finding, and it is a state that can change, so event_date is null.
+
+Example 4
+[1] [user] [2026-06-03] Necesito cambiar las pastillas de freno.
+[2] [assistant] [2026-06-03] Para tu coche, el modelo T-200 de 2019, las pastillas delanteras cuestan unos 80 euros. ¿Es ese tu modelo?
+=== new ===
+[3] [user] [2026-06-03] no, es el T-250
+{"memories": [{"kind": "fact", "content": "El coche del usuario es el modelo T-250, no el
+T-200 de 2019 que suponía el asistente.", "basis": "user_agreement", "turn": 3,
+"event_date": null, "importance": 0.7, "confidence": 0.9, "expected_valid_days": 1095,
+"is_correction": true}]}
+Why: line 3 rejects what line 2 assumed and gives the new value, so it is a correction and
+both values are written.
+
+Example 5
+=== new ===
+[1] [user] [2026-07-08] Our hall holds 120 people. Can you check the booking page to be sure?
+[2] [activity] tools called this turn: web_fetch ×1
+[3] [assistant] [2026-07-08] The booking page lists a capacity of 120 for the main hall.
+{"memories": [{"kind": "fact", "content": "The assistant found that the booking page lists
+a capacity of 120 for the main hall.", "basis": "assistant", "turn": 3, "event_date": null,
+"importance": 0.5, "confidence": 0.6, "expected_valid_days": 365, "is_correction": false}]}
+Why: record what the assistant found even when it matches what the user said; matching
+memories are merged in a later step.
+
+Example 6
+=== new ===
+[1] [user] [2026-08-15] 发你一张月季叶子的照片
+[2] [attached data] images: 1, files: 0, external blocks: 0
+[3] [assistant] [2026-08-15] 从照片看,叶片上的黑斑像是真菌引起的,不过只凭一张照片不好确定。
+[4] [user] [2026-08-15] 那浇水要怎么调整?
+{"memories": [{"kind": "fact", "content": "助手根据一张照片判断,用户月季叶片上的黑斑可能是真菌引起的,尚未确定",
+"basis": "assistant", "turn": 3, "event_date": null, "importance": 0.4,
+"confidence": 0.4, "expected_valid_days": 30, "is_correction": false}]}
+Why: line 4 moves on to another question without agreeing, so the judgement stays the
+assistant's, with its doubt kept.
+
+Example 7
+[1] [assistant] [2026-09-01] Sure. What did the electricity meter show this morning?
+=== new ===
+[2] [user] [2026-09-01] 18342
+{"memories": [{"kind": "fact", "content": "The electricity meter read 18342 on the morning
+of 2026-09-01.", "basis": "user_answer", "turn": 2, "event_date": "2026-09-01",
+"importance": 0.5, "confidence": 0.9, "expected_valid_days": null, "is_correction": false}]}
+Why: a reading taken on one day gets that day as event_date, so a reading on another day
+is kept next to it.
+
+Example 8
+=== new ===
+[1] [user] [2026-10-12] 我想报个西班牙语课
+[2] [assistant] [2026-10-12] 好的。你现在大概是什么水平?初级、中级还是高级?
+[3] [user] [2026-10-12] 应该算中级吧,不太确定
+{"memories": [{"kind": "fact", "content": "用户认为自己的西班牙语大概是中级水平,但不太确定",
+"basis": "user_answer", "turn": 3, "event_date": null, "importance": 0.6,
+"confidence": 0.6, "expected_valid_days": 180, "is_correction": false}]}
+Why: the user's own doubt stays in the content and in the confidence.
+
+Example 9
+[1] [user] [2026-11-02] I can't sign in to my account.
+[2] [assistant] [2026-11-02] I've sent a six-digit code to your phone. What is it?
+=== new ===
+[3] [user] [2026-11-02] 482913
+{"memories": []}
+Why: a one-time code is a secret; it is never recorded, even as an answer.
+
 Respond with ONLY a JSON object, no prose and no code fences:
-{"memories": [{"kind": "fact" | "episodic", "content": "<one concise sentence>",
-"importance": <0-1>, "confidence": <0-1>, "expected_valid_days": <int or null>,
-"is_correction": <bool>}]}
-If there is nothing worth remembering, return {"memories": []}."""  # noqa: E501
+{"memories": [{"kind": "fact" | "episodic", "content": "<one sentence>",
+"basis": "assistant" | "user_answer" | "user_agreement", "turn": <line number>,
+"event_date": "<YYYY-MM-DD>" | null, "importance": <0-1>, "confidence": <0-1>,
+"expected_valid_days": <int or null>, "is_correction": <bool>}]}
+If nothing in the lines below "=== new ===" is worth remembering, return {"memories": []}."""  # noqa: E501, RUF001
 
 
-def _sent_date_tag(typed: UserInput, message: BaseMessage) -> str:
-    """第一次提炼一行的日期标签 ``[YYYY-MM-DD]``:那条消息的发送日期,按智能体的时区
-    (``resolve_agent_timezone``,与智能体提示词里的「今天」同一口径)。先看白名单标记里的
-    ``sent_at``;没有就用消息写入时盖的 ``expert_work_created_at``(复审 11-14:``sent_at`` 之前的
-    消息大多有它);两样都没有(评测脚本显式声明的消息等)或读不懂 → 不加,指令要求这种行里的
-    相对日期原样不换算。已知局限:``sent_at`` 之前的消息被「重新生成」时,
-    ``expert_work_created_at`` 是重新生成那天盖的,这一行就按那天换算(复审 11-14,接受)。
-
-    审查 MEDIUM-1 / MEDIUM-2(11-14):每轮整段重读,不能按重读那天换算「今天早上」。"""
-    stamped = message.additional_kwargs.get(STAMP_CREATED_AT)
-    raw = typed.sent_at or (stamped if isinstance(stamped, str) else None)
-    if raw is None:
-        return ""
+def _parse_stamp(raw: object) -> datetime | None:
+    """ISO 8601 时间戳 → 带时区的 UTC(没写时区的按 UTC);读不懂 → ``None``。它会作为 ``line_at``
+    进去重合并、与记录时间比先后,所以一律换成 UTC。"""
+    if not isinstance(raw, str):
+        return None
     try:
         sent = datetime.fromisoformat(raw)
     except ValueError:
-        return ""
-    if sent.tzinfo is None:
-        sent = sent.replace(tzinfo=UTC)
-    return f"[{sent.astimezone(resolve_agent_timezone()).date().isoformat()}]"
+        return None
+    return sent.replace(tzinfo=UTC) if sent.tzinfo is None else sent.astimezone(UTC)
+
+
+def _user_sent_at(typed: UserInput, message: BaseMessage) -> datetime | None:
+    """一条用户输入的发送时刻。先看白名单标记里的 ``sent_at``;没有就用消息写入时盖的
+    ``expert_work_created_at``(复审 11-14:``sent_at`` 之前的消息大多有它);两样都没有(评测脚本
+    显式声明的消息等)或读不懂 → ``None``,这一行不带日期,指令要求这种行里的相对日期原样不换算。
+    已知局限:``sent_at`` 之前的消息被「重新生成」时,``expert_work_created_at`` 是重新生成那天盖的,
+    这一行就按那天换算(复审 11-14,接受)。
+
+    审查 MEDIUM-1 / MEDIUM-2(11-14):每轮整段重读,不能按重读那天换算「今天早上」。"""
+    return _parse_stamp(typed.sent_at or message.additional_kwargs.get(STAMP_CREATED_AT))
+
+
+def _agent_day(sent: datetime | None) -> date | None:
+    """行里显示的日期:按智能体的时区(``resolve_agent_timezone``,与智能体提示词里的「今天」同一
+    口径)。"""
+    return sent.astimezone(resolve_agent_timezone()).date() if sent is not None else None
 
 
 def _extract_system(pass_name: str, language: str | None) -> str:
@@ -343,18 +481,41 @@ def _one_line(text: str) -> tuple[str, bool]:
     return flat, False
 
 
+@dataclass(frozen=True)
+class _LineSource:
+    """一行来自哪条消息(证据指针)、何时发送、在不在本次写回负责的轮次里。"""
+
+    message_id: str | None = None
+    message_index: int | None = None
+    sent_at: datetime | None = None
+    fresh: bool = False
+
+
 @dataclass
 class _PassInput:
     """一次提炼要给模型的行(最早的在前),以及被截到每条上限的消息数。"""
 
-    lines: list[str]
+    lines: list[ExtractionLine]
     truncated: int = 0
 
-    def add(self, text: str, tag: str = "") -> None:
+    def add(self, text: str, tag: str = "", *, source: _LineSource, dated: bool = False) -> None:
+        """``dated``:这一行在标签后带发送日期(第一次的每一行、第二次的 ``[user]`` /
+        ``[assistant]``,设计 §5.1);不带日期的行也不报发送时刻。"""
         line, cut = _one_line(text)
         if not line:
             return
-        self.lines.append(f"{tag} {line}" if tag else line)
+        sent_at = source.sent_at if dated else None
+        self.lines.append(
+            ExtractionLine(
+                text=line,
+                tag=tag,
+                sent_at=sent_at,
+                sent_day=_agent_day(sent_at),
+                message_id=source.message_id,
+                message_index=source.message_index,
+                fresh=source.fresh,
+            )
+        )
         self.truncated += int(cut)
 
 
@@ -406,56 +567,70 @@ def _typed_input(message: HumanMessage, explicit: set[int]) -> UserInput | None:
     return read_user_input(message)
 
 
+def _source(
+    message: BaseMessage, positions: Mapping[int, int], sent_at: datetime | None, fresh: bool
+) -> _LineSource:
+    message_id = message.id if isinstance(message.id, str) and message.id else None
+    return _LineSource(message_id, positions.get(id(message)), sent_at, fresh)
+
+
 def _extraction_inputs(
-    messages: Sequence[BaseMessage], explicit_user_text: Sequence[BaseMessage]
+    messages: Sequence[BaseMessage],
+    explicit_user_text: Sequence[BaseMessage],
+    *,
+    whole_conversation: bool = True,
 ) -> _ExtractionInputs:
     """B-300 ① —— 两次提炼各看到什么(设计 §4.1 的表)。
 
     * 第一次:只有白名单里用户输入的文字(``_build_human_message`` 记下的那一段,或调用方经
-      ``user_text_messages`` 显式声明的整条消息),一条一行,无标签;
+      ``user_text_messages`` 显式声明的整条消息),一条一行,带发送日期;
     * 第二次:``[user]`` 同一段文字;没有白名单的用户角色消息(定时任务的种子、子智能体的任务说明、
       发版前的旧消息)标 ``[task]``;附件 / 外部内容只给 ``[attached data]`` 计数;每轮只给调用过的
       工具 ``[activity]`` 与助手的最终回答 ``[assistant]``(该轮最后一条不带工具调用的助手消息,
       只取文字段)。工具结果、助手的中间消息、思考段两次都不给。
+
+    B-300 重做(PR X)—— 每行记下它来自哪条消息:id,以及在 ``messages`` 里的序号
+    (``whole_conversation`` 为假时不记序号 —— 压缩前抢存拿到的是中段,序号不是整段对话里的);
+    ``[activity]`` 行指向该轮第一条调工具的助手消息,``[attached data]`` 行指向那条用户消息。
+    ``fresh``(交给去重合并的 ``in_new_segment``)= 这一行属于本次写回负责的轮次。切片(PR S)之前
+    每次写回整段重抽,只有最后一轮(落这个写回任务的那一轮)是第一次被提炼的:更早轮次的行再被判成
+    「重复」不能算用户又说了一次。
     """
     explicit = {id(m) for m in explicit_user_text}
+    positions = {id(m): idx for idx, m in enumerate(messages)} if whole_conversation else {}
     user = _PassInput(lines=[])
     conversation = _PassInput(lines=[])
     has_reply = False
-    for segment in _segments(messages):
+    segments = _segments(messages)
+    for number, segment in enumerate(segments):
+        fresh = number == len(segments) - 1
         opener = segment[0]
         if isinstance(opener, HumanMessage):
             typed = _typed_input(opener, explicit)
             if typed is None:
                 # 外部内容(围栏里的)不跟着进 ``[task]``(review L1)。
-                conversation.add(text_before_external_content(_reply_text(opener)), "[task]")
+                text = text_before_external_content(_reply_text(opener))
+                conversation.add(text, "[task]", source=_source(opener, positions, None, fresh))
             else:
-                user.add(typed.text, tag=_sent_date_tag(typed, opener))
-                conversation.add(typed.text, "[user]")
+                asked = _source(opener, positions, _user_sent_at(typed, opener), fresh)
+                user.add(typed.text, source=asked, dated=True)
+                conversation.add(typed.text, USER_TAG, source=asked, dated=True)
                 if typed.images or typed.files or typed.external_blocks:
-                    conversation.add(_attached_line(typed), "[attached data]")
+                    conversation.add(_attached_line(typed), "[attached data]", source=asked)
         replies = [m for m in segment if isinstance(m, AIMessage)]
-        tools = [str(call.get("name") or "") for m in replies for call in m.tool_calls]
+        callers = [m for m in replies if m.tool_calls]
+        tools = [str(call.get("name") or "") for m in callers for call in m.tool_calls]
         if tools:
-            conversation.add(_activity_line(tools), "[activity]")
+            activity = _source(callers[0], positions, None, fresh)
+            conversation.add(_activity_line(tools), "[activity]", source=activity)
         finals = [m for m in replies if not m.tool_calls and _reply_text(m).strip()]
         if finals:
-            conversation.add(_reply_text(finals[-1]), "[assistant]")
+            final = finals[-1]
+            stamped = _parse_stamp(final.additional_kwargs.get(STAMP_CREATED_AT))
+            replied = _source(final, positions, stamped, fresh)
+            conversation.add(_reply_text(final), ASSISTANT_TAG, source=replied, dated=True)
             has_reply = True
     return _ExtractionInputs(user=user, conversation=conversation, has_reply=has_reply)
-
-
-def _cap_total(lines: Sequence[str]) -> tuple[list[str], bool]:
-    """B-300 D3 —— 总量上限:从最近的一行往前收,超了就停(更早的丢掉)。
-    返回 ``(留下的行, 是否超了)``。"""
-    kept: list[str] = []
-    used = 0
-    for line in reversed(lines):
-        used += len(line) + (1 if kept else 0)
-        if used > _EXTRACT_INPUT_CHAR_CAP:
-            return kept[::-1], True
-        kept.append(line)
-    return kept[::-1], False
 
 
 def _extract_json_object(text: str) -> str | None:
@@ -484,16 +659,24 @@ class ExtractedMemory:
     # P5b-2b ⑧ — LLM flag: this memory explicitly corrects prior info. Transient
     # (never persisted); threaded into reconcile to bias the UPDATE decision.
     is_correction: bool = False
-    # B-300 ② — set by the program from WHICH extraction pass produced it (never
-    # read from the reply): pass 1 → ``user_stated``, pass 2 → ``assistant_derived``.
+    # B-300 ② — set by the program, never read from the reply: pass 1 → ``user_stated``;
+    # pass 2 → ``user_confirmed`` when its ``basis`` / ``turn`` anchor on a real user
+    # line, else ``assistant_derived`` (redesign §5.4, ``memory_lines``).
     origin: MemoryOrigin | None = None
-    # B-300 redesign — hooks the reconcile reads; extraction (PR X) fills them from the
-    # line ``turn`` points at. Until then they stay unknown: no event date, no line
-    # time (an UPDATE is not re-judged by age), not in the new segment (a NOOP never
-    # refreshes the confirmed date).
+    # B-300 redesign — what the reply claims (transient, checked by the program):
+    # ``basis`` (pass 2 only), the line number ``turn``, and the raw ``event_date``.
+    basis: str | None = None
+    turn: int | None = None
+    claimed_event_date: str | None = None
+    # B-300 redesign — filled by the program from the line ``turn`` points at (the
+    # reconcile reads them): the checked event date, the line's send time, whether
+    # that line is in the turns this write-back covers, and the evidence pointer.
+    # Unknown (``None`` / ``False``) when the turn does not resolve.
     event_date: date | None = None
     line_at: datetime | None = None
     in_new_segment: bool = False
+    evidence_message_id: str | None = None
+    evidence_message_index: int | None = None
 
 
 #: Stream RT-2 PR-2 (review HIGH) — ceiling for extraction-scored confidence.
@@ -588,9 +771,23 @@ def _parse_extraction(text: str) -> list[ExtractedMemory] | None:
                     # Strict bool — only a real JSON `true` counts as a correction
                     # (a truthy string must not silently trip UPDATE recall).
                     is_correction=row.get("is_correction") is True,
+                    **_claims(row),
                 )
             )
     return out
+
+
+def _claims(row: Mapping[str, Any]) -> dict[str, Any]:
+    """B-300 重做 —— 回复里 ``basis`` / ``turn`` / ``event_date`` 的原样(程序随后核对)。
+    ``turn`` 只认真正的整数;``event_date`` 不是 ``null`` 就留成文字,核对不过再置空、计数。"""
+    basis = row.get("basis")
+    turn = row.get("turn")
+    claimed = row.get("event_date")
+    return {
+        "basis": basis.strip().lower() if isinstance(basis, str) else None,
+        "turn": turn if isinstance(turn, int) and not isinstance(turn, bool) else None,
+        "claimed_event_date": None if claimed is None else str(claimed),
+    }
 
 
 def _redact_memory(item: MemoryItem) -> MemoryItem:
@@ -1910,9 +2107,35 @@ async def _apply_delete(
     )
 
 
+def _settled(
+    pass_name: str, memory: ExtractedMemory, lines: Sequence[ExtractionLine]
+) -> ExtractedMemory:
+    """B-300 重做 §4 / §5.4 —— 程序按 ``turn`` 那一行定来源、置信度上限、证据指针、事件日期、
+    那一行的发送时间与在不在新段;降级、指针留空、事件日期置空各计一次。"""
+    if pass_name == _CONVERSATION_EXTRACTION:
+        settled = settle_conversation(memory.basis, memory.turn, memory.claimed_event_date, lines)
+    else:
+        settled = settle_user_text(memory.turn, memory.claimed_event_date, lines)
+    for check in settled.checks:
+        record_memory_extraction_check(pass_name=pass_name, check=check)
+    confidence = memory.confidence
+    if settled.max_confidence is not None:
+        confidence = min(confidence, settled.max_confidence)
+    return replace(
+        memory,
+        origin=settled.origin,
+        confidence=confidence,
+        event_date=settled.event_date,
+        line_at=settled.line_at,
+        in_new_segment=settled.in_new_segment,
+        evidence_message_id=settled.evidence_message_id,
+        evidence_message_index=settled.evidence_message_index,
+    )
+
+
 async def _extract_pass(
     pass_name: str,
-    lines: Sequence[str],
+    lines: Sequence[ExtractionLine],
     *,
     language: str | None,
     llm_caller: LLMCaller,
@@ -1921,7 +2144,7 @@ async def _extract_pass(
     """一次提炼:一次模型调用 + 解析;结果按四种计数(B-300 D3)。调用失败原样抛给调用方。"""
     prompt = [
         SystemMessage(content=_extract_system(pass_name, language)),
-        HumanMessage(content="\n".join(lines)),
+        HumanMessage(content=render_lines(lines)),
     ]
     with expert_work_span(ExpertWorkComponent.MEMORY, "extract"):
         response = await token.run_cancellable(llm_caller(messages=prompt, tools=[]))
@@ -1933,26 +2156,16 @@ async def _extract_pass(
     else:
         outcome = "extracted" if parsed else "empty"
     record_memory_extraction(pass_name=pass_name, outcome=outcome)
-    memories = parsed or []
-    if pass_name == _CONVERSATION_EXTRACTION:
-        # 来自助手:无论模型给多少,置信度压到 0.6 以内(B-300 ①;与整理汇总共用一个数)。
-        return [
-            replace(
-                m,
-                confidence=min(m.confidence, ASSISTANT_DERIVED_MAX_CONFIDENCE),
-                origin="assistant_derived",
-            )
-            for m in memories
-        ]
-    # B-300 ② —— 第一次提炼只看得到用户输入的文字:产出一律是「用户消息里说的」。
-    return [replace(m, origin="user_stated") for m in memories]
+    # B-300 ② / 重做 §5.4 —— 第一次只看得到用户输入的文字:一律「用户消息里说的」;第二次由程序
+    # 按 basis + turn 定「用户确认」(≤ 0.8)或「来自助手」(≤ 0.6),无论模型给多少。
+    return [_settled(pass_name, m, lines) for m in parsed or []]
 
 
-def _pass_lines(pass_name: str, pass_input: _PassInput) -> list[str]:
+def _pass_lines(pass_name: str, pass_input: _PassInput) -> list[ExtractionLine]:
     """一次提炼的输入行:总量上限内的最近几行;顺带记两个 D3 计数。"""
     if pass_input.truncated:
         record_memory_extraction_message_truncated(pass_name=pass_name, count=pass_input.truncated)
-    lines, capped = _cap_total(pass_input.lines)
+    lines, capped = cap_lines(pass_input.lines, _EXTRACT_INPUT_CHAR_CAP)
     if capped:
         record_memory_extraction_input_capped(pass_name=pass_name)
     return lines
@@ -1965,12 +2178,13 @@ async def _extract_two_passes(
     llm_caller: LLMCaller,
     token: CancellationToken,
     log_label: str,
+    whole_conversation: bool = True,
 ) -> tuple[list[ExtractedMemory], bool]:
     """B-300 ① —— 两次提炼(并发),产出合在一起:第一次的在前,同内容只留一条。
 
     返回 ``(产出, 是否有一次调用失败)``。一次的普通失败只丢那一次;取消原样抛出,并先取消另一次。"""
-    inputs = _extraction_inputs(messages, user_text_messages)
-    plan: list[tuple[str, list[str]]] = []
+    inputs = _extraction_inputs(messages, user_text_messages, whole_conversation=whole_conversation)
+    plan: list[tuple[str, list[ExtractionLine]]] = []
     if inputs.user.lines:
         plan.append((_USER_TEXT_EXTRACTION, _pass_lines(_USER_TEXT_EXTRACTION, inputs.user)))
     if inputs.has_reply:
@@ -1979,9 +2193,9 @@ async def _extract_two_passes(
     if not plan:
         return [], False
     # 语言只按用户输入的文字判(附件、外部内容、助手的话都不算,B-300 ④)。
-    language = detect_user_language(inputs.user.lines)
+    language = detect_user_language([line.text for line in inputs.user.lines])
 
-    async def guarded(name: str, lines: list[str]) -> list[ExtractedMemory] | Exception:
+    async def guarded(name: str, lines: list[ExtractionLine]) -> list[ExtractedMemory] | Exception:
         # 普通失败交回来(只丢这一次);取消原样抛出,TaskGroup 随即取消另一次(review L3)。
         try:
             return await _extract_pass(
@@ -2045,6 +2259,7 @@ async def flush_messages_to_memory(
     write_min_importance: float = 0.0,
     audit_logger: AuditLogger | None = None,
     user_text_messages: Sequence[BaseMessage] | None = None,
+    whole_conversation: bool = True,
 ) -> int:
     """:func:`flush_messages_with_outcome` 只取写入条数 —— 压缩前抢存与评测脚本用。"""
     outcome = await flush_messages_with_outcome(
@@ -2064,6 +2279,7 @@ async def flush_messages_to_memory(
         write_min_importance=write_min_importance,
         audit_logger=audit_logger,
         user_text_messages=user_text_messages,
+        whole_conversation=whole_conversation,
     )
     return outcome.written
 
@@ -2087,6 +2303,7 @@ async def flush_messages_with_outcome(
     before_store: BeforeStore | None = None,
     audit_logger: AuditLogger | None = None,
     user_text_messages: Sequence[BaseMessage] | None = None,
+    whole_conversation: bool = True,
 ) -> FlushOutcome:
     """Extract durable memories from ``messages``, embed, and persist them.
 
@@ -2141,6 +2358,9 @@ async def flush_messages_with_outcome(
     调用方(评测脚本)显式声明「这几条消息整条都是用户文字」,不经 ``_build_human_message`` 的
     白名单标记。
 
+    B-300 重做(PR X)—— 每条记忆带证据指针(``turn`` 那一行的消息 id + 在 ``messages`` 里的序号)
+    与事件日期;``whole_conversation`` 为假(压缩前抢存:``messages`` 是对话中段)时不写序号。
+
     B-300 D12 —— 返回的条数是实际落库的条数(与库里已有同内容的、被拦的都不算;去重合并里
     「更新」由 ``supersede`` 取代出来的新行要算,「删除」只作废旧行、不算)。出错走失败分支时
     条数一律是 0、``failed`` 为真 —— 即使去重合并里已有取代落了库、之后的 ``write`` 才抛错。
@@ -2158,6 +2378,7 @@ async def flush_messages_with_outcome(
             llm_caller=llm_caller,
             token=token,
             log_label=log_label,
+            whole_conversation=whole_conversation,
         )
         # Stream Memory-Enhance (M-2) — write-filter: drop low-value memories
         # before embedding (saves embed cost on dropped items). Applied here,
@@ -2201,8 +2422,10 @@ async def flush_messages_with_outcome(
                 # B-300 ② —— 来源由提炼次序决定;向量模型名。
                 origin=mem.origin,
                 embedding_model=embedding_model,
-                # B-300 重做 —— 事件日期(提炼给了才有,PR X)。
+                # B-300 重做 —— 事件日期与证据指针(程序按 ``turn`` 核对后留下的)。
                 occurred_on=mem.event_date,
+                evidence_message_id=mem.evidence_message_id,
+                evidence_message_index=mem.evidence_message_index,
             )
             for mem, vector in zip(extracted, vectors, strict=True)
         ]
@@ -2405,6 +2628,8 @@ def make_pre_compaction_flush(
             agent_name=agent_name,
             write_min_importance=write_min_importance,
             audit_logger=audit_logger_from_config(config),
+            # 拿到的是对话中段:消息序号不是整段对话里的,证据指针不写序号。
+            whole_conversation=False,
         )
 
     return flush

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -44,7 +45,7 @@ _USER = UUID("00000000-0000-4000-8000-0000000000b1")
 
 #: 两段指令里各自独有的一句(评测脚本 ``b300_live`` 靠它们认出第几次提炼,一字不改)。
 PASS1_MARK = "The other side of the conversation is not shown."
-PASS2_MARK = "Every line starts with a tag:"
+PASS2_MARK = "Each line starts with its number in brackets and a tag:"
 
 _EMPTY = '{"memories": []}'
 
@@ -75,8 +76,14 @@ class _ByPassLLM:
         return [c for c in self.calls if self._pass_of(c) == which]
 
     def input_of(self, which: str) -> str:
+        """那一次的输入,去掉行号与 ``=== new ===`` 标记(B-300 重做 PR X;编号、标记、日期的
+        格式由 ``test_memory_extraction_redesign`` 钉住,这里只看给了哪些行、行里是什么)。"""
         [call] = self.calls_of(which)
-        return str(call[1].content)
+        return "\n".join(
+            re.sub(r"^\[\d+\] ", "", line)
+            for line in str(call[1].content).splitlines()
+            if line != "=== new ==="
+        )
 
     def system_of(self, which: str) -> str:
         [call] = self.calls_of(which)
@@ -268,82 +275,22 @@ async def test_prompts_carry_the_design_text() -> None:
     await _flush(_turn_with_tools(), llm)
     first = llm.system_of("user")
     assert first.startswith(
-        "You are a memory extraction module. The input is every message one user typed in a\n"
-        "conversation, one per line, oldest first. The other side of the conversation is not shown."
+        "You are a memory extraction module. The input is messages one user typed in a\n"
+        "conversation, one per line, oldest first, each starting with its number in brackets.\n"
+        "The other side of the conversation is not shown."
     )
     assert "- A question, a guess, a hypothetical, or a repeat of what someone else said" in first
     # 打分、有效天数、JSON 格式沿用现有文字;is_correction 一句用户 11-14 改过(设计 §4.2)。
     assert '"expected_valid_days"' in first
     assert '"is_correction": true ONLY when the same message itself says' in first
     second = llm.system_of("conversation")
+    # B-300 重做:第二次整段换成附录 A(逐字由 test_memory_extraction_redesign 钉住)。
     assert second.startswith(
-        "You are a memory extraction module. The input is a conversation transcript, one message\n"
-        "per line. Every line starts with a tag:"
+        "You are a memory extraction module. The input is part of a conversation, one message per\n"
+        "line. Each line starts with its number in brackets and a tag:"
     )
-    assert "Never write it as a plain statement of fact with no source." in second
     for system in (first, second):
         assert "From the conversation, extract" not in system
-
-
-async def test_conversation_pass_does_not_restate_what_the_user_said() -> None:
-    """用户 11-14(验收 118.5 重跑,3a4cfd3b3):第二次提炼把 [user] 行里用户自己说全的话又记了一遍
-    (换个说法、加上出处),同一件事多出一条来自助手的。复审(11-14)后合成一段、一条规则:
-
-    * 单独读得懂的 [user] 行由另一次记,这里不再记(换说法、加出处、助手复述 / 确认 / 用到都不算);
-    * 助手从用户的话里得出的结论照记,只是用户的话本身不记;
-    * 离开助手上一条读不懂的 [user] 行(短回答、同意、「现在是 Y 了」一类短更正)由这一次记,带出处,
-      改了什么就带 ``is_correction``(设计 §6.2 的同一把尺子);
-    * 助手得出、用户随后否定的,不单独当结论记;
-    * 「只记」的范围就是上面两类(含助手做了什么、产出了什么、定了什么),不另列一份更窄的。"""
-    llm = _ByPassLLM()
-    await _flush(_turn_with_tools(), llm)
-    second = " ".join(llm.system_of("conversation").split())
-    passage = (
-        "What a [user] line says that can be understood on its own is recorded by another "
-        "pass: do not record it again here — not in other words, not with a source added, and "
-        "not when an [assistant] line repeats, confirms or uses it. A conclusion the assistant "
-        "reached from what the user said is still recorded here; only the user's statement "
-        "itself is not. A tool result or record lookup that only confirms what the user "
-        "currently says (their latest value) is not recorded again; one that differs from the "
-        "user's latest statement is recorded, with its source. What a [user] line says that "
-        "cannot be understood without the "
-        "assistant's previous message — a short answer, an agreement, or a short correction "
-        'such as "it\'s Y now" or "no, it\'s the other one" — is recorded here, with its '
-        'source, and with "is_correction" when it changes something; one line can hold both '
-        "kinds, so judge each statement in it. Something the assistant "
-        "concluded that the user then rejected is not recorded as a conclusion on its own. "
-        "Record only the two sorts above; they include what the assistant reports that tool "
-        "results or attachments told it."
-    )
-    assert passage in second
-    # 用户 11-14(评测 A12):查记录 / 工具只是印证了用户说过的值 → 不再记一条「助手查到并确认了 X」;
-    # 查到的与用户说的不同 → 照记、带出处。
-    assert (
-        "A tool result or record lookup that only confirms what the user currently says (their "
-        "latest value) is not recorded again;" in second
-    )
-    assert "one that differs from the user's latest statement is recorded, with its source." in (
-        second
-    )
-    # 「两类」里仍有「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它)。
-    assert '- what the assistant did or produced, and what was decided ("episodic");' in second
-    assert second.index("of two sorts only:") < second.index(passage)
-    # 复审 LOW(11-14):第二类含「用户纠正助手才定下的」;[user] 标签说明只说「单独读得懂的」另记。
-    assert (
-        "what was settled only because the user agreed with, answered or corrected the assistant"
-        in second
-    )
-    assert (
-        "[user] — text the user typed. It is here for context; what a [user] line states on "
-        "its own is recorded separately." in second
-    )
-    # 合成一条规则:原来那句与上一版另起的两句都不在了。
-    assert "states completely on its own" not in second
-    assert "Record only what the assistant found" not in second
-    # 原有的「助手提出、用户同意」示例、出处要求、复述旧记录不再记都还在。
-    assert '"the assistant proposed ... and the user agreed"' in second
-    assert "Never write it as a plain statement of fact with no source." in second
-    assert "When the assistant only repeats something from earlier records or memory" in second
 
 
 async def test_no_user_text_skips_pass_one() -> None:
@@ -521,8 +468,8 @@ async def test_user_text_pass_records_dated_one_off_values() -> None:
         "saying what it is — a reading or measurement, an id or number, a current status — is "
         "recorded even though it may change, except passwords, one-time codes, bank card or "
         "bank account numbers and other secrets, which are never recorded. Write it with the "
-        "date or time it refers to, so it is not later taken for a current value: a line that "
-        'starts with a date in brackets was sent on that date, so turn "this morning", '
+        "date or time it refers to, so it is not later taken for a current value: a date in "
+        'brackets after the line number is the day that line was sent, so turn "this morning", '
         '"yesterday" and the like in that line into a date counted from it; in a line without '
         "a date, leave such words as they are."
     )

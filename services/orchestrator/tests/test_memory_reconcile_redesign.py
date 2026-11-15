@@ -794,7 +794,7 @@ async def test_a_naive_line_time_is_read_as_utc() -> None:
 # ─── 写回整体:两段合并、出错时只直接写还没写的 ───────────────────────────────────
 
 PASS1_MARK = "The other side of the conversation is not shown."
-PASS2_MARK = "Every line starts with a tag:"
+PASS2_MARK = "Each line starts with its number in brackets and a tag:"
 
 
 @dataclass

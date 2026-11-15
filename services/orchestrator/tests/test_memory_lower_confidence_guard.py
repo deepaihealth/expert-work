@@ -55,7 +55,7 @@ def _ids_as_short_ids(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 PASS1_MARK = "The other side of the conversation is not shown."
-PASS2_MARK = "Every line starts with a tag:"
+PASS2_MARK = "Each line starts with its number in brackets and a tag:"
 _EMPTY = '{"memories": []}'
 
 
