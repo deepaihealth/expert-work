@@ -20,6 +20,7 @@ if str(_HERE) not in sys.path:
 
 import b300_live as live  # noqa: E402
 import b300_plan as plan  # noqa: E402
+import b300_redesign_scenarios as ns  # noqa: E402
 import b300_scenarios as sc  # noqa: E402
 
 INPOD_SOURCE = _HERE / "b300_inpod.py"
@@ -56,6 +57,15 @@ PHASES: dict[str, Phase] = {
         Phase("c2-baseline", ("C2",), "conversation", True, single="always"),
         Phase("c4-baseline", ("C4",), "c4", True, single="always"),
         Phase("c5-baseline", ("C5",), "c5", True, single="always"),
+        # B-300 重做(设计 2026-11-15 §11.1):回归闸门 = A 组原样的 P6 / P7 单元;正式一轮的 S 组、
+        # 形状留出集、A13~A15、同一天读数都在本机写回,与 A 组同一条路子。
+        Phase("gate", ("P6", "P7"), "extraction", False),
+        Phase("s", ns.S_CLASSES, "extraction", False),
+        Phase("shape", ns.SHAPE_CLASSES, "extraction", False),
+        Phase("a13", ("A13",), "extraction", False),
+        Phase("a14", ("A14",), "extraction", False),
+        Phase("a15", ("A15",), "extraction", False),
+        Phase("sd", ns.SD_CLASSES, "extraction", False),
     )
 }
 
@@ -75,21 +85,38 @@ PHASE_BUDGET = {
     "compare-before": "A",
     "compare-after": "A",
     "calibration-a": "A",
+    **dict.fromkeys(("s", "shape", "a13", "a14", "a15", "sd"), "A"),
+    "gate": "G",
+    "calibration-g": "G",
 }
+#: 判官的记账段名后缀(§11.8 ③:判官单独一段子预算);校准只有判官调用。
+JUDGE_SUFFIX = "-judge"
 
 
 def budget_of(phase: str, *, pilot: bool = False) -> str:
-    return "pilot" if pilot else PHASE_BUDGET.get(phase, "B")
+    """记账用的 phase → 分预算的段;判官的调用(``<段>-judge``、校准)记在 ``<段>-judge``。"""
+    if pilot:
+        return "pilot"
+    if phase.endswith(JUDGE_SUFFIX):
+        return PHASE_BUDGET.get(phase.removesuffix(JUDGE_SUFFIX), "B") + JUDGE_SUFFIX
+    if phase.startswith("calibration"):
+        return PHASE_BUDGET.get(phase, "B") + JUDGE_SUFFIX
+    return PHASE_BUDGET.get(phase, "B")
+
+
+def parent_budget(budget: str) -> str:
+    """``A-judge`` → ``A``(报价覆盖的段按父段认)。"""
+    return budget.removesuffix(JUDGE_SUFFIX)
 
 
 def scenarios_for(phase: Phase) -> list[sc.Scenario]:
     if phase.classes == ("D",):
         return sc.build_compare()
-    return [s for s in sc.build_all() if s.cls in phase.classes]
+    return [s for s in [*sc.build_all(), *ns.build_redesign()] if s.cls in phase.classes]
 
 
 def all_scenarios() -> dict[str, sc.Scenario]:
-    return sc.by_id([*sc.build_all(), *sc.build_compare()])
+    return sc.by_id([*sc.build_all(), *sc.build_compare(), *ns.build_redesign()])
 
 
 def phase_vendors(phase: Phase, q: Mapping[str, Any]) -> list[str]:

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -15,6 +15,9 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import b300_plan as plan  # noqa: E402
+import b300_redesign_base as base  # noqa: E402
+import b300_redesign_checks as chk  # noqa: E402
+import b300_redesign_scenarios as ns  # noqa: E402
 import b300_report as rep  # noqa: E402
 from b300_phases import (  # noqa: E402
     PHASES,
@@ -49,7 +52,7 @@ def judge_items(out: Path, phase: Phase) -> tuple[list[rep.JudgeItem], dict[str,
             continue
         s = scenarios[r["scenario_id"]]
         if phase.kind == "extraction":
-            checks, more = rep.a_checks(r, s) if phase.classes != ("D",) else ({}, [])
+            checks, more = _extraction_checks(phase, r, s)
             facts[key] = {"checks": checks}
             items += more
             continue
@@ -108,7 +111,34 @@ def judge_items(out: Path, phase: Phase) -> tuple[list[rep.JudgeItem], dict[str,
     return items, facts
 
 
+def _extraction_checks(
+    phase: Phase, r: Mapping[str, Any], s: Any
+) -> tuple[dict[str, Any], list[rep.JudgeItem]]:
+    """A 组走 ``a_checks``;回归闸门与重做的各段走 ``b300_redesign_checks``;另外每条带事件日期的
+    记忆送判官判是不是一次性的事(§11.3,全部提炼段,不含对比与基线)。"""
+    if phase.classes == ("D",):
+        return {}, []
+    if phase.name == GATE_PHASE:
+        checks, items = chk.gate_checks(r, s)
+    elif s.cls in ns.REDESIGN_CLASSES:
+        checks, items = chk.checks(r, s)
+    else:
+        checks, items = rep.a_checks(r, s)
+    if not phase.baseline:
+        items = [*items, *chk.event_date_items(r)]
+    return checks, items
+
+
+#: 回归闸门的段名;它的线带 ``G-`` 前缀,与正式一轮 A 组的 P6 / P7 分开(§11.1 第 2 步)。
+GATE_PHASE = "gate"
+
+
 # --------------------------------------------------------------------------- 报告
+
+
+def _unjudged(verdicts: Mapping[str, Any], key: str) -> str:
+    """没有判分可用的原因:还没判(``judge_missing``)/ 判了但没有多数(``judge_split``)。"""
+    return "judge_missing" if verdicts.get(key) is None else "judge_split"
 
 
 def _bad(verdicts: Mapping[str, Any], key: str) -> bool | None:
@@ -116,12 +146,18 @@ def _bad(verdicts: Mapping[str, Any], key: str) -> bool | None:
     return None if row is None else row.get("verdict")
 
 
+Missing = dict[tuple[str, str, str], dict[str, int]]
+
+
 def collect_outcomes(
     out: Path,
-) -> tuple[dict[tuple[str, str, str], list[tuple[str, bool]]], dict[str, Any], dict[str, Any]]:
+) -> tuple[
+    dict[tuple[str, str, str], list[tuple[str, bool]]], dict[str, Any], dict[str, Any], Missing
+]:
     outcomes: dict[tuple[str, str, str], list[tuple[str, bool]]] = defaultdict(list)
     counts: dict[str, Any] = defaultdict(lambda: defaultdict(int))
     baseline: dict[str, Any] = {}
+    missing: Missing = defaultdict(lambda: defaultdict(int))
     for name, phase in PHASES.items():
         if not (out / name).exists() or phase.classes == ("D",):
             continue
@@ -139,7 +175,10 @@ def collect_outcomes(
             r = records[key]
             cls, vendor, domain = r["cls"], r["vendor"], r["domain"]
             if phase.kind == "extraction":
-                _a_outcomes(outcomes, counts[name], r, info["checks"], verdicts)
+                label = f"G-{cls}" if name == GATE_PHASE else cls
+                _a_outcomes(outcomes, missing, counts[name], r, info["checks"], verdicts, label)
+                if not phase.baseline:
+                    _event_date_outcomes(outcomes, missing, r, verdicts)
                 continue
             if not info["recall_ok"]:
                 counts[name]["not_recalled_excluded"] += 1
@@ -152,7 +191,7 @@ def collect_outcomes(
                 continue
             bad = _bad(verdicts, f"{key}|answer")
             if bad is None:
-                counts[name]["judge_split_or_missing"] += 1
+                counts[name][_unjudged(verdicts, f"{key}|answer")] += 1
                 continue
             if phase.baseline:
                 red_rows.append((r["scenario_id"], bad))
@@ -170,7 +209,12 @@ def collect_outcomes(
                 measured = [(domain, bad) for _sid, domain, bad, _c in summary_rows]
                 if measured:  # 一次都没测到就不出这条线(「未测到」另列)
                     outcomes[("C5", "summary_violation", "consolidation")] += measured
-    return outcomes, {k: dict(v) for k, v in counts.items()}, baseline
+    return (
+        outcomes,
+        {k: dict(v) for k, v in counts.items()},
+        baseline,
+        {k: dict(v) for k, v in missing.items()},
+    )
 
 
 def _c5_summaries(
@@ -214,67 +258,92 @@ def _c5_summaries(
         clustered = True  # 没凑成簇的上面已经记成「未测到」
         bad = _bad(verdicts, f"{r['user']}|summary") if info.get("summaries") else False
         if bad is None:
-            counts["judge_split_or_missing"] += 1
+            counts[_unjudged(verdicts, f"{r['user']}|summary")] += 1
             continue
         rows.append((r["scenario_id"], r["domain"], bool(bad), clustered))
     return rows
 
 
+#: 检查里只报数、不进线的键(另有专门的计数)。
+_INFO_KEYS = frozenset(
+    {
+        "two_pass",
+        "missing",
+        "counts",
+        "is_correction",
+        "user_version",
+        "original_superseded",
+        "user_side_rows",
+        "user_side_max_per_kind",
+        "origin_unknown",
+        "assistant_restatements",
+    }
+)
+#: 待判项的检查名与指标名不同的(P8)。
+_ITEM_CHECK = {"pass1_statement": "statement"}
+#: 跨全部提炼段合计的指标(§11.3「误伤」)。
+_AGGREGATE = frozenset({"collateral"})
+
+
 def _a_outcomes(
     outcomes: dict[tuple[str, str, str], list[tuple[str, bool]]],
+    missing: Missing,
     counts: Any,
     r: Mapping[str, Any],
     checks: Mapping[str, Any],
     verdicts: Mapping[str, Any],
+    cls: str,
 ) -> None:
-    cls, vendor, domain, key = r["cls"], r["vendor"], r["domain"], r["key"]
-    if not checks.get("two_pass"):
+    """一条提炼记录 → 各线的(领域, 坏不坏)。「坏」类指标 ``True`` = 坏;「好」类
+    (``chk.GOOD_METRICS``、``y_valid``)``True`` = 做到了;``None`` = 看判官(``<键>|<检查名>``)。
+    平台没有字段而量不了的,记进 ``missing``(报告判 incomplete、写明缺哪个字段)。"""
+    vendor, domain, key = r["vendor"], r["domain"], r["key"]
+    if "two_pass" in checks and not checks.get("two_pass"):
         counts["pre_pr1_or_no_two_pass"] += 1
         return
-
-    def add(metric: str, bad: bool | None) -> None:
-        if bad is None:
-            counts["judge_split_or_missing"] += 1
+    good_metrics = chk.GOOD_METRICS | {"y_valid"}
+    for metric, value in checks.items():
+        if metric in _INFO_KEYS:
+            continue
+        if value is None:
+            row = verdicts.get(f"{key}|{_ITEM_CHECK.get(metric, metric)}")
+            verdict = None if row is None else row.get("verdict")
+            if verdict is None:
+                counts["judge_missing" if row is None else "judge_split"] += 1
+                continue
+            bad = not verdict if metric in good_metrics else bool(verdict)
         else:
-            outcomes[(cls, metric, vendor)].append((domain, bool(bad)))
-
-    for metric in (
-        "missed",
-        "pass1_leak",
-        "pass1_fabricate",
-        "user_memory_lost",
-        "user_side_duplicate",
-    ):
-        if metric in checks:
-            add(metric, checks[metric])
-    if "plain" in checks:
-        add(
-            "plain",
-            checks["plain"] if checks["plain"] is not None else _bad(verdicts, f"{key}|plain"),
-        )
-    if "pass1_statement" in checks:
-        value = checks["pass1_statement"]
-        add("pass1_statement", value if value is not None else _bad(verdicts, f"{key}|statement"))
-    if "attributed" in checks:
-        good = (
-            checks["attributed"]
-            if checks["attributed"] is not None
-            else _bad(verdicts, f"{key}|attributed")
-        )
-        if cls == "P9":
-            add(
-                "attributed_correction",
-                None if good is None else not (good and checks.get("is_correction")),
-            )
-            add("y_valid", not checks.get("y_valid"))
-        else:
-            add("attributed", None if good is None else not good)
+            bad = not value if metric in good_metrics else bool(value)
+        outcomes[("ALL" if metric in _AGGREGATE else cls, metric, vendor)].append((domain, bad))
+    for metric, field in (checks.get("missing") or {}).items():
+        missing[(cls, metric, vendor)][field] += 1
+    for name, n in (checks.get("counts") or {}).items():
+        counts[f"{cls}.{name}"] += int(n)
     if cls == "A10":
         counts["a10_user_version"] += bool(checks.get("user_version"))
+        counts["a10_original_superseded"] += bool(checks.get("original_superseded"))  # 也在线里
     if cls == "A12":  # 用户 11-14:来自助手的复述允许,计数报出
         counts["a12_assistant_restatements"] += int(checks.get("assistant_restatements", 0))
         counts["a12_user_side_zero"] += checks.get("user_side_rows") == 0  # 不算违规,单列
         counts["a12_origin_unknown"] += int(checks.get("origin_unknown", 0))
+
+
+def _event_date_outcomes(
+    outcomes: dict[tuple[str, str, str], list[tuple[str, bool]]],
+    missing: Missing,
+    r: Mapping[str, Any],
+    verdicts: Mapping[str, Any],
+) -> None:
+    """§11.3「不是事件却被标了事件日期」:每条带事件日期的记忆一行(判官 yes = 不是一次性的事)。"""
+    if not base.capability(r["result"], "event_date"):
+        missing[("ALL", "event_date_not_event", r["vendor"])]["event_date"] += 1
+        return
+    prefix = f"{r['key']}|event_date|"
+    for vkey, row in verdicts.items():
+        if vkey.startswith(prefix) and row.get("verdict") is not None:
+            outcomes[("ALL", "event_date_not_event", r["vendor"])].append(
+                (r["domain"], bool(row["verdict"]))
+            )
 
 
 def compare_counts(out: Path) -> dict[str, Any]:
@@ -305,8 +374,44 @@ def compare_counts(out: Path) -> dict[str, Any]:
     }
 
 
+REDESIGN_PHASES = ("gate", "s", "shape", "a13", "a14", "a15", "sd")
+#: 重做设计 §11.3 末、§11.2 的照实说明。
+REDESIGN_DISCLOSURES = (
+    "统计力(§11.3):30 次里 0 次只能说明真实比例大致低于 10%,15 次里 0 次约 20%;这些线挡得住"
+    "明显的问题,挡不住低比例的偶发。",
+    "可比性(§11.3):11-15 及以前的 P6 / P7、A12 是在「每轮整段重抽」下量的,本项之后是切片 + "
+    "新指令,不能直接比;以回归闸门那一次为新基线,旧数只说明问题存在。",
+    "回归闸门(§11.1 第 2 步)按原文只设总数线(空列表各 ≤ 2 / 30、用户确认且有据各 ≥ 24 / 30),"
+    "不设逐领域;它用 A 组原样的 P6 / P7 单元(只在最后一轮写回一次)。",
+    "形状留出集只报数;它由另一位没看过提示词例子的人写(20 个,4 种形状 x 5 个领域,中英各 10),"
+    "脚本只转成数据结构、给期望值补了几种写法,并把一个卡号的首位改成 0。",
+    "误伤只在种了旁观记忆的 S 组上量(每个 S 场景一条同领域、无关的用户说的记忆);A 组原样不动,"
+    "没有旁观记忆。",
+    "A14 量的是每次提炼输入里分隔行以下的新段(按字符数),不含上下文行,与设计 §11.3「最后 3 轮"
+    "的平均 ≤ 前 3 轮平均的 1.5 倍」口径不同:上下文从 0 行热身到上限,前 3 轮天然偏短,连上下文"
+    "一起量会让切片正确时也在 1.5 上下(审查二);上下文另查不超过第一次 2 条、第二次 4 行。",
+    "形状留出集的 H2(隔一轮才回答):按 §5.4 这种回答会被降成来自助手,所以 H2 的 "
+    "user_confirmed_other_origin 是预期的,不算漏记。",
+    "切片起点按参数名 start_message_count 传给写回入口;被测代码不收这个参数时 A13、A14 报 "
+    "incomplete,"
+    "其余各段照整段重抽量。",
+)
+
+
+def votes_disclosures(out: Path) -> list[str]:
+    """审查 M5:报告写明每段判官实际用了几票(按判分行里的票数数,不按假设)。"""
+    lines = []
+    for name in PHASES:
+        rows = read_jsonl(out / name / "verdicts.jsonl")
+        per = Counter(len(r.get("votes") or []) for r in rows if r.get("votes"))
+        if per:
+            shown = "、".join(f"{v} 票 {n} 条" for v, n in sorted(per.items()))
+            lines.append(f"{name}:判官每条 {shown}(B / C 组按拍板 3 票;A 组与闸门按报价)。")
+    return lines
+
+
 def report(out: Path, q: Mapping[str, Any] | None) -> dict[str, Any]:
-    outcomes, counts, baseline = collect_outcomes(out)
+    outcomes, counts, baseline, missing = collect_outcomes(out)
     carried = {
         name: len(read_jsonl(out / name / "carried.jsonl"))
         for name in PHASES
@@ -338,7 +443,13 @@ def report(out: Path, q: Mapping[str, Any] | None) -> dict[str, Any]:
         all_vendors=vendors,
         cuts_applied=cuts,
         baseline=baseline,
+        missing=missing,
     )
+    body["disclosures"] += votes_disclosures(out)
+    if any(name in REDESIGN_PHASES for name in meta) or any(
+        (out / name).exists() for name in REDESIGN_PHASES
+    ):
+        body["disclosures"] += REDESIGN_DISCLOSURES
     if (out / "compare-before").exists() or (out / "compare-after").exists():
         body["compare"] = compare_counts(out)
     # 从旧报价搬过来的记录(``prepare --resume-from``)与新跑的合在一起算;这里报搬了多少。

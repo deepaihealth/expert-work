@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import sys
@@ -43,6 +44,8 @@ __all__ = [
     "TEST_STATE_DIR_ENV",
     "Guard",
     "LockedError",
+    "RoomGate",
+    "Slot",
     "SpendLedger",
     "SpendStopError",
     "StateDirError",
@@ -232,6 +235,19 @@ class Guard:
     def may_spend(self, phase: str) -> bool:
         return self.blocked is None and self._budget(phase) not in self.phase_refused
 
+    def room(self, phase: str) -> float:
+        """这一段现在还能预留多少(止损线、¥400 总账、所属段的分预算里最紧的那条);只读,不落账。"""
+        rooms = [self.stop_line - self.spent, self.global_cap - self.others - self.spent]
+        budget = self._budget(phase)
+        if budget in self.phase_caps:
+            rooms.append(self.phase_caps[budget] - self.phase_spent(budget))
+        return min(rooms)
+
+    def fits(self, phase: str, cap: float) -> bool:
+        """这一笔现在预留得下(没停、这段没被拒、装得进 :meth:`room`,边上留一点余量免得浮点误差让
+        :meth:`reserve` 撞线)。不落账、不止损。"""
+        return self.may_spend(phase) and cap <= self.room(phase) - 1e-9
+
     def block(self, reason: str) -> None:
         if self.blocked is None:
             self.blocked = reason
@@ -352,3 +368,53 @@ class Guard:
                 self.blocked or f"the spend ledger could not be written ({type(exc).__name__})"
             )
             raise SpendStopError(self.blocked) from exc
+
+
+@dataclass
+class Slot:
+    """:class:`RoomGate` 给出的一个位置:``remaining`` = 答应给它、它还没预留的额度。"""
+
+    remaining: float
+
+
+class RoomGate:
+    """判官的并发随剩余额度收缩(设计 2026-11-15 §11.8 ②):至多 ``limit`` 项同时在飞;一项要几票就先
+    要到几笔最坏值的额度(``count``),装不进剩余额度(扣掉已答应给在飞各项、它们还没预留的)时,
+    **等在飞的结算后再发**,而不是让 :meth:`Guard.reserve` 撞线、停下整份报价。一项都没在飞仍装不下
+    = 这一段的钱真的用完了:``acquire`` 返回 ``None``,调用方不发、不止损(没判的项留给下次)。
+    每一票预留之前调 :meth:`consume`(同一个协程里不让出)。只在一个事件循环里用。"""
+
+    def __init__(self, guard: Guard, phase: str, *, limit: int) -> None:
+        self.guard, self.phase, self.limit = guard, phase, limit
+        self.in_flight = 0
+        self.promised = 0.0
+        self._cond = asyncio.Condition()
+
+    async def acquire(self, cap: float, *, count: int = 1) -> Slot | None:
+        need = cap * count
+        async with self._cond:
+            while True:
+                if not self.guard.may_spend(self.phase):
+                    return None
+                if self.in_flight < self.limit and self.guard.fits(
+                    self.phase, need + self.promised
+                ):
+                    self.in_flight += 1
+                    self.promised += need
+                    return Slot(need)
+                if self.in_flight == 0:
+                    return None
+                await self._cond.wait()
+
+    def consume(self, slot: Slot, cap: float) -> None:
+        """这一票马上要预留:它从「答应的」转成账上的预留。"""
+        used = min(cap, slot.remaining)
+        slot.remaining -= used
+        self.promised -= used
+
+    async def release(self, slot: Slot) -> None:
+        async with self._cond:
+            self.in_flight -= 1
+            self.promised -= slot.remaining
+            slot.remaining = 0.0
+            self._cond.notify_all()

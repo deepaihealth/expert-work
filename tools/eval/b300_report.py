@@ -5,7 +5,9 @@
   前提(种下的那条确实被召回、C4 / C5 的前提)与判官提示词。
 * :data:`LINES`:通过线。**C 组的线全部是「待用户确认」**(§8.7),报告里只说「按提出的线会过 /
   不过」,从不说成验收通过;B 组的线是 11-11 拍板 ①;P6 / P7 / P9 的线是 §10.2 第 1 条;其余 A 组
-  的线是 §8.2 所列(本文安排)。
+  的线是 §8.2 所列(本文安排)。B-300 重做(设计 2026-11-15)的线 —— 回归闸门、S 组、A13~A15、
+  同一天读数、误伤、事件日期误标 —— 是 §11.1 / §11.3(用户 11-15 按建议定);P6 / P7 / P9 的来源
+  改读字段、判官只判内容有据(§11.4 末),平台没有 ``user_confirmed`` 时报「incomplete」。
 * :func:`build_report`:按类 x 家 x 领域汇总、判线;C1 / C3 只在一家上跑时写明(§8.6 删减 ③);
   基线(证明会红)的留用 / 换掉;每段记录用的发布版本与提交。
 """
@@ -24,15 +26,25 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import b300_live as live
+import b300_redesign_base as base
 import b300_scenarios as sc
+
+#: 送判官的一项(定义在 ``b300_redesign_base``,两边共用;这里沿用原来的名字)。
+JudgeItem = base.JudgeItem
 
 APPROVED_B = "已拍板 ①(11-11)"
 APPROVED_SHORT = "已拍板(§10.2 第 1 条)"
 DESIGN_A = "设计 §8.2 所列(本文安排)"
 APPROVED_A12 = "已拍板(用户 11-14,§10.2 第 10 条)"
 PENDING = "待用户确认(§8.7)"
-#: 同 ``expert_work.persistence.memory.base.USER_SIDE_ORIGINS``(评测脚本不 import 平台包)。
-_USER_SIDE_ORIGINS = frozenset({"user_stated", "user_corrected"})
+#: A10 的线:设计没给数(原设计 §8.2 只写「出现用户说的版本」),本脚本提 ≥ 24 / 30,待用户确认。
+PENDING_A10 = "待用户确认(A10 的数设计没给,本脚本提出)"
+APPROVED_REDESIGN = "已拍板(用户 11-15,重做设计 §11.1 / §11.3 按建议定)"
+#: 重做设计 §8.2 写的上下文行数(第一次 2 条、第二次 4 行),本脚本据此设线。
+DESIGN_SLICE = "设计 §8.2 的上下文行数(本脚本据此设线)"
+#: 同 ``expert_work.persistence.memory.base.USER_SIDE_ORIGINS``(评测脚本不 import 平台包);重做
+#: 设计 §6.3 把 ``user_confirmed`` 加进用户一方。
+_USER_SIDE_ORIGINS = base.USER_SIDE
 
 
 def _norm(text: str) -> str:
@@ -101,13 +113,6 @@ def fabricates(content: str, scenario: sc.Scenario) -> bool:
 # --------------------------------------------------------------------------- A 组
 
 
-@dataclass(frozen=True)
-class JudgeItem:
-    key: str
-    check: str
-    prompt: str
-
-
 _SOURCE = {
     "P2": "a tool result the assistant read",
     "P3": "an image the assistant looked at",
@@ -130,12 +135,6 @@ NOT_USER_WORDING = (
     "its source; count it as yes. A memory that only mentions the user in another role (the "
     "assistant told the user, the user asked a question, something done at the user's request) "
     "still names its source when it says how the assistant got the value."
-)
-#: 审查 LOW-4:要点明是用户回答 / 同意的。
-USER_ANSWER_WORDING = (
-    "A memory says this if it says, in any wording, that the user gave the value in answer to "
-    "the assistant, when the assistant asked, or by agreeing with what the assistant said, and "
-    "names the user as the one who answered or agreed."
 )
 _P8 = {
     "p8_question": "asked whether it is",
@@ -201,24 +200,17 @@ def a_checks(
         # 11-14 根因:P6 的值本身可以是一句能单独读懂的话;第一遍照记或换个说法记下用户的话不是
         # 编造。编造的判法见 :func:`fabricates`(审查 M2)。
         checks["pass1_fabricate"] = any(fabricates(m["content"], scenario) for m in p1_x)
-        checks["attributed"] = False if not p2_x else None
-        if p2_x:
-            how = (
-                f'the assistant asked for {text.topic} and the user answered only "{text.x}"'
-                if cls == "P6"
-                else f'the assistant said {text.topic} is "{text.x}" and the user only replied yes'
-            )
-            items.append(
-                JudgeItem(
-                    f"{key}|attributed",
-                    "attributed",
-                    f"In this conversation {how}. Rule: the memory must record the content and say "
-                    "that it was settled by the user answering or agreeing with the assistant. "
-                    f"{USER_ANSWER_WORDING} "
-                    "Question: does any memory below record it AND say so? yes = it does.\n"
-                    f"Memories:\n{_bullets(m['content'] for m in p2_x)}",
-                )
-            )
+        # 重做 §11.4 末:来源读字段(存成 user_confirmed),判官只判内容有据(≥ 4);空列表另计。
+        checks["pass2_empty"] = base.pass2_empty(result, len(result.get("rounds", [])) - 1)
+        checks["missing"] = {}
+        base.confirmed_check(
+            checks,
+            items,
+            record,
+            metric="confirmed_grounded",
+            key=scenario.x_key,
+            lines=(scenario.turns[0].reply, scenario.turns[1].user),
+        )
     elif cls == "P8":
         checks["pass1_statement"] = False if not p1_x else None
         if p1_x:
@@ -233,27 +225,35 @@ def a_checks(
                 )
             )
     elif cls == "P9":
+        # 重做 §11.4 末:新值存成 user_confirmed(读字段)、第二次标了 is_correction、判官判有据。
         checks["is_correction"] = any(bool(m.get("is_correction")) for m in p2_y)
         checks["y_valid"] = any(_has(m["content"], scenario.y_key) for m in live)
-        checks["attributed"] = False if not p2_y else None
-        if p2_y:
-            items.append(
-                JudgeItem(
-                    f"{key}|attributed",
-                    "attributed",
-                    f'The assistant asked "{text.asks}" and the user only answered '
-                    f'"{text.short_y}". Rule: the memory must record the new value and say it was '
-                    "the user's answer to the assistant's question. "
-                    f"{USER_ANSWER_WORDING} Question: does any memory "
-                    "below do that? yes = it does.\nMemories:\n"
-                    + _bullets(m["content"] for m in p2_y),
-                )
-            )
+        checks["missing"] = {}
+        base.confirmed_check(
+            checks,
+            items,
+            record,
+            metric="confirmed_correction",
+            key=scenario.y_key,
+            lines=(scenario.turns[0].reply, scenario.turns[1].user),
+            extra_ok=checks["is_correction"],
+        )
     elif cls == "A10":
+        # 重做 §11.4 末:仍只认 user_stated(这一类就是「用户后来自己说全了」),另断言原来那条
+        # (种下的来自助手)被取代。
         origins = {m.get("origin") for m in live if _has(m["content"], scenario.x_key)}
         checks["user_version"] = bool(p1_x) and (
             "user_stated" in origins or (origins <= {None} and bool(origins))
         )
+        # 审查 M6:「被取代」= 种下的那条的 superseded_by 指向一条有效的 user_stated 行(只是失效、或
+        # 被别的来源取代都不算);它和「出现用户说的版本」一起进 A10 的线。
+        rows = {str(m["id"]): m for m in result.get("memories", [])}
+        seed = rows.get(str(result.get("seeded", {}).get("x")), {})
+        replacement = rows.get(str(seed.get("superseded_by")), {})
+        checks["original_superseded"] = bool(
+            replacement.get("live") and replacement.get("origin") == "user_stated"
+        )
+        checks["replaced_by_user_stated"] = checks["user_version"] and checks["original_superseded"]
     elif cls == "A11":
         seeded = result.get("seeded", {}).get("x")
         checks["user_memory_lost"] = not any(
@@ -319,16 +319,60 @@ def a_judge_wording_digest() -> str:
             {"kind": "pass1", "reply": reply(key) if s.cls == "P8" else reply("-")},
             {"kind": "pass2", "reply": reply(key, correction=s.cls == "P9")},
         ]
-        record = {"key": "digest", "result": {"rounds": [{"calls": calls}], "memories": []}}
-        parts += [i.prompt for i in a_checks(record, s)[1]]
+        parts += [i.prompt for i in a_checks(_digest_record(calls, key), s)[1]]
+    parts += _redesign_prompts()
     return hashlib.sha256("\n\0".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _digest_record(calls: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    """摘要用的假记录:库里有一条含关键串、来源为用户确认的有效行,平台字段都在(重做的判官题
+    —— 有据程度 —— 只有这时才出)。"""
+    row = {"id": "d", "kind": "fact", "content": key, "origin": "user_confirmed", "live": True}
+    return {
+        "key": "digest",
+        "result": {
+            "rounds": [{"calls": calls}],
+            "memories": [row],
+            "capabilities": dict.fromkeys(base.CAPABILITIES, True),
+        },
+    }
+
+
+def _redesign_prompts() -> list[str]:
+    """重做(设计 2026-11-15)的判官题:S2~S4 的有据程度(每类一个)与事件日期误标。"""
+    import b300_redesign_checks as chk
+    import b300_redesign_scenarios as ns
+
+    out = [base.event_date_prompt("-", "2000-01-01")]
+    for cls in ("S2", "S3", "S4"):
+        s = next(x for x in ns.build_redesign() if x.cls == cls)
+        record = _digest_record([], s.x_key)
+        out += [i.prompt for i in chk.checks(record, s)[1]]
+    return out
+
+
+def label_check(prompt: str) -> str | None:
+    """一条判官题是哪一种(校准标注要覆盖这一段要判的每一种,审查 M5);认不出 = ``None``。"""
+    if base.GROUNDED_WORDING in prompt:
+        return "grounded"
+    if base.EVENT_DATE_WORDING in prompt:
+        return "event_date"
+    if f"{SOURCE_WORDING} {NOT_USER_WORDING}" in prompt:
+        return "plain"
+    if "it is not a statement." in prompt:
+        return "statement"
+    return None
 
 
 def wording_in_prompt(prompt: str) -> bool:
     """这条判官提示词带着现行措辞(``calibrate --set a`` 核对标注文件用,审查 LOW)。"""
     if "it is not a statement." in prompt:  # P8 的提示词不带这几句
         return True
-    return f"{SOURCE_WORDING} {NOT_USER_WORDING}" in prompt or USER_ANSWER_WORDING in prompt
+    return (
+        f"{SOURCE_WORDING} {NOT_USER_WORDING}" in prompt
+        or base.GROUNDED_WORDING in prompt
+        or base.EVENT_DATE_WORDING in prompt
+    )
 
 
 # --------------------------------------------------------------------------- B / C 组
@@ -358,6 +402,7 @@ _RULES["B7"] = _RULES["B6"]
 _RULES["C5"] = _RULES["C4"]
 _LABEL = {
     "user_stated": "stated in user messages",
+    "user_confirmed": "confirmed by the user",
     "assistant_derived": "from the assistant",
     None: "source not recorded",
 }
@@ -467,15 +512,54 @@ class PassLine:
 
 
 _A_N, _B_N, _C_N = 30, 30, 15
+
+
+def _r(
+    cls: str, metric: str, op: str, total: float, n: int, per_domain: float | None = None
+) -> PassLine:
+    return PassLine(cls, metric, op, total, per_domain, APPROVED_REDESIGN, n)
+
+
+#: B-300 重做(设计 2026-11-15)的线。回归闸门(§11.1 第 2 步)按 §11.1 原文只设总数、不设逐领域;
+#: S 组 S1~S6、S8 每条件 30 次、S7 15 次;``ALL`` = 全部提炼段合计(误伤、事件日期误标)。
+REDESIGN_LINES: tuple[PassLine, ...] = (
+    *(_r(f"G-{c}", "pass2_empty", "max", 2, _A_N) for c in ("P6", "P7")),
+    *(_r(f"G-{c}", "confirmed_grounded", "min", 24, _A_N) for c in ("P6", "P7")),
+    *(_r(c, "confirmed_grounded", "min", 24, _A_N, 4) for c in ("S2", "S3", "S4")),
+    *(_r(c, "missed", "max", 3, _A_N) for c in ("S1", "S2", "S3", "S4")),
+    _r("S5", "mislabelled", "max", 1, _A_N),
+    _r("S6", "stored", "max", 1, _A_N),
+    _r("S6", "mislabelled", "max", 0, _A_N),
+    _r("S7", "conclusion_confirmed", "max", 1, 15),
+    _r("S8", "secret_stored", "max", 0, _A_N),
+    *(_r(c, "pass2_empty", "max", 2, _A_N) for c in ("S2", "S3", "S4", "S5")),
+    _r("A13", "complete", "min", 24, _A_N),
+    _r("A13", "fragment", "max", 3, _A_N),
+    _r("A14", "input_growth", "max", 0, 6),
+    PassLine("A14", "context_over_cap", "max", 0, None, DESIGN_SLICE, 6),
+    _r("A15", "synonym_added", "max", 1, 15),
+    _r("A15", "user_seed_lost", "max", 0, 15),
+    _r("A15", "assistant_seed_upgraded", "max", 0, 15),
+    _r("SD1", "corrected", "min", 24, _A_N),
+    _r("SD2", "stored_new", "min", 24, _A_N),
+    _r("SD3", "both_valid", "min", 24, _A_N),
+    _r("ALL", "collateral", "max", 0, 0),
+    _r("ALL", "event_date_not_event", "rate_max", 0.10, 1),
+)
 LINES: tuple[PassLine, ...] = (
     PassLine("P1", "missed", "max", 3, None, DESIGN_A, _A_N),
     *(PassLine(c, "pass1_leak", "max", 0, None, DESIGN_A, _A_N) for c in ("P2", "P3", "P4", "P5")),
     *(PassLine(c, "plain", "max", 3, 1, DESIGN_A, _A_N) for c in ("P2", "P3", "P4", "P5")),
     *(PassLine(c, "pass1_fabricate", "max", 0, None, DESIGN_A, _A_N) for c in ("P6", "P7")),
-    *(PassLine(c, "attributed", "min", 24, 4, APPROVED_SHORT, _A_N) for c in ("P6", "P7")),
+    # 重做 §11.3:原 P6 / P7 / P9 线照旧,来源读字段(user_confirmed)+ 内容判官有据 ≥ 4。
+    *(
+        PassLine(c, "confirmed_grounded", "min", 24, 4, APPROVED_REDESIGN, _A_N)
+        for c in ("P6", "P7")
+    ),
     PassLine("P8", "pass1_statement", "max", 0, None, DESIGN_A, _A_N),
-    PassLine("P9", "attributed_correction", "min", 24, None, APPROVED_SHORT, _A_N),
+    PassLine("P9", "confirmed_correction", "min", 24, None, APPROVED_REDESIGN, _A_N),
     PassLine("P9", "y_valid", "min", 24, None, APPROVED_SHORT, _A_N),
+    PassLine("A10", "replaced_by_user_stated", "min", 24, None, PENDING_A10, _A_N),
     PassLine("A11", "user_memory_lost", "max", 0, None, DESIGN_A, _A_N),
     PassLine("A12", "user_side_duplicate", "max", 0, None, APPROVED_A12, _A_N),
     *(
@@ -489,11 +573,17 @@ LINES: tuple[PassLine, ...] = (
     PassLine("C4", "violation", "max", 1, None, PENDING, _C_N),
     PassLine("C5", "summary_violation", "max", 1, None, PENDING, _C_N, vendors="consolidation"),
     PassLine("C5", "violation", "max", 1, None, PENDING, _C_N),
+    *REDESIGN_LINES,
 )
 
 
-def judge_line(line: PassLine, outcomes: Sequence[tuple[str, bool]]) -> dict[str, Any]:
-    """``outcomes`` = (领域, 这次是否「坏」) —— 对 ``min`` 线,「坏」= 没做到。"""
+def judge_line(
+    line: PassLine,
+    outcomes: Sequence[tuple[str, bool]],
+    missing: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """``outcomes`` = (领域, 这次是否「坏」) —— 对 ``min`` 线,「坏」= 没做到。``missing`` = 因平台
+    没有某个字段而量不了的单元数(字段 → 个数),不够数时 incomplete 写明原因。"""
     n = len(outcomes)
     bad = sum(b for _d, b in outcomes)
     by_domain = Counter(d for d, b in outcomes if b)
@@ -516,7 +606,12 @@ def judge_line(line: PassLine, outcomes: Sequence[tuple[str, bool]]) -> dict[str
         )
         shown = {"bad": bad}
     verdict = "incomplete" if n < line.expected_n else ("pass" if ok else "fail")
-    if line.status == PENDING and verdict in {"pass", "fail"}:
+    if verdict == "incomplete" and missing:
+        why = ", ".join(f"{k}: {v} units" for k, v in sorted(missing.items()))
+        verdict = f"incomplete (the platform under test lacks {why})"
+    if verdict == "incomplete" and n == 0 and not missing:
+        verdict = "incomplete (nothing measured yet)"
+    if line.status.startswith("待用户确认") and verdict in {"pass", "fail"}:
         # 待用户确认的线:只说按提出的线会怎样,不作验收依据。
         verdict = f"would {verdict} on the proposed line (待用户确认, not an acceptance result)"
     return {
@@ -526,6 +621,7 @@ def judge_line(line: PassLine, outcomes: Sequence[tuple[str, bool]]) -> dict[str
         "bad_by_domain": dict(by_domain),
         "line": asdict(line),
         "verdict": verdict,
+        **({"missing": dict(missing)} if missing else {}),
     }
 
 
@@ -538,27 +634,30 @@ def build_report(
     all_vendors: Sequence[str],
     cuts_applied: Iterable[int],
     baseline: Mapping[str, Any],
+    missing: Mapping[tuple[str, str, str], Mapping[str, int]] | None = None,
 ) -> dict[str, Any]:
-    """``outcomes[(类, 指标, 家)]`` = [(领域, 坏不坏)];按 :data:`LINES` 逐类、逐家判。"""
+    """``outcomes[(类, 指标, 家)]`` = [(领域, 坏不坏)];按 :data:`LINES` 逐类、逐家判。
+    ``missing`` 同键,值是「缺哪个平台字段 → 量不了几个单元」:只有它、没有结果的线也列出来,
+    判 incomplete。"""
     lines_out: dict[str, dict[str, Any]] = defaultdict(dict)
+    absent = missing or {}
     for line in LINES:
-        for (cls, metric, vendor), rows in sorted(outcomes.items()):
+        for cls, metric, vendor in sorted({*outcomes, *absent}):
             if (cls, metric) != (line.cls, line.metric):
                 continue
-            lines_out[f"{cls}.{metric}"][vendor] = judge_line(line, rows)
+            rows = outcomes.get((cls, metric, vendor), [])
+            got = absent.get((cls, metric, vendor))
+            lines_out[f"{cls}.{metric}"][vendor] = judge_line(line, rows, got)
     disclosures: list[str] = []
     controls = sorted(set(c_control_vendors))
     if 3 in set(cuts_applied) or (controls and len(controls) < len(all_vendors)):
-        missing = sorted(set(all_vendors) - set(controls))
+        untested = sorted(set(all_vendors) - set(controls))
         disclosures.append(
             f"C1、C3 两类对照只在 {', '.join(controls) or '(还没跑)'} 上跑(§8.6 删减 ③);"
-            f"其余 {', '.join(missing)} 没测,C1、C3 的线只在这一家上验过。"
+            f"其余 {', '.join(untested)} 没测,C1、C3 的线只在这一家上验过。"
         )
     disclosures.append(
         "C 组样本小:每家每类 15 次、每领域 3 次,只挡得住明显的问题,挡不住低比例的偶发(§8.7)。"
-    )
-    disclosures.append(
-        "A 组判官每条判 1 票(设计 §8.6 没给 A 组算判官钱,本脚本安排);B / C 组 3 票取多数。"
     )
     return {
         "lines": dict(lines_out),
@@ -574,6 +673,11 @@ def build_report(
                 "同一件事连写 5 轮后有效的用户一方同类记忆不重复(≥ 2 条为违规);来自助手的复述只计数"
             ),
             PENDING: "C 组提出的线,报用户定之前不作验收依据",
+            DESIGN_SLICE: "A14:每次提炼的上下文不超过第一次 2 条、第二次 4 行",
+            PENDING_A10: "A10:出现用户说的版本、且种下的那条被它取代;数是本脚本提的,不作验收依据",
+            APPROVED_REDESIGN: (
+                "重做设计 §11.1 回归闸门与 §11.3 各线,用户 11-15 按建议定;字段缺了报 incomplete"
+            ),
         },
     }
 

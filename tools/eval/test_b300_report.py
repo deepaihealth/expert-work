@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import b300_redesign_base as base
 import b300_report as rep
 import b300_scenarios as sc
 import pytest
@@ -128,12 +129,6 @@ def test_judge_wording_is_pinned() -> None:
         "role (the assistant told the user, the user asked a question, something done at the "
         "user's request) still names its source when it says how the assistant got the value."
     )
-    # 审查 LOW-4:要点明回答 / 同意的是用户
-    assert rep.USER_ANSWER_WORDING == (
-        "A memory says this if it says, in any wording, that the user gave the value in answer "
-        "to the assistant, when the assistant asked, or by agreeing with what the assistant "
-        "said, and names the user as the one who answered or agreed."
-    )
 
 
 @pytest.mark.parametrize("cls", ["P2", "P3", "P4", "P5"])
@@ -146,40 +141,17 @@ def test_plain_prompt_carries_the_source_wording(cls: str) -> None:
     head = item.prompt.split("Memories:\n")[0]
     source, not_user = head.index(rep.SOURCE_WORDING), head.index(rep.NOT_USER_WORDING)
     assert source < not_user < head.index("Question:")
-    assert rep.USER_ANSWER_WORDING not in item.prompt
+    assert base.GROUNDED_WORDING not in item.prompt  # P6 / P7 / P9 的有据程度题不混进来
 
 
 def test_wording_digest_follows_the_judge_wording(monkeypatch: pytest.MonkeyPatch) -> None:
     """审查 LOW-2:措辞一改摘要就变(校准与判分靠它对上)。"""
     before = rep.a_judge_wording_digest()
     assert before == rep.a_judge_wording_digest() and len(before) == 16
-    for name in ("SOURCE_WORDING", "NOT_USER_WORDING", "USER_ANSWER_WORDING"):
+    for name in ("SOURCE_WORDING", "NOT_USER_WORDING"):
         with monkeypatch.context() as m:
             m.setattr(rep, name, getattr(rep, name) + " x")
             assert rep.a_judge_wording_digest() != before, name
-
-
-@pytest.mark.parametrize("cls", ["P6", "P7"])
-def test_attributed_prompt_carries_the_user_answer_wording(cls: str) -> None:
-    s = _scenario(cls)
-    x = sc.fact("budget").texts[s.lang].x
-    _checks, items = rep.a_checks(_record([("pass1", _reply()), ("pass2", _reply(x))]), s)
-    (item,) = items
-    head = item.prompt.split("Memories:\n")[0]
-    assert item.check == "attributed" and rep.USER_ANSWER_WORDING in head
-    assert head.index(rep.USER_ANSWER_WORDING) < head.index("Question:")
-    assert rep.SOURCE_WORDING not in item.prompt
-
-
-def test_p9_prompt_carries_the_user_answer_wording() -> None:
-    p9 = _scenario("P9")
-    y = sc.fact("budget").texts[p9.lang].y
-    rec = _record([("pass1", _reply()), ("pass2", _reply(y, correction=True))])
-    (item,) = rep.a_checks(rec, p9)[1]
-    head = item.prompt.split("Memories:\n")[0]
-    assert rep.USER_ANSWER_WORDING in head and head.index(rep.USER_ANSWER_WORDING) < head.index(
-        "Question:"
-    )
 
 
 def test_p6_p8_p9_a11_a12_checks() -> None:
@@ -188,7 +160,9 @@ def test_p6_p8_p9_a11_a12_checks() -> None:
     checks, items = rep.a_checks(
         _record([("pass1", _reply(f"{t6.topic} {t6.x}")), ("pass2", _reply())]), p6
     )
-    assert checks["pass1_fabricate"] is True and checks["attributed"] is False and not items
+    # 重做 §11.4 末:来源读字段;这条记录没记平台字段(老记录)→ incomplete,不送判官
+    assert checks["pass1_fabricate"] is True and not items
+    assert checks["missing"] == {"confirmed_grounded": "user_confirmed"}
 
     p8 = _scenario("P8")
     checks, items = rep.a_checks(_record([("pass1", _reply()), ("pass2", _reply())]), p8)
@@ -201,9 +175,8 @@ def test_p6_p8_p9_a11_a12_checks() -> None:
         memories=[{"id": "1", "content": f"budget {y}", "live": True}],
     )
     checks, items = rep.a_checks(rec, p9)
-    assert (
-        checks["is_correction"] and checks["y_valid"] and [i.check for i in items] == ["attributed"]
-    )
+    assert checks["is_correction"] and checks["y_valid"] and items == []
+    assert checks["missing"] == {"confirmed_correction": "user_confirmed"}
 
     a11 = _scenario("A11")
     lost = _record(
@@ -334,7 +307,7 @@ def test_max_line_with_per_domain() -> None:
 
 
 def test_min_line() -> None:
-    line = _line("P6", "attributed")  # ≥ 24,逐领域 ≥ 4(「坏」= 没写明出处)
+    line = _line("P6", "confirmed_grounded")  # ≥ 24,逐领域 ≥ 4(「坏」= 没存成用户确认或无据)
     rows = [(d, i < 1) for d in sc.DOMAINS for i in range(6)]
     assert rep.judge_line(line, rows)["verdict"] == "pass"
     rows = [(d, i < 3 and d == "legal") for d in sc.DOMAINS for i in range(6)]

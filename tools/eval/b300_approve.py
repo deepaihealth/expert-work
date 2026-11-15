@@ -20,9 +20,16 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import b300_plan as plan  # noqa: E402
+import b300_redesign_scenarios as ns  # noqa: E402
 import b300_scenarios as sc  # noqa: E402
 import b300_spend as spend  # noqa: E402
-from b300_phases import EvalError, budget_of, record_approval, remaining_for  # noqa: E402
+from b300_phases import (  # noqa: E402
+    EvalError,
+    budget_of,
+    parent_budget,
+    record_approval,
+    remaining_for,
+)
 
 
 def vendors_of(raw: Sequence[str] | None) -> list[plan.Vendor]:
@@ -49,10 +56,14 @@ def make_quote(args: argparse.Namespace, *, exclude: str | None = None) -> dict[
         already_spent=already,
         single_vendor=args.single_vendor,
         stop_line=args.stop_line,
-        scenario_digest=sc.scenario_digest([*sc.build_all(), *sc.build_compare()]),
+        scenario_digest=(
+            f"{sc.scenario_digest([*sc.build_all(), *sc.build_compare()])}"
+            f"+{ns.scenario_digest_all()}"
+        ),
         include_compare=not args.no_compare,
         tokens=token_table(args.tokens),
         a_votes=args.a_judge_votes,
+        gate_votes=args.gate_judge_votes,
         pilot=args.pilot,
         embed_price=args.embed_price,
         phases=phases_covered,
@@ -103,9 +114,10 @@ def approved(
     """花钱之前的全部核对;从这个报价的账本接着记。用户原话记进 ``approvals.jsonl``。
     ``allow_blocked``:只结算、不新花的步骤(收整理 / 写回的实际用量)在停着时也能做。"""
     q = check_quote(args)
-    if phase is not None and not q["pilot"] and budget_of(phase) not in q["phases"]:
+    covered = phase is None or parent_budget(budget_of(phase)) in q["phases"]
+    if not covered and not q["pilot"]:
         raise EvalError(
-            f"phase {phase} ({budget_of(phase)}) is not covered by quote {q['quote_id']} "
+            f"phase {phase} ({budget_of(phase or '')}) is not covered by quote {q['quote_id']} "
             f"(covers {q['phases']}); quote it with --phases first"
         )
     if q["status"] != "within_cap" and not args.user_said:

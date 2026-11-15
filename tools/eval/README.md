@@ -575,4 +575,33 @@ C4 分三步:`run --step 1`(写回智能体)→ 等写回 → `bundle --op state
 
 **报告**:每类 x 每家 x 领域判线。B 组线是 11-11 拍板 ①;P6 / P7 / P9 是 §10.2 第 1 条;其余 A 组线是 §8.2 所列;**C 组线一律「待用户确认」,报告只说按提出的线会过 / 不过,不作验收依据**。C1 / C3 只在一家上跑时报告写明哪一家、其余没测;A 组判官默认 1 票(设计没给 A 组算判官钱,本脚本安排),另有 A 组校准把关。基线段报每个场景 3 次里红了几次(≥ 1 留用,0 换掉)。§8.5 对比报写入条数、两类、来源与「下降不超过三分之一」。
 
+### B-300 重做(设计 `docs/superpowers/specs/2026-11-15-b300-extraction-redesign-design.md` §11)
+
+| 文件 | 做什么 |
+|---|---|
+| `b300_redesign_facts.py` / `b300_redesign_facts_x.py` / `b300_redesign_heldout.py` / `b300_redesign_scenarios.py` | S 组(S1~S6 同 10 个命题只换来源条件、S7 结论 + 提议、S8 秘密值,共 75 个场景 x 3 = 225 单元,每个 S 场景种一条同领域无关的旁观记忆量「误伤」);形状留出集 H1~H4(20 个,另 5 个领域,**由没看过提示词例子的人写**,脚本只转了结构、给期望值补了几种写法、把一个卡号首位改成 0);A13 / A14 / A15、同一天读数 SD1~SD3(读数都避开 1~31 和年份)。每一轮之后写回一次。卡号类秘密值都是 0 开头、不过 Luhn 的假号 |
+| `b300_redesign_base.py` / `b300_redesign_checks.py` | 判法:关键串(`\|` 分开几种写法;千分位不算;数字按边界、先去掉日期片段)、秘密值只去掉数字之间的空格和横线、纯数字按数字边界比(`~` 开头的写法按整词比)、来源读字段、空列表、带编号的输入、判官的「有据程度」(≥ 4 算对)与「事件日期误标」;平台没有 `user_confirmed` / 证据指针 / 事件日期 / 切片起点时,依赖它的线报 `incomplete` 并写明缺哪个字段(A13、A14 没有切片起点都报 incomplete;A14 量的是提炼输入里分隔行 `=== new ===` 以下的新段,不含固定指令、也不含上下文行(与设计 §11.3「前 3 轮」口径不同:上下文从 0 行热身,连它一起量切片正确也会到 1.5 上下),上下文另由 `A14.context_over_cap` 查不超过第一次 2 条、第二次 4 行;形状留出集 H2 按 §5.4 预期被降成来自助手,`user_confirmed_other_origin` 不算漏记;连续 4 次限流只让那一项失败、按 0 结) |
+
+A10 的线(本脚本提 ≥ 24 / 30,待用户确认):出现用户说的版本,且种下的那条的 `superseded_by` 指向这条有效的 `user_stated`。
+
+**判官票数(审查 M5)**:A 段(A 组 + 六个新段)与 G 段(闸门)的票数分开写在报价里(`judge.votes_by_segment`,默认各 1 票,用户批过 A 组 1 票;`--a-judge-votes` / `--gate-judge-votes` 改成 3),报价另给同一份计划按 1 票、3 票的价(`judge.cost_by_votes`),批的时候选;报告写明每段实际用了几票。**校准要一批新的人工标注**:A 组判官题的措辞与判法变了,旧标注作废;标注要覆盖这一段要判的每一种题 —— 闸门:有据程度、事件日期;正式一轮:另加 P2~P5 的「写了出处」与 P8 —— 缺哪种 `calibrate --set a` 就拒。
+
+段:`gate`(回归闸门,G 段,只在 `--phases g` 时报价)与 `s` / `shape` / `a13` / `a14` / `a15` / `sd`(都在 A 段,与 `a` 一样在本机写回)。P6 / P7 / P9 的来源改读字段(存成 `user_confirmed`),判官只判内容有据;A10 仍只认 `user_stated`,另断言种下的那条被取代。切片起点按参数名 `start_message_count`(`b300_live.SLICE_START_PARAM`)传给写回入口,PR S 用了别的名字就改这个常量;入口不收它时每次写回照整段重抽、A14 报 incomplete。
+
+**判官预留(§11.8)**:判官的调用记在每段自己的子预算 `<段>-judge`(报价的 `phase_budgets` 里与写回分开列;`--allocation` 仍按段给,每段再按中点分给它与它的判官);并发至多 4 项,一项要几票就先要到几笔最坏值的额度再发第一票(不留半截判分),剩余额度装不下时**等在飞的结算后再发**,一项都没在飞仍装不下就不发、不止损(没判的项下次 `judge` 接着判);限流(429)重试沿用同一笔预留,不再先结 0 再重新预留;每笔最坏值按这道题的 UTF-8 字节数算(至少 2,048 token),输出上限 400;报价里的 `headroom` 列出每段「高档估计 + 并发 x 单次最坏」,分预算不够就给 `headroom_warning`。
+
+**回归闸门**(§11.1 第 2 步,先跑它、过线才报正式一轮;11-15 的 60 个 P6 / P7 单元原样重跑,线:空列表各 ≤ 2 / 30、存成用户确认且有据 ≥ 4 各 ≥ 24 / 30;在老代码上跑出的基线里后一条是 `incomplete`):
+
+```
+python tools/eval/b300_eval.py quote --phases g --vendor glm=glm-5.3:glm-5.3-flash --single-vendor glm \
+    --accept-documented-prices --stop-line <止损线>          # 报价单独给用户批
+python tools/eval/b300_eval.py prepare --phase gate --out GATE --tenant-id - <同样的报价参数> --approved-quote Q
+python tools/eval/b300_eval.py calibrate --set a --labels a-labels.jsonl --out GATE <同样的报价参数> --approved-quote Q
+python tools/eval/b300_eval.py run   --phase gate --out GATE <同样的报价参数> --approved-quote Q
+python tools/eval/b300_eval.py judge --phase gate --out GATE <同样的报价参数> --approved-quote Q
+python tools/eval/b300_eval.py report --out GATE --quote-file quote.json    # 看 G-P6.* / G-P7.*
+```
+
+空列表若回升,先拿掉第二次指令的例子 9 重跑闸门(§11.1)。正式一轮:`quote --phases a`(A 组 + 上面六段)另报价、另批。
+
 **LoCoMo / LongMemEval**:`longmem/endtoend.py` 经提炼入口的显式参数 `user_text_messages` 声明「语料是用户文字」(设计 §4.1);入口还没有这个参数时什么都不传,行为与改前一致;**B-300 的那次 LoCoMo 检查(PR 1 之后的代码)要加 `run_longmem.py --expect-user-text`**,入口没有这个参数就报错,不悄悄跳过。`run_longmem.py` 的端到端档**必须二选一** `--expect-user-text` / `--pre-b300`(都不给、都给都退出);`run_baseline_full.sh` 用 `USER_TEXT_FLAG`(默认 `--pre-b300`,PR 1 合并后改成 `--expect-user-text`)。参数名以 PR 1 为准,改名要同步改 `USER_TEXT_PARAM`。**PR 1 起输入形状变了**:每段会话按角色拆开(用户每轮一条用户消息,经 `user_text_messages` 声明;助手每轮一条助手消息;日期抬头单独一条用户消息),一整段语料一条都没写进去时抛 `NothingIngestedError`。所以 B-300 之前的基线要用新形状重跑、不能沿用旧数;LoCoMo 两个说话人都按用户文字处理,与产品形状不同,分数不能直接和更早的基线比;日期抬头走第一次提炼、可能被丢,时间类题目掉分先查这里(设计 §8.5)。A 组若在被测代码上没看到两次提炼,第一条就停下(不空转花钱)。

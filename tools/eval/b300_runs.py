@@ -205,6 +205,14 @@ async def run_conversation_phase(
         await asyncio.gather(*(one(u) for u in units))
 
 
+def judge_phase(phase: str) -> str:
+    """判官调用记账的 phase:``<段>-judge``(校准本来就只有判官调用)—— 算在判官自己那段子预算里
+    (重做设计 §11.8 ③)。"""
+    if phase.startswith("calibration") or phase.endswith("-judge"):
+        return phase
+    return f"{phase}-judge"
+
+
 async def run_judge(
     items: Sequence[rep.JudgeItem],
     *,
@@ -216,7 +224,12 @@ async def run_judge(
     stamp: Mapping[str, str] | None = None,
 ) -> None:
     """``stamp``(审查 M3):写进每条判分的字段(A 组:``wording_digest``);已有判分只有这些字段都
-    对得上才跳过,对不上的重判。"""
+    对得上才跳过,对不上的重判。
+
+    重做设计 §11.8:判官记在自己的子预算(:func:`judge_phase`);并发至多
+    ``live.JUDGE_CONCURRENCY``,剩余额度装不下下一笔最坏值时等在飞的结算(``spend.RoomGate``);
+    每笔的最坏值按这道题的长度算(``live.judge_input_bound``)。一笔都装不下的项不判、留给下次,
+    不止损。"""
     import httpx
 
     base_url, api_key = (
@@ -231,7 +244,8 @@ async def run_judge(
         for r in read_jsonl(out_file)
         if all(r.get(field) == value for field, value in stamp.items())
     }
-    sem = asyncio.Semaphore(4)
+    ledger_phase = judge_phase(phase)
+    gate = spend.RoomGate(guard, ledger_phase, limit=live.JUDGE_CONCURRENCY)
     async with httpx.AsyncClient() as http:
         judge = live.Judge(
             live.ChatTransport(
@@ -244,17 +258,17 @@ async def run_judge(
                 provider=plan.JUDGE_PROVIDER,
             ),
             votes,
+            gate=gate,
         )
 
         async def one(item: rep.JudgeItem) -> None:
-            if item.key in done or not guard_ok(guard, phase):
+            if item.key in done or not guard_ok(guard, ledger_phase):
                 return
-            async with sem:
-                try:
-                    got = await judge.vote_with_usage(item.prompt, item=item.key, phase=phase)
-                except (Exception, spend.SpendStopError) as exc:
-                    emit(f"{item.key}: {exc!r}")
-                    return
+            try:
+                got = await judge.vote_with_usage(item.prompt, item=item.key, phase=ledger_phase)
+            except (Exception, spend.SpendStopError) as exc:
+                emit(f"{item.key}: {exc!r}")
+                return
             votes_only = [v for v, _u in got]
             append_jsonl(
                 out_file,

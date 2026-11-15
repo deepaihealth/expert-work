@@ -231,12 +231,16 @@ def test_a_failed_conversation_still_records_its_writeback_reservation(
 
 def test_quote_covers_only_the_named_phases(tmp_path: Path) -> None:
     q = _quote(tmp_path, "--phases", "b")
-    assert q["phases"] == ["B"] and set(q["phase_budgets"]) == {"B"}
+    # 重做设计 §11.8 ③:每段另有判官自己的子预算(``<段>-judge``)
+    assert q["phases"] == ["B"] and set(q["phase_budgets"]) == {"B", "B-judge"}
     assert {plan.budget_of_group(g) for g in q["planned"]["groups"]} == {"B"}
-    assert q["phase_budgets"]["B"]["budget_yuan"] == q["stop_line_yuan"]
+    assert sum(b["budget_yuan"] for b in q["phase_budgets"].values()) == pytest.approx(
+        q["stop_line_yuan"], abs=0.02
+    )
     full = _quote(tmp_path)
     budgets = full["phase_budgets"]
-    assert set(budgets) == {"B", "C", "A"} and all(b["budget_yuan"] > 0 for b in budgets.values())
+    assert set(budgets) == {"B", "C", "A", "B-judge", "C-judge", "A-judge"}
+    assert all(b["budget_yuan"] > 0 for b in budgets.values())
     assert sum(b["budget_yuan"] for b in budgets.values()) == pytest.approx(
         full["stop_line_yuan"], abs=0.05
     )
