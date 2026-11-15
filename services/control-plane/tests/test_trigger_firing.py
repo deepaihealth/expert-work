@@ -20,11 +20,13 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from langchain_core.messages import HumanMessage
 
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.audit import build_default_audit_logger
 from control_plane.tenant_status import TenantStatusService
 from control_plane.trigger_firing import fire_trigger
+from expert_work.common.message_stamp import STAMP_CREATED_AT
 from expert_work.persistence import (
     InMemoryAgentDisableStore,
     InMemoryApprovalStore,
@@ -295,6 +297,33 @@ async def test_fire_puts_trigger_origin_in_run_agent_config(
     assert run_id is not None
     await _drain(ctx, run_id)
     assert captured["config"]["configurable"]["trigger_origin"] is True
+
+
+@pytest.mark.asyncio
+async def test_fire_stamps_the_seed_that_opens_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-300 PR S —— 触发器开的对话没有更早的写回任务,后台写回按开轮消息的
+    ``expert_work_created_at`` 判「最近 30 天」;种子消息必须盖它(取触发时刻)。"""
+    captured: dict[str, Any] = {}
+
+    async def _fake_run_agent(**kwargs: Any) -> None:
+        captured["graph_input"] = kwargs["graph_input"]
+
+    monkeypatch.setattr("control_plane.trigger_firing.run_agent", _fake_run_agent)
+
+    ctx = await _build_ctx()
+    run_id = await fire_trigger(
+        _trigger(seed_input="Summarise last week's open PRs."),
+        now=_NOW,
+        **{k: v for k, v in ctx.items() if k != "audit_store"},
+        agent_disable_service=AgentDisableService(store=InMemoryAgentDisableStore()),
+        tenant_status_service=TenantStatusService(store=ctx["tenant_config_store"]),
+    )
+    assert run_id is not None
+    await _drain(ctx, run_id)
+    [seed] = [m for m in captured["graph_input"]["messages"] if isinstance(m, HumanMessage)]
+    assert seed.additional_kwargs[STAMP_CREATED_AT] == _NOW.isoformat()
 
 
 @pytest.mark.asyncio
