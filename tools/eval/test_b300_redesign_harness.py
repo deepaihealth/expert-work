@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from collections.abc import Callable
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -355,11 +357,51 @@ def test_classify_call_knows_the_new_prompts() -> None:
     assert live.classify_call(first) == "pass1"
 
 
-def test_capabilities_reflect_the_code_under_test() -> None:
+def _field_kept(name: str, value: Any) -> bool:
+    """按被测代码的协议模型造一条记忆:这个字段收下了这个值没有(不认识的字段会被丢掉)。"""
+    from uuid import uuid4
+
+    from expert_work.protocol import MemoryItem
+
+    try:
+        item = MemoryItem(
+            id=uuid4(),
+            tenant_id=uuid4(),
+            user_id=uuid4(),
+            kind="fact",
+            content="probe",
+            embedding=(0.0,),
+            confidence=0.5,
+            importance=0.5,
+            **{name: value},
+        )
+    except Exception:  # 认识这个字段但不收这个值,也算没有
+        return False
+    return getattr(item, name, None) == value
+
+
+def _takes_slice_start() -> bool:
+    from orchestrator.graph_builder import memory as memory_module
+
+    entry = inspect.signature(memory_module.flush_messages_with_outcome).parameters
+    return live.SLICE_START_PARAM in entry
+
+
+#: 每个能力按被测代码**实际的行为**去探(不写死 True / False):PR M / R / X / S 合进来前后都成立。
+_PROBES: dict[str, Callable[[], bool]] = {
+    "user_confirmed": lambda: _field_kept("origin", "user_confirmed"),
+    "evidence_pointer": lambda: _field_kept("evidence_message_id", "m-1"),
+    "event_date": lambda: _field_kept("occurred_on", date(2026, 11, 15)),
+    "confirmed_at": lambda: _field_kept("confirmed_at", datetime(2026, 11, 15, tzinfo=UTC)),
+    "slicing": _takes_slice_start,
+}
+
+
+@pytest.mark.parametrize("name", base.CAPABILITIES)
+def test_capabilities_reflect_the_code_under_test(name: str) -> None:
     caps = live.platform_capabilities()
     assert set(caps) == set(base.CAPABILITIES)
-    # 这个分支上的平台还没有重做的字段(PR M / R / X / S 之前):全是 False
-    assert caps == dict.fromkeys(base.CAPABILITIES, False)
+    assert caps[name] is _PROBES[name](), name
 
 
 def test_slice_start_is_passed_only_when_the_entry_takes_it(
@@ -401,12 +443,28 @@ def test_slice_start_is_passed_only_when_the_entry_takes_it(
 def test_run_extraction_records_what_the_redesign_measures() -> None:
     s = next(x for x in ns.build_redesign() if x.cls == "S2")
 
+    # 提炼出的内容与旁观记忆几乎一样(多几个字),去重合并一定会被叫到;假的去重合并对每条候选回
+    # NOOP(按附录 B 的回答格式 ``{"ops": [...]}``,目标用材料里给的编号)。回答格式对不上时平台会
+    # 退回直接新增,这条候选就会落库 —— 下面断言它没落库,所以走的一定是成功的那条路。
+    bystander = next(x.content for x in s.seeds if x.key == ns.BYSTANDER)
+    candidate = f"{bystander} 已确认"
+    reconciled: list[str] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         system = " ".join(m["content"] for m in body["messages"] if m["role"] == "system")
         kind = live.classify_call(system)
-        content = json.dumps({"memories": [{"kind": "fact", "content": f"limit {s.x_key}"}]})
-        reply = content if kind in {"pass1", "pass2", "extract_old"} else '{"operations": []}'
+        if kind == "reconcile":
+            user = next(m["content"] for m in body["messages"] if m["role"] == "user")
+            ops = [
+                {"index": c["index"], "op": "NOOP", "target_id": c["existing"][0]["id"]}
+                for c in json.loads(user)["candidates"]
+                if c.get("existing")
+            ]
+            reply = json.dumps({"ops": ops})
+            reconciled.append(reply)
+        else:
+            reply = json.dumps({"memories": [{"kind": "fact", "content": candidate}]})
         return httpx.Response(
             200,
             json={
@@ -425,6 +483,10 @@ def test_run_extraction_records_what_the_redesign_measures() -> None:
             )
 
     result = asyncio.run(main())
+    assert reconciled, "the reconcile step was never reached"
+    live_rows = [m["content"] for m in result["memories"] if m["live"]]
+    assert candidate not in live_rows  # NOOP 被采纳:走的是成功的那条路,不是失败后直接新增
+    assert all(not r["failed"] for r in result["rounds"])
     assert result["capabilities"] == live.platform_capabilities()
     assert len(result["user_message_ids"]) == len(s.turns) and all(result["user_message_ids"])
     for r in result["rounds"]:
