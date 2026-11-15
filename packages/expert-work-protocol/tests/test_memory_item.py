@@ -108,7 +108,7 @@ def test_newer_payload_with_extra_fields_still_reads() -> None:
     assert item.origin == "user_stated"
 
 
-def test_effective_origin_four_cases() -> None:
+def test_effective_origin_five_cases() -> None:
     # 置信度 1.0 只有更正接口会写:不论来源列是什么,都是用户更正。
     assert effective_origin(_origin_item(confidence=1.0)) == "user_corrected"
     assert (
@@ -116,6 +116,7 @@ def test_effective_origin_four_cases() -> None:
         == "user_corrected"
     )
     assert effective_origin(_origin_item(origin="user_stated")) == "user_stated"
+    assert effective_origin(_origin_item(origin="user_confirmed")) == "user_confirmed"
     assert effective_origin(_origin_item(origin="assistant_derived")) == "assistant_derived"
     assert effective_origin(_origin_item()) == "unrecorded"
 

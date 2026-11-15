@@ -98,6 +98,14 @@ def test_line_carries_kind_source_and_recorded_date() -> None:
 def test_line_without_a_creation_time_has_no_date() -> None:
     item = _item("x", kind="episodic", origin="assistant_derived")
     assert memory_line(item) == "- (episodic · from the assistant) x"
+    # 用户一方的行没有创建时间、只有确认日期:显示确认日期;来自助手的照旧不显示。
+    stated = _item("x", origin="user_stated", confirmed=datetime(2026, 11, 14, 1, 0, tzinfo=UTC))
+    assert memory_line(stated) == "- (fact · stated in user messages · 2026-11-14) x"
+    derived = _item(
+        "x", kind="episodic", origin="assistant_derived",
+        confirmed=datetime(2026, 11, 14, 1, 0, tzinfo=UTC),
+    )  # fmt: skip
+    assert memory_line(derived) == "- (episodic · from the assistant) x"
 
 
 def test_line_content_cannot_forge_another_line() -> None:

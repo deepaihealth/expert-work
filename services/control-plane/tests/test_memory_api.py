@@ -1183,12 +1183,19 @@ async def test_list_shows_the_source_but_not_the_embedding_model(
 # ---------------------------------------------------------------------------
 
 
+_EVIDENCE = {
+    "evidence_message_id": "msg-4",
+    "evidence_message_index": 4,
+    "occurred_on": "2026-11-14",
+    "confirmed_at": "2026-11-15T08:30:00Z",
+}
+
+
 def _mark_user_confirmed(store: InMemoryMemoryStore, mem_id: UUID) -> None:
     """Re-validate the row (``model_copy`` would skip the origin validator)."""
+    update = {"origin": "user_confirmed", "confidence": 0.8, **_EVIDENCE}
     store._rows = [
-        MemoryItem.model_validate({**r.model_dump(), "origin": "user_confirmed", "confidence": 0.8})
-        if r.id == mem_id
-        else r
+        MemoryItem.model_validate({**r.model_dump(), **update}) if r.id == mem_id else r
         for r in store._rows
     ]
 
@@ -1203,6 +1210,12 @@ async def test_list_shows_a_user_confirmed_source(
     assert resp.status_code == 200, resp.text
     [row] = [i for i in resp.json()["data"]["items"] if i["id"] == str(mem_id)]
     assert (row["origin"], row["confidence"]) == ("user_confirmed", 0.8)
+    # Decision (PR M): ``_serialise`` keeps the four new internal fields on the console
+    # wire (only the vector and its model name are dropped); the admin UI does not show
+    # them. A later change that drops them from the wire must change this test.
+    assert (row["evidence_message_id"], row["evidence_message_index"]) == ("msg-4", 4)
+    assert row["occurred_on"] == "2026-11-14"
+    assert row["confirmed_at"].startswith("2026-11-15T08:30:00")
 
 
 @pytest.mark.asyncio

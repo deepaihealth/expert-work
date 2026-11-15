@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import text
 
 from expert_work.persistence import (
     DatabaseConfig,
@@ -82,12 +83,22 @@ def _item(
 
 
 def _evidence(index: int) -> dict[str, Any]:
+    """四个字段都随 ``index`` 变,取代时分得清新行带的是候选的还是旧行的。"""
     return {
         "evidence_message_id": f"msg-{index}",
         "evidence_message_index": index,
-        "occurred_on": date(2026, 11, 14),
-        "confirmed_at": _CONFIRMED,
+        "occurred_on": date(2026, 11, 1) + timedelta(days=index),
+        "confirmed_at": _CONFIRMED + timedelta(hours=index),
     }
+
+
+def _expected(index: int) -> tuple[object, ...]:
+    return (
+        f"msg-{index}",
+        index,
+        date(2026, 11, 1) + timedelta(days=index),
+        _CONFIRMED + timedelta(hours=index),
+    )
 
 
 def _fields(item: MemoryItem) -> tuple[object, ...]:
@@ -152,7 +163,7 @@ async def test_write_keeps_user_confirmed_and_the_four_new_fields(store: MemoryS
     await store.write([confirmed, legacy])
     got = await _row(store, t, u, confirmed.id)
     assert got.origin == "user_confirmed"
-    assert _fields(got) == ("msg-3", 3, date(2026, 11, 14), _CONFIRMED)
+    assert _fields(got) == _expected(3)
     assert _fields(await _row(store, t, u, legacy.id)) == (None, None, None, None)
 
 
@@ -167,7 +178,7 @@ async def test_supersede_writes_the_candidates_pointer_and_event_date(store: Mem
     assert written is not None
     got = await _row(store, t, u, new.id)
     assert got.origin == "user_confirmed"
-    assert _fields(got) == ("msg-9", 9, date(2026, 11, 14), _CONFIRMED)
+    assert _fields(got) == _expected(9)
 
 
 @pytest.mark.asyncio
@@ -233,6 +244,24 @@ async def test_summary_has_no_pointer_event_date_or_confirmed_date(store: Memory
 
 
 @pytest.mark.asyncio
+async def _set_last_reviewed(store: MemoryStore, memory_id: UUID, when: datetime) -> None:
+    """``write`` 不落 ``last_reviewed_at``、``mark_reviewed`` 只写「现在」:直接改行。"""
+    if isinstance(store, InMemoryMemoryStore):
+        store._rows = [
+            r.model_copy(update={"last_reviewed_at": when}) if r.id == memory_id else r
+            for r in store._rows
+        ]
+        return
+    assert isinstance(store, SqlMemoryStore)
+    async with store._sf() as session:
+        await session.execute(
+            text("UPDATE memory_item SET last_reviewed_at = :when WHERE id = :id"),
+            {"when": when, "id": memory_id},
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
 async def test_due_for_review_counts_from_the_latest_of_created_reviewed_confirmed(
     store: MemoryStore,
 ) -> None:
@@ -241,7 +270,8 @@ async def test_due_for_review_counts_from_the_latest_of_created_reviewed_confirm
     * 没有确认日期 → 到期;
     * 5 天前用户又说了一遍 → 没到期;
     * 40 天前确认、刚复核过 → 没到期(取最晚的,不是「有确认日期就用它」);
-    * 40 天前确认 → 仍到期(确认本身也过了 30 天)。"""
+    * 40 天前确认 → 仍到期(确认本身也过了 30 天);
+    * 50 天前复核过、5 天前确认 → 没到期(取最晚的,不是「有复核时间就用它」)。"""
     t, u = uuid4(), uuid4()
     created = _NOW - timedelta(days=60)
 
@@ -255,7 +285,9 @@ async def test_due_for_review_counts_from_the_latest_of_created_reviewed_confirm
     restated = aged("restated", _NOW - timedelta(days=5))
     reviewed = aged("reviewed", _NOW - timedelta(days=40))
     stale = aged("stale", _NOW - timedelta(days=40))
-    await store.write([plain, restated, reviewed, stale])
+    reconfirmed = aged("reconfirmed", _NOW - timedelta(days=5))
+    await store.write([plain, restated, reviewed, stale, reconfirmed])
     assert await store.mark_reviewed(tenant_id=t, user_id=u, memory_id=reviewed.id)
+    await _set_last_reviewed(store, reconfirmed.id, _NOW - timedelta(days=50))
     due = await store.list_due_for_review(tenant_id=t, user_id=u, limit=10)
     assert {m.content for m in due} == {"plain", "stale"}
