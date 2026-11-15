@@ -66,9 +66,10 @@ def _calls(
 
 def test_counts_follow_the_design() -> None:
     lines = plan.lines_for(plan.DEFAULT_VENDORS)
-    # A:11 类各 30 次写回 + A12 30 次 x 5 轮 = 480 次写回 / 家,每次 2 次提炼 + 0~1 次去重合并。
+    # A:11 类各 30 次写回 + A12 30 次 x 5 轮 = 480 次写回 / 家,每次 2 次提炼 + 0~2 次去重合并
+    # (重做设计 §7.5:两段合并,每段 0~1 次)。
     assert _calls(lines, "A", "extract", "glm") == (960, 960)
-    assert _calls(lines, "A", "reconcile", "glm") == (0, 480)
+    assert _calls(lines, "A", "reconcile", "glm") == (0, 960)
     # B:7 类 x 10 x 3 = 210 段 / 家,加两成补跑;每段 1.5~2 次主模型。
     assert _calls(lines, "B", "main", "glm") == pytest.approx((378, 504))
     assert _calls(lines, "B", "judge", "glm") == pytest.approx((756, 756))
@@ -98,6 +99,8 @@ def test_cut_order_and_stop() -> None:
     totals = {}
     for cuts in ((), (1,), (1, 2), (1, 2, 3)):
         lines = plan.lines_for(plan.DEFAULT_VENDORS, cuts=cuts, single_vendor="qwen")
+        # 默认报价只覆盖 B / C / A;回归闸门(G)只在点名时才算(重做设计 §11.1 第 2 步)
+        lines = plan.select_lines(lines, plan.BUDGET_ORDER, None)
         totals[cuts] = plan.summarize(lines, prices)["total"]["yuan_high"]
     assert totals[()] > totals[(1,)] > totals[(1, 2)] > totals[(1, 2, 3)]
 

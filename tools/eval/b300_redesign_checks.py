@@ -90,7 +90,8 @@ def _stage_counts(out: dict[str, Any], result: Mapping[str, Any], s: Scenario) -
                 counts[f"basis_{basis or 'none'}"] += 1
                 if sp is None or sp.answer_turn is None or basis not in _USER_BASIS:
                     continue
-                line = lines.get(m.get("turn")) if isinstance(m.get("turn"), int) else None
+                turn = m.get("turn")
+                line = lines.get(turn) if isinstance(turn, int) else None
                 if not lines:
                     counts["turn_unknown"] += 1
                 elif line and line[0] == "user" and sp.answer_text in line[1]:
@@ -274,7 +275,7 @@ def _same_day(out: dict[str, Any], result: Mapping[str, Any], s: Scenario) -> No
 
 
 def checks(record: Mapping[str, Any], scenario: Scenario) -> tuple[dict[str, Any], list[JudgeItem]]:
-    out, items = _new(), []
+    out, items = _new(), list[JudgeItem]()
     result, cls = record["result"], scenario.cls
     if cls in ns.S_CLASSES:
         _s_checks(out, items, record, scenario)
@@ -301,7 +302,7 @@ def gate_checks(
 ) -> tuple[dict[str, Any], list[JudgeItem]]:
     """回归闸门(§11.1 第 2 步):A 组原样的 P6 / P7 单元(只在最后一轮写回一次)—— 第二次的空列表、
     存成 ``user_confirmed`` 且有据 ≥ 4。"""
-    out, items = _new(), []
+    out, items = _new(), list[JudgeItem]()
     result = record["result"]
     out["pass2_empty"] = pass2_empty(result, max(len(result.get("rounds", [])) - 1, 0))
     _grounded(

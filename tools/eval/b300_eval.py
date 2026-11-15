@@ -21,6 +21,10 @@
     python tools/eval/b300_eval.py pilot-tokens --out PILOT_OUT --write tokens.json
     python tools/eval/b300_eval.py report  --out OUT
 
+B-300 重做(设计 ``docs/superpowers/specs/2026-11-15-b300-extraction-redesign-design.md`` §11)的
+回归闸门是单独一份报价 ``quote --phases g``,段 ``gate``;正式一轮的段是 ``a`` 与 ``s`` / ``shape``
+/ ``a13`` / ``a14`` / ``a15`` / ``sd``(都在 A 段)。命令见 ``tools/eval/README.md``。
+
 各段怎么接见 ``tools/eval/README.md`` 的 B-300 一节。
 """
 
@@ -380,6 +384,15 @@ def _judge(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     emit(f"{len(items)} items; spent on this quote ¥{guard.spent:.2f}; blocked={guard.blocked}")
 
 
+def calibration_phase(which: str, phases_arg: str | None) -> str:
+    """校准记在哪一段:B / C 组 → ``calibration``;A 组判官 → ``calibration-a``,只覆盖回归闸门的
+    那份报价(``--phases g``)→ ``calibration-g``(闸门的输出目录单独校一次,§11.1 第 2 步)。"""
+    if which == "b":
+        return "calibration"
+    covered = plan.parse_phases(phases_arg)
+    return "calibration-a" if "A" in covered or "G" not in covered else "calibration-g"
+
+
 def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     labels = read_jsonl(args.labels)
     check_labels(labels)
@@ -392,7 +405,7 @@ def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
             )
     items = [rep.JudgeItem(f"cal|{i}", "calibration", r["prompt"]) for i, r in enumerate(labels)]
     args.out.mkdir(parents=True, exist_ok=True)
-    phase = "calibration" if args.which == "b" else "calibration-a"
+    phase = calibration_phase(args.which, args.phases)
     with spending(args):
         q, guard = approved(args, cmd=f"calibrate {args.which}", phase=phase)
         votes = plan.JUDGE_VOTES if args.which == "b" else int(q["judge"]["a_group_votes"])

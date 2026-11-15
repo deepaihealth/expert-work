@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import sys
@@ -45,7 +46,16 @@ from behavior_client import SseParser, content_type_for  # noqa: E402
 #: 单次调用的输入上限(token)—— 只用来算预留;我们自己拼的提示词远小于它,超了结算时会止损。
 MAX_CALL_INPUT_TOKENS = 40_000
 EXTRACT_MAX_TOKENS = 4_000
-JUDGE_MAX_TOKENS = 2_000
+#: 判官的输出上限(重做设计 §11.8 ④:判词是一个 JSON、一句理由,按需要设,单次最坏值随之变小)。
+JUDGE_MAX_TOKENS = 400
+#: 判官同时在飞的笔数上限(实际笔数还随剩余额度收缩,``b300_spend.RoomGate``)。
+JUDGE_CONCURRENCY = 4
+#: 判官一次调用的输入上界 = 系统提示词与题目的 UTF-8 字节数(字节级分词每个 token 至少一个字节)
+#: + 对话模板的特殊 token 余量。超了结算时会按「超过上限」止损,不会悄悄多花。
+JUDGE_TEMPLATE_OVERHEAD_TOKENS = 64
+#: 判官一次调用输入上界的下限:题目很短时也至少按这么多预留(防厂商计数比字节上界多出一点,
+#: 比如另加的系统前缀)。仍远小于 :data:`MAX_CALL_INPUT_TOKENS`。
+JUDGE_MIN_INPUT_TOKENS = 2_048
 #: 每次调用的采样温度与 JSON 模式的回答格式(判官措辞摘要也算它们,改了要重新校准)。
 TEMPERATURE = 0.0
 JSON_RESPONSE_FORMAT: Mapping[str, str] = {"type": "json_object"}
@@ -67,6 +77,12 @@ PASS1_MARK = "The other side of the conversation is not shown."
 PASS2_MARK = "Every line starts with a tag:"
 OLD_EXTRACT_MARK = "You are a memory extraction module. From the conversation, extract"
 RECONCILE_MARK = "You reconcile newly extracted memories"
+#: 重做(设计 2026-11-15 附录 A / B)换了第二次与去重合并指令的开头;第一次的那句(附录 C)不变。
+REDESIGN_PASS2_MARK = "Each line starts with its number in brackets and a tag:"
+REDESIGN_RECONCILE_MARK = "You compare newly extracted memories"
+#: 切片起点(重做设计 §8.1:同一对话前一个任务的 ``message_count``)传给写回入口的参数名。设计没有
+#: 给参数名,这里按它的说法取;PR S 用了别的名字就同步改这一个常量(同 ``USER_TEXT_PARAM`` 的做法)。
+SLICE_START_PARAM = "start_message_count"
 
 
 #: 睡眠的间接层(测试换掉,不碰全局的 ``asyncio.sleep``;同 ``b302_live``)。
@@ -76,11 +92,11 @@ _sleep = asyncio.sleep
 def classify_call(system_text: str) -> str:
     if PASS1_MARK in system_text:
         return "pass1"
-    if PASS2_MARK in system_text:
+    if PASS2_MARK in system_text or REDESIGN_PASS2_MARK in system_text:
         return "pass2"
     if OLD_EXTRACT_MARK in system_text:
         return "extract_old"
-    if RECONCILE_MARK in system_text:
+    if RECONCILE_MARK in system_text or REDESIGN_RECONCILE_MARK in system_text:
         return "reconcile"
     return "other"
 
@@ -119,11 +135,22 @@ class ChatTransport:
     #: 厂商(glm / deepseek / qwen / doubao):决定关思考与输出上限的字段(审查 H2)。
     provider: str = ""
 
+    def cap_for(self, max_input_tokens: int | None = None) -> float:
+        """一次调用的上限(元);``max_input_tokens`` 不给按 :data:`MAX_CALL_INPUT_TOKENS`。"""
+        price = self.guard.prices[self.model]
+        return call_cap_yuan(price, max_input_tokens or MAX_CALL_INPUT_TOKENS, self.max_tokens)
+
     async def complete(
-        self, messages: list[dict[str, str]], *, item: str, phase: str, json_mode: bool = False
+        self,
+        messages: list[dict[str, str]],
+        *,
+        item: str,
+        phase: str,
+        json_mode: bool = False,
+        max_input_tokens: int | None = None,
     ) -> tuple[str, Mapping[str, Any]]:
         price = self.guard.prices[self.model]
-        cap = call_cap_yuan(price, MAX_CALL_INPUT_TOKENS, self.max_tokens)
+        cap = self.cap_for(max_input_tokens)
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -226,6 +253,8 @@ class GuardedCaller:
         )
         system = "\n".join(m["content"] for m in payload["messages"] if m["role"] == "system")
         kind = classify_call(system)
+        # 重做 §11.4:提炼的输入原样记下(带行号的那几行),``turn`` 指得对不对由它来查。合成内容。
+        rest = "\n".join(str(m["content"]) for m in payload["messages"] if m["role"] != "system")
         try:
             text, usage = await self.transport.complete(
                 payload["messages"], item=f"{self.item}|{kind}", phase=self.phase
@@ -239,6 +268,7 @@ class GuardedCaller:
                 "reply": text,
                 "input_tokens": int(usage.get("prompt_tokens") or 0),
                 "output_tokens": int(usage.get("completion_tokens") or 0),
+                **({"input": rest} if kind in {"pass1", "pass2"} else {}),
             }
         )
         return AIMessage(
@@ -281,6 +311,55 @@ def _live(item: Any) -> bool:
     return item.deleted_at is None and item.invalid_at is None and item.superseded_by is None
 
 
+def platform_capabilities() -> dict[str, bool]:
+    """被测代码有没有重做加的字段(设计 2026-11-15 §9.1 / §8.1);没有的指标报 incomplete。"""
+    from expert_work.protocol import MemoryItem
+    from expert_work.protocol import memory_item as protocol_item
+    from orchestrator.graph_builder import memory as memory_module
+
+    fields = MemoryItem.model_fields
+    origins: frozenset[str] = getattr(protocol_item, "MEMORY_ORIGINS", frozenset())
+    entry = inspect.signature(memory_module.flush_messages_with_outcome).parameters
+    return {
+        "user_confirmed": "user_confirmed" in origins,
+        "evidence_pointer": "evidence_message_id" in fields,
+        "event_date": "occurred_on" in fields,
+        "confirmed_at": "confirmed_at" in fields,
+        "slicing": SLICE_START_PARAM in entry,
+    }
+
+
+def _with_ids(messages: Sequence[Any], turn: int) -> list[Any]:
+    """每条消息一个 id(证据指针指向它;没 id 的补一个)。不进提示词,不改提炼的输入。"""
+    out = []
+    for n, m in enumerate(messages):
+        out.append(
+            m if m.id else m.model_copy(update={"id": f"b300-t{turn}-m{n}-{uuid4().hex[:8]}"})
+        )
+    return out
+
+
+def _text(value: Any) -> Any:
+    return None if value is None else (value if isinstance(value, int) else str(value))
+
+
+def _dump(m: Any) -> dict[str, Any]:
+    return {
+        "id": str(m.id),
+        "kind": m.kind,
+        "content": m.content,
+        "confidence": m.confidence,
+        "origin": getattr(m, "origin", None),
+        "live": _live(m),
+        # 重做要量的(§11.3 / §11.4):谁取代了它、证据指针、事件日期、确认日期。老代码上没有的为空。
+        "superseded_by": _text(getattr(m, "superseded_by", None)),
+        "evidence_message_id": _text(getattr(m, "evidence_message_id", None)),
+        "evidence_message_index": _text(getattr(m, "evidence_message_index", None)),
+        "occurred_on": _text(getattr(m, "occurred_on", None)),
+        "confirmed_at": _text(getattr(m, "confirmed_at", None)),
+    }
+
+
 async def _seed_store(
     store: Any, embedder: Any, scenario: sc.Scenario, user_id: UUID
 ) -> dict[str, str]:
@@ -319,23 +398,31 @@ async def run_extraction(
     item: str,
     phase: str,
 ) -> dict[str, Any]:
-    """一个 A 组(或 §8.5 对比)场景的一次:按 ``writebacks`` 在对应轮之后各写回一次。"""
+    """一个 A 组(或 §8.5 对比、重做的各段)场景的一次:按 ``writebacks`` 在对应轮之后各写回一次。
+    平台收切片起点(:data:`SLICE_START_PARAM`)时,每次写回从上一次写回结束的消息条数起(没有上一次
+    就是 0)—— 同一对话里前一个任务的 ``message_count``(重做设计 §8.1)。"""
     from expert_work.persistence import InMemoryMemoryStore
     from expert_work.runtime.cancellation import CancellationToken
-    from orchestrator.graph_builder.memory import flush_messages_with_outcome
+    from orchestrator.graph_builder import memory as memory_module
 
+    caps = platform_capabilities()
     store = InMemoryMemoryStore()
     user_id = uuid4()
     seeded = await _seed_store(store, embedder, scenario, user_id)
     messages: list[Any] = []
     rounds: list[dict[str, Any]] = []
+    user_ids: list[str | None] = []
     thread = uuid4()
+    start = 0
     for index, turn in enumerate(scenario.turns):
-        messages += turn_messages(turn, index)
+        added = _with_ids(turn_messages(turn, index), index)
+        user_ids.append(str(added[0].id) if added else None)
+        messages += added
         if index not in scenario.writebacks:
             continue
         caller = GuardedCaller(transport, f"{item}|wb{index}", phase)
-        outcome = await flush_messages_with_outcome(
+        slice_arg: dict[str, Any] = {SLICE_START_PARAM: start} if caps["slicing"] else {}
+        outcome = await memory_module.flush_messages_with_outcome(
             list(messages),
             memory_store=store,
             embedder=embedder,
@@ -346,34 +433,32 @@ async def run_extraction(
             token=CancellationToken(),
             reconcile=True,
             agent_name=A_AGENT,
+            **slice_arg,
         )
         if caller.failures or transport.guard.blocked:
             if transport.guard.blocked:
                 raise SpendStopError(transport.guard.blocked)
             raise RuntimeError(f"model call failed inside the writeback: {caller.failures}")
+        now = await store.list_for_user(tenant_id=A_TENANT, user_id=user_id, limit=500)
         rounds.append(
             {
                 "after_turn": index,
                 "written": outcome.written,
                 "failed": outcome.failed,
                 "calls": caller.calls,
+                "message_count": len(messages),
+                "sliced": bool(slice_arg),
+                "live_after": [m.content for m in now if _live(m)],
             }
         )
+        start = len(messages)
     everything = await store.list_for_user(tenant_id=A_TENANT, user_id=user_id, limit=500)
     return {
         "seeded": seeded,
         "rounds": rounds,
-        "memories": [
-            {
-                "id": str(m.id),
-                "kind": m.kind,
-                "content": m.content,
-                "confidence": m.confidence,
-                "origin": getattr(m, "origin", None),
-                "live": _live(m),
-            }
-            for m in everything
-        ],
+        "memories": [_dump(m) for m in everything],
+        "capabilities": caps,
+        "user_message_ids": user_ids,
     }
 
 
@@ -572,10 +657,23 @@ JUDGE_SYSTEM = (
 )
 
 
+def judge_input_bound(messages: Sequence[Mapping[str, str]]) -> int:
+    """判官一次调用输入 token 的上界(§11.8 ④):UTF-8 字节数 + 模板余量,至少
+    :data:`JUDGE_MIN_INPUT_TOKENS`。"""
+    size = sum(len(str(m.get("content", "")).encode("utf-8")) for m in messages)
+    return max(size + JUDGE_TEMPLATE_OVERHEAD_TOKENS, JUDGE_MIN_INPUT_TOKENS)
+
+
+class NoRoomError(RuntimeError):
+    """这一段剩下的钱一笔判官调用都装不下(没有在飞的可等):这一项不判,留给下次;不止损。"""
+
+
 @dataclass
 class Judge:
     transport: ChatTransport
     votes: int
+    #: ``b300_spend.RoomGate``:给了就按剩余额度收缩并发(§11.8 ②)。
+    gate: Any = None
 
     async def vote(self, prompt: str, *, item: str, phase: str) -> list[bool | None]:
         """``votes`` 次独立判;每票 ``True`` / ``False``,解析不了记 ``None``。"""
@@ -586,13 +684,25 @@ class Judge:
     ) -> list[tuple[bool | None, dict[str, int]]]:
         """同 :meth:`vote`,另带每票的 token(试点量 token 用)。"""
         out: list[tuple[bool | None, dict[str, int]]] = []
+        messages = [
+            {"role": "system", "content": JUDGE_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
+        bound = judge_input_bound(messages)
         for n in range(self.votes):
-            text, usage = await self.transport.complete(
-                [{"role": "system", "content": JUDGE_SYSTEM}, {"role": "user", "content": prompt}],
-                item=f"{item}|v{n}",
-                phase=phase,
-                json_mode=True,
-            )
+            if self.gate is not None and not await self.gate.acquire(self.transport.cap_for(bound)):
+                raise NoRoomError(f"{item}: no room left for a judge call in {phase}")
+            try:
+                text, usage = await self.transport.complete(
+                    messages,
+                    item=f"{item}|v{n}",
+                    phase=phase,
+                    json_mode=True,
+                    max_input_tokens=bound,
+                )
+            finally:
+                if self.gate is not None:
+                    await self.gate.release()
             tokens = {
                 "input_tokens": int(usage.get("prompt_tokens") or 0),
                 "output_tokens": int(usage.get("completion_tokens") or 0),

@@ -625,10 +625,10 @@ def build_report(
     disclosures: list[str] = []
     controls = sorted(set(c_control_vendors))
     if 3 in set(cuts_applied) or (controls and len(controls) < len(all_vendors)):
-        missing = sorted(set(all_vendors) - set(controls))
+        untested = sorted(set(all_vendors) - set(controls))
         disclosures.append(
             f"C1、C3 两类对照只在 {', '.join(controls) or '(还没跑)'} 上跑(§8.6 删减 ③);"
-            f"其余 {', '.join(missing)} 没测,C1、C3 的线只在这一家上验过。"
+            f"其余 {', '.join(untested)} 没测,C1、C3 的线只在这一家上验过。"
         )
     disclosures.append(
         "C 组样本小:每家每类 15 次、每领域 3 次,只挡得住明显的问题,挡不住低比例的偶发(§8.7)。"

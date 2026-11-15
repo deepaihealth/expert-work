@@ -575,4 +575,29 @@ C4 分三步:`run --step 1`(写回智能体)→ 等写回 → `bundle --op state
 
 **报告**:每类 x 每家 x 领域判线。B 组线是 11-11 拍板 ①;P6 / P7 / P9 是 §10.2 第 1 条;其余 A 组线是 §8.2 所列;**C 组线一律「待用户确认」,报告只说按提出的线会过 / 不过,不作验收依据**。C1 / C3 只在一家上跑时报告写明哪一家、其余没测;A 组判官默认 1 票(设计没给 A 组算判官钱,本脚本安排),另有 A 组校准把关。基线段报每个场景 3 次里红了几次(≥ 1 留用,0 换掉)。§8.5 对比报写入条数、两类、来源与「下降不超过三分之一」。
 
+### B-300 重做(设计 `docs/superpowers/specs/2026-11-15-b300-extraction-redesign-design.md` §11)
+
+| 文件 | 做什么 |
+|---|---|
+| `b300_redesign_facts.py` / `b300_redesign_scenarios.py` | S 组(S1~S6 同 10 个命题只换来源条件、S7 结论 + 提议、S8 秘密值,共 75 个场景 x 3 = 225 单元,每个 S 场景种一条同领域无关的旁观记忆量「误伤」)、形状留出集(H1~H4 各 5 个,另 5 个领域)、A13 / A14 / A15、同一天读数 SD1~SD3。每一轮之后写回一次 |
+| `b300_redesign_base.py` / `b300_redesign_checks.py` | 判法:关键串(数字按边界)、来源读字段、空列表、带编号的输入、判官的「有据程度」(≥ 4 算对)与「事件日期误标」;平台没有 `user_confirmed` / 证据指针 / 事件日期 / 切片起点时,依赖它的线报 `incomplete` 并写明缺哪个字段 |
+
+段:`gate`(回归闸门,G 段,只在 `--phases g` 时报价)与 `s` / `shape` / `a13` / `a14` / `a15` / `sd`(都在 A 段,与 `a` 一样在本机写回)。P6 / P7 / P9 的来源改读字段(存成 `user_confirmed`),判官只判内容有据;A10 仍只认 `user_stated`,另断言种下的那条被取代。切片起点按参数名 `start_message_count`(`b300_live.SLICE_START_PARAM`)传给写回入口,PR S 用了别的名字就改这个常量;入口不收它时每次写回照整段重抽、A14 报 incomplete。
+
+**判官预留(§11.8)**:判官的调用记在每段自己的子预算 `<段>-judge`(报价的 `phase_budgets` 里与写回分开列;`--allocation` 仍按段给,每段再按中点分给它与它的判官);并发至多 4 路,剩余额度装不下下一笔最坏值时**等在飞的结算后再发**,一笔都没在飞仍装不下就不发、不止损(没判的项下次 `judge` 接着判);每笔最坏值按这道题的 UTF-8 字节数算(至少 2,048 token),输出上限 400;报价里的 `headroom` 列出每段「高档估计 + 并发 x 单次最坏」,分预算不够就给 `headroom_warning`。
+
+**回归闸门**(§11.1 第 2 步,先跑它、过线才报正式一轮;11-15 的 60 个 P6 / P7 单元原样重跑,线:空列表各 ≤ 2 / 30、存成用户确认且有据 ≥ 4 各 ≥ 24 / 30;在老代码上跑出的基线里后一条是 `incomplete`):
+
+```
+python tools/eval/b300_eval.py quote --phases g --vendor glm=glm-5.3:glm-5.3-flash --single-vendor glm \
+    --accept-documented-prices --stop-line <止损线>          # 报价单独给用户批
+python tools/eval/b300_eval.py prepare --phase gate --out GATE --tenant-id - <同样的报价参数> --approved-quote Q
+python tools/eval/b300_eval.py calibrate --set a --labels a-labels.jsonl --out GATE <同样的报价参数> --approved-quote Q
+python tools/eval/b300_eval.py run   --phase gate --out GATE <同样的报价参数> --approved-quote Q
+python tools/eval/b300_eval.py judge --phase gate --out GATE <同样的报价参数> --approved-quote Q
+python tools/eval/b300_eval.py report --out GATE --quote-file quote.json    # 看 G-P6.* / G-P7.*
+```
+
+空列表若回升,先拿掉第二次指令的例子 9 重跑闸门(§11.1)。正式一轮:`quote --phases a`(A 组 + 上面六段)另报价、另批。
+
 **LoCoMo / LongMemEval**:`longmem/endtoend.py` 经提炼入口的显式参数 `user_text_messages` 声明「语料是用户文字」(设计 §4.1);入口还没有这个参数时什么都不传,行为与改前一致;**B-300 的那次 LoCoMo 检查(PR 1 之后的代码)要加 `run_longmem.py --expect-user-text`**,入口没有这个参数就报错,不悄悄跳过。`run_longmem.py` 的端到端档**必须二选一** `--expect-user-text` / `--pre-b300`(都不给、都给都退出);`run_baseline_full.sh` 用 `USER_TEXT_FLAG`(默认 `--pre-b300`,PR 1 合并后改成 `--expect-user-text`)。参数名以 PR 1 为准,改名要同步改 `USER_TEXT_PARAM`。**PR 1 起输入形状变了**:每段会话按角色拆开(用户每轮一条用户消息,经 `user_text_messages` 声明;助手每轮一条助手消息;日期抬头单独一条用户消息),一整段语料一条都没写进去时抛 `NothingIngestedError`。所以 B-300 之前的基线要用新形状重跑、不能沿用旧数;LoCoMo 两个说话人都按用户文字处理,与产品形状不同,分数不能直接和更早的基线比;日期抬头走第一次提炼、可能被丢,时间类题目掉分先查这里(设计 §8.5)。A 组若在被测代码上没看到两次提炼,第一条就停下(不空转花钱)。

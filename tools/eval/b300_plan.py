@@ -37,6 +37,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import b300_redesign_scenarios as ns  # noqa: E402
 import b300_scenarios as sc  # noqa: E402
 from b301_plan import Price, rate_card_rows  # noqa: E402
 
@@ -69,22 +70,26 @@ DOCUMENTED_PRICES: dict[str, tuple[tuple[float, float, float], str]] = {
 
 #: 每种调用每次的 (输入, 输出) token,(低, 高)。**本脚本的假设,未实测**,整理那一行除外。
 CALL_TOKENS: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {
-    # 一次提炼:指令 ~500 + 对话;输出含思考段(glm-5.3-flash 始终带思考,§12 ②)。
-    "extract": ((1_500, 300), (4_000, 1_200)),
-    "reconcile": ((800, 100), (2_000, 600)),
+    # 一次提炼:指令 + 对话;输出含思考段(glm-5.3-flash 始终带思考,§12 ②)。重做设计 §11.7:第二次
+    # 的指令约 2,800 token(原来约 740),第一次不变,低档取两次的平均、高档取第二次加一段长对话。
+    "extract": ((2_000, 300), (6_000, 1_200)),
+    # 重做后每条候选带最多 5 条邻居(原来 3 条),指令约 660(§11.7)。
+    "reconcile": ((1_000, 100), (2_500, 600)),
     # 主模型一步:系统提示词 + 工具定义 + 记忆块 + 附件文字(§8.6「并不短」)。
     "main": ((6_000, 300), (15_000, 1_500)),
     "review": ((800, 50), (2_000, 600)),  # 读时复核
-    "judge": ((1_500, 200), (3_000, 800)),
+    # §11.8 ④:判词很短,高档输出按判官的输出上限(``b300_live.JUDGE_MAX_TOKENS``)。
+    "judge": ((1_500, 200), (3_000, 400)),
     # §12 ⑥ 实测:测试 136,488 / 217 ≈ 629 入、573 出;生产 76,669 / 94 ≈ 816 入、1,128 出。
     "consolidate": ((629, 573), (816, 1_128)),
 }
 #: 每段对话的调用次数(低, 高)(§8.6:每次约 1.5~2 次主模型 + 1 次读时复核)。
 MAIN_PER_CONV = (1.5, 2.0)
 REVIEW_PER_CONV = (1.0, 1.0)
-#: 每次写回:2 次提炼 + 0~1 次去重合并(§8.6)。改前的代码只有 1 次提炼(§8.5 对比用)。
+#: 每次写回:2 次提炼 + 去重合并。改前的代码只有 1 次提炼(§8.5 对比用)。重做设计 §7.5:两次提炼的
+#: 产出分两段合并,每段 0~1 次,所以每次写回 0~2 次(原来 0~1 次)。
 EXTRACT_PER_WRITEBACK, OLD_EXTRACT_PER_WRITEBACK = 2, 1
-RECONCILE_PER_WRITEBACK = (0.0, 1.0)
+RECONCILE_PER_WRITEBACK = (0.0, 2.0)
 #: C5 每次整理 1~3 次整理调用(§8.6)。
 CONSOLIDATE_PER_SWEEP = (1.0, 3.0)
 #: C4 前两段造数对话第一段没有记忆可召回,复核 0~1 次。
@@ -266,6 +271,7 @@ def lines_for(
             n = 2 * len(sc.FACTS)  # 20 段跨领域带工具的对话(§8.5:15~20 段)
             lines += _writebacks("D-compare", v, n, extract=EXTRACT_PER_WRITEBACK)
             lines += _writebacks("D-compare", v, n, extract=OLD_EXTRACT_PER_WRITEBACK)
+        lines += _redesign_lines(v, a_votes)
     # C5 ①:整理只在一个型号上(15 次)+ 判官判汇总行。
     sweeps = c_n * RERUN_FACTOR
     lines += [
@@ -323,6 +329,17 @@ def lines_for(
             CALIBRATION_ITEMS * JUDGE_VOTES,
         )
     )
+    # 回归闸门的那份报价自带一套 A 组判官校准(它的输出目录与正式一轮分开,§11.1 第 2 步)。
+    lines.append(
+        Line(
+            "calibration-g",
+            "judge",
+            JUDGE_MODEL,
+            "judge",
+            CALIBRATION_ITEMS * a_votes,
+            CALIBRATION_ITEMS * a_votes,
+        )
+    )
     # A 组判官另有一套校准(审查 M3):A 组的判法与 B 组不同,用 A 组的票数校。
     lines.append(
         Line(
@@ -334,6 +351,50 @@ def lines_for(
             CALIBRATION_ITEMS * a_votes,
         )
     )
+    return lines
+
+
+#: 重做(设计 2026-11-15 §11.2 / §11.3)要判官判「有据程度」的类;做到的比例按 0.8~1 估。
+REDESIGN_GROUNDED = ("S2", "S3", "S4")
+GROUNDED_SHARE = (0.8, 1.0)
+
+
+def _redesign_lines(v: Vendor, a_votes: int) -> list[Line]:
+    """§11.7 ①:S 组、形状留出集、A13~A15、同一天读数(组 ``S``,A 段)与回归闸门(组 ``gate``,G 段)。
+    每个场景每轮写回一次;判官:有据程度(S2~S4、闸门的 P6 / P7)、事件日期误标(每个单元至多按
+    一条带事件日期的记忆估,低档只算同一天读数那几类)。A 组原有的单元另加事件日期那一项。"""
+    rows = ns.build_redesign()
+    writebacks = sum(len(s.writebacks) for s in rows) * REPEATS
+    units = len(rows) * REPEATS
+    grounded = sum(s.cls in REDESIGN_GROUNDED for s in rows) * REPEATS
+    dated_low = sum(s.cls in ns.SD_CLASSES for s in rows) * REPEATS
+    a_units = len(sc.A_CLASSES) * sc.SCENARIOS_PER_CLASS["A"] * REPEATS
+    gate_units = 2 * sc.SCENARIOS_PER_CLASS["A"] * REPEATS
+    lines = _writebacks("S", v, writebacks)
+    lines += [
+        Line(
+            "S",
+            v.provider,
+            JUDGE_MODEL,
+            "judge",
+            grounded * GROUNDED_SHARE[0] * a_votes,
+            grounded * GROUNDED_SHARE[1] * a_votes,
+        ),
+        Line("S", v.provider, JUDGE_MODEL, "judge_event", dated_low * a_votes, units * a_votes),
+        Line("A", v.provider, JUDGE_MODEL, "judge_event", 0.0, a_units * a_votes),
+    ]
+    lines += _writebacks("gate", v, gate_units)
+    lines += [
+        Line(
+            "gate",
+            v.provider,
+            JUDGE_MODEL,
+            "judge",
+            gate_units * GROUNDED_SHARE[0] * a_votes,
+            gate_units * GROUNDED_SHARE[1] * a_votes,
+        ),
+        Line("gate", v.provider, JUDGE_MODEL, "judge_event", 0.0, gate_units * a_votes),
+    ]
     return lines
 
 
@@ -376,6 +437,9 @@ def pilot_lines(
 #: 分预算(审查 M4):止损线按 B → C → A 的先后分给三段(B 是核心验收),每段最多拿到自己的高档
 #: 估计;记账用的 phase → 段。
 BUDGET_ORDER = ("B", "C", "A")
+#: 只在点名时才覆盖的段(不进默认报价):G = 回归闸门(§11.1 第 2 步,单独报价、单独批)。
+EXPLICIT_BUDGETS = ("G",)
+JUDGE_SUFFIX = "-judge"
 _GROUP_BUDGET = {
     "B": "B",
     "B-alt": "B",
@@ -384,6 +448,9 @@ _GROUP_BUDGET = {
     "A": "A",
     "D-compare": "A",
     "calibration-a": "A",
+    "S": "A",
+    "gate": "G",
+    "calibration-g": "G",
 }
 
 
@@ -398,9 +465,10 @@ def parse_phases(raw: str | None) -> tuple[str, ...]:
     if not raw:
         return BUDGET_ORDER
     picked = tuple(dict.fromkeys(x.strip().upper() for x in raw.split(",") if x.strip()))
-    if not picked or set(picked) - set(BUDGET_ORDER):
-        raise PlanError(f"--phases takes a subset of b,c,a; got {raw!r}")
-    return tuple(b for b in BUDGET_ORDER if b in picked)
+    known = (*BUDGET_ORDER, *EXPLICIT_BUDGETS)
+    if not picked or set(picked) - set(known):
+        raise PlanError(f"--phases takes a subset of b,c,a,g; got {raw!r}")
+    return tuple(b for b in known if b in picked)
 
 
 def parse_allocation(raw: str | None) -> dict[str, float] | None:
@@ -443,6 +511,8 @@ GROUP_PHASES: dict[str, tuple[str, ...]] = {
     "C-C4": ("c4",),
     "C-C5": ("c5",),
     "C-baseline": ("c2-baseline", "c4-baseline", "c5-baseline"),
+    "S": ("s", "shape", "a13", "a14", "a15", "sd"),
+    "gate": ("gate",),
 }
 
 
@@ -481,34 +551,94 @@ def phase_budgets(
     """分预算是报价里**写明、由用户批**的一部分(审查 M-b):默认按每段估计的中点(低档与高档的
     平均)按比例分止损线;给了 ``--allocation`` 就用用户的(只能覆盖本报价的段、合计不超过止损线)。
     超了分预算只拒那一段。"""
-    low: dict[str, float] = dict.fromkeys(phases, 0.0)
-    high: dict[str, float] = dict.fromkeys(phases, 0.0)
-    for group, g in planned["groups"].items():
-        budget = budget_of_group(group)
-        if budget in low:
-            low[budget] += float(g["yuan_low"])
-            high[budget] += float(g["yuan_high"])
-    mid = {b: (low[b] + high[b]) / 2 for b in phases}
+    low: dict[str, float] = {}
+    high: dict[str, float] = {}
+    if "budgets" in planned:  # 判官另一段(§11.8 ③):``<段>`` 与 ``<段>-judge``
+        for key, b in planned["budgets"].items():
+            if key.removesuffix(JUDGE_SUFFIX) in phases:
+                low[key] = float(b["yuan_low"])
+                high[key] = float(b["yuan_high"])
+    else:
+        for group, g in planned["groups"].items():
+            budget = budget_of_group(group)
+            if budget in phases:
+                low[budget] = low.get(budget, 0.0) + float(g["yuan_low"])
+                high[budget] = high.get(budget, 0.0) + float(g["yuan_high"])
+    for b in phases:
+        low.setdefault(b, 0.0)
+        high.setdefault(b, 0.0)
+    keys = sorted(low, key=lambda k: (phases.index(k.removesuffix(JUDGE_SUFFIX)), k))
+    mid = {k: (low[k] + high[k]) / 2 for k in keys}
     if allocation is not None:
         if set(allocation) != set(phases):
             raise PlanError(f"--allocation must name exactly the covered phases {list(phases)}")
         if sum(allocation.values()) > stop_line + 1e-9 or min(allocation.values()) < 0:
             raise PlanError("--allocation must be non-negative and sum to at most the stop line")
-        given, basis = dict(allocation), "user (--allocation)"
+        given = {}
+        for k in keys:  # 每段的钱按中点再分给它自己与它的判官
+            parent = k.removesuffix(JUDGE_SUFFIX)
+            family = sum(mid[x] for x in keys if x.removesuffix(JUDGE_SUFFIX) == parent)
+            share = mid[k] / family if family else (1.0 if k == parent else 0.0)
+            given[k] = allocation[parent] * share
+        basis = "user (--allocation), each phase split with its judge by midpoint"
     else:
         total = sum(mid.values()) or 1.0
-        given = {b: stop_line * mid[b] / total for b in phases}
+        given = {k: stop_line * mid[k] / total for k in keys}
         basis = "proportional to the low-high midpoint of each phase"
     return {
-        b: {
-            "low_estimate_yuan": round(low[b], 2),
-            "high_estimate_yuan": round(high[b], 2),
-            "midpoint_yuan": round(mid[b], 2),
-            "budget_yuan": round(given[b], 2),
+        k: {
+            "low_estimate_yuan": round(low[k], 2),
+            "high_estimate_yuan": round(high[k], 2),
+            "midpoint_yuan": round(mid[k], 2),
+            "budget_yuan": round(given[k], 2),
             "basis": basis,
         }
-        for b in phases
+        for k in keys
     }
+
+
+#: 报价时按多长的判官题算单次最坏值(token;运行时按每道题的实际字节数,见 ``b300_live``)。
+JUDGE_QUOTE_INPUT_BOUND = 8_000
+
+
+def headroom(
+    lines: Sequence[Line], prices: Mapping[str, Price], budgets: Mapping[str, Any]
+) -> dict[str, Any]:
+    """§11.8 ①:每段要留的余量 = 同时在飞的笔数 x 单次最坏值;分预算低于「高档估计 + 余量」
+    就标出来。"""
+    import b300_live as live
+
+    def worst(line: Line) -> float:
+        price = prices[line.model]
+        if line.kind.startswith("judge"):
+            return spend_cap(price, JUDGE_QUOTE_INPUT_BOUND, live.JUDGE_MAX_TOKENS)
+        if line.kind in {"main", "review"}:
+            return live.RUN_TOKEN_BUDGET * price.output / 1e6
+        return spend_cap(price, live.MAX_CALL_INPUT_TOKENS, live.EXTRACT_MAX_TOKENS)
+
+    out: dict[str, Any] = {}
+    for key, b in budgets.items():
+        mine = [ln for ln in lines if budget_key(ln) == key and (ln.high or ln.low)]
+        if not mine:
+            in_flight = 0.0
+        elif key.endswith(JUDGE_SUFFIX):
+            in_flight = live.JUDGE_CONCURRENCY * max(worst(ln) for ln in mine)
+        else:
+            vendors = {ln.vendor for ln in mine}
+            in_flight = live.CONCURRENCY_PER_VENDOR * len(vendors) * max(worst(ln) for ln in mine)
+        needed = float(b["high_estimate_yuan"]) + in_flight
+        out[key] = {
+            "budget_yuan": b["budget_yuan"],
+            "high_estimate_yuan": b["high_estimate_yuan"],
+            "in_flight_worst_yuan": round(in_flight, 4),
+            "needed_yuan": round(needed, 4),
+            "short": float(b["budget_yuan"]) < needed - 1e-9,
+        }
+    return out
+
+
+def spend_cap(price: Price, max_input: int, max_output: int) -> float:
+    return (max_input * price.input + max_output * price.output) / 1e6
 
 
 #: 嵌入没有价目行(价目表里只有对话模型),用量只报估计条数与 token;给了 ``--embed-price``
@@ -571,19 +701,33 @@ def load_token_overrides(
 
 
 def line_cost(line: Line, price: Price, tokens: TokenTable = CALL_TOKENS) -> tuple[float, float]:
-    (lin, lout), (hin, hout) = tokens["judge" if line.kind == "judge_p8" else line.kind]
+    (lin, lout), (hin, hout) = tokens["judge" if line.kind.startswith("judge") else line.kind]
     low = line.low * (lin * price.input + lout * price.output) / 1e6
     high = line.high * (hin * price.input + hout * price.output) / 1e6
     return low, high
+
+
+def budget_key(line: Line) -> str:
+    """一行调用记在哪一段分预算:判官的调用(和校准)记在 ``<段>-judge``(§11.8 ③)。"""
+    budget = budget_of_group(line.group)
+    if budget != "pilot" and (
+        line.kind.startswith("judge") or line.group.startswith("calibration")
+    ):
+        return budget + JUDGE_SUFFIX
+    return budget
 
 
 def summarize(
     lines: Sequence[Line], prices: Mapping[str, Price], tokens: TokenTable = CALL_TOKENS
 ) -> dict[str, Any]:
     groups: dict[str, Any] = {}
+    budgets: dict[str, dict[str, float]] = {}
     total = [0.0, 0.0, 0.0, 0.0]
     for line in lines:
         low, high = line_cost(line, prices[line.model], tokens)
+        b = budgets.setdefault(budget_key(line), {"yuan_low": 0.0, "yuan_high": 0.0})
+        b["yuan_low"] += low
+        b["yuan_high"] += high
         g = groups.setdefault(
             line.group,
             {
@@ -618,6 +762,7 @@ def summarize(
         total[3] += high
     return {
         "groups": _rounded(groups),
+        "budgets": _rounded(dict(sorted(budgets.items()))),
         "total": {
             "calls_low": round(total[0]),
             "calls_high": round(total[1]),
@@ -716,6 +861,21 @@ def quote(
             remaining_for=remaining_for,
         )
     shares, counts = remaining_for(cuts, one) if remaining_for is not None else ({}, {})
+    planned_lines = (
+        pilot_lines(vendors, single_vendor=one, a_votes=a_votes)
+        if pilot
+        else select_lines(
+            lines_for(
+                vendors,
+                cuts=cuts,
+                single_vendor=one,
+                include_compare=include_compare,
+                a_votes=a_votes,
+            ),
+            phases,
+            shares or None,
+        )
+    )
     if stop_line is None:
         # 试点的止损线默认取它自己的高档估计(审查 M-c),正式报价默认 ¥400。
         stop_line = float(math.ceil(planned["total"]["yuan_high"])) if pilot else cap
@@ -767,6 +927,16 @@ def quote(
             "embeddings unless --embed-price is given (see 'embeddings')",
         ],
     }
+    if not pilot:
+        room = headroom(planned_lines, prices, body["phase_budgets"])
+        body["headroom"] = room
+        short = sorted(k for k, h in room.items() if h["short"])
+        if short:
+            body["headroom_warning"] = (
+                f"the sub-budget of {', '.join(short)} is below its high estimate plus the worst "
+                "cost of the calls that may be in flight at once (design 2026-11-15 §11.8 ①): "
+                "raise the stop line or the allocation, or the run may stop half way"
+            )
     if status == "stop_and_ask":
         body["note"] = (
             "after cuts 1-3 the high estimate still crosses the cap, or the stop line would: "

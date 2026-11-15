@@ -27,7 +27,9 @@ def _m(content: str, **kw: Any) -> dict[str, Any]:
     return {"kind": "fact", "content": content, **kw}
 
 
-def _row(rid: str, content: str, origin: str | None, *, live: bool = True, **kw: Any) -> dict:
+def _row(
+    rid: str, content: str, origin: str | None, *, live: bool = True, **kw: Any
+) -> dict[str, Any]:
     return {"id": rid, "kind": "fact", "content": content, "origin": origin, "live": live, **kw}
 
 
@@ -73,6 +75,7 @@ def _rec(
 def test_s2_to_s4_need_user_confirmed_and_a_grounded_judgement(cls: str) -> None:
     s = _s(cls)
     sp = ns.spec(s)
+    assert sp.answer_turn is not None
     row = _row("1", f"stored {s.x_key}", "user_confirmed")
     checks, items = chk.checks(_rec(s, memories=[row]), s)
     assert checks["confirmed_grounded"] is None  # 等判官

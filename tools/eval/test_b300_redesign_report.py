@@ -42,7 +42,7 @@ def _record(
     }
 
 
-def _row(content: str, origin: str | None, *, live: bool = True, rid: str = "1") -> dict:
+def _row(content: str, origin: str | None, *, live: bool = True, rid: str = "1") -> dict[str, Any]:
     return {"id": rid, "kind": "fact", "content": content, "origin": origin, "live": live}
 
 
