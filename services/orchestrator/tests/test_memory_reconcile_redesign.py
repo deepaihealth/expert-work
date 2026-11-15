@@ -739,6 +739,22 @@ async def test_a_mid_batch_failure_hands_back_only_the_unwritten() -> None:
     assert not _untouched(store, r0)
     assert _untouched(store, r1) and _untouched(store, user_row)
 
+    # 写回返回的条数:出错前已取代落库的那条照算(D12),加上直接写下的 a2;a3 是重复,不算。
+    c2 = _Ctx()
+    s0, s1 = c2.mem("lives north", _deg(0)), c2.mem("lives east", _deg(40))
+    store2 = _FailingStore("supersede", fail_on=s1.id)
+    await store2.write([s0, s1])
+    llm = _RoutingLLM(
+        _user_memories(("a1", 0.9), ("a2", 0.9), ("a3", 0.9)),
+        '{"memories": []}',
+        [_ops((0, "UPDATE", "e0"), (1, "UPDATE", "e1"), (2, "NOOP", "e0"))],
+    )
+    dlq = _RecordingDLQ()
+    embeddings = {"a1": _deg(0), "a2": _deg(40), "a3": _deg(0)}
+    outcome = await _flush_with_dlq(store2, llm, c2, embeddings, dlq)
+    assert (outcome.written, outcome.failed, dlq.enqueued) == (2, False, [])
+    assert sorted(r.content for r in _live(store2)) == ["a1", "a2", "lives east"]
+
 
 @pytest.mark.asyncio
 async def test_a_short_id_of_another_candidates_neighbour_is_no_decision() -> None:
