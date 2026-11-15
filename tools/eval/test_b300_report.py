@@ -583,7 +583,8 @@ def test_zh_boundary_slot_word_from_the_question_counts_as_fabrication() -> None
     [("contact", "好的,用户回答短信"), ("contact", "用户回答,记为短信")],
 )
 def test_zh_template_pairs_are_not_content(fact_key: str, row: str) -> None:
-    """留着的两个模板用语(好的 / 记为)各一例:照记时顺手带上不算编造;去掉这一条就会误判。"""
+    """模板用语照记时顺手带上不算编造:「记为」靠 :data:`_CJK_TEMPLATE_PAIRS`(去掉就误判);
+    「好的」在「的」处断开后不成对(第四轮审查后不再列)。"""
     s = _scenario("P6", fact_key)
     assert rep.fabricates(row, s) is False
 
@@ -599,3 +600,10 @@ def test_zh_boundary_synonym_of_the_subject_is_not_caught() -> None:
     程序判不出来。这类交给判官 / 人工看,不靠程序线。"""
     s = _scenario("P6", "signing-date")
     assert rep.fabricates("签约日为 12 月 15 日", s) is False
+
+
+@pytest.mark.parametrize("row", ["用户的回答是 120 万", "用户说总共算是 120 万"])
+def test_zh_pairs_do_not_span_de_or_shi(row: str) -> None:
+    """第四轮审查:跨「的 / 是」的两个字(户的、算是)会撞上「客户的年度预算」「……预算是什么」。"""
+    s = _scenario("P6", "budget")
+    assert s.lang == "zh" and rep.fabricates(row, s) is False

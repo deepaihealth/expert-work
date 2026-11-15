@@ -56,8 +56,12 @@ _FUNCTION_WORDS = frozenset(
 #: 只接了两个字主题词的编造(「预算:……」「用药:……」「通知:……」)又漏掉(第三轮审查)。
 #: 边界(已接受、设计 §8.2 写明):「用户说日期是……」里的「日期」只在助手问的主题里出现,算编造。
 _CJK_GRAM = 2
-#: 助手模板里的应答用语,不是内容:照记的人可能顺手带上(「好的,用户回答……」「记为……」)。
-_CJK_TEMPLATE_PAIRS = frozenset({"好的", "记为"})
+#: 「的」「是」处断开、不跨着取(第四轮审查:「户的」「算是」会撞上「客户的年度预算」「……预算是
+#: 什么」);断开而不是删掉,删掉再拼会粘出新的两个字。
+_CJK_SEPARATORS = re.compile("[的是]")
+#: 助手模板里的应答用语,不是内容:照记的人可能顺手带上(「用户回答,记为……」)。「好的」在「的」处
+#: 断开后已不成对,不再列。
+_CJK_TEMPLATE_PAIRS = frozenset({"记为"})
 _CONTRACTION = re.compile(r"(?<=[a-z])(n't|'s|'re|'m|'ll|'ve|'d)\b")
 _EXPANDED = {"n't": " not", "'s": "", "'re": " are", "'m": " am", "'ll": " will", "'ve": " have"}
 _CURLY_APOSTROPHE = chr(0x2019)
@@ -65,13 +69,14 @@ _CURLY_APOSTROPHE = chr(0x2019)
 
 def _content_tokens(text: str) -> set[str]:
     """内容词:NFKC、小写、只展开词尾的缩写(引号里的 'staging' 不受影响);英文按词(带小数的数字
-    算一个,去掉 :data:`_FUNCTION_WORDS`),中文取每段连续汉字里相邻的 :data:`_CJK_GRAM` 个字(去掉
-    :data:`_CJK_TEMPLATE_PAIRS`)。"""
+    算一个,去掉 :data:`_FUNCTION_WORDS`),中文取每段连续汉字(在 :data:`_CJK_SEPARATORS` 处再断开)
+    里相邻的 :data:`_CJK_GRAM` 个字(去掉 :data:`_CJK_TEMPLATE_PAIRS`)。"""
     low = unicodedata.normalize("NFKC", text).lower().replace(_CURLY_APOSTROPHE, "'")
     low = _CONTRACTION.sub(lambda m: _EXPANDED.get(m.group(1), " would"), low)
     words = {w for w in re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", low) if w not in _FUNCTION_WORDS}
     for run in re.findall(r"[\u4e00-\u9fff]+", low):
-        words |= {run[i : i + _CJK_GRAM] for i in range(len(run) - _CJK_GRAM + 1)}
+        for part in _CJK_SEPARATORS.split(run):
+            words |= {part[i : i + _CJK_GRAM] for i in range(len(part) - _CJK_GRAM + 1)}
     return words - _CJK_TEMPLATE_PAIRS
 
 
