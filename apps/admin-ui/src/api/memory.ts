@@ -23,14 +23,17 @@ import { listAudit, type AuditEntry } from "./audit";
 
 export type MemoryKind = "fact" | "episodic";
 
-/** B-300 PR 2 — the source column: what the user typed (``user_stated``) or
- *  what came from the transcript (``assistant_derived``); null = not recorded. */
-export type MemoryOrigin = "user_stated" | "assistant_derived";
+/** B-300 PR 2 — the source column: what the user typed (``user_stated``),
+ *  the user's answer to / agreement with the assistant (``user_confirmed``,
+ *  B-300 redesign) or what came from the transcript (``assistant_derived``);
+ *  null = not recorded. */
+export type MemoryOrigin = "user_stated" | "user_confirmed" | "assistant_derived";
 
-/** The four labels every reader shows (B-300 design §5.1). */
+/** The five labels every reader shows (B-300 design §5.1, redesign §6.2). */
 export type EffectiveOrigin =
   | "user_corrected"
   | "user_stated"
+  | "user_confirmed"
   | "assistant_derived"
   | "unrecorded";
 
@@ -39,6 +42,7 @@ export type EffectiveOrigin =
 export function effectiveOrigin(item: Pick<MemoryItem, "origin" | "confidence">): EffectiveOrigin {
   if (item.confidence >= 1) return "user_corrected";
   if (item.origin === "user_stated") return "user_stated";
+  if (item.origin === "user_confirmed") return "user_confirmed";
   if (item.origin === "assistant_derived") return "assistant_derived";
   return "unrecorded";
 }

@@ -112,6 +112,11 @@ def _row_to_item(row: MemoryItemRow) -> MemoryItem:
         # B-300 PR 2 — an unknown stored origin reads as None (model validator).
         origin=row.origin,  # type: ignore[arg-type]
         embedding_model=row.embedding_model,
+        # B-300 redesign PR M — evidence pointer, event date, last restated by the user.
+        evidence_message_id=row.evidence_message_id,
+        evidence_message_index=row.evidence_message_index,
+        occurred_on=row.occurred_on,
+        confirmed_at=row.confirmed_at,
     )
     # Capability Uplift Sprint #2 (Mini-ADR U-4) — drift detection.
     if row.content_hash and hash_content(row.content) != row.content_hash:
@@ -239,6 +244,11 @@ class SqlMemoryStore(MemoryStore):
                 # B-300 PR 2 — source + the model that computed the vector.
                 "origin": item.origin,
                 "embedding_model": item.embedding_model,
+                # B-300 redesign PR M.
+                "evidence_message_id": item.evidence_message_id,
+                "evidence_message_index": item.evidence_message_index,
+                "occurred_on": item.occurred_on,
+                "confirmed_at": item.confirmed_at,
             }
             for item in items
         ]
@@ -663,6 +673,12 @@ class SqlMemoryStore(MemoryStore):
                 expected_valid_days=new_item.expected_valid_days,
                 origin=new_item.origin,
                 embedding_model=new_item.embedding_model,
+                # B-300 redesign §9.2 — the new row carries the candidate's evidence
+                # pointer and event date (and, like the in-memory store, the rest of it).
+                evidence_message_id=new_item.evidence_message_id,
+                evidence_message_index=new_item.evidence_message_index,
+                occurred_on=new_item.occurred_on,
+                confirmed_at=new_item.confirmed_at,
             )
             session.add(new_row)
             await session.commit()
@@ -1169,7 +1185,11 @@ class SqlMemoryStore(MemoryStore):
         limit: int,
     ) -> list[MemoryItem]:
         now = datetime.now(UTC)
-        base_ts = func.coalesce(MemoryItemRow.last_reviewed_at, MemoryItemRow.created_at)
+        # B-300 redesign §9.2 — the latest of created / last reviewed / last restated by
+        # the user (GREATEST skips NULLs): a memory the user just said again is not due.
+        base_ts = func.greatest(
+            MemoryItemRow.created_at, MemoryItemRow.last_reviewed_at, MemoryItemRow.confirmed_at
+        )
         due_at = base_ts + func.make_interval(0, 0, 0, MemoryItemRow.expected_valid_days)
         stmt = (
             select(MemoryItemRow)

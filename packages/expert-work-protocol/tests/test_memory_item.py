@@ -108,7 +108,7 @@ def test_newer_payload_with_extra_fields_still_reads() -> None:
     assert item.origin == "user_stated"
 
 
-def test_effective_origin_four_cases() -> None:
+def test_effective_origin_five_cases() -> None:
     # 置信度 1.0 只有更正接口会写:不论来源列是什么,都是用户更正。
     assert effective_origin(_origin_item(confidence=1.0)) == "user_corrected"
     assert (
@@ -116,5 +116,52 @@ def test_effective_origin_four_cases() -> None:
         == "user_corrected"
     )
     assert effective_origin(_origin_item(origin="user_stated")) == "user_stated"
+    assert effective_origin(_origin_item(origin="user_confirmed")) == "user_confirmed"
     assert effective_origin(_origin_item(origin="assistant_derived")) == "assistant_derived"
     assert effective_origin(_origin_item()) == "unrecorded"
+
+
+# ─── B-300 重做 PR M —— 第三个来源值「用户确认」与证据指针、事件日期、确认日期 ─────────
+
+
+def test_user_confirmed_is_a_known_origin() -> None:
+    """重做设计 §6.2:来源加第三个值 ``user_confirmed``,读写都原样保留。"""
+    assert _origin_item(origin="user_confirmed").origin == "user_confirmed"
+
+
+def test_effective_origin_user_confirmed_sits_below_correction() -> None:
+    """有效来源的顺序:置信度 1.0 → 用户更正;否则 用户说的 → 用户确认 → 来自助手 → 未记录。"""
+    assert effective_origin(_origin_item(origin="user_confirmed")) == "user_confirmed"
+    assert (
+        effective_origin(_origin_item(origin="user_confirmed", confidence=1.0)) == "user_corrected"
+    )
+
+
+def test_evidence_event_and_confirmed_fields_default_none() -> None:
+    """老行、老检查点里的记忆对象没有这四个字段:读出来都是空。"""
+    item = _origin_item()
+    assert item.evidence_message_id is None
+    assert item.evidence_message_index is None
+    assert item.occurred_on is None
+    assert item.confirmed_at is None
+
+
+def test_evidence_event_and_confirmed_fields_round_trip() -> None:
+    """证据指针(消息 id + 序号)、事件日期(只到天)、确认日期;经 JSON 往返不变
+    (记忆对象会进检查点)。"""
+    from datetime import UTC, date, datetime
+
+    confirmed = datetime(2026, 11, 15, 8, 30, tzinfo=UTC)
+    item = _origin_item(
+        evidence_message_id="msg-7",
+        evidence_message_index=7,
+        occurred_on="2026-11-14",
+        confirmed_at=confirmed,
+    )
+    assert item.evidence_message_id == "msg-7"
+    assert item.evidence_message_index == 7
+    assert item.occurred_on == date(2026, 11, 14)
+    assert item.confirmed_at == confirmed
+    again = MemoryItem.model_validate_json(item.model_dump_json())
+    assert (again.evidence_message_id, again.evidence_message_index) == ("msg-7", 7)
+    assert (again.occurred_on, again.confirmed_at) == (date(2026, 11, 14), confirmed)
