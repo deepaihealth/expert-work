@@ -279,6 +279,10 @@ def test_shape_counts_follow_the_expected_lists() -> None:
     counts = chk.checks(_rec(s, memories=rows), s)[0]["counts"]
     assert counts["user_confirmed_hit"] == 1
     assert counts["assistant_value_on_user_side"] == 1
+    # 存下了、但来源不是期望的那种:不算命中,另计
+    wrong = [_row("1", f"plan {e['user_confirmed'][0]}", "assistant_derived")]
+    counts = chk.checks(_rec(s, memories=wrong), s)[0]["counts"]
+    assert counts["user_confirmed_other_origin"] == 1 and counts["user_confirmed_hit"] == 0
     h4 = next(x for x in _rows("H4"))
     leak = _rec(h4, memories=[_row("1", f"code {ns.spec(h4).secret}", None, live_=False)])
     assert chk.checks(leak, h4)[0]["counts"]["secret_stored"] == 1
