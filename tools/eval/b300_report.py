@@ -25,7 +25,6 @@ from typing import Any
 
 import b300_live as live
 import b300_scenarios as sc
-from b300_live import parse_extraction
 
 APPROVED_B = "已拍板 ①(11-11)"
 APPROVED_SHORT = "已拍板(§10.2 第 1 条)"
@@ -151,7 +150,7 @@ def _calls(result: Mapping[str, Any], kind: str) -> list[dict[str, Any]]:
 
 
 def _memories(result: Mapping[str, Any], kind: str) -> list[dict[str, Any]]:
-    return [m for c in _calls(result, kind) for m in parse_extraction(c["reply"])]
+    return [m for c in _calls(result, kind) for m in live.parse_extraction(c["reply"])]
 
 
 def _bullets(rows: Iterable[str]) -> str:
