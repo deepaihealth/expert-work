@@ -16,9 +16,20 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from b300_live import parse_extraction
+
+
+@dataclass(frozen=True)
+class JudgeItem:
+    """送判官的一项(``b300_report`` 沿用这个名字)。"""
+
+    key: str
+    check: str
+    prompt: str
+
 
 #: 用户一方的来源(设计 §6.2:用户更正、用户说的、用户确认)。``user_corrected`` 不是列值(更正靠
 #: 置信度 1.0),这里只为对得上平台的 ``USER_SIDE_ORIGINS``。
@@ -147,6 +158,32 @@ def grounded_prompt(assistant_line: str, user_line: str, memories: Sequence[str]
         "Give the level you chose in the reason.\n"
         f"Memories:\n{_bullets(memories)}"
     )
+
+
+def confirmed_check(
+    out: dict[str, Any],
+    items: list[JudgeItem],
+    record: Mapping[str, Any],
+    *,
+    metric: str,
+    key: str,
+    lines: tuple[str, str],
+    extra_ok: bool = True,
+) -> None:
+    """存成 ``user_confirmed``(**读字段**)且判官判「有据程度 ≥ 4」(§11.3 / §11.4)。``lines`` =
+    (助手那一行, 用户那一行)。平台没有这个来源值 → ``out["missing"][metric]``(incomplete);
+    没存成用户确认、或 ``extra_ok`` 不成立 → ``False``(不送判官);否则 ``None`` + 一项待判。"""
+    result = record["result"]
+    if not capability(result, "user_confirmed"):
+        out.setdefault("missing", {})[metric] = "user_confirmed"
+        return
+    rows = stored(result, key, live_only=True, origins={"user_confirmed"})
+    if not rows or not extra_ok:
+        out[metric] = False
+        return
+    out[metric] = None
+    prompt = grounded_prompt(lines[0], lines[1], [str(m["content"]) for m in rows])
+    items.append(JudgeItem(f"{record['key']}|{metric}", metric, prompt))
 
 
 def event_date_prompt(content: str, occurred_on: str) -> str:

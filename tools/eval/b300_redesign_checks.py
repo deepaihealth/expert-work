@@ -25,16 +25,16 @@ import b300_redesign_scenarios as ns
 from b300_live import parse_extraction
 from b300_redesign_base import (
     USER_SIDE,
+    JudgeItem,
     capability,
+    confirmed_check,
     event_date_prompt,
-    grounded_prompt,
     has_key,
     numbered_lines,
     pass2_empty,
     pass_memories,
     stored,
 )
-from b300_report import JudgeItem
 from b300_scenarios import Scenario
 
 #: 「好」类指标:``True`` = 做到了;判官答 yes = 做到了。
@@ -66,24 +66,9 @@ def _grounded(
     metric: str,
     key: str,
     answer_turn: int,
-    extra_ok: bool = True,
 ) -> None:
-    """存成 ``user_confirmed``(读字段)且判官判「有据程度 ≥ 4」(§11.3 / §11.4)。"""
-    result = record["result"]
-    if not capability(result, "user_confirmed"):
-        out["missing"][metric] = "user_confirmed"
-        return
-    rows = stored(result, key, live_only=True, origins={"user_confirmed"})
-    if not rows or not extra_ok:
-        out[metric] = False
-        return
-    out[metric] = None
-    prompt = grounded_prompt(
-        scenario.turns[answer_turn - 1].reply,
-        scenario.turns[answer_turn].user,
-        [str(m["content"]) for m in rows],
-    )
-    items.append(JudgeItem(f"{record['key']}|{metric}", metric, prompt))
+    lines = (scenario.turns[answer_turn - 1].reply, scenario.turns[answer_turn].user)
+    confirmed_check(out, items, record, metric=metric, key=key, lines=lines)
 
 
 def _stage_counts(out: dict[str, Any], result: Mapping[str, Any], s: Scenario) -> None:
