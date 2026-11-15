@@ -16,23 +16,24 @@ from expert_work.common.search.decay import (
 from expert_work.common.search.rrf import rrf_fuse_scored
 from expert_work.persistence.knowledge.text_search import tokenize_for_search
 from expert_work.persistence.memory.base import (
+    USER_SIDE_ORIGINS,
     ConsolidationSourcesChangedError,
     MemberLoader,
     MemoryInjectionBlockedError,
     MemoryStore,
     MemoryWriteResult,
+    OriginStanding,
     SupersedeTargetChangedError,
     is_mixed_origin,
-    is_user_side_protected,
-    refuse_if_user_side,
+    origin_standing,
+    refuse_if_outranked,
     scan_memory_content,
     split_blocked,
     summary_fields,
-    user_side_confidence,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
-from expert_work.protocol.memory_item import MemoryOrigin
+from expert_work.protocol.memory_item import MemoryOrigin, effective_origin
 
 #: Per-side recall depth fetched before RRF fusion — mirrors the J.5
 #: knowledge subsystem so behavior is comparable across hybrid paths.
@@ -359,6 +360,8 @@ class InMemoryMemoryStore(MemoryStore):
                         # the source as the caller decides (see the base class).
                         "embedding_model": embedding_model,
                         "origin": new_origin,
+                        # B-300 redesign — off the user's side, no confirmed date.
+                        "confirmed_at": None if clear_origin else row.confirmed_at,
                     }
                 )
                 self._rows[idx] = updated
@@ -399,8 +402,7 @@ class InMemoryMemoryStore(MemoryStore):
         user_id: UUID,
         old_id: UUID,
         new_item: MemoryItem,
-        refuse_user_side: bool = False,
-        refuse_user_side_above: float | None = None,
+        candidate_standing: OriginStanding | None = None,
     ) -> MemoryItem | None:
         hit = scan_memory_content(new_item.id, new_item.content)
         if hit is not None:
@@ -425,8 +427,8 @@ class InMemoryMemoryStore(MemoryStore):
             # archived since the caller picked it: change nothing.
             msg = f"memory item {old_id} is no longer current; not superseding it"
             raise SupersedeTargetChangedError(msg)
-        await self._refuse_if_user_side(
-            self._rows[idx], refuse=refuse_user_side, above=refuse_user_side_above
+        await refuse_if_outranked(
+            self._rows[idx], self._member_loader(tenant_id, user_id), candidate_standing
         )
         self._rows[idx] = self._rows[idx].model_copy(
             update={"invalid_at": now, "superseded_by": new_item.id}
@@ -439,6 +441,10 @@ class InMemoryMemoryStore(MemoryStore):
                 "valid_at": now,
                 "created_at": now,
                 "last_used_at": now,
+                # B-300 redesign §9.2 — only user-side rows carry a confirmed date.
+                "confirmed_at": new_item.confirmed_at
+                if effective_origin(new_item) in USER_SIDE_ORIGINS
+                else None,
             }
         )
         self._rows.append(written)
@@ -450,8 +456,7 @@ class InMemoryMemoryStore(MemoryStore):
         tenant_id: UUID,
         user_id: UUID,
         memory_id: UUID,
-        refuse_user_side: bool = False,
-        refuse_user_side_above: float | None = None,
+        candidate_standing: OriginStanding | None = None,
     ) -> bool:
         for idx, row in enumerate(self._rows):
             if (
@@ -460,29 +465,16 @@ class InMemoryMemoryStore(MemoryStore):
                 and row.user_id == user_id
                 and row.deleted_at is None
             ):
-                await self._refuse_if_user_side(
-                    row, refuse=refuse_user_side, above=refuse_user_side_above
+                await refuse_if_outranked(
+                    row, self._member_loader(tenant_id, user_id), candidate_standing
                 )
                 self._rows[idx] = row.model_copy(update={"expired_at": datetime.now(UTC)})
                 return True
         return False
 
-    async def user_side_protected(self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID) -> bool:
-        row = next(
-            (
-                r
-                for r in self._rows
-                if r.id == memory_id and r.tenant_id == tenant_id and r.user_id == user_id
-            ),
-            None,
-        )
-        if row is None:
-            return False
-        return await is_user_side_protected(row, self._member_loader(tenant_id, user_id))
-
-    async def user_side_confidence(
+    async def origin_standing(
         self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID
-    ) -> float | None:
+    ) -> OriginStanding | None:
         row = next(
             (
                 r
@@ -493,7 +485,25 @@ class InMemoryMemoryStore(MemoryStore):
         )
         if row is None:
             return None
-        return await user_side_confidence(row, self._member_loader(tenant_id, user_id))
+        return await origin_standing(row, self._member_loader(tenant_id, user_id))
+
+    async def refresh_confirmed_at(
+        self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID, confirmed_at: datetime
+    ) -> bool:
+        for idx, row in enumerate(self._rows):
+            if (
+                row.id == memory_id
+                and row.tenant_id == tenant_id
+                and row.user_id == user_id
+                and row.deleted_at is None
+                and row.invalid_at is None
+                and row.expired_at is None
+                and effective_origin(row) in USER_SIDE_ORIGINS
+            ):
+                stamps = [ts for ts in (row.confirmed_at, confirmed_at) if ts is not None]
+                self._rows[idx] = row.model_copy(update={"confirmed_at": max(stamps)})
+                return True
+        return False
 
     def _member_loader(self, tenant_id: UUID, user_id: UUID) -> MemberLoader:
         async def load(ids: Sequence[UUID]) -> list[MemoryItem]:
@@ -505,14 +515,6 @@ class InMemoryMemoryStore(MemoryStore):
             ]
 
         return load
-
-    async def _refuse_if_user_side(
-        self, row: MemoryItem, *, refuse: bool, above: float | None
-    ) -> None:
-        """B-300 review MEDIUM-1 / MEDIUM-3, user 11-14 — re-judge the target as it is now."""
-        await refuse_if_user_side(
-            row, self._member_loader(row.tenant_id, row.user_id), refuse=refuse, above=above
-        )
 
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         now = datetime.now(UTC)
@@ -721,6 +723,8 @@ class InMemoryMemoryStore(MemoryStore):
                 and row.status == "transient"
                 and row.consolidated_into is None
                 and row.last_reviewed_at is None
+                # B-300 redesign — a memory the user said again is not noise.
+                and row.confirmed_at is None
                 and row.created_at is not None
                 and row.created_at < cutoff
             ):

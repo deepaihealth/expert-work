@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -31,12 +31,11 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.memory.base import (
-    MAX_SUMMARY_DEPTH,
     ConsolidationSourcesChangedError,
     MemoryStore,
+    OriginStanding,
     UserSideHigherConfidenceError,
     UserSideTargetError,
-    user_side_confidence,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
@@ -46,6 +45,12 @@ ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 _MODEL = "vendor-a/embed-v2"
 _NEW_MODEL = "vendor-b/embed-v3"
 _T0 = datetime(2026, 11, 1, tzinfo=UTC)
+#: B-300 重做 §6.3 —— 来自助手的候选(层级 0);用户说的候选按 ``_stated(x)``(层级 2)。
+_ASSISTANT = OriginStanding(tier=0, confidence=0.6)
+
+
+def _stated(confidence: float) -> OriginStanding:
+    return OriginStanding(tier=2, confidence=confidence)
 
 
 def _vec(*head: float) -> tuple[float, ...]:
@@ -319,10 +324,12 @@ async def test_guarded_supersede_refuses_a_target_corrected_after_it_was_read(
         await store.supersede(
             tenant_id=t, user_id=u, old_id=target.id,
             new_item=_item(t, u, "assistant rewrite", origin="assistant_derived"),
-            refuse_user_side=True,
+            candidate_standing=_ASSISTANT,
         )  # fmt: skip
     with pytest.raises(UserSideTargetError):
-        await store.expire(tenant_id=t, user_id=u, memory_id=target.id, refuse_user_side=True)
+        await store.expire(
+            tenant_id=t, user_id=u, memory_id=target.id, candidate_standing=_ASSISTANT
+        )
     await _assert_untouched(store, t, u, target)
     assert (await _row(store, t, u, target.id)).content == "corrected"
 
@@ -334,11 +341,11 @@ async def test_guard_lets_assistant_and_unrecorded_targets_through(store: Memory
     await store.write([derived, unrecorded])
     new = _item(t, u, "d2", origin="assistant_derived")
     written = await store.supersede(
-        tenant_id=t, user_id=u, old_id=derived.id, new_item=new, refuse_user_side=True
+        tenant_id=t, user_id=u, old_id=derived.id, new_item=new, candidate_standing=_ASSISTANT
     )
     assert written is not None
     assert await store.expire(
-        tenant_id=t, user_id=u, memory_id=unrecorded.id, refuse_user_side=True
+        tenant_id=t, user_id=u, memory_id=unrecorded.id, candidate_standing=_ASSISTANT
     )
     # 不带保护(用户说的候选)照旧能取代用户那一条。
     stated = _item(t, u, "s", origin="user_stated")
@@ -377,16 +384,18 @@ async def test_summary_is_protected_by_its_user_side_members(
     t, u = uuid4(), uuid4()
     summary = await _summary(store, t, u, origins)
     assert summary.origin is None
-    assert await store.user_side_protected(tenant_id=t, user_id=u, memory_id=summary.id) is (
-        protected
-    )
+    standing = await store.origin_standing(tenant_id=t, user_id=u, memory_id=summary.id)
+    assert standing is not None
+    assert (standing.tier > 0) is protected
     if protected:
         with pytest.raises(UserSideTargetError):
-            await store.expire(tenant_id=t, user_id=u, memory_id=summary.id, refuse_user_side=True)
+            await store.expire(
+                tenant_id=t, user_id=u, memory_id=summary.id, candidate_standing=_ASSISTANT
+            )
         await _assert_untouched(store, t, u, summary)
     else:
         assert await store.expire(
-            tenant_id=t, user_id=u, memory_id=summary.id, refuse_user_side=True
+            tenant_id=t, user_id=u, memory_id=summary.id, candidate_standing=_ASSISTANT
         )
 
 
@@ -398,37 +407,50 @@ async def test_nested_summary_inherits_protection(store: MemoryStore) -> None:
         store, [inner, _item(t, u, "o1", created_at=_T0), _item(t, u, "o2", created_at=_T0)]
     )
     assert inner.id in outer.consolidated_from
-    assert await store.user_side_protected(tenant_id=t, user_id=u, memory_id=outer.id)
+    standing = await store.origin_standing(tenant_id=t, user_id=u, memory_id=outer.id)
+    assert standing is not None
+    assert standing.tier == 2
     with pytest.raises(UserSideTargetError):
         await store.supersede(
             tenant_id=t, user_id=u, old_id=outer.id,
             new_item=_item(t, u, "rewrite", origin="assistant_derived"),
-            refuse_user_side=True,
+            candidate_standing=_ASSISTANT,
         )  # fmt: skip
     await _assert_untouched(store, t, u, outer)
     plain = await _summary(store, t, u, [None, None, None])
     outer2 = await _consolidate(
         store, [plain, _item(t, u, "p1", created_at=_T0), _item(t, u, "p2", created_at=_T0)]
     )
-    assert not await store.user_side_protected(tenant_id=t, user_id=u, memory_id=outer2.id)
+    standing2 = await store.origin_standing(tenant_id=t, user_id=u, memory_id=outer2.id)
+    assert standing2 is not None
+    assert standing2.tier == 0
 
 
 # ─── 用户 11-14:置信度更低的「用户消息里说的」候选不得改用户一方的记忆(锁里重判)──────
 
 
 async def _refuse_both(
-    store: MemoryStore, t: UUID, u: UUID, target: MemoryItem, above: float
+    store: MemoryStore,
+    t: UUID,
+    u: UUID,
+    target: MemoryItem,
+    above: float,
+    error: type[UserSideTargetError] = UserSideHigherConfidenceError,
 ) -> None:
-    with pytest.raises(UserSideHigherConfidenceError):
+    """``error``:同层更确定 → :class:`UserSideHigherConfidenceError`;重做 §6.3 起,目标层级
+    更高(用户更正)→ :class:`UserSideTargetError` 本身(不是置信度那个子类)。"""
+    with pytest.raises(error) as raised:
         _ = await store.supersede(
             tenant_id=t, user_id=u, old_id=target.id,
             new_item=_item(t, u, f"rewrite {uuid4()}", origin="user_stated", confidence=above),
-            refuse_user_side_above=above,
+            candidate_standing=_stated(above),
         )  # fmt: skip
-    with pytest.raises(UserSideHigherConfidenceError):
+    assert type(raised.value) is error
+    with pytest.raises(error) as raised:
         _ = await store.expire(
-            tenant_id=t, user_id=u, memory_id=target.id, refuse_user_side_above=above
+            tenant_id=t, user_id=u, memory_id=target.id, candidate_standing=_stated(above)
         )
+    assert type(raised.value) is error
     await _assert_untouched(store, t, u, target)
 
 
@@ -456,7 +478,7 @@ async def test_lower_confidence_guard_judges_the_targets_current_confidence(
         tenant_id=t, user_id=u, memory_id=target.id, content="corrected",
         embedding=_vec(1.0), confidence=1.0,
     )  # fmt: skip
-    await _refuse_both(store, t, u, target, above=0.6)
+    await _refuse_both(store, t, u, target, above=0.6, error=UserSideTargetError)
 
 
 @pytest.mark.asyncio
@@ -472,10 +494,10 @@ async def test_lower_confidence_guard_lets_equal_and_non_user_targets_through(
         assert await store.supersede(
             tenant_id=t, user_id=u, old_id=target.id,
             new_item=_item(t, u, f"new {target.content}", origin="user_stated"),
-            refuse_user_side_above=0.5,
+            candidate_standing=_stated(0.5),
         )  # fmt: skip
     assert await store.expire(
-        tenant_id=t, user_id=u, memory_id=unrecorded.id, refuse_user_side_above=0.5
+        tenant_id=t, user_id=u, memory_id=unrecorded.id, candidate_standing=_stated(0.5)
     )
 
 
@@ -489,7 +511,7 @@ async def test_lower_confidence_guard_on_a_summary_uses_its_user_side_members(
     assert summary.confidence == 0.5
     await _refuse_both(store, t, u, summary, above=0.4)
     assert await store.expire(
-        tenant_id=t, user_id=u, memory_id=summary.id, refuse_user_side_above=0.5
+        tenant_id=t, user_id=u, memory_id=summary.id, candidate_standing=_stated(0.5)
     )
 
 
@@ -502,29 +524,11 @@ async def test_lower_confidence_guard_keeps_a_correction_folded_into_a_summary(
     t, u = uuid4(), uuid4()
     summary = await _summary(store, t, u, ["corrected", None, None])
     assert summary.confidence == 0.5
-    # 写回预判用的同一个口径(存储方法,读邻居之后、改库之前)。
-    assert await store.user_side_confidence(tenant_id=t, user_id=u, memory_id=summary.id) == 1.0
-    await _refuse_both(store, t, u, summary, above=0.6)
-    await _refuse_both(store, t, u, summary, above=0.99)
-
-
-@pytest.mark.asyncio
-async def test_user_side_confidence_fails_closed_past_the_depth_bound() -> None:
-    """嵌套汇总查到 ``MAX_SUMMARY_DEPTH`` 层还有没查的成员 → 按 1.0(与受保护判断同一个上限)。"""
-    t, u = uuid4(), uuid4()
-    chain = [_item(t, u, f"level {i}") for i in range(MAX_SUMMARY_DEPTH + 2)]
-    rows = {
-        row.id: row.model_copy(update={"consolidated_from": [chain[i + 1].id]})
-        for i, row in enumerate(chain[:-1])
-    }
-    rows[chain[-1].id] = chain[-1].model_copy(update={"origin": "user_stated"})
-
-    async def load(ids: Sequence[UUID]) -> list[MemoryItem]:
-        return [rows[i] for i in ids if i in rows]
-
-    top = rows[chain[0].id]
-    assert await user_side_confidence(top, load) == 1.0
-    assert await user_side_confidence(chain[-1].model_copy(update={"origin": None}), load) is None
+    # 写回预判用的同一个口径(存储方法,读邻居之后、改库之前):成员里的更正 → 层级 3。
+    got = await store.origin_standing(tenant_id=t, user_id=u, memory_id=summary.id)
+    assert got == OriginStanding(3, 1.0)
+    await _refuse_both(store, t, u, summary, above=0.6, error=UserSideTargetError)
+    await _refuse_both(store, t, u, summary, above=0.99, error=UserSideTargetError)
 
 
 @pytest.mark.asyncio

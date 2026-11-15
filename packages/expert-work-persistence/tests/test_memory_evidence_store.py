@@ -38,6 +38,7 @@ from expert_work.persistence.memory.base import (
     USER_SIDE_ORIGINS,
     ConsolidationSourcesChangedError,
     MemoryStore,
+    OriginStanding,
     UserSideTargetError,
     is_mixed_origin,
 )
@@ -193,10 +194,12 @@ async def test_guarded_supersede_and_expire_refuse_a_user_confirmed_target(
         await store.supersede(
             tenant_id=t, user_id=u, old_id=target.id,
             new_item=_item(t, u, "assistant rewrite", origin="assistant_derived"),
-            refuse_user_side=True,
+            candidate_standing=OriginStanding(0, 0.6),
         )  # fmt: skip
     with pytest.raises(UserSideTargetError):
-        await store.expire(tenant_id=t, user_id=u, memory_id=target.id, refuse_user_side=True)
+        await store.expire(
+            tenant_id=t, user_id=u, memory_id=target.id, candidate_standing=OriginStanding(0, 0.6)
+        )
     got = await _row(store, t, u, target.id)
     assert (got.invalid_at, got.expired_at, got.superseded_by) == (None, None, None)
 

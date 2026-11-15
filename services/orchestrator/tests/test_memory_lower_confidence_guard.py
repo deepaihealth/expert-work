@@ -32,6 +32,7 @@ from expert_work.persistence import InMemoryMemoryStore
 from expert_work.protocol import MemoryItem
 from expert_work.protocol.memory_item import MemoryOrigin
 from expert_work.runtime.cancellation import CancellationToken
+from orchestrator.graph_builder import memory as memory_module
 from orchestrator.graph_builder.memory import _normalized_text, flush_messages_with_outcome
 
 _TENANT = UUID("00000000-0000-4000-8000-0000000000a3")
@@ -39,6 +40,19 @@ _USER = UUID("00000000-0000-4000-8000-0000000000b3")
 _EAST = (1.0, 0.0, 0.0, 0.0)
 _NEAR_EAST = (0.9, 0.43589, 0.0, 0.0)  # cosine vs _EAST = 0.9 ≥ 0.80
 _NORTH = (0.0, 1.0, 0.0, 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _ids_as_short_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """重做 §7.1 第 3 行起,材料里的已有记忆用本次调用内的短编号(``e0, e1, …``)。本文件的用例
+    按记忆 id 写模型的决定,这里让「短编号」就是 id 本身;短编号的生成与映射由
+    ``test_memory_reconcile_redesign`` 钉住。"""
+    monkeypatch.setattr(
+        memory_module,
+        "_short_ids",
+        lambda pending: {n.id: str(n.id) for entry in pending for n in entry.neighbors},
+    )
+
 
 PASS1_MARK = "The other side of the conversation is not shown."
 PASS2_MARK = "Every line starts with a tag:"
@@ -210,13 +224,16 @@ async def test_reconcile_prompt_says_an_assistant_copy_of_a_user_memory_is_a_noo
     _ = await _seed(store, origin="user_stated", confidence=0.9)
     llm = _LLM(conversation_reply=_reply({"kind": "fact", "content": "cand"}), ops_reply="{}")
     _ = await _flush(llm, store)
-    system = llm.system_of(None)
+    # 重做附录 B:来源不弱于候选的已有记忆说的是同一件事 → NOOP;反过来(已有的更弱)→ UPDATE。
+    system = " ".join(llm.system_of(None).split())
     assert (
-        "A candidate from the assistant that matches an existing memory stated in user "
-        "messages or corrected by the user is a NOOP, not an ADD." in system
+        "When an existing memory whose source is at least as strong as the candidate's says the "
+        "same thing, the candidate is a NOOP of that memory" in system
     )
-    # 原来那个方向的一句还在。
-    assert "is an UPDATE, not a NOOP." in system
+    assert (
+        "When the candidate says the same thing as an existing memory with a weaker source, it is "
+        "an UPDATE of that memory." in system
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -225,18 +242,21 @@ async def test_reconcile_prompt_says_an_assistant_copy_of_a_user_memory_is_a_noo
 
 
 @pytest.mark.parametrize(
-    ("op", "is_correction", "expected_live", "written", "label"),
+    ("op", "is_correction", "expected_live", "written", "suffix"),
     [
-        ("UPDATE", True, {"user said", "cand"}, 1, "lower_confidence_update_added"),
-        ("UPDATE", False, {"user said"}, 0, "lower_confidence_update_dropped"),
-        ("DELETE", False, {"user said"}, 0, "lower_confidence_delete"),
-        ("DELETE", True, {"user said", "cand"}, 1, "lower_confidence_delete_added"),
+        ("UPDATE", True, {"user said", "cand"}, 1, "update_added"),
+        ("UPDATE", False, {"user said"}, 0, "update_dropped"),
+        ("DELETE", False, {"user said"}, 0, "delete"),
+        ("DELETE", True, {"user said", "cand"}, 1, "delete_added"),
     ],
     ids=["update-correction-added", "update-dropped", "delete-noop", "delete-correction-added"],
 )
 @pytest.mark.parametrize(
-    ("origin", "confidence"),
-    [("user_stated", 0.9), (None, 1.0)],
+    ("origin", "confidence", "prefix", "other"),
+    [
+        ("user_stated", 0.9, "lower_confidence", "blocked"),
+        (None, 1.0, "blocked", "lower_confidence"),
+    ],
     ids=["user_stated", "user_corrected"],
 )
 async def test_lower_confidence_user_candidate_cannot_change_a_user_memory(
@@ -244,14 +264,19 @@ async def test_lower_confidence_user_candidate_cannot_change_a_user_memory(
     is_correction: bool,
     expected_live: set[str],
     written: int,
-    label: str,
+    suffix: str,
     origin: MemoryOrigin | None,
     confidence: float,
+    prefix: str,
+    other: str,
 ) -> None:
+    """同一层级(用户说的)更确定 → ``lower_confidence_*``;重做 §6.3 起用户更正是更高的层级 →
+    ``blocked_*``(不再比置信度)。两种计数分开。"""
+    label = f"{prefix}_{suffix}"
     store = _CountingStore()
     target = await _seed(store, origin=origin, confidence=confidence)
     llm = _LLM(user_reply=_stated(0.5, is_correction=is_correction), ops_reply=_ops(op, target.id))
-    before, before_assistant = _count(label), _count("blocked_update_added")
+    before, before_other = _count(label), _count(f"{other}_{suffix}")
     assert await _flush(llm, store) == written
     rows = await _live(store)
     assert set(rows) == expected_live
@@ -261,7 +286,7 @@ async def test_lower_confidence_user_candidate_cannot_change_a_user_memory(
         assert rows["cand"].supersedes is None
         assert rows["cand"].origin == "user_stated"
     assert _count(label) == before + 1
-    assert _count("blocked_update_added") == before_assistant  # 与来自助手的拦截分开计
+    assert _count(f"{other}_{suffix}") == before_other  # 层级拦截与同层置信度分开计
     # 预判就拦下了,没有走到改库那一步(锁里的那道是兜底)。
     assert store.writes_to_targets == 0
 
@@ -363,17 +388,18 @@ def _raise_confidence_while_deciding(
 @pytest.mark.parametrize(
     ("op", "is_correction", "expected_live", "label"),
     [
-        ("UPDATE", True, {"corrected by the user", "cand"}, "lower_confidence_update_added"),
-        ("UPDATE", False, {"corrected by the user"}, "lower_confidence_update_dropped"),
-        ("DELETE", False, {"corrected by the user"}, "lower_confidence_delete"),
-        ("DELETE", True, {"corrected by the user", "cand"}, "lower_confidence_delete_added"),
+        ("UPDATE", True, {"corrected by the user", "cand"}, "blocked_update_added"),
+        ("UPDATE", False, {"corrected by the user"}, "blocked_update_dropped"),
+        ("DELETE", False, {"corrected by the user"}, "blocked_delete"),
+        ("DELETE", True, {"corrected by the user", "cand"}, "blocked_delete_added"),
     ],
     ids=["update-added", "update-dropped", "delete-noop", "delete-correction-added"],
 )
 async def test_target_made_more_certain_while_deciding_is_rechecked_under_the_lock(
     op: str, is_correction: bool, expected_live: set[str], label: str
 ) -> None:
-    """读邻居时目标是 0.5(候选 0.6 预判放过),判的那几秒里用户「更正」成 1.0:锁里重判,拦下。"""
+    """读邻居时目标是 0.5(候选 0.6 预判放过),判的那几秒里用户「更正」成 1.0:锁里重判,拦下
+    (重做 §6.3 起用户更正是更高的层级,计 ``blocked_*``)。"""
     store = InMemoryMemoryStore()
     target = await _seed(store, origin="user_stated", confidence=0.5)
     llm = _LLM(
@@ -492,24 +518,24 @@ async def test_reconcile_prompt_puts_an_identical_user_memory_first() -> None:
     _ = await _seed_row(store, "cand x", origin="user_stated", confidence=0.9)
     llm = _LLM(user_reply=_stated(0.9), ops_reply="{}")
     _ = await _flush(llm, store)
-    system = llm.system_of(None)
+    system = " ".join(llm.system_of(None).split())
+    # 重做附录 B:来源不弱的相同记忆 → NOOP,即使一条更弱的也对得上;先于「更弱的 → UPDATE」。
     rule = (
-        "When an existing memory stated in user messages or corrected by the user already "
-        "says the same thing as the candidate, the candidate is a NOOP, even if an existing "
-        "memory from the assistant also matches it; this takes precedence over the rule below "
-        "about memories from the assistant."
+        "When an existing memory whose source is at least as strong as the candidate's says the "
+        "same thing, the candidate is a NOOP of that memory, even if a memory with a weaker "
+        "source also matches."
     )
+    weaker = "it is an UPDATE of that memory."
     assert rule in system
-    assert system.index(rule) < system.index("is an UPDATE, not a NOOP.")
+    assert system.index(rule) < system.index(weaker)
     # 审查 MEDIUM-2 —— 与代码里「带更正的不走确定性 NOOP」一致。
     exception = (
-        'In that case, a candidate with "is_correction": true is not a NOOP for this reason; '
-        "it DELETEs the existing memory it contradicts, if there is one; otherwise it is a NOOP."
+        'When a candidate with "is_correction": true says the same thing as an existing memory '
+        "whose source is at least as strong, and another existing memory still says the earlier "
+        "value, DELETE that other memory; otherwise the candidate is a NOOP."
     )
     assert exception in system
     assert system.index(rule) < system.index(exception)
-    # 审查 LOW-4 —— 「优先于」指的是下面那句「用户说的对上来自助手的 → UPDATE」。
-    assert system.index(exception) < system.index("is an UPDATE, not a NOOP.")
 
 
 async def test_identical_correction_still_asks_so_a_conflicting_memory_can_be_retracted() -> None:
@@ -674,12 +700,13 @@ async def test_converted_update_of_a_more_certain_user_memory_is_refused(op: str
 
 
 async def test_identical_correction_without_a_similar_neighbour_adds_nothing() -> None:
-    """向量不够近、没进模型的材料时,带更正的相同候选同样不落新行(原来会直接新增)。"""
+    """向量离得远的带更正的相同候选:重做 §7.1 起没有门槛,它照样进模型;模型没给决定时同样
+    不落新行(原来会直接新增)。"""
     store = InMemoryMemoryStore()
     stated, _derived = await _x_and_derived(store)
     llm = _LLM(user_reply=_correction_x())
     assert await _flush(llm, store, near=()) == 0
-    assert _reconcile_calls(llm) == 0
+    assert _reconcile_calls(llm) == 1
     assert [r.id for r in _user_rows_with_x(store)] == [stated.id]
 
 
@@ -773,12 +800,16 @@ async def test_reconcile_prompt_keeps_new_values_and_dated_readings() -> None:
     llm = _LLM(user_reply=_stated(0.9), ops_reply="{}")
     _ = await _flush(llm, store)
     system = " ".join(llm.system_of(None).split())
+    # 重做附录 B:带新值的更正是更新;删除只在没有新内容可放时。
     assert (
-        "A correction that carries a new value is an UPDATE of the memory it replaces, not a "
-        "DELETE; DELETE only when the candidate retracts an existing memory without giving a "
-        "new value." in system
+        'A candidate with "is_correction": true changes something said earlier: when an existing '
+        "memory still says the earlier value, the candidate is an UPDATE of that memory." in system
     )
     assert (
-        "A reading, measurement or status that refers to a different date or time than an "
-        "existing one is a new memory (ADD), not an UPDATE of the earlier one." in system
+        '"DELETE": the candidate says that one existing memory is no longer true and gives '
+        "nothing to put in its place." in system
+    )
+    assert (
+        "A reading, count or status that refers to a different date or time than an existing "
+        "memory is a new memory (ADD), not an UPDATE of the earlier one." in system
     )

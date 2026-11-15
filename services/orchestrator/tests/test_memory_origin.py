@@ -27,6 +27,7 @@ from expert_work.persistence import InMemoryMemoryStore
 from expert_work.protocol import MemoryItem
 from expert_work.protocol.memory_item import MemoryOrigin
 from expert_work.runtime.cancellation import CancellationToken
+from orchestrator.graph_builder import memory as memory_module
 from orchestrator.graph_builder.memory import (
     flush_messages_with_outcome,
     make_pre_compaction_flush,
@@ -37,6 +38,20 @@ _USER = UUID("00000000-0000-4000-8000-0000000000b2")
 _EAST = (1.0, 0.0, 0.0, 0.0)
 _NEAR_EAST = (0.9, 0.43589, 0.0, 0.0)  # cosine vs _EAST = 0.9 ≥ 0.80
 _NORTH = (0.0, 1.0, 0.0, 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _ids_as_short_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """重做 §7.1 第 3 行起,材料里的已有记忆用本次调用内的短编号(``e0, e1, …``)。本文件的用例
+    按记忆 id 写模型的决定,这里让「短编号」就是 id 本身;短编号的生成与映射由
+    ``test_memory_reconcile_redesign`` 钉住。"""
+    monkeypatch.setattr(
+        memory_module,
+        "_short_ids",
+        lambda pending: {n.id: str(n.id) for entry in pending for n in entry.neighbors},
+    )
+
+
 _MODEL = "vendor-x/embed-1"
 
 PASS1_MARK = "The other side of the conversation is not shown."
@@ -374,9 +389,10 @@ async def test_reconcile_material_carries_both_sides_sources_and_the_rule() -> N
     llm = _LLM(user_reply=_reply({"kind": "fact", "content": "said now"}), ops_reply=_ops("NOOP"))
     await _flush(llm, store, _ReportingEmbedder({"said now": _NEAR_EAST}), reconcile=True)
     [call] = llm.reconcile_calls()
+    # 重做附录 B:同样内容、已有的来源更弱 → 更新(用户后来自己说全了,取代来自助手的版本)。
     assert (
-        "A candidate stated in user messages that matches an existing memory from the "
-        "assistant is an UPDATE, not a NOOP." in str(call[0].content)
+        "When the candidate says the same thing as an existing memory with a weaker source, it is\n"
+        "  an UPDATE of that memory." in str(call[0].content)
     )
     payload = json.loads(str(call[1].content))
     [candidate] = payload["candidates"]
@@ -533,11 +549,13 @@ async def test_dlq_gets_only_what_reconcile_meant_to_write() -> None:
             {"kind": "fact", "content": "drop"},
             {"kind": "fact", "content": "retract"},
         ),
+        # 重做 §7.1 第 2 行:没有相似度门槛,三条都交给模型(「keep」的邻居再远也算)。
         ops_reply=json.dumps(
             {
                 "ops": [
-                    {"index": 0, "op": "UPDATE", "target_id": str(user_target.id)},
-                    {"index": 1, "op": "DELETE", "target_id": str(derived_target.id)},
+                    {"index": 0, "op": "ADD"},
+                    {"index": 1, "op": "UPDATE", "target_id": str(user_target.id)},
+                    {"index": 2, "op": "DELETE", "target_id": str(derived_target.id)},
                 ]
             }
         ),

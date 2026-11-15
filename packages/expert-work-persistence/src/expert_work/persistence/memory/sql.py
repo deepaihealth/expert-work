@@ -21,19 +21,20 @@ from expert_work.common.search.rrf import rrf_fuse_scored
 from expert_work.persistence.bulk_delete import count_where, delete_where
 from expert_work.persistence.knowledge.text_search import tokenize_for_search
 from expert_work.persistence.memory.base import (
+    USER_SIDE_ORIGINS,
     ConsolidationSourcesChangedError,
     MemberLoader,
     MemoryInjectionBlockedError,
     MemoryStore,
     MemoryWriteResult,
+    OriginStanding,
     SupersedeTargetChangedError,
     is_mixed_origin,
-    is_user_side_protected,
-    refuse_if_user_side,
+    origin_standing,
+    refuse_if_outranked,
     scan_memory_content,
     split_blocked,
     summary_fields,
-    user_side_confidence,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.persistence.models import (
@@ -42,7 +43,7 @@ from expert_work.persistence.models import (
     MemoryItemRow,
 )
 from expert_work.protocol import MemoryItem
-from expert_work.protocol.memory_item import MemoryOrigin
+from expert_work.protocol.memory_item import MemoryOrigin, effective_origin
 
 #: Postgres ``tsvector`` configuration — ``simple`` so app-side jieba
 #: segmentation is what controls tokenization (mirrors J.5 knowledge).
@@ -172,18 +173,23 @@ def _member_loader(session: AsyncSession, tenant_id: UUID, user_id: UUID) -> Mem
     return load
 
 
-async def _refuse_if_user_side(
-    session: AsyncSession, row: MemoryItemRow, *, refuse: bool, above: float | None
+async def _refuse_if_outranked(
+    session: AsyncSession, row: MemoryItemRow, candidate: OriginStanding | None
 ) -> None:
-    """B-300 review MEDIUM-1, user 11-14 — raise on a user-side target (the row is
-    already locked by the caller, so its confidence is the current one; members are
-    read, not locked)."""
-    await refuse_if_user_side(
-        _row_to_item(row),
-        _member_loader(session, row.tenant_id, row.user_id),
-        refuse=refuse,
-        above=above,
+    """B-300 redesign §6.3 — raise when the target outranks the candidate (the row is
+    already locked by the caller, so its source and confidence are the current ones;
+    members are read, not locked)."""
+    await refuse_if_outranked(
+        _row_to_item(row), _member_loader(session, row.tenant_id, row.user_id), candidate
     )
+
+
+#: B-300 redesign §9.2 — a row whose effective origin is on the user's side (the same
+#: test as :func:`effective_origin` in ``USER_SIDE_ORIGINS``: 1.0 = a user correction).
+_USER_SIDE_ROW = or_(
+    MemoryItemRow.confidence >= 1.0,
+    MemoryItemRow.origin.in_(sorted(USER_SIDE_ORIGINS - {"user_corrected"})),
+)
 
 
 class SqlMemoryStore(MemoryStore):
@@ -544,6 +550,8 @@ class SqlMemoryStore(MemoryStore):
             row.embedding_model = embedding_model
             if clear_origin:
                 row.origin = None
+                # B-300 redesign — off the user's side, no confirmed date.
+                row.confirmed_at = None
             elif origin is not None:
                 row.origin = origin
             await session.commit()
@@ -612,8 +620,7 @@ class SqlMemoryStore(MemoryStore):
         user_id: UUID,
         old_id: UUID,
         new_item: MemoryItem,
-        refuse_user_side: bool = False,
-        refuse_user_side_above: float | None = None,
+        candidate_standing: OriginStanding | None = None,
     ) -> MemoryItem | None:
         hit = scan_memory_content(new_item.id, new_item.content)
         if hit is not None:
@@ -646,9 +653,7 @@ class SqlMemoryStore(MemoryStore):
                 msg = f"memory item {old_id} is no longer current; not superseding it"
                 raise SupersedeTargetChangedError(msg)
             # B-300 review MEDIUM-1 / MEDIUM-3 — re-judged on the locked row.
-            await _refuse_if_user_side(
-                session, old, refuse=refuse_user_side, above=refuse_user_side_above
-            )
+            await _refuse_if_outranked(session, old, candidate_standing)
             old.invalid_at = now
             old.superseded_by = new_item.id
             content = new_item.content
@@ -678,7 +683,10 @@ class SqlMemoryStore(MemoryStore):
                 evidence_message_id=new_item.evidence_message_id,
                 evidence_message_index=new_item.evidence_message_index,
                 occurred_on=new_item.occurred_on,
-                confirmed_at=new_item.confirmed_at,
+                # Only user-side rows carry a confirmed date.
+                confirmed_at=new_item.confirmed_at
+                if effective_origin(new_item) in USER_SIDE_ORIGINS
+                else None,
             )
             session.add(new_row)
             await session.commit()
@@ -691,8 +699,7 @@ class SqlMemoryStore(MemoryStore):
         tenant_id: UUID,
         user_id: UUID,
         memory_id: UUID,
-        refuse_user_side: bool = False,
-        refuse_user_side_above: float | None = None,
+        candidate_standing: OriginStanding | None = None,
     ) -> bool:
         now = datetime.now(UTC)
         async with self._sf() as session:
@@ -712,33 +719,14 @@ class SqlMemoryStore(MemoryStore):
             ).scalar_one_or_none()
             if row is None:
                 return False
-            await _refuse_if_user_side(
-                session, row, refuse=refuse_user_side, above=refuse_user_side_above
-            )
+            await _refuse_if_outranked(session, row, candidate_standing)
             row.expired_at = now
             await session.commit()
         return True
 
-    async def user_side_protected(self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID) -> bool:
-        async with self._sf() as session:
-            row = (
-                await session.execute(
-                    select(MemoryItemRow).where(
-                        MemoryItemRow.id == memory_id,
-                        MemoryItemRow.tenant_id == tenant_id,
-                        MemoryItemRow.user_id == user_id,
-                    )
-                )
-            ).scalar_one_or_none()
-            if row is None:
-                return False
-            return await is_user_side_protected(
-                _row_to_item(row), _member_loader(session, tenant_id, user_id)
-            )
-
-    async def user_side_confidence(
+    async def origin_standing(
         self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID
-    ) -> float | None:
+    ) -> OriginStanding | None:
         async with self._sf() as session:
             row = (
                 await session.execute(
@@ -751,9 +739,31 @@ class SqlMemoryStore(MemoryStore):
             ).scalar_one_or_none()
             if row is None:
                 return None
-            return await user_side_confidence(
+            return await origin_standing(
                 _row_to_item(row), _member_loader(session, tenant_id, user_id)
             )
+
+    async def refresh_confirmed_at(
+        self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID, confirmed_at: datetime
+    ) -> bool:
+        stmt = (
+            update(MemoryItemRow)
+            .where(
+                MemoryItemRow.id == memory_id,
+                MemoryItemRow.tenant_id == tenant_id,
+                MemoryItemRow.user_id == user_id,
+                MemoryItemRow.deleted_at.is_(None),
+                MemoryItemRow.invalid_at.is_(None),
+                MemoryItemRow.expired_at.is_(None),
+                _USER_SIDE_ROW,
+            )
+            # GREATEST skips NULL: only ever moves forward.
+            .values(confirmed_at=func.greatest(MemoryItemRow.confirmed_at, confirmed_at))
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
 
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         now = datetime.now(UTC)
@@ -1096,6 +1106,8 @@ class SqlMemoryStore(MemoryStore):
                 MemoryItemRow.status == "transient",
                 MemoryItemRow.consolidated_into.is_(None),
                 MemoryItemRow.last_reviewed_at.is_(None),
+                # B-300 redesign — a memory the user said again is not noise.
+                MemoryItemRow.confirmed_at.is_(None),
                 MemoryItemRow.created_at < cutoff,
                 and_(never_used),
             )

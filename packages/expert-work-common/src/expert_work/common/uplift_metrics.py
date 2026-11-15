@@ -121,6 +121,14 @@ _memory_reconcile_total = expert_work_counter(
     label_names=("op",),  # add | update | delete | noop | degraded
 )
 
+# B-300 redesign §7.1 row 6 — the target the reconcile model picked: its cosine rank
+# within the candidate's cell and a coarse similarity band (no gate; counted only).
+_memory_reconcile_target_total = expert_work_counter(
+    "expert_work_memory_reconcile_target_total",
+    "Reconcile targets picked by the model, by op, cosine rank in the cell and similarity.",
+    label_names=("op", "rank", "similarity"),
+)
+
 # B-300 D3 (incl. G13) — long-term memory extraction, per pass. ``extraction_pass`` is
 # ``user`` (only what the user typed) or ``conversation`` (the transcript).
 _memory_extraction_total = expert_work_counter(
@@ -490,8 +498,41 @@ def record_memory_reconcile(*, op: str) -> None:
     messages that was less certain than the user-side memory it would change.
     ``delete_added`` (B-300, 11-14) = a correction candidate whose DELETE was not
     blocked: the target was retracted and the candidate stored as well.
+
+    B-300 redesign (§7): ``refused_cross_cell`` / ``refused_rank`` /
+    ``refused_event_date`` / ``refused_older_line`` = an UPDATE / DELETE the program
+    turned into an ADD (another kind or agent; not among the 2 nearest by cosine in
+    the cell; the event-date rule; the candidate's line is older than the target's
+    record); ``noop_out_of_scope`` = a NOOP whose target the candidate could not be
+    recalled through, written instead; ``noop_refreshed`` = a NOOP that moved the
+    user-side target's confirmed date. ``degraded`` now only means the model gave no
+    usable decision for that candidate (or the UPDATE / DELETE target was already
+    gone). ``reconcile_failed_direct`` = one reconcile call failed inside (lookup,
+    model, unusable reply, store error): the candidates of that batch not written yet
+    were written directly with their own fields (once per failed call).
     """
     _memory_reconcile_total.labels(op=op).inc()
+
+
+def _similarity_band(similarity: float) -> str:
+    if similarity >= 0.8:
+        return ">=0.8"
+    if similarity >= 0.6:
+        return "0.6-0.8"
+    if similarity >= 0.4:
+        return "0.4-0.6"
+    return "<0.4"
+
+
+def record_memory_reconcile_target(*, op: str, rank: int | None, similarity: float) -> None:
+    """Bump ``expert_work_memory_reconcile_target_total{op, rank, similarity}`` (B-300
+    redesign §7.1 row 6): ``rank`` is the target's cosine rank among the candidate's
+    same-cell neighbours (``"1"``, ``"2"``, ``"3+"``), ``"other_cell"`` when it is in
+    another cell; ``similarity`` is a band (``"<0.4"`` … ``">=0.8"``)."""
+    rank_label = "other_cell" if rank is None else (str(rank) if rank <= 2 else "3+")
+    _memory_reconcile_target_total.labels(
+        op=op, rank=rank_label, similarity=_similarity_band(similarity)
+    ).inc()
 
 
 def record_memory_extraction(*, pass_name: str, outcome: str) -> None:

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 
 from expert_work.persistence.memory.base import USER_SIDE_ORIGINS
 from expert_work.protocol import MemoryItem
@@ -75,16 +76,28 @@ def recorded_date(item: MemoryItem) -> str | None:
     return item.created_at.date().isoformat()
 
 
-def line_date(item: MemoryItem) -> str | None:
-    """行里显示的日期(``YYYY-MM-DD``,UTC):记录日期;用户一方的行若有确认日期,取两者里晚的。
+def as_utc(ts: datetime) -> datetime:
+    """比较前统一到 UTC;没有时区的按 UTC 读(库里写的都是 UTC)。"""
+    return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
 
-    来自助手、来源未记录的行不看确认日期(它们不会有;万一有也不显示),免得显得被用户确认过
-    (重做设计 §9.2,审查 M4)。都没有 → ``None``。"""
+
+def restated_at(item: MemoryItem) -> datetime | None:
+    """这条记忆的记录时间(UTC):记录日期;用户一方的行若有确认日期,取两者里晚的。
+
+    来自助手、来源未记录的行不看确认日期(它们不会有;万一有也不算),免得显得被用户确认过
+    (重做设计 §9.2,审查 M4)。召回行显示的日期、去重合并材料里的日期、「候选那一行早于目标
+    的记录时间」都用它。都没有 → ``None``。"""
     stamps = [item.created_at]
     if effective_origin(item) in USER_SIDE_ORIGINS:
         stamps.append(item.confirmed_at)
-    known = [ts for ts in stamps if ts is not None]
-    return max(known).date().isoformat() if known else None
+    known = [as_utc(ts) for ts in stamps if ts is not None]
+    return max(known) if known else None
+
+
+def line_date(item: MemoryItem) -> str | None:
+    """行里显示的日期(``YYYY-MM-DD``,UTC)::func:`restated_at` 的那一天。"""
+    ts = restated_at(item)
+    return ts.date().isoformat() if ts is not None else None
 
 
 def origin_label(item: MemoryItem) -> str:
