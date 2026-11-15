@@ -224,11 +224,23 @@ CONTEXT_CAP = {"pass1": 2, "pass2": 4}
 
 
 def _split_input(text: str) -> tuple[list[str], str]:
-    """提炼输入 → (分隔行之上的上下文行, 新段)。没有分隔行 = 整段都是新段(不切片的代码)。"""
+    """提炼输入 → (分隔行之上的上下文行的标签, 新段)。只数 ``[n]`` 开头的行(一条消息占几行时,续行
+    不算);没有分隔行 = 整段都是新段(不切片的代码)。"""
     if NEW_MARKER not in text:
         return [], text
     above, below = text.split(NEW_MARKER, 1)
-    return [ln for ln in above.splitlines() if ln.strip()], below
+    return [tag for _n, (tag, _rest) in sorted(numbered_lines(above).items())], below
+
+
+def _context_ok(kind: str, tags: list[str]) -> bool:
+    """上下文行数在设计 §8.2 之内:第一次至多 2 条;第二次至多 4 行 —— 最近 4 行里没有
+    [assistant] 时可以往前补到恰好含一条为止(补到的第一行就是那条 [assistant],其后再没有)。"""
+    cap = CONTEXT_CAP[kind]
+    if len(tags) <= cap:
+        return True
+    if kind != "pass2":
+        return False
+    return tags[0] == "assistant" and "assistant" not in tags[1:]
 
 
 def _a14(out: dict[str, Any], result: Mapping[str, Any]) -> None:
@@ -254,7 +266,7 @@ def _a14(out: dict[str, Any], result: Mapping[str, Any]) -> None:
         for c in calls:
             context, new = _split_input(str(c["input"]))
             size += len(new)
-            over = over or len(context) > CONTEXT_CAP[str(c["kind"])]
+            over = over or not _context_ok(str(c["kind"]), context)
         per_round.append(size)
     out["context_over_cap"] = over
     first, last = per_round[:3], per_round[-3:]

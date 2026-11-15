@@ -264,3 +264,73 @@ def test_four_rate_limits_fail_the_item_not_the_quote(monkeypatch: pytest.Monkey
     assert guard.settled < 0.001  # 被限流的那一项按 0 结,不按上限
     assert not isinstance(live.RateLimitedError("x"), spend.SpendStopError)
     assert plan.JUDGE_MODEL  # 只是让 import 有用
+
+
+# --------------------------------------------------------------------------- 第三轮 LOW
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("门禁密码 4417", "4417#"),
+        ("password maple#2291", "Maple#2291"),
+        ("root 密码是 Qz7 vR2m", "Qz7!vR2m"),
+        ("portal password Birch4471", "Birch!4471"),
+    ],
+)
+def test_symbol_bearing_secrets_match_with_symbols_stripped(text: str, secret: str) -> None:
+    """第三轮 LOW 1:带符号的秘密值两边去掉一切非字母数字、不分大小写再比。"""
+    assert base.has_secret(text, secret)
+
+
+def test_numeric_secrets_still_keep_their_digit_boundaries() -> None:
+    assert not base.has_secret("PIN 88, 41 left", "8841")
+    assert not base.has_secret("order 188415", "8841")
+
+
+def _call(kind: str, context: list[str], new: list[str]) -> dict[str, Any]:
+    return {"kind": kind, "reply": '{"memories": []}', "input": _numbered(context, new)}
+
+
+def _over(p2_context: list[str], p1_context: list[str] | None = None) -> bool:
+    new = ["[user] [2026-11-15] next item", "[assistant] ok"]
+    rounds = [
+        {
+            "after_turn": k,
+            "calls": [
+                _call("pass1", p1_context or [], new[:1]),
+                _call("pass2", p2_context, new),
+            ],
+        }
+        for k in range(12)
+    ]
+    rec = {"key": "u", "result": {"rounds": rounds, "memories": [], "capabilities": ALL}}
+    return bool(chk.checks(rec, _a14())[0]["context_over_cap"])
+
+
+def test_context_cap_counts_only_numbered_lines() -> None:
+    """第三轮 LOW 2:一条消息占几行时,续行不带 ``[n]``,不算上下文行数。"""
+    multi = [
+        "[user] a",
+        "[assistant] first line\ncontinued line\nanother continued line",
+        "[user] b",
+        "[assistant] c",
+    ]
+    assert _over(multi) is False
+
+
+def test_context_may_reach_back_to_one_assistant_line() -> None:
+    """§8.2:最近 4 行里没有 [assistant] 时往前补到含一条为止;补的是规则允许的,不算超。"""
+    no_reply_in_last_four = [
+        "[assistant] earlier reply",
+        "[user] u1",
+        "[user] u2",
+        "[task] t",
+        "[user] u3",
+    ]
+    assert _over(no_reply_in_last_four) is False
+    too_far = ["[assistant] r0", "[assistant] r1", "[user] u1", "[user] u2", "[user] u3"]
+    assert _over(too_far) is True  # 最近 4 行之外多补了不需要的
+    plain_five = ["[user] u0", "[assistant] r0", "[user] u1", "[assistant] r1", "[user] u2"]
+    assert _over(plain_five) is True
+    assert _over([], p1_context=["[user] a", "[user] b", "[user] c"]) is True  # 第一次不补
