@@ -6,7 +6,9 @@
 * ``text_chars`` —— 用户输入的文字在正文开头占几个字符(正文 = 字符串,或各文字块按顺序拼起来;
   输入文字永远排在附件行、外部内容之前);
 * ``images`` / ``files`` / ``external_blocks`` —— 这条消息还带了几张图、几个文件、几段对接方的外部
-  内容(只有计数,长期记忆的第二次提炼只给计数,不给内容)。
+  内容(只有计数,长期记忆的第二次提炼只给计数,不给内容);
+* ``sent_at`` —— 消息构造时刻(UTC,ISO 8601;11-14 起有,之前的消息没有)。第一次提炼每轮重读整段
+  对话,相对日期(「今天早上」)要按这条消息自己的日期换算,不能按重读那天。
 
 **只有带这个标记的消息,其输入文字那一段,才进长期记忆的第一次提炼**(只看用户自己说的那一次)。
 没有标记的用户角色消息 —— 定时任务的种子、子智能体的任务说明、发版前的旧消息 —— 一律不算。
@@ -38,20 +40,23 @@ class UserInput:
     images: int = 0
     files: int = 0
     external_blocks: int = 0
+    #: 消息构造时刻(UTC,ISO 8601);发版前的旧消息没有。
+    sent_at: str | None = None
 
 
 def user_input_kwargs(
-    *, text: str, images: int, files: int, external_blocks: int
+    *, text: str, images: int, files: int, external_blocks: int, sent_at: str | None = None
 ) -> dict[str, Any]:
     """``_build_human_message`` 给消息附加的字段。只有那一个构造点调用它。"""
-    return {
-        USER_INPUT_KEY: {
-            "text_chars": len(text),
-            "images": images,
-            "files": files,
-            "external_blocks": external_blocks,
-        }
+    mark: dict[str, Any] = {
+        "text_chars": len(text),
+        "images": images,
+        "files": files,
+        "external_blocks": external_blocks,
     }
+    if sent_at is not None:
+        mark["sent_at"] = sent_at
+    return {USER_INPUT_KEY: mark}
 
 
 def _count(value: object) -> int | None:
@@ -81,6 +86,7 @@ def read_user_input(message: Any) -> UserInput | None:
         images=_count(mark.get("images")) or 0,
         files=_count(mark.get("files")) or 0,
         external_blocks=_count(mark.get("external_blocks")) or 0,
+        sent_at=sent_at if isinstance(sent_at := mark.get("sent_at"), str) else None,
     )
 
 

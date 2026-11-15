@@ -26,6 +26,7 @@ from langchain_core.messages import (
 )
 
 from expert_work.common.conversation_channel import HIDE_FROM_UI, SUPERSEDED_BY
+from expert_work.common.message_stamp import STAMP_CREATED_AT
 from expert_work.common.user_input import mark_draft_turn, user_input_kwargs
 from expert_work.persistence import InMemoryMemoryStore
 from expert_work.protocol import MemoryItem
@@ -302,7 +303,10 @@ async def test_conversation_pass_does_not_restate_what_the_user_said() -> None:
         "pass: do not record it again here — not in other words, not with a source added, and "
         "not when an [assistant] line repeats, confirms or uses it. A conclusion the assistant "
         "reached from what the user said is still recorded here; only the user's statement "
-        "itself is not. What a [user] line says that cannot be understood without the "
+        "itself is not. A tool result or record lookup that only confirms what the user "
+        "currently says (their latest value) is not recorded again; one that differs from the "
+        "user's latest statement is recorded, with its source. What a [user] line says that "
+        "cannot be understood without the "
         "assistant's previous message — a short answer, an agreement, or a short correction "
         'such as "it\'s Y now" or "no, it\'s the other one" — is recorded here, with its '
         'source, and with "is_correction" when it changes something; one line can hold both '
@@ -312,6 +316,15 @@ async def test_conversation_pass_does_not_restate_what_the_user_said() -> None:
         "results or attachments told it."
     )
     assert passage in second
+    # 用户 11-14(评测 A12):查记录 / 工具只是印证了用户说过的值 → 不再记一条「助手查到并确认了 X」;
+    # 查到的与用户说的不同 → 照记、带出处。
+    assert (
+        "A tool result or record lookup that only confirms what the user currently says (their "
+        "latest value) is not recorded again;" in second
+    )
+    assert "one that differs from the user's latest statement is recorded, with its source." in (
+        second
+    )
     # 「两类」里仍有「助手做了什么、产出了什么、定了什么」(定时任务那类运行主要就是它)。
     assert '- what the assistant did or produced, and what was decided ("episodic");' in second
     assert second.index("of two sorts only:") < second.index(passage)
@@ -423,6 +436,110 @@ async def test_language_not_named_without_user_text() -> None:
         llm,
     )
     assert "in the language the user writes in" in llm.system_of("conversation")
+
+
+async def test_english_user_text_names_english() -> None:
+    """评测 A 组(11-14):英文场景里约一成半的记忆被写成中文 / 葡西语一类 —— 英语要点名。"""
+    llm = _ByPassLLM()
+    await _flush(
+        [
+            _user("Please remember that my return order number is RX-2291"),
+            AIMessage(content="Noted."),
+        ],
+        llm,
+    )
+    for which in ("user", "conversation"):
+        assert 'Write the "content" of every memory in English, in the same script' in (
+            llm.system_of(which)
+        )
+
+
+async def test_other_latin_user_text_follows_the_users_own_language() -> None:
+    llm = _ByPassLLM()
+    await _flush(
+        [_user("Por favor, mueve la reunión al jueves por la tarde"), AIMessage(content="Noted.")],
+        llm,
+    )
+    for which in ("user", "conversation"):
+        system = " ".join(llm.system_of(which).split())
+        assert "in exactly the language of the user's own messages in the input" in system
+
+
+# ---------------------------------------------------------------------------
+# 评测 A 组 P1(用户 11-14「记,带上日期」)—— 用户说自己的一次性读数 / 编号 / 状态要记,带日期
+# ---------------------------------------------------------------------------
+
+
+def _created_user(text: str, created_at: str) -> HumanMessage:
+    """``sent_at`` 之前的用户消息:只有写入时盖的 ``expert_work_created_at``。"""
+    kwargs = user_input_kwargs(text=text, images=0, files=0, external_blocks=0)
+    return HumanMessage(content=text, additional_kwargs={**kwargs, STAMP_CREATED_AT: created_at})
+
+
+def _dated_user(text: str, sent_at: str) -> HumanMessage:
+    return HumanMessage(
+        content=text,
+        additional_kwargs=user_input_kwargs(
+            text=text, images=0, files=0, external_blocks=0, sent_at=sent_at
+        ),
+    )
+
+
+async def test_user_text_lines_carry_their_own_send_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    """审查 MEDIUM-1 / MEDIUM-2(11-14):每行带那条消息自己的发送日期(按智能体时区换算),重读旧消息时
+    「今天早上」仍按当天换算;发版前的旧消息没有发送时刻,不加日期。"""
+    monkeypatch.setenv("EXPERT_WORK_TIMEZONE", "Asia/Shanghai")
+    llm = _ByPassLLM()
+    await _flush(
+        [
+            _user("an old message with no send time"),
+            AIMessage(content="ok"),
+            # sent_at 之前的消息:写入时盖的 expert_work_created_at 兜底(复审 11-14)。
+            _created_user("my weight yesterday was 70 kg", "2026-11-12T03:00:00+00:00"),
+            AIMessage(content="ok"),
+            # UTC 11-13 17:00 = 上海 11-14 01:00:按智能体时区是 11-14。
+            _dated_user("my fasting glucose this morning is 6.1", "2026-11-13T17:00:00+00:00"),
+            AIMessage(content="Noted."),
+        ],
+        llm,
+    )
+    assert llm.input_of("user").splitlines() == [
+        "an old message with no send time",
+        "[2026-11-12] my weight yesterday was 70 kg",
+        "[2026-11-14] my fasting glucose this morning is 6.1",
+    ]
+
+
+async def test_user_text_pass_records_dated_one_off_values() -> None:
+    llm = _ByPassLLM()
+    await _flush(
+        [_user("my fasting glucose this morning is 6.1"), AIMessage(content="Noted.")], llm
+    )
+    system = " ".join(llm.system_of("user").split())
+    rule = (
+        "- A value the user states about themselves or their own things, with the same message "
+        "saying what it is — a reading or measurement, an id or number, a current status — is "
+        "recorded even though it may change, except passwords, one-time codes, bank card or "
+        "bank account numbers and other secrets, which are never recorded. Write it with the "
+        "date or time it refers to, so it is not later taken for a current value: a line that "
+        'starts with a date in brackets was sent on that date, so turn "this morning", '
+        '"yesterday" and the like in that line into a date counted from it; in a line without '
+        "a date, leave such words as they are."
+    )
+    assert rule in system
+    assert "today is" not in system
+    # 「不记琐碎」仍在,但不再一概排除会变的值。
+    assert "Extract nothing trivial or ephemeral." not in system
+    assert (
+        "Extract nothing trivial: small talk and passing remarks that are not the user's own "
+        "facts are not memories." in system
+    )
+    # 光有一个值、没说是什么的那句,仍不是更正(11-14 那条不变)。
+    assert "A value or name on its own, with nothing in the same message saying what it is" in (
+        system
+    )
+    # 第二次提炼不加这一条。
+    assert "A value the user states about themselves" not in llm.system_of("conversation")
 
 
 # ---------------------------------------------------------------------------

@@ -229,9 +229,10 @@ async def test_reconcile_prompt_says_an_assistant_copy_of_a_user_memory_is_a_noo
     [
         ("UPDATE", True, {"user said", "cand"}, 1, "lower_confidence_update_added"),
         ("UPDATE", False, {"user said"}, 0, "lower_confidence_update_dropped"),
-        ("DELETE", True, {"user said"}, 0, "lower_confidence_delete"),
+        ("DELETE", False, {"user said"}, 0, "lower_confidence_delete"),
+        ("DELETE", True, {"user said", "cand"}, 1, "lower_confidence_delete_added"),
     ],
-    ids=["update-correction-added", "update-dropped", "delete-noop"],
+    ids=["update-correction-added", "update-dropped", "delete-noop", "delete-correction-added"],
 )
 @pytest.mark.parametrize(
     ("origin", "confidence"),
@@ -364,9 +365,10 @@ def _raise_confidence_while_deciding(
     [
         ("UPDATE", True, {"corrected by the user", "cand"}, "lower_confidence_update_added"),
         ("UPDATE", False, {"corrected by the user"}, "lower_confidence_update_dropped"),
-        ("DELETE", True, {"corrected by the user"}, "lower_confidence_delete"),
+        ("DELETE", False, {"corrected by the user"}, "lower_confidence_delete"),
+        ("DELETE", True, {"corrected by the user", "cand"}, "lower_confidence_delete_added"),
     ],
-    ids=["update-added", "update-dropped", "delete-noop"],
+    ids=["update-added", "update-dropped", "delete-noop", "delete-correction-added"],
 )
 async def test_target_made_more_certain_while_deciding_is_rechecked_under_the_lock(
     op: str, is_correction: bool, expected_live: set[str], label: str
@@ -501,7 +503,7 @@ async def test_reconcile_prompt_puts_an_identical_user_memory_first() -> None:
     assert system.index(rule) < system.index("is an UPDATE, not a NOOP.")
     # 审查 MEDIUM-2 —— 与代码里「带更正的不走确定性 NOOP」一致。
     exception = (
-        'Exception: a candidate with "is_correction": true is not a NOOP for this reason; '
+        'In that case, a candidate with "is_correction": true is not a NOOP for this reason; '
         "it DELETEs the existing memory it contradicts, if there is one; otherwise it is a NOOP."
     )
     assert exception in system
@@ -654,15 +656,17 @@ async def test_identical_correction_deleting_the_identical_memory_is_a_noop(
     assert next(r for r in store._rows if r.id == stated.id).expired_at is None
 
 
-async def test_converted_update_of_a_more_certain_user_memory_is_refused() -> None:
-    """复审 LOW-2 —— 模型判「更新」一条更有把握的冲突用户记忆 → 改写成删除 → 第二条拦截规则拒绝:
-    什么都没改,计在 ``lower_confidence_delete``,不会按新增存下。"""
+@pytest.mark.parametrize("op", ["UPDATE", "DELETE"])
+async def test_converted_update_of_a_more_certain_user_memory_is_refused(op: str) -> None:
+    """复审 LOW-2 —— 模型判「更新」(改写成删除)或「删除」一条更有把握的冲突用户记忆 → 第二条
+    拦截规则拒绝:什么都没改,计在 ``lower_confidence_delete``。评测 A 组 P9(11-14)后被拦的删除
+    带更正会按新增存下,但与已有用户记忆内容相同的这种除外 —— 仍不落新行。"""
     store = InMemoryMemoryStore()
     stated = await _seed_row(store, _X_STOP, origin="user_stated", confidence=0.5)
     other = await _seed_row(store, _X + "?", origin="user_stated", confidence=0.95)
     before_delete = _count("lower_confidence_delete")
     before_added = _count("lower_confidence_update_added")
-    llm = _LLM(user_reply=_correction_x(), ops_reply=_ops("UPDATE", other.id))
+    llm = _LLM(user_reply=_correction_x(), ops_reply=_ops(op, other.id))
     assert await _flush(llm, store, near=_X) == 0
     assert {r.id for r in _valid(store)} == {stated.id, other.id}
     assert _count("lower_confidence_delete") == before_delete + 1
@@ -707,3 +711,74 @@ async def test_decisions_stay_aligned_when_an_earlier_candidate_is_dropped() -> 
     rows = await _live(store)
     assert set(rows) == {"cand", "new other"}
     assert rows["new other"].supersedes == other.id
+
+
+# ---------------------------------------------------------------------------
+# 审查(11-14,8ddd32c0f)MEDIUM-3 / MEDIUM-4 —— 更正型候选的新值既不重复落行,也不跟着删除丢掉
+# ---------------------------------------------------------------------------
+
+
+async def test_blocked_correction_restating_an_existing_memory_is_not_added_again() -> None:
+    """来自助手的更正 Y 每轮都被重抽;库里已有一条只差标点的来自助手的 Y。模型判「删掉用户的 X」被拦:
+    带更正也不再按新增存下 —— 几轮下来有效的 Y 只有一条。"""
+    store = InMemoryMemoryStore()
+    x = await _seed_row(store, "cand", origin="user_stated", confidence=0.9)
+    y = await _seed_row(store, "cand y\u3002", origin="assistant_derived", confidence=0.6)
+    for _turn_no in range(3):
+        llm = _LLM(
+            conversation_reply=_reply({"kind": "fact", "content": "cand y", "is_correction": True}),
+            ops_reply=_ops("DELETE", x.id),
+        )
+        assert await _flush(llm, store, near="cand y") == 0
+    valid = {r.id for r in _valid(store)}
+    assert valid == {x.id, y.id}
+
+
+@pytest.mark.parametrize(
+    ("candidate", "target_origin"),
+    [("user", "assistant_derived"), ("assistant", "assistant_derived"), ("user", None)],
+    ids=["user-vs-assistant", "assistant-vs-assistant", "user-vs-unrecorded"],
+)
+async def test_unblocked_delete_by_a_correction_keeps_the_new_value(
+    candidate: str, target_origin: MemoryOrigin | None
+) -> None:
+    """更正被判成「删除」而且没被拦(目标不受保护):旧的作废,新值也要存下,不能两样都没了。"""
+    store = InMemoryMemoryStore()
+    old = await _seed_row(store, "old value", origin=target_origin, confidence=0.6)
+    reply = _reply({"kind": "fact", "content": "cand", "confidence": 0.9, "is_correction": True})
+    llm = (
+        _LLM(user_reply=reply, ops_reply=_ops("DELETE", old.id))
+        if candidate == "user"
+        else _LLM(conversation_reply=reply, ops_reply=_ops("DELETE", old.id))
+    )
+    before = _count("delete_added")
+    assert await _flush(llm, store) == 1
+    rows = await _live(store)
+    assert set(rows) == {"cand"}
+    assert next(r for r in store._rows if r.id == old.id).expired_at is not None
+    assert _count("delete_added") == before + 1
+
+
+async def test_unblocked_delete_without_a_correction_still_stores_nothing() -> None:
+    store = InMemoryMemoryStore()
+    old = await _seed_row(store, "old value", origin="assistant_derived", confidence=0.6)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply=_ops("DELETE", old.id))
+    assert await _flush(llm, store) == 0
+    assert await _live(store) == {}
+
+
+async def test_reconcile_prompt_keeps_new_values_and_dated_readings() -> None:
+    store = InMemoryMemoryStore()
+    _ = await _seed_row(store, "cand x", origin="user_stated", confidence=0.9)
+    llm = _LLM(user_reply=_stated(0.9), ops_reply="{}")
+    _ = await _flush(llm, store)
+    system = " ".join(llm.system_of(None).split())
+    assert (
+        "A correction that carries a new value is an UPDATE of the memory it replaces, not a "
+        "DELETE; DELETE only when the candidate retracts an existing memory without giving a "
+        "new value." in system
+    )
+    assert (
+        "A reading, measurement or status that refers to a different date or time than an "
+        "existing one is a new memory (ADD), not an UPDATE of the earlier one." in system
+    )

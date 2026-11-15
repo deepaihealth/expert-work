@@ -517,6 +517,8 @@ def _build_human_message(
         images=len(image_refs),
         files=len(document_names or []),
         external_blocks=len(untrusted_content or []),
+        # B-300 审查 MEDIUM-1(11-14):第一次提炼按这条消息自己的日期换算「今天早上」一类说法。
+        sent_at=datetime.now(UTC).isoformat(),
     )
     untrusted = (
         _fence_untrusted(untrusted_content, spotlight_nonce=spotlight_nonce)
