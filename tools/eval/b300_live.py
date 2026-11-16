@@ -325,7 +325,15 @@ def turn_messages(turn: sc.Turn, index: int) -> list[Any]:
 
 
 def _live(item: Any) -> bool:
-    return item.deleted_at is None and item.invalid_at is None and item.superseded_by is None
+    """有效 = 没删、没作废、没被取代,且不是已并入汇总的成员(成员召回不到,平台也不当它「已经
+    在了」,审查 M3;汇总行自己算)。"""
+    folded = item.status != "consolidated" and getattr(item, "consolidated_into", None) is not None
+    return (
+        item.deleted_at is None
+        and item.invalid_at is None
+        and item.superseded_by is None
+        and not folded
+    )
 
 
 def platform_capabilities() -> dict[str, bool]:
@@ -490,6 +498,8 @@ async def run_extraction(
             rewrite["calls"] = aux.calls
             if transport.guard.blocked:  # 重写器把模型调用的错吞成 failed:止损了照样停
                 raise SpendStopError(transport.guard.blocked)
+            if aux.failures:  # 评测这边的调用出错(限流用完重试等):这条记录要补跑
+                raise RuntimeError(f"summary rewrite model call failed: {aux.failures}")
         now = await store.list_for_user(tenant_id=A_TENANT, user_id=user_id, limit=500)
         rounds.append(
             {

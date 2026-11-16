@@ -452,7 +452,9 @@ RECALL_TARGETS = {
 }
 
 
-def _seed_lines(scenario: sc.Scenario) -> str:
+def _seed_lines(scenario: sc.Scenario, days: Mapping[str, int] | None = None) -> str:
+    """``days`` = 种进库里之后读回来的真实日子(pod 里 ``seed`` 那一步报的 ``memory_days``);
+    没有就用场景写的日子。"""
     rows = []
     for s in scenario.seeds:
         if getattr(s, "summary_of", ()):  # 汇总行的成员不单独召回,材料里只列汇总行
@@ -462,11 +464,14 @@ def _seed_lines(scenario: sc.Scenario) -> str:
         else:
             label = "corrected by the user" if s.confidence >= 1.0 else _LABEL.get(s.origin, "?")
         state = " (replaced)" if s.superseded_by else ""
-        rows.append(f"({s.kind} · {label} · {s.days_ago} days ago{state}) {s.content}")
+        ago = (days or {}).get(s.key, s.days_ago)
+        rows.append(f"({s.kind} · {label} · {ago} days ago{state}) {s.content}")
     return _bullets(rows)
 
 
-def conversation_prompt(scenario: sc.Scenario, answer: str) -> str:
+def conversation_prompt(
+    scenario: sc.Scenario, answer: str, days: Mapping[str, int] | None = None
+) -> str:
     text = sc.fact(scenario.fact_key).texts[scenario.lang]
     asked = scenario.conversations[-1]
     docs = "".join(f"\nAttached file {name}:\n{body}" for name, body in asked.documents)
@@ -478,7 +483,7 @@ def conversation_prompt(scenario: sc.Scenario, answer: str) -> str:
         else ""
     )
     return (
-        f"Memories the assistant had recalled before answering:\n{_seed_lines(scenario)}\n\n"
+        f"Memories the assistant had recalled before answering:\n{_seed_lines(scenario, days)}\n\n"
         f"User message: {asked.user}{docs}\n\n{values}\n"
         f"Assistant's answer:\n{answer}\n\n"
         f"Rule: {_RULES[scenario.cls]}\n"

@@ -28,6 +28,7 @@ from b300_phases import (  # noqa: E402
     PHASES,
     Phase,
     all_scenarios,
+    calibration_path,
     inpod_rows,
     latest,
     read_jsonl,
@@ -48,6 +49,7 @@ def judge_items(out: Path, phase: Phase) -> tuple[list[rep.JudgeItem], dict[str,
     items: list[rep.JudgeItem] = []
     facts: dict[str, Any] = {}
     recalled = latest(inpod_rows(out, phase.name, "recalled"), "run_id")
+    seeded = latest(inpod_rows(out, phase.name, "seed"), "key")
     states = {step: latest(inpod_rows(out, phase.name, "state", step), "key") for step in (1, 2)}
     final_state = latest(inpod_rows(out, phase.name, "state"), "key")
     candidates = latest(inpod_rows(out, phase.name, "candidates"), "key")
@@ -110,7 +112,11 @@ def judge_items(out: Path, phase: Phase) -> tuple[list[rep.JudgeItem], dict[str,
         if info["recall_ok"] and info.get("precondition", True) is True:
             items.append(
                 rep.JudgeItem(
-                    f"{key}|answer", "answer", rep.conversation_prompt(s, answer["final_text"])
+                    f"{key}|answer",
+                    "answer",
+                    rep.conversation_prompt(
+                        s, answer["final_text"], (seeded.get(r["user"]) or {}).get("memory_days")
+                    ),
                 )
             )
     return items, facts
@@ -242,7 +248,7 @@ def collect_outcomes(
             else:
                 outcomes[(cls, "violation", vendor)].append((domain, bad))
         if phase.kind == "extraction":
-            _reply_errors(outcomes, counts[name], records, gate=name == GATE_K_PHASE)
+            _reply_errors(outcomes, counts[name], records, gate=name in GATE_PHASES)
         if phase.baseline:
             baseline[name] = {"answers": rep.prove_red(red_rows)}
         if phase.kind == "c5":
@@ -513,6 +519,13 @@ def report(out: Path, q: Mapping[str, Any] | None) -> dict[str, Any]:
         (out / name).exists() for name in REDESIGN_PHASES
     ):
         body["disclosures"] += REDESIGN_DISCLOSURES
+    calibration = calibration_path(out, "a")
+    if calibration.exists():  # 审查 M4:本轮没有待判项的题型没校准
+        skipped = json.loads(calibration.read_text(encoding="utf-8")).get("checks_without_items")
+        if skipped:
+            body["disclosures"].append(
+                f"判官题型 {', '.join(skipped)} 本轮无待判项、未校准(校准只覆盖真有待判项的题型)。"
+            )
     if any((out / name).exists() for name in V9_PHASES):
         body["disclosures"] += krep.disclosures()
         body["statistical_power"] = list(krep.POWER)

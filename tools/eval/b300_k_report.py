@@ -19,7 +19,8 @@ K_LINES: tuple[tuple[str, str, str, float, int, float | None], ...] = (
     ("G-K-n2", "x_retired", "max", 0, 10, None),
     ("G-K-cp", "x_retired", "max", 0, 10, None),
     ("G-ALL", "write_guarantee_broken", "max", 0, 1, None),
-    ("G-ALL", "reconcile_reply_error", "max", 0, 40, None),
+    # 闸门里全部 100 个单元(60 个 P6 / P7 + 40 个 K),与写的保证同口径(审查 M2)
+    ("G-ALL", "reconcile_reply_error", "max", 0, 100, None),
     # §11.3 K 组
     # 用户 11-16:带事件日期的 2 个场景(6 个单元)剔出 K-a 的线、单独报数;线按原 24 / 30 同比例,
     # 三个数(19 / 24、漏记 ≤ 2 / 24、闸门 ≥ 6 / 8)与逐领域三分之二都由用户 11-16 确认
@@ -117,6 +118,30 @@ POWER: tuple[dict[str, str], ...] = (
         "two_sided": "约 39%",
         "used_by": "各「该退的退了」的线",
     },
+    {
+        "shape": "≥ 19 / 24(坏的 ≤ 5)",
+        "one_sided": "约 39%",
+        "two_sided": "约 42%",
+        "used_by": "K-a 新值有效、旧值作废(用户 11-16)",
+    },
+    {
+        "shape": "≤ 2 / 24",
+        "one_sided": "约 24%",
+        "two_sided": "约 27%",
+        "used_by": "K-a 漏记(用户 11-16)",
+    },
+    {
+        "shape": "≥ 6 / 8(坏的 ≤ 2)",
+        "one_sided": "约 60%",
+        "two_sided": "约 65%",
+        "used_by": "闸门的 K-a(用户 11-16)—— 很弱,只挡得住大面积退不掉",
+    },
+    {
+        "shape": "≤ 2 / 15",
+        "one_sided": "约 36%",
+        "two_sided": "约 41%",
+        "used_by": "K-s 重写后 B 仍在、再说一遍多出同义行",
+    },
 )
 
 _NOTES: tuple[str, ...] = (
@@ -142,6 +167,12 @@ _NOTES: tuple[str, ...] = (
     "(列了、程序没让打标)、deny_marked_not_rewritten(打了标、重写没落库)、deny_rewritten;不达标的"
     "次数再按这四种分:<指标>_bad_<原因>(如 b_still_in_summary_bad_listed_blocked = 被名次等规则"
     "挡下,b_still_in_summary_bad_rewritten = 重写本身错)。线的判定照旧。",
+    "B4d 的汇总行在提问之前可能被平台的整理巡检(每 4 小时一轮,没有按租户的开关)重写掉:那时种下"
+    "的汇总行不在召回里,recall_ok 判前提不成立、补跑;补跑的花费不在报价里。",
+    "K-f、K-p 的 stored_new 只看「有一条新写的、有效的用户一方普通行」,不看内容;那句话的关键串"
+    "有没有命中另报(K-f 的 new_key_hit)。",
+    "K-s 当场重写的模型调用若出错(限流用完重试、传输错误),这一条记录判「评测出错、要补跑」,"
+    "不算成产品「打了标没重写」。",
     "K-s 再说一遍的那一半(用户 11-16):提炼出的话与某条已并入汇总的成员原文归一后相同、撞上那条"
     "成员(它被作废并连到新行)而新写的一行,单独计数(counts 的 restate_member_verbatim),不算进"
     "「多出一行同义的 ≤ 2 / 15」;那条线只算其它原因多出来的同义行。",

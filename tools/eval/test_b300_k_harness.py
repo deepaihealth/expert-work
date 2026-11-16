@@ -156,7 +156,7 @@ def test_k_lines_match_the_design() -> None:
         ("G-K-n2", "x_retired"): ("max", 0, None, 10),
         ("G-K-cp", "x_retired"): ("max", 0, None, 10),
         ("G-ALL", "write_guarantee_broken"): ("max", 0, None, 1),
-        ("G-ALL", "reconcile_reply_error"): ("max", 0, None, 40),
+        ("G-ALL", "reconcile_reply_error"): ("max", 0, None, 100),  # 闸门全部单元(审查 M2)
         ("K-a", "retired_to_new"): ("min", 19, None, 24),  # 用户 11-16:带日期的 6 个单元剔出
         ("K-a", "missed"): ("max", 2, None, 24),
         ("K-ap", "new_valid"): ("min", 24, None, 30),
@@ -387,7 +387,15 @@ def test_report_carries_the_power_table_and_the_assumptions(tmp_path: Path) -> N
     body = cli.report(out, None)
     shapes = {row["shape"]: row for row in body["statistical_power"]}
     assert shapes["0 / 30"]["one_sided"] == "约 10%" and shapes["0 / 10"]["one_sided"] == "约 26%"
-    assert shapes["0 / 15"]["two_sided"] == "约 22%" and len(shapes) == 7
+    assert shapes["0 / 15"]["two_sided"] == "约 22%" and len(shapes) == 11
+    # 用户 11-16 新定的线形(精确二项区间,单侧 / 双侧 95%)
+    assert (shapes["≥ 19 / 24(坏的 ≤ 5)"]["one_sided"], shapes["≤ 2 / 24"]["one_sided"]) == (
+        "约 39%",
+        "约 24%",
+    )
+    assert shapes["≥ 6 / 8(坏的 ≤ 2)"]["one_sided"] == "约 60%"
+    assert "很弱" in shapes["≥ 6 / 8(坏的 ≤ 2)"]["used_by"]
+    assert shapes["≤ 2 / 15"]["two_sided"] == "约 41%"
     text = "\n".join(body["disclosures"])
     assert all(a in text for a in kp.ASSUMPTIONS)
     assert "K-b" in text and "K-n2" in text and "K-p" in text  # 没有程序兜底的三处
@@ -848,3 +856,171 @@ def test_on_v9_code_a_restatement_that_matches_a_member_is_not_a_synonym_row() -
     out, _items = kchk.checks({"key": "u", "result": result}, s)
     assert out["counts"]["restate_member_verbatim"] == 1 and out["synonym_added"] is False
     assert out["rewrite_marked"] is False and out["summary_changed"] is False
+
+
+# --------------------------------------------------------------------------- 审查 M2 / M4 / LOW
+
+
+def test_reply_errors_line_counts_every_gate_unit(tmp_path: Path) -> None:
+    """闸门里原样的 P6 / P7 单元也进「去重合并回复解析失败」那条线(审查 M2)。"""
+    out = tmp_path / "out"
+    p6 = next(s for s in sc.build_group("A") if s.cls == "P6")
+    rec = _record(p6, "g1", [], errors=["ReconcileReplyError"])
+    _write(out, "gate", [rec])
+    line = cli.report(out, None)["lines"]["G-ALL.reconcile_reply_error"]["glm"]
+    assert (line["bad"], line["n"]) == (1, 1)
+
+
+def test_rewrite_failure_on_the_eval_side_makes_the_record_an_error() -> None:
+    """K-s 当场重写的模型调用出错(这里:返回 HTTP 500):不算产品「打了标没重写」,整条记录出错、
+    要补跑。"""
+    s = next(x for x in K if x.cls == "K-s" and x.variant == "deny")
+    trio = ks.item_of(s).trio
+    inner = _scripted(f"{trio.summary} {trio.deny_b}", trio.summary, "x")
+    guard = spend.Guard(stop_line=5.0, prices={"mem": Price(1, 1, 1, "t")})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        system = "\n".join(m["content"] for m in body["messages"] if m["role"] == "system")
+        kind = live.classify_call(system)
+        if kind == "other":
+            return httpx.Response(429)
+        usage = {"prompt_tokens": 10, "completion_tokens": 5}
+        content = inner(kind, body)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": content}}], "usage": usage}
+        )
+
+    async def main() -> Any:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            t = live.ChatTransport("mem", "https://v", "k", guard, http, 500, provider="deepseek")
+            return await live.run_extraction(
+                s, transport=t, embedder=KeywordEmbedder(), item="u", phase="k"
+            )
+
+    sleeps: list[float] = []
+
+    async def no_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(live, "_sleep", no_sleep)
+        with pytest.raises(RuntimeError, match="summary rewrite model call failed"):
+            asyncio.run(main())
+    assert len(sleeps) == live.RATE_LIMIT_RETRIES
+
+
+def test_calibration_covers_only_kinds_with_pending_items(tmp_path: Path) -> None:
+    """审查 M4:校准只要求本段真有待判项的题型;段里还没有记录时要求全部题型。"""
+    out = tmp_path / "out"
+    assert cli.checks_to_calibrate(out, "calibration-a") == cli.CALIBRATION_CHECKS["calibration-a"]
+    b = next(s for s in K if s.cls == "K-b")
+    _write(out, "k", [_record(b, "k1", [_mem("n1", ks.item_of(b).hedge_memory)])])
+    assert cli.checks_to_calibrate(out, "calibration-a") == {"hedge"}
+    assert cli.checks_to_calibrate(out, "calibration-g") == cli.CALIBRATION_CHECKS["calibration-g"]
+
+
+def test_judge_refuses_kinds_the_calibration_did_not_cover(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    b = next(s for s in K if s.cls == "K-b")
+    _write(out, "k", [_record(b, "k1", [_mem("n1", ks.item_of(b).hedge_memory)])])
+    items, _facts = cli.judge_items(out, phases.PHASES["k"])
+    cli.uncalibrated_items(out, items)  # 没有校准文件:不拦(judge_votes 那一步另有检查)
+    path = phases.calibration_path(out, "a")
+    path.write_text(json.dumps({"checks": ["hedge"]}))
+    cli.uncalibrated_items(out, items)
+    path.write_text(json.dumps({"checks": ["half"]}))
+    with pytest.raises(phases.EvalError, match="hedge"):
+        cli.uncalibrated_items(out, items)
+    path.write_text(json.dumps({"agree": 20}))  # 老格式:按当时的规矩覆盖了全部题型
+    cli.uncalibrated_items(out, items)
+
+
+def test_report_names_kinds_without_items_as_not_calibrated(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    _write(out, "k", [_record(_k("K-a"), "k1", [])])
+    phases.calibration_path(out, "a").write_text(
+        json.dumps({"checks": ["hedge"], "checks_without_items": ["fuller", "summary"]})
+    )
+    text = "\n".join(cli.report(out, None)["disclosures"])
+    assert "fuller, summary 本轮无待判项、未校准" in text
+
+
+def test_calibration_labels_reject_five_in_one_domain() -> None:
+    def labels(domains: list[str]) -> list[dict[str, Any]]:
+        return [{"domain": d, "label": i % 2 == 0, "prompt": "p"} for i, d in enumerate(domains)]
+
+    five = ["support"] * 5 + ["legal"] * 4 + ["coding"] * 4 + ["sales"] * 4 + ["health"] * 3
+    with pytest.raises(phases.EvalError, match="at most 4 per domain"):
+        phases.check_labels(labels(five))
+    four = ["support"] * 4 + ["legal"] * 4 + ["coding"] * 4 + ["sales"] * 4 + ["health"] * 4
+    phases.check_labels(labels(four))
+
+
+def test_s7_topics_avoid_the_replaced_one() -> None:
+    import b300_redesign_facts as rf
+
+    assert "hotfix-branch" not in {p.key for p in rf.S7_ITEMS}
+    assert not any("hotfix" in p.topic for p in rf.S7_ITEMS)
+
+
+def test_disclosures_cover_b4d_rewrite_risk_and_stored_new() -> None:
+    text = "\n".join(krep.disclosures())
+    assert "整理巡检" in text and "补跑的花费不在报价里" in text
+    assert "stored_new 只看" in text and "new_key_hit" in text
+
+
+def test_judge_items_use_the_seed_days_read_back_from_the_store(tmp_path: Path) -> None:
+    """使用侧的判官材料用 pod 里 seed 那一步报的真实日子(审查 H1)。"""
+    out = tmp_path / "out"
+    s = ks.build_use_class("B4d")[0]
+    seed_ids = {x.key: f"id-{x.key}" for x in s.seeds}
+    record = {
+        "key": "b1",
+        "scenario_id": s.scenario_id,
+        "cls": s.cls,
+        "vendor": "glm",
+        "domain": s.domain,
+        "user": "user-1",
+        "seed_ids": seed_ids,
+        "convs": [{"run_id": "r1", "final_text": "answer"}],
+    }
+    _write(out, "b4x", [record])
+    (out / "b4x" / "inpod-recalled.jsonl").write_text(
+        json.dumps({"run_id": "r1", "memory_ids": list(seed_ids.values())}) + "\n"
+    )
+    (out / "b4x" / "inpod-seed.jsonl").write_text(
+        json.dumps({"key": "user-1", "memory_days": {"summary": 13, "y": 2}}) + "\n"
+    )
+    items, _facts = cli.judge_items(out, phases.PHASES["b4x"])
+    (item,) = items
+    assert "13 days ago" in item.prompt and "2 days ago" in item.prompt
+
+
+def test_the_judge_command_checks_calibration_coverage_before_spending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``judge`` 在发任何调用之前就拒掉校准没覆盖的题型(审查 M4)。"""
+    import argparse
+    import contextlib
+
+    out = tmp_path / "out"
+    b = next(s for s in K if s.cls == "K-b")
+    _write(out, "k", [_record(b, "k1", [_mem("n1", ks.item_of(b).hedge_memory)])])
+    phases.calibration_path(out, "a").write_text(json.dumps({"checks": ["half"]}))
+    guard = spend.Guard(stop_line=5.0, prices={})
+    monkeypatch.setattr(cli, "spending", lambda _args: contextlib.nullcontext())
+    q = {"pilot": False, "quote_id": "q1"}
+    monkeypatch.setattr(cli, "approved", lambda *_a, **_k: (q, guard))
+    monkeypatch.setattr(cli, "load_units", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli, "judge_votes", lambda *_a, **_k: 1)
+
+    async def must_not_run(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("judge calls went out")
+
+    import b300_runs
+
+    monkeypatch.setattr(b300_runs, "run_judge", must_not_run)
+    args = argparse.Namespace(phase="k", out=out)
+    with pytest.raises(phases.EvalError, match="hedge"):
+        cli._judge(args, lambda _line: None)

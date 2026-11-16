@@ -347,16 +347,16 @@ S7_ITEMS: tuple[Proposal, ...] = (
         "我方",
     ),
     Proposal(
-        "hotfix-branch",
+        "doc-owner",
         "coding",
         "en",
         (
-            Finding("the failing job", "the nightly build", "nightly"),
-            Finding("the last green commit", "a41c9e", "a41c9e"),
+            Finding("the slowest endpoint", "the export report", "export report"),
+            Finding("the library flagged as outdated", "the PDF renderer", "pdf renderer"),
         ),
-        "the branch to cut the hotfix from",
-        "release-7",
-        "release-7",
+        "the reviewer for the API reference",
+        "Ines Carvalho",
+        "carvalho",
     ),
     Proposal(
         "next-visit",

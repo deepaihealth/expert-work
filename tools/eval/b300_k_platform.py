@@ -47,8 +47,8 @@ ASSUMPTIONS: tuple[str, ...] = (
     "A8 当场重写的入口(§7.12 第 2 步):control_plane.memory_consolidator.SummaryRewriter("
     "memory_store, aux_model, embedder, audit_logger, default_aux_model_name).rewrite_for_user("
     "tenant_id, user_id) -> list[str](各条的结果:rewritten / emptied / unchanged / collided / "
-    "stale / corrected_member / blocked / abandoned / failed)。它从不向外抛:模型调用出错记成 "
-    "failed。评测给它的审计是空桩(只有新句子被写入扫描拦下时才用到)。",
+    "stale / corrected_member / blocked / abandoned / failed / statement_gone)。它从不向外抛:"
+    "模型调用出错记成 failed。评测给它的审计是空桩(只有新句子被写入扫描拦下时才用到)。",
     "A9 去重合并的材料是一条 JSON(candidates[].index / content / source / existing[].id / "
     'content,短编号 e0、e1……);回复是 {"ops": [{index, op, target_id, replaces, restates}]}'
     "(已核实)。评测只读这两张清单与 op / target_id,按候选的 index 对回材料。",
@@ -203,11 +203,20 @@ async def seed_store(
             source_hashes={m.id: hash_content(m.content) for m in members},
         )
         ids[s.key] = str(row.id)
+        _backdate_local(store, row.id, items[s.key].created_at)  # 插进去是「此刻」(审查 H1)
     for s in linked:
         row = items[s.key].model_copy(update={"supersedes": UUID(ids[s.linked_to])})
         await store.write([row])
         ids[s.key] = str(row.id)
     return ids
+
+
+def _backdate_local(store: Any, memory_id: UUID, when: datetime) -> None:
+    """本机的内存库:把一行的记录时间改成种子的日子(pod 里同样的事在 ``b300_inpod._backdate``)。"""
+    rows = store._rows
+    for i, row in enumerate(rows):
+        if row.id == memory_id:
+            rows[i] = row.model_copy(update={"created_at": when, "last_used_at": when})
 
 
 def dump_row(m: Any) -> dict[str, Any]:
@@ -299,16 +308,23 @@ class GuardedAux:
     def __init__(self, transport: Any, item: str, phase: str) -> None:
         self._transport, self._item, self._phase = transport, item, phase
         self.calls: list[dict[str, Any]] = []
+        #: 失败的调用(同 ``GuardedCaller``):重写器把它吞成 ``failed``,这里记下,由调用方判这条
+        #: 记录「评测出错、要补跑」,而不是产品「打了标没重写」。
+        self.failures: list[str] = []
 
     async def __call__(self, *, prompt: str, output_schema: Any = None, **_: Any) -> Any:
         from control_plane.memory_consolidator import ConsolidatorLLMReply
 
-        text, usage = await self._transport.complete(
-            [{"role": "user", "content": prompt}],
-            item=f"{self._item}|rewrite",
-            phase=self._phase,
-            json_mode=output_schema is not None,
-        )
+        try:
+            text, usage = await self._transport.complete(
+                [{"role": "user", "content": prompt}],
+                item=f"{self._item}|rewrite",
+                phase=self._phase,
+                json_mode=output_schema is not None,
+            )
+        except BaseException as exc:
+            self.failures.append(repr(exc))
+            raise
         tokens = (int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0))
         self.calls.append(
             {

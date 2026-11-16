@@ -65,6 +65,10 @@ def _record(
                 consolidated_from=members,
             )
         )
+    for seed in s.seeds:  # 并入汇总的成员:不算有效(``b300_live._live``,审查 M3)
+        for k in getattr(seed, "summary_of", ()):
+            member = next(r for r in rows if r["id"] == seeded[k])
+            member.update(live=False, consolidated_into=seeded[seed.key])
     for key, successor in (retire or {}).items():
         row = next(r for r in rows if r["id"] == seeded[key])
         row.update(live=False, superseded_by=successor)
@@ -644,3 +648,57 @@ def test_content_norm_matches_the_platform_rule() -> None:
     ]
     for text in samples:
         assert kchk._content_norm(text) == normalized_memory_text(text), text
+
+
+# --------------------------------------------------------------------------- 审查 M1 / M2 / M3
+
+
+def test_write_guarantee_compares_content_the_way_the_platform_does() -> None:
+    """审查 M1:内容相同按平台的归一口径 —— 末尾句号、大小写不同也算同一句。"""
+    s = _s("K-a")
+    assert _y(s).endswith(("。", "."))  # 种下的句子带句号;库里那条去掉了句号
+    stored = _row("n1", _y(s).rstrip("。."))
+    assert _guarantee(s, [stored], {"op": "ADD"})["write_guarantee_broken"] is False
+    loud = _row("n1", _y(s).upper())
+    assert _guarantee(s, [loud], {"op": "ADD"})["write_guarantee_broken"] is False
+    inside = _row("n1", _y(s).replace(" ", " , ", 1) if " " in _y(s) else _y(s) + "x")
+    assert _guarantee(s, [inside], {"op": "ADD"})["write_guarantee_broken"] is True  # 句中不同
+
+
+def test_write_guarantee_skips_unfinished_writebacks() -> None:
+    """审查 M2:没做完的那一次写回(failed 或记下了被吞的错)不查,只报数。"""
+    s = _s("K-a")
+    existing = [x.content for x in s.seeds]
+    call = _reconcile(0, _y(s), existing, {"op": "ADD"})
+    record = _record(s, [], calls=[call])
+    record["result"]["rounds"][0].update(failed=True, errors=["ReconcileFailedError"])
+    out, _items = kchk.checks(record, s)
+    assert out["write_guarantee_broken"] is False
+    assert out["counts"]["guarantee_rounds_skipped"] == 1
+    assert out["counts"].get("guarantee_candidates", 0) == 0
+    record["result"]["rounds"][0].update(failed=False, errors=[])
+    assert kchk.checks(record, s)[0]["write_guarantee_broken"] is True
+
+
+def test_a_folded_member_does_not_count_as_already_there() -> None:
+    """审查 M3(假设 H-1 回归):候选与一条已并入汇总的成员内容相同、自己却没写下 —— 成员召回不到,
+    不算「那句话已经在了」,写的保证不成立。"""
+    s = _s("K-s", "restate")
+    member = ks.item_of(s).trio.b.memory
+    existing = [x.content for x in s.seeds]
+    call = _reconcile(0, member, existing, {"op": "ADD"})
+    out = _check(s, [], calls=[call], rewrite=_before())
+    assert out["write_guarantee_broken"] is True
+    written = _check(s, [_row("n1", member)], calls=[call], rewrite=_before())
+    assert written["write_guarantee_broken"] is False
+
+
+def test_write_guarantee_matches_the_duplicate_target_the_way_the_platform_does() -> None:
+    """模型判重复的那一条:材料里的正文与库里的差一个末尾句号,也认得出是同一条(审查 M1)。"""
+    e1 = _s("K-e1")
+    y = next(x for x in e1.seeds if x.key == "y")
+    assert y.content.endswith(("。", "."))
+    existing = [x.content.rstrip("。.") if x.key == "y" else x.content for x in e1.seeds]
+    at = next(n for n, x in enumerate(e1.seeds) if x.key == "y")
+    call = _reconcile(0, "Y said again", existing, {"op": "NOOP", "target_id": f"e{at}"})
+    assert _check(e1, [], calls=[call])["write_guarantee_broken"] is False

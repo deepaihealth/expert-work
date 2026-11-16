@@ -201,9 +201,13 @@ def _user_statement_stored(rows: Rows) -> bool:
 # --------------------------------------------------------------------------- 跨类:近邻、写的保证
 
 
-def _reconciled(result: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _reconciled(result: Mapping[str, Any], *, finished_only: bool = False) -> list[dict[str, Any]]:
+    """各次写回里去重合并的决定。``finished_only``:跳过没做完的那几次写回(``failed`` 或记下了被吞的
+    错 —— 写的保证只对「正常做完」的尝试成立,§7.3)。"""
     out: list[dict[str, Any]] = []
     for rnd in result.get("rounds", []):
+        if finished_only and (rnd.get("failed") or rnd.get("errors")):
+            continue
         for call in rnd.get("calls", []):
             if call.get("kind") == "reconcile" and "input" in call:
                 out += parse_reconcile(str(call["input"]), str(call.get("reply", "")))
@@ -239,8 +243,10 @@ def write_guarantee(out: dict[str, Any], result: Mapping[str, Any]) -> None:
         return
     labels = result.get("origin_labels") or {}
     rows, counts = Rows(result), out["counts"]
+    unfinished = [r for r in result.get("rounds", []) if r.get("failed") or r.get("errors")]
+    counts["guarantee_rounds_skipped"] += len(unfinished)  # 没做完的写回不查,只报数
     broken = False
-    for decision in _reconciled(result):
+    for decision in _reconciled(result, finished_only=True):
         origin = labels.get(decision["source"])
         if origin not in USER_SIDE:
             continue
@@ -253,13 +259,15 @@ def write_guarantee(out: dict[str, Any], result: Mapping[str, Any]) -> None:
 
 
 def _guaranteed(rows: Rows, decision: Mapping[str, Any], tier: int) -> bool:
-    same = [m for m in rows.all if _norm(m.get("content", "")) == _norm(decision["content"])]
+    text = _content_norm(decision["content"])  # 与平台 normalized_memory_text 同一口径(审查 M1)
+    same = [m for m in rows.all if _content_norm(m.get("content", "")) == text]
     # ① 它自己是有效行,或 ② 有一条层级不低于它、内容相同的有效行
     if any(m.get("live") and rows.tier(m) >= tier for m in same):
         return True
     # ② 模型判它与之重复的那一条有效、层级不低于它
     if decision["op"].upper() == "NOOP" and decision["target"] is not None:
-        targets = [m for m in rows.all if _norm(m.get("content", "")) == _norm(decision["target"])]
+        target = _content_norm(decision["target"])
+        targets = [m for m in rows.all if _content_norm(m.get("content", "")) == target]
         if any(m.get("live") and rows.tier(m) >= tier for m in targets):
             return True
     # ③ 它是历史行(或之后又被更晚的说法退了):顺着 superseded_by 走得到一条有效行

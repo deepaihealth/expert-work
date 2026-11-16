@@ -70,7 +70,8 @@ _EXPECT = {
     "K-n1": "short answer that is not a statement: X is never retired",
     "K-n2": "full sentence that is not a statement: X is never retired",
     "K-e1": "Y restated verbatim in a new message: X retired and linked to Y, no new row",
-    "K-e2": "Y stated in full by the user: a valid user_stated Y; the confirmed Y and X retired",
+    "K-e2": "Y stated in full by the user: a valid user_stated Y and X retired; the confirmed Y "
+    "may stay valid next to it",
     "K-f": "X is gone, no replacement: the statement is stored, X retired and linked to it",
     "K-g": "one sentence ends two rows: at least one retired",
     "K-p": "only half of a compound row denied: the other half survives in a valid row",

@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -449,3 +449,118 @@ def test_inpod_links_a_seed_to_an_ordinary_row_that_stays_valid() -> None:
     rows = {str(r.id): r for r in store._rows}
     assert str(rows[ids["y"]].supersedes) == ids["x"]
     assert rows[ids["x"]].invalid_at is None and rows[ids["x"]].review_flagged_at is None
+
+
+# --------------------------------------------------------------------------- 审查 H1:种子的真实日期
+
+
+def _age_days(row: Any) -> float:
+    assert row.created_at is not None
+    age: timedelta = datetime.now(UTC) - row.created_at
+    return float(age.days + age.seconds / 86400)
+
+
+def test_inpod_b4d_rows_carry_the_designed_days_and_the_flag() -> None:
+    """汇总行与成员是几天前、更晚的那句 Y 是 3 天前(不是「此刻」);汇总行打了重写标记、它的
+    supersedes 记着 Y;seed 报出库里的真实日子。"""
+    store = InMemoryMemoryStore()
+    s = ks.build_use_class("B4d")[0]
+    out = _inpod_seed(store, s)
+    ids = out["memory_ids"]
+    rows = {str(r.id): r for r in store._rows}
+    summary, y = rows[ids["summary"]], rows[ids["y"]]
+    seeds = {x.key: x for x in s.seeds}
+    assert abs(_age_days(summary) - seeds["summary"].days_ago) < 0.1
+    assert abs(_age_days(y) - seeds["y"].days_ago) < 0.1
+    assert all(abs(_age_days(rows[ids[k]]) - seeds[k].days_ago) < 0.1 for k in ("a", "x", "c"))
+    assert summary.review_flagged_at is not None and str(summary.supersedes) == ids["y"]
+    assert str(y.supersedes) == ids["summary"] and y.invalid_at is None
+    assert out["memory_days"] == {k: seeds[k].days_ago for k in ids}
+
+
+def test_inpod_c5_replacing_row_keeps_its_day() -> None:
+    """C5:supersede 插的 Y 改回种子的日子(判官材料写 5 天前,库里也是 5 天前)。"""
+    store = InMemoryMemoryStore()
+    s = next(x for x in sc.build_group("C") if x.cls == "C5")
+    out = _inpod_seed(store, s)
+    y = next(r for r in store._rows if str(r.id) == out["memory_ids"]["y"])
+    want = next(x for x in s.seeds if x.key == "y").days_ago
+    assert abs(_age_days(y) - want) < 0.1 and out["memory_days"]["y"] == want
+
+
+def test_backdate_on_the_sql_store_issues_one_scoped_update() -> None:
+    """SQL 存储(pod 里):在它自己的 session 里按 id + 租户 + 用户改记录时间,并提交。"""
+    seen: list[Any] = []
+
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_: Any) -> None:
+            return None
+
+        async def execute(self, stmt: Any) -> None:
+            seen.append(stmt)
+
+        async def commit(self) -> None:
+            seen.append("commit")
+
+    store = SimpleNamespace(_sf=_Session)
+    when = datetime(2026, 11, 1, tzinfo=UTC)
+    rid, user = uuid4(), uuid4()
+    asyncio.run(inpod._backdate(store, tenant_id=TENANT, user_id=user, memory_id=rid, when=when))
+    stmt, done = seen
+    assert done == "commit"
+    compiled = stmt.compile()
+    assert set(compiled.params) >= {"created_at", "last_used_at"}
+    assert compiled.params["created_at"] == when
+    where = str(stmt.whereclause)
+    assert "memory_item.id" in where and "tenant_id" in where and "user_id" in where
+
+
+def test_local_k_summary_seed_keeps_its_day() -> None:
+    ids, rows = _seed(_s("K-s"))
+    summary = rows[ids["summary"]]
+    want = next(x for x in _s("K-s").seeds if x.key == "summary").days_ago
+    assert abs(_age_days(summary) - want) < 0.1
+
+
+def test_judge_material_uses_the_days_read_back_from_the_store() -> None:
+    import b300_report as rep
+
+    s = ks.build_use_class("B4d")[0]
+    prompt = rep.conversation_prompt(s, "a", {"summary": 11, "y": 2})
+    assert "11 days ago" in prompt and "2 days ago" in prompt
+    plain = rep.conversation_prompt(s, "a")
+    assert f"{next(x for x in s.seeds if x.key == 'summary').days_ago} days ago" in plain
+
+
+# --------------------------------------------------------------------------- 审查 M3 / LOW
+
+
+def test_a_folded_member_is_not_live_in_the_dump() -> None:
+    import b300_live as live
+
+    ids, rows = _seed(_s("K-s"))
+    assert not live._live(rows[ids["b"]]) and live._live(rows[ids["summary"]])
+    assert live._live(rows[ids["near1"]])
+
+
+def test_guarded_aux_records_a_failed_call() -> None:
+    class _Broken:
+        model = "mem"
+
+        async def complete(self, *_: Any, **__: Any) -> Any:
+            raise RuntimeError("rate limited")
+
+    aux = kp.GuardedAux(_Broken(), "u", "k")
+    with pytest.raises(RuntimeError):
+        asyncio.run(aux(prompt="p", model=None, tenant_id=TENANT))
+    assert aux.failures == ["RuntimeError('rate limited')"] and aux.calls == []
+
+
+def test_a8_lists_statement_gone_and_k_e2_expect_allows_coexistence() -> None:
+    a8 = next(a for a in kp.ASSUMPTIONS if a.startswith("A8"))
+    assert "statement_gone" in a8
+    e2 = next(s for s in K if s.cls == "K-e2")
+    assert "may stay valid" in e2.expect

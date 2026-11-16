@@ -616,7 +616,8 @@ def record_approval(out: Path, *, cmd: str, quote_id: str, user_said: str | None
 
 
 def check_labels(labels: Sequence[Mapping[str, Any]]) -> None:
-    """§8.3:20 条人工标注,5 个领域各 4 条,是 / 否各半。标注由人给,脚本不造。"""
+    """§8.3:20 条人工标注,至少 5 个领域、每个领域至多 4 条(用户 11-16 放宽),是 / 否各半。
+    领域要是 A 组或 K 组认识的。标注由人给,脚本不造。"""
     if len(labels) != plan.CALIBRATION_ITEMS:
         raise EvalError(f"calibration wants {plan.CALIBRATION_ITEMS} labels, got {len(labels)}")
     per_domain = defaultdict(int)
@@ -626,6 +627,9 @@ def check_labels(labels: Sequence[Mapping[str, Any]]) -> None:
     # 领域要认识、至少 5 个、每个至多 4 条(只用 A 组的领域时就是原来的「5 个领域各 4 条」)。
     known = {*sc.DOMAINS, *ki.K_DOMAINS}
     if set(per_domain) - known or len(per_domain) < len(sc.DOMAINS) or max(per_domain.values()) > 4:
-        raise EvalError(f"calibration labels must be 4 per domain: {dict(per_domain)}")
+        raise EvalError(
+            "calibration labels need at least 5 known domains and at most 4 per domain: "
+            f"{dict(per_domain)}"
+        )
     if sum(bool(r["label"]) for r in labels) * 2 != len(labels):
         raise EvalError("calibration labels must be half yes, half no")

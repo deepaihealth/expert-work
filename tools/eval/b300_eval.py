@@ -60,6 +60,7 @@ from b300_phases import (  # noqa: E402
     PHASES,
     EvalError,
     agent_code,
+    budget_of,
     build_units,
     bundle_source,
     calibration_ok,
@@ -384,6 +385,8 @@ def _judge(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
         load_units(args.out, phase.name, q["quote_id"])
         votes = judge_votes(args.out, q, phase.kind, phase.name)
         items, _facts = judge_items(args.out, phase)
+        if phase.kind == "extraction" and not q["pilot"]:
+            uncalibrated_items(args.out, items)
         # 审查 M3:A 组每条判分记判官措辞;措辞对不上的旧判分重判,报告不认
         stamp = (
             {"wording_digest": rep.a_judge_wording_digest()} if phase.kind == "extraction" else {}
@@ -412,6 +415,40 @@ CALIBRATION_CHECKS = {
 }
 
 
+def checks_to_calibrate(out: Path, calibration: str) -> frozenset[str]:
+    """这套校准要覆盖的题型(审查 M4):它管的那几段(A 或 G)里**真的有待判项**的题型;这几段在
+    ``out`` 里还一条记录都没有(先校准、后跑)时按全部题型要求。"""
+    everything = CALIBRATION_CHECKS[calibration]
+    budget = "G" if calibration == "calibration-g" else "A"
+    names = [
+        n
+        for n, p in PHASES.items()
+        if p.kind == "extraction"
+        and budget_of(n) == budget
+        and (out / n / "records.jsonl").exists()
+    ]
+    if not names:
+        return everything
+    pending = {rep.label_check(i.prompt) for n in names for i in judge_items(out, PHASES[n])[0]}
+    return everything & frozenset(k for k in pending if k)
+
+
+def uncalibrated_items(out: Path, items: Sequence[rep.JudgeItem]) -> None:
+    """要判的题里有校准时没覆盖的题型(校准之后又跑出了新题型)→ 拒,先补标、重校准。"""
+    path = calibration_path(out, "a")
+    if not path.exists():
+        return
+    checks = json.loads(path.read_text(encoding="utf-8")).get("checks")
+    if checks is None:  # 老格式的校准:按当时的规矩覆盖了全部题型
+        return
+    missing = sorted({k for i in items if (k := rep.label_check(i.prompt))} - set(checks))
+    if missing:
+        raise EvalError(
+            f"items of kind {missing} were not covered by the calibration (it had no such items "
+            "when it ran); label a new batch with them and `calibrate --set a` again"
+        )
+
+
 def calibration_phase(which: str, phases_arg: str | None) -> str:
     """校准记在哪一段:B / C 组 → ``calibration``;A 组判官 → ``calibration-a``,只覆盖回归闸门的
     那份报价(``--phases g``)→ ``calibration-g``(闸门的输出目录单独校一次,§11.1 第 2 步)。"""
@@ -432,7 +469,7 @@ def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
                 "rebuild their prompts with the current code"
             )
         phase_name = calibration_phase(args.which, args.phases)
-        needed = CALIBRATION_CHECKS[phase_name]
+        needed = checks_to_calibrate(args.out, phase_name)
         have = {rep.label_check(r["prompt"]) for r in labels}
         if needed - have:
             raise EvalError(
@@ -480,6 +517,11 @@ def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
         "of": len(labels),
     }
     result.update(stamp)  # 审查 LOW-2:校准绑定判官措辞(A 组)与标注文件
+    if args.which == "a":  # 审查 M4:这次校准覆盖了哪些题型;本轮无待判项的题型没校准,报告注明
+        covered = checks_to_calibrate(args.out, calibration_phase(args.which, args.phases))
+        everything = CALIBRATION_CHECKS[calibration_phase(args.which, args.phases)]
+        result["checks"] = sorted(covered)
+        result["checks_without_items"] = sorted(everything - covered)
     calibration_path(args.out, args.which).write_text(json.dumps(result), encoding="utf-8")
     emit(
         f"judge ({args.which}, {votes} vote(s)) agrees on {agree} / {len(labels)} "
