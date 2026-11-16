@@ -146,6 +146,9 @@ def _memory_item(
     # PR 2 之前的提交上没有 ``origin``:种子的出处只在正文里(基线就是这样)。
     if seed.get("origin") is not None and "origin" in MemoryItem.model_fields:
         fields["origin"] = seed["origin"]
+    # 第 9 版的种子(``b300_k_scenarios.KSeed``):事件日期在几天前;没有这个键 = 不带。
+    if seed.get("occurred_days_ago") is not None and "occurred_on" in MemoryItem.model_fields:
+        fields["occurred_on"] = (now - timedelta(days=int(seed["occurred_days_ago"]))).date()
     return MemoryItem(**fields)
 
 
@@ -154,14 +157,13 @@ async def _supersede_seed(
 ) -> str:
     """种「已被取代」的种子。**接口假设**(与 ``b300_k_platform`` 的 A1 / A2 是同一条;这个文件要
     整份喂进 pod,不能 import 那边,所以在这里再写一遍):第 9 版的 ``supersede`` 收 ``old_ids``
-    (零到多个),返回 ``SupersedeResult``(``item`` = 新行或它撞上的那条);之前的收 ``old_id``,返回
-    新行或 ``None``。按签名认是哪一种。返回新行的 id(没写成 = 空串)。旧行没被退(来源组合不许
-    退,``refused``)时新行照写 —— 种子里「已被取代」的那一对要用许退的组合。"""
+    (零到多个),返回 (新行或它撞上的那条, 退了哪些, 没退的各自原因);之前的收 ``old_id``,返回
+    新行或 ``None``。按签名认是哪一种。返回新行的 id(没写成 = 空串)。"""
     if "old_ids" in inspect.signature(store.supersede).parameters:
         result = await store.supersede(
             tenant_id=tenant_id, user_id=user_id, old_ids=[old_id], new_item=new_item
         )
-        row = result.item
+        row = result[0] if isinstance(result, tuple) else result
     else:
         row = await store.supersede(
             tenant_id=tenant_id, user_id=user_id, old_id=old_id, new_item=new_item
@@ -169,11 +171,60 @@ async def _supersede_seed(
     return str(row.id) if row is not None else ""
 
 
+async def _write_seeds(
+    store: Any,
+    seeds: Sequence[Mapping[str, Any]],
+    items: Mapping[str, Any],
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+) -> dict[str, str]:
+    """一个用户的种子按先后写:普通行(并存的两条就是两条普通行;置信度 1.0 = 控制台更正过的)→
+    汇总行(成员先在、用现有的 ``write_consolidated`` 标成已汇总)→ 连着另一条的行(``supersedes``
+    指向一条仍有效的行,设计 §7.8)→ 已被取代的(``supersede``)。"""
+    from expert_work.persistence.memory import hash_content
+
+    replacing = {s["superseded_by"] for s in seeds if s.get("superseded_by")}
+    later = replacing | {s["key"] for s in seeds if s.get("summary_of") or s.get("linked_to")}
+    await store.write([items[s["key"]] for s in seeds if s["key"] not in later])
+    ids = {s["key"]: str(items[s["key"]].id) for s in seeds if s["key"] not in later}
+    for s in seeds:
+        members = [items[k] for k in s.get("summary_of") or ()]
+        if not members:
+            continue
+        row = await store.write_consolidated(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            content=s["content"],
+            embedding=items[s["key"]].embedding,
+            source_ids=[m.id for m in members],
+            source_hashes={m.id: hash_content(m.content) for m in members},
+        )
+        ids[s["key"]] = str(row.id)
+    for s in seeds:
+        if s.get("linked_to"):
+            row = items[s["key"]].model_copy(update={"supersedes": UUID(ids[s["linked_to"]])})
+            await store.write([row])
+            ids[s["key"]] = str(row.id)
+    for s in seeds:
+        target = s.get("superseded_by")
+        if target:
+            ids[target] = await _supersede_seed(
+                store,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                old_id=items[s["key"]].id,
+                new_item=items[target],
+            )
+    return ids
+
+
 async def seed(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str], None]) -> None:
     """``payload["entries"]``:``{key, tenant_id, user, agent_name, seeds: [...]}``。
 
     被取代的种子(``superseded_by``)先写,再用存储的 ``supersede`` 换成取代它的那条 —— 与去重合并
-    判「更新」时同一条路(P5b append-only)。"""
+    退一条旧行时同一条路(P5b append-only)。第 9 版另有汇总行与成员、连着另一条的行
+    (:func:`_write_seeds`)。"""
     now = datetime.now(UTC)
     for entry in payload["entries"]:
         tenant_id = UUID(entry["tenant_id"])
@@ -191,25 +242,10 @@ async def seed(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str], Non
             )
             for s, vec in zip(seeds, vectors, strict=True)
         }
-        replacing = {s["superseded_by"] for s in seeds if s.get("superseded_by")}
-        ids: dict[str, str] = {}
         with _scope(tenant_id, user_id):
-            plain = [items[s["key"]] for s in seeds if s["key"] not in replacing]
-            await deps.memory.write(plain)
-            for s in seeds:
-                if s["key"] not in replacing:
-                    ids[s["key"]] = str(items[s["key"]].id)
-            for s in seeds:
-                target = s.get("superseded_by")
-                if not target:
-                    continue
-                ids[target] = await _supersede_seed(
-                    deps.memory,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    old_id=items[s["key"]].id,
-                    new_item=items[target],
-                )
+            ids = await _write_seeds(
+                deps.memory, seeds, items, tenant_id=tenant_id, user_id=user_id
+            )
         emit(
             json.dumps(
                 {

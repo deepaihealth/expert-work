@@ -324,7 +324,67 @@ S7_ITEMS: tuple[Proposal, ...] = (
         "30 分钟",
         "30分钟",
     ),
+    # 第 9 版(审查 M-1):S7 从 5 个命题加到 10 个(30 次);前 5 个原样不动(A15 仍只用前 5 个)。
+    Proposal(
+        "callback-slot",
+        "support",
+        "en",
+        (
+            Finding("the order status", "held at the depot", "depot"),
+            Finding("the previous claim", "closed in March", "march"),
+        ),
+        "the callback slot",
+        "Tuesday morning",
+        "tuesday morning",
+    ),
+    Proposal(
+        "addendum-drafter",
+        "legal",
+        "zh",
+        (Finding("合同的签署方", "三家", "三家"), Finding("违约金条款", "在第 9 条", "第9条")),
+        "补充协议的起草方",
+        "我方",
+        "我方",
+    ),
+    Proposal(
+        "hotfix-branch",
+        "coding",
+        "en",
+        (
+            Finding("the failing job", "the nightly build", "nightly"),
+            Finding("the last green commit", "a41c9e", "a41c9e"),
+        ),
+        "the branch to cut the hotfix from",
+        "release-7",
+        "release-7",
+    ),
+    Proposal(
+        "next-visit",
+        "sales",
+        "zh",
+        (
+            Finding("客户去年的采购额", "约 36 万", "36万"),
+            Finding("他们的决策人", "采购部的贺经理", "贺经理"),
+        ),
+        "下次拜访的时间",
+        "下周三上午",
+        "下周三",
+    ),
+    Proposal(
+        "stretch-break",
+        "health",
+        "en",
+        (
+            Finding("the average resting heart rate last week", "about 64", "64"),
+            Finding("the longest sitting stretch", "around three hours", "three hours|3 hours"),
+        ),
+        "the daily stretching break",
+        "every 90 minutes",
+        "90 minutes|90-minute",
+    ),
 )
+#: A15(召回后复述)只用前 5 个(§11.3:5 场景 x 3)。
+A15_ITEMS = S7_ITEMS[:5]
 
 
 @dataclass(frozen=True)

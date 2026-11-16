@@ -37,6 +37,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import b300_k_scenarios as ks  # noqa: E402
 import b300_redesign_scenarios as ns  # noqa: E402
 import b300_scenarios as sc  # noqa: E402
 from b301_plan import Price, rate_card_rows  # noqa: E402
@@ -273,6 +274,7 @@ def lines_for(
             lines += _writebacks("D-compare", v, n, extract=EXTRACT_PER_WRITEBACK)
             lines += _writebacks("D-compare", v, n, extract=OLD_EXTRACT_PER_WRITEBACK)
         lines += _redesign_lines(v, a_votes, gate_votes)
+        lines += _k_lines(v, a_votes, gate_votes)
     # C5 ①:整理只在一个型号上(15 次)+ 判官判汇总行。
     sweeps = c_n * RERUN_FACTOR
     lines += [
@@ -399,6 +401,70 @@ def _redesign_lines(v: Vendor, a_votes: int, gate_votes: int) -> list[Line]:
     return lines
 
 
+#: 第 9 版 K 组要判官的类(§11.2a 末,各一票;K-s 两问)。低档:K-b / K-b2 那句犹豫的话存下了才判
+#: (按 :data:`GROUNDED_SHARE` 的下沿);K-p、K-late 只在读库定不了时才判,按 0;K-s 只在重写
+#: 发生之后才判,按 0。
+K_HEDGE = ("K-b", "K-b2")
+
+
+def k_unit_shape() -> dict[str, float]:
+    """K 组、闸门的 K 段、使用侧 B4c / B4d 的单元形状(§11.7 第 4 步的表;已乘次数)。"""
+    rows = ks.build_k()
+    gate = [s for s in rows if s.cls in ks.GATE_K_CLASSES]
+    hedge = sum(s.cls in K_HEDGE for s in rows) * REPEATS
+    half = sum(s.cls == "K-p" for s in rows) * REPEATS
+    fuller = sum(s.cls == "K-late" and s.variant == "fuller" for s in rows) * REPEATS
+    deny = sum(s.cls == "K-s" and s.variant == "deny" for s in rows) * REPEATS
+    restate = sum(s.cls == "K-s" and s.variant == "restate" for s in rows) * REPEATS
+    return {
+        "units": len(rows) * REPEATS,
+        "writebacks": sum(len(s.writebacks) for s in rows) * REPEATS,
+        "judge_low": hedge * GROUNDED_SHARE[0],
+        "judge_high": hedge + half + fuller + 2 * deny,
+        "dated_low": sum(s.variant == "dated" for s in rows) * REPEATS,
+        # 汇总行重写:否认的那一半每个单元一次;再说一遍的那一半不该触发(高档按也触发算)
+        "rewrite_low": deny,
+        "rewrite_high": deny + restate,
+        "gate_units": len(gate),
+        "gate_writebacks": sum(len(s.writebacks) for s in gate),
+        "use_conversations": len(ks.build_use()) * REPEATS * RERUN_FACTOR,
+    }
+
+
+def _k_lines(v: Vendor, a_votes: int, gate_votes: int) -> list[Line]:
+    """第 9 版(§11.2a / §11.3 / §11.1 第 2 步):K 组(组 ``K``,A 段)、闸门的 K 段(组 ``gate-k``,
+    G 段,不送判官)、使用侧 B4c / B4d(组 ``B-K``,B 段,同 B 组一类的形状)。"""
+    n = k_unit_shape()
+    lines = _writebacks("K", v, n["writebacks"])
+    lines += [
+        Line(
+            "K",
+            v.provider,
+            JUDGE_MODEL,
+            "judge",
+            n["judge_low"] * a_votes,
+            n["judge_high"] * a_votes,
+        ),
+        Line(
+            "K",
+            v.provider,
+            JUDGE_MODEL,
+            "judge_event",
+            n["dated_low"] * a_votes,
+            n["units"] * a_votes,
+        ),
+        # 重写与整理是同一个辅助模型调用(§7.12「成本」),在本机写回里用记忆模型跑
+        Line("K", v.provider, v.memory, "consolidate", n["rewrite_low"], n["rewrite_high"]),
+    ]
+    lines += _writebacks("gate-k", v, n["gate_writebacks"])
+    # 闸门的 K 段不送 K 组的判官题;带事件日期的记忆照常送「是不是一次性的事」(每个单元至多一条)
+    lines.append(
+        Line("gate-k", v.provider, JUDGE_MODEL, "judge_event", 0.0, n["gate_units"] * gate_votes)
+    )
+    lines += _conversations("B-K", v, n["use_conversations"])
+    return lines
+
+
 #: 试点(审查 M4):每段 2 个单元、只跑一家、每个只跑 1 次;量出来的 token 交给 ``--tokens`` 重报。
 PILOT_UNITS_PER_PHASE = 2
 
@@ -452,6 +518,9 @@ _GROUP_BUDGET = {
     "S": "A",
     "gate": "G",
     "calibration-g": "G",
+    "K": "A",
+    "gate-k": "G",
+    "B-K": "B",
 }
 
 
@@ -514,6 +583,9 @@ GROUP_PHASES: dict[str, tuple[str, ...]] = {
     "C-baseline": ("c2-baseline", "c4-baseline", "c5-baseline"),
     "S": ("s", "shape", "a13", "a14", "a15", "sd"),
     "gate": ("gate",),
+    "K": ("k",),
+    "gate-k": ("gate-k",),
+    "B-K": ("b4x",),
 }
 
 

@@ -55,6 +55,7 @@ import b300_steps as steps  # noqa: E402
 from b300_approve import approved, make_quote, spending, vendors_of  # noqa: E402
 from b300_outcomes import judge_items, report  # noqa: E402
 from b300_phases import (  # noqa: E402
+    GATE_PHASES,
     INPOD_SOURCE,
     PHASES,
     EvalError,
@@ -340,7 +341,7 @@ def a_votes_ready(out: Path, q: Mapping[str, Any], phase_name: str = "") -> int:
     judge = q["judge"]
     votes = int(
         judge.get("gate_votes", judge["a_group_votes"])
-        if phase_name == "gate"
+        if phase_name in GATE_PHASES
         else judge["a_group_votes"]
     )
     path = calibration_path(out, "a")
@@ -399,7 +400,10 @@ def _judge(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
 #: 每套 A 组校准要覆盖的判官题(审查 M5):闸门只判有据程度与事件日期;正式一轮另有 P2~P5 / P8。
 CALIBRATION_CHECKS = {
     "calibration-g": frozenset({"grounded", "event_date"}),
-    "calibration-a": frozenset({"plain", "statement", "grounded", "event_date"}),
+    # 第 9 版:正式一轮多了 K 组的四种判官题(闸门的 K 段不送判官)
+    "calibration-a": frozenset(
+        {"plain", "statement", "grounded", "event_date", "hedge", "half", "fuller", "summary"}
+    ),
 }
 
 

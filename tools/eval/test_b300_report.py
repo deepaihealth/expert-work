@@ -329,7 +329,14 @@ def test_c_lines_are_never_called_approved() -> None:
     verdict = rep.judge_line(line, rows)["verdict"]
     assert "待用户确认" in verdict and "not an acceptance result" in verdict
     assert all(ln.status == rep.PENDING for ln in rep.LINES if ln.cls.startswith("C"))
-    assert all(ln.status == rep.APPROVED_B for ln in rep.LINES if ln.cls.startswith("B"))
+    # B1~B7 是 11-11 拍板 ①;B4c / B4d 是第 9 版加的子类(用户 11-16),线同 B 组、出处不同
+    later = {"B4c", "B4d"}
+    assert all(
+        ln.status == rep.APPROVED_B
+        for ln in rep.LINES
+        if ln.cls.startswith("B") and ln.cls not in later
+    )
+    assert {ln.cls for ln in rep.LINES if ln.cls in later} == later
 
 
 def test_report_discloses_cut_three() -> None:

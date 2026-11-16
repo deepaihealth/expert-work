@@ -14,12 +14,17 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import b300_k_checks as kchk  # noqa: E402
+import b300_k_platform as kp  # noqa: E402
+import b300_k_report as krep  # noqa: E402
+import b300_k_scenarios as ks  # noqa: E402
 import b300_plan as plan  # noqa: E402
 import b300_redesign_base as base  # noqa: E402
 import b300_redesign_checks as chk  # noqa: E402
 import b300_redesign_scenarios as ns  # noqa: E402
 import b300_report as rep  # noqa: E402
 from b300_phases import (  # noqa: E402
+    GATE_PHASES,
     PHASES,
     Phase,
     all_scenarios,
@@ -118,7 +123,10 @@ def _extraction_checks(
     记忆送判官判是不是一次性的事(§11.3,全部提炼段,不含对比与基线)。"""
     if phase.classes == ("D",):
         return {}, []
-    if phase.name == GATE_PHASE:
+    if s.cls in ks.K_CLASSES:  # 第 9 版 K 组:读库断言;闸门的 K 段不送判官
+        gate = phase.name in GATE_PHASES
+        checks, items = (kchk.gate_checks if gate else kchk.checks)(r, s)
+    elif phase.name == GATE_PHASE:
         checks, items = chk.gate_checks(r, s)
     elif s.cls in ns.REDESIGN_CLASSES:
         checks, items = chk.checks(r, s)
@@ -126,11 +134,47 @@ def _extraction_checks(
         checks, items = rep.a_checks(r, s)
     if not phase.baseline:
         items = [*items, *chk.event_date_items(r)]
+        if s.cls not in ks.K_CLASSES:
+            _add_write_guarantee(checks, r)
     return checks, items
+
+
+def _add_write_guarantee(checks: dict[str, Any], r: Mapping[str, Any]) -> None:
+    """§11.3「写的保证(K、A、S 组全部)」:A / S 组的记录也按同一个定义核对(K 组在它自己的检查里)。"""
+    extra: dict[str, Any] = {"missing": {}, "counts": Counter()}
+    kchk.write_guarantee(extra, r["result"])
+    checks.setdefault("missing", {}).update(extra["missing"])
+    checks.setdefault("counts", Counter()).update(extra["counts"])
+    if "write_guarantee_broken" in extra:
+        checks["write_guarantee_broken"] = extra["write_guarantee_broken"]
 
 
 #: 回归闸门的段名;它的线带 ``G-`` 前缀,与正式一轮 A 组的 P6 / P7 分开(§11.1 第 2 步)。
 GATE_PHASE = "gate"
+#: 第 9 版闸门多看的 K 四类那一段(§11.1 第 2 步 ①~③)。
+GATE_K_PHASE = "gate-k"
+
+
+def _reply_errors(
+    outcomes: dict[tuple[str, str, str], list[tuple[str, bool]]],
+    counts: Any,
+    records: Mapping[str, Mapping[str, Any]],
+    *,
+    gate: bool,
+) -> None:
+    """有几个单元里去重合并的回复解析失败(§11.1 第 2 步 ③:闸门里 0 次):看每次写回记下的异常名
+    (写回入口把错吞掉、只回 failed),整条记录出错的也看它的错。每段都报数;闸门的 K 段另进线
+    (每个单元一行)。"""
+    for r in records.values():
+        rounds = (r.get("result") or {}).get("rounds", [])
+        names = [n for rnd in rounds for n in rnd.get("errors") or []]
+        failed = kp.RECONCILE_REPLY_ERROR in names or kp.RECONCILE_REPLY_ERROR in str(
+            r.get("error") or ""
+        )
+        counts["writeback_failed"] += int(any(rnd.get("failed") for rnd in rounds))
+        counts["reconcile_reply_errors"] += int(failed)
+        if gate:
+            outcomes[("G-ALL", "reconcile_reply_error", r["vendor"])].append((r["domain"], failed))
 
 
 # --------------------------------------------------------------------------- 报告
@@ -175,7 +219,7 @@ def collect_outcomes(
             r = records[key]
             cls, vendor, domain = r["cls"], r["vendor"], r["domain"]
             if phase.kind == "extraction":
-                label = f"G-{cls}" if name == GATE_PHASE else cls
+                label = f"G-{cls}" if name in GATE_PHASES else cls
                 _a_outcomes(outcomes, missing, counts[name], r, info["checks"], verdicts, label)
                 if not phase.baseline:
                     _event_date_outcomes(outcomes, missing, r, verdicts)
@@ -197,6 +241,8 @@ def collect_outcomes(
                 red_rows.append((r["scenario_id"], bad))
             else:
                 outcomes[(cls, "violation", vendor)].append((domain, bad))
+        if phase.kind == "extraction":
+            _reply_errors(outcomes, counts[name], records, gate=name == GATE_K_PHASE)
         if phase.baseline:
             baseline[name] = {"answers": rep.prove_red(red_rows)}
         if phase.kind == "c5":
@@ -281,8 +327,15 @@ _INFO_KEYS = frozenset(
 )
 #: 待判项的检查名与指标名不同的(P8)。
 _ITEM_CHECK = {"pass1_statement": "statement"}
-#: 跨全部提炼段合计的指标(§11.3「误伤」)。
-_AGGREGATE = frozenset({"collateral"})
+#: 跨类合计的指标 → 报告里的类名(§11.3「误伤」;第 9 版的近邻、写的保证)。闸门里的带 ``G-`` 前缀。
+_AGGREGATE = {"collateral": "ALL", **kchk.AGGREGATE}
+
+
+def _line_class(cls: str, metric: str) -> str:
+    whole = _AGGREGATE.get(metric)
+    if whole is None:
+        return cls
+    return f"G-{whole}" if cls.startswith("G-") else whole
 
 
 def _a_outcomes(
@@ -301,7 +354,7 @@ def _a_outcomes(
     if "two_pass" in checks and not checks.get("two_pass"):
         counts["pre_pr1_or_no_two_pass"] += 1
         return
-    good_metrics = chk.GOOD_METRICS | {"y_valid"}
+    good_metrics = chk.GOOD_METRICS | kchk.GOOD_METRICS | {"y_valid"}
     for metric, value in checks.items():
         if metric in _INFO_KEYS:
             continue
@@ -314,9 +367,9 @@ def _a_outcomes(
             bad = not verdict if metric in good_metrics else bool(verdict)
         else:
             bad = not value if metric in good_metrics else bool(value)
-        outcomes[("ALL" if metric in _AGGREGATE else cls, metric, vendor)].append((domain, bad))
+        outcomes[(_line_class(cls, metric), metric, vendor)].append((domain, bad))
     for metric, field in (checks.get("missing") or {}).items():
-        missing[(cls, metric, vendor)][field] += 1
+        missing[(_line_class(cls, metric), metric, vendor)][field] += 1
     for name, n in (checks.get("counts") or {}).items():
         counts[f"{cls}.{name}"] += int(n)
     if cls == "A10":
@@ -375,6 +428,8 @@ def compare_counts(out: Path) -> dict[str, Any]:
 
 
 REDESIGN_PHASES = ("gate", "s", "shape", "a13", "a14", "a15", "sd")
+#: 第 9 版加的段:有它们的输出时,报告带上第 9 版的照实说明、接口假设与统计力表。
+V9_PHASES = (GATE_K_PHASE, "k", "b4x")
 #: 重做设计 §11.3 末、§11.2 的照实说明。
 REDESIGN_DISCLOSURES = (
     "统计力(§11.3):30 次里 0 次只能说明真实比例大致低于 10%,15 次里 0 次约 20%;这些线挡得住"
@@ -449,6 +504,9 @@ def report(out: Path, q: Mapping[str, Any] | None) -> dict[str, Any]:
         (out / name).exists() for name in REDESIGN_PHASES
     ):
         body["disclosures"] += REDESIGN_DISCLOSURES
+    if any((out / name).exists() for name in V9_PHASES):
+        body["disclosures"] += krep.disclosures()
+        body["statistical_power"] = list(krep.POWER)
     if (out / "compare-before").exists() or (out / "compare-after").exists():
         body["compare"] = compare_counts(out)
     # 从旧报价搬过来的记录(``prepare --resume-from``)与新跑的合在一起算;这里报搬了多少。
