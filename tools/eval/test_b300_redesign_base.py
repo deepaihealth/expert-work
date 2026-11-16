@@ -330,9 +330,10 @@ def test_line_cap_counts_the_text_not_the_prefix() -> None:
 
 
 def test_turn_given_as_a_numeric_string_is_named() -> None:
-    made = [{"content": "the reading is 6.8", "turn": "3"}]
+    # 「1」不是最后一条用户行(那是第 3 行):点名第 1 行说明字符串真被读成了数
+    made = [{"content": "the reading is 6.8", "turn": "1"}]
     item = _judge(_record([_round(_EVIDENCE, made, [])], "the reading is 6.8"))
-    assert item.evidence == "exact" and "The user line is line [3]." in item.prompt
+    assert item.evidence == "exact" and "The user line is line [1]." in item.prompt
 
 
 def test_fallback_names_the_last_user_line_of_that_input_or_says_not_named() -> None:
@@ -344,3 +345,12 @@ def test_fallback_names_the_last_user_line_of_that_input_or_says_not_named() -> 
         _record([_round(no_user, [{"content": "x"}], ["the reading is 6.8"])], "the reading is 6.8")
     )
     assert "The user line is not named." in item.prompt
+
+
+def test_prompt_keeps_the_line_above_the_named_user_line_when_capping() -> None:
+    """经判官题这一层也要留住:点名的用户行在新段,它正上方的问题在最早的上下文里。"""
+    question = "[1] [assistant] What is the reading?"
+    filler = "\n".join(f"[{i}] [user] [2026-11-15] c{i}" for i in range(2, 400))
+    evidence = f"{question}\n{filler}\n=== new ===\n[400] [user] [2026-11-16] 6.8"
+    prompt = base.grounded_prompt("q", "a", ["m"], evidence=evidence, user_line_no=2)
+    assert question in prompt
