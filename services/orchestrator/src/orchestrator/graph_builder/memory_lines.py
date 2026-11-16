@@ -5,8 +5,7 @@
 ``=== new ===`` 之上(``context``,上下文行,PR S 的切片)。不是上下文行的就在本次写回负责的新段里
 (交给去重合并的 ``in_new_segment``)。
 
-程序从不因为指针不对而丢掉一条记忆,只会让标签变弱或指针留空(§4 末)。「事实」带了事件日期,
-程序清空事件日期并计数,记忆照写(§7.4,「方案三:折中」,用户 2026-11-16)。
+程序从不因为指针不对而丢掉一条记忆,只会让标签变弱或指针留空(§4 末)。
 """
 
 from __future__ import annotations
@@ -82,7 +81,7 @@ def evidence_pointer(line: ExtractionLine | None) -> tuple[str | None, int | Non
 @dataclass(frozen=True)
 class Settled:
     """程序对一条提炼结果的核对结论(§5.4)。``checks`` 是要计数的事(降级原因、指针留空、
-    事件日期置空、「事实」带的事件日期被清空)。"""
+    事件日期置空)。"""
 
     origin: MemoryOrigin
     max_confidence: float | None
@@ -139,21 +138,16 @@ def _settle(
     claimed_event_date: object,
     lines: Sequence[ExtractionLine],
     today: date,
-    kind: str,
     downgraded: tuple[str, ...] = (),
 ) -> Settled:
     line = _line_of(turn, lines)
     new_line = line if line is not None and not line.context else None
     pointer = evidence_pointer(new_line)
-    valid = _event_date(claimed_event_date, line, today)
-    # 自检(「方案三:折中」,用户 2026-11-16):「事实」= 一直成立的,带事件日期自相矛盾 → 清空。
-    on_fact = valid is not None and kind == "fact"
-    event_date = None if on_fact else valid
+    event_date = _event_date(claimed_event_date, line, today)
     checks = (
         *downgraded,
         *(("pointer_missing",) if new_line is None else ()),
-        *(("event_date_dropped",) if claimed_event_date is not None and valid is None else ()),
-        *(("event_date_on_fact",) if on_fact else ()),
+        *(("event_date_dropped",) if claimed_event_date is not None and event_date is None else ()),
     )
     return Settled(
         origin=origin,
@@ -168,15 +162,10 @@ def _settle(
 
 
 def settle_user_text(
-    turn: object,
-    claimed_event_date: object,
-    lines: Sequence[ExtractionLine],
-    *,
-    today: date,
-    kind: str,
+    turn: object, claimed_event_date: object, lines: Sequence[ExtractionLine], *, today: date
 ) -> Settled:
     """第一次提炼:来源永远是 ``user_stated``(第一次只看得到用户的字),与 ``turn`` 对不对无关。"""
-    return _settle("user_stated", None, turn, claimed_event_date, lines, today, kind)
+    return _settle("user_stated", None, turn, claimed_event_date, lines, today)
 
 
 def settle_conversation(
@@ -186,7 +175,6 @@ def settle_conversation(
     lines: Sequence[ExtractionLine],
     *,
     today: date,
-    kind: str,
 ) -> Settled:
     """第二次提炼:``basis`` 为用户回答 / 同意且挂得上 → ``user_confirmed``(≤ 0.8);其余一律
     ``assistant_derived``(≤ 0.6),挂不上的计一次降级与原因。"""
@@ -201,7 +189,6 @@ def settle_conversation(
                 claimed_event_date,
                 lines,
                 today,
-                kind,
             )
         downgraded = (f"downgraded_{reason}",)
     return _settle(
@@ -211,6 +198,5 @@ def settle_conversation(
         claimed_event_date,
         lines,
         today,
-        kind,
         downgraded,
     )

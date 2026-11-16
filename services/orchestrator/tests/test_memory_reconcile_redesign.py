@@ -5,7 +5,8 @@
   不认识的编号按没给决定;
 * 更新 / 删除:跨格、不是同一格里按余弦(不是检索顺序)最近的前 2 条 → 新增;两边都有事件日期时,
   相同且候选带更正才可以,相同不是更正、不同 → 新增;只有一边有 → 不按这条拒绝(「方案三:折中」,
-  用户 2026-11-16);候选那一行早于目标的记录时间的「更新」→ 新增;
+  用户 2026-11-16),只有不带日期、不是更正的候选删一条带日期的仍拒绝;放行的按 ``update`` /
+  ``delete`` 计 ``event_date_one_sided_*``;候选那一行早于目标的记录时间的「更新」→ 新增;
 * 「重复」要带目标、目标要在候选的召回范围内;只在用户一方对用户一方、候选那一行在新段里时把目标
   的确认日期刷新为那一行的发送时间,确定性「重复」同样;
 * 层级拦截:用户确认改不动用户说的;用户说的可以改用户确认的;
@@ -61,11 +62,15 @@ For each candidate choose one operation:
 - "ADD": anything else. A memory that is only related — the same topic but another subject,
   person, item or occasion — is not a target; the candidate is an ADD.
 UPDATE and DELETE apply only to an existing memory of the same kind.
-Two memories with different event dates are different occasions: ADD. When both have the
-same "event_date", the existing memory is changed only by a candidate with
-"is_correction": true; any other candidate about that day is a NOOP when it says the same
-thing and an ADD otherwise. A reading, count or status that refers to a different date or
-time than an existing memory is a new memory (ADD), not an UPDATE of the earlier one.
+An "event_date" marks something that happened or was measured on one day, such as a
+reading or a count. Two such memories with different event dates are different occasions:
+ADD. When both have the same "event_date", the existing memory is changed only by a
+candidate with "is_correction": true; any other candidate about that day is a NOOP when it
+says the same thing and an ADD otherwise. A reading or count taken on a different date or
+time than an existing one is a new memory (ADD), not an UPDATE of the earlier one.
+A date written in the content, such as "(as of <date>)", does not make another occasion: a
+changed state of the same thing is an UPDATE, and the same state said again is a NOOP.
+When only one of the two has an "event_date", decide by what they say.
 A candidate with "is_correction": true changes something said earlier: when an existing
 memory still says the earlier value, the candidate is an UPDATE of that memory.
 A candidate's "is_correction" says what the candidate does, not where it comes from; its
@@ -356,18 +361,19 @@ async def test_targets_are_ranked_by_cosine_not_by_retrieval_order() -> None:
 
 
 @pytest.mark.parametrize(
-    ("cand_day", "target_day", "correction", "applied"),
+    ("cand_day", "target_day", "correction", "applied_by_op"),
     [
-        (1, 1, True, True),
-        (1, 1, False, False),
-        (1, 2, True, False),
-        (1, 2, False, False),
-        # 「方案三:折中」(用户 2026-11-16):只有一边有事件日期 → 不按这条拒绝,由模型照常判。
-        (1, None, True, True),
-        (1, None, False, True),
-        (None, 1, True, True),
-        (None, 1, False, True),
-        (None, None, False, True),
+        (1, 1, True, {"UPDATE": True, "DELETE": True}),
+        (1, 1, False, {"UPDATE": False, "DELETE": False}),
+        (1, 2, True, {"UPDATE": False, "DELETE": False}),
+        (1, 2, False, {"UPDATE": False, "DELETE": False}),
+        # 「方案三:折中」(用户 2026-11-16):只有一边有事件日期 → 不按这条拒绝,由模型照常判;
+        # 例外:不带日期、不是更正的候选删不掉一条带日期的(过去的读数不会变得不成立)。
+        (1, None, True, {"UPDATE": True, "DELETE": True}),
+        (1, None, False, {"UPDATE": True, "DELETE": True}),
+        (None, 1, True, {"UPDATE": True, "DELETE": True}),
+        (None, 1, False, {"UPDATE": True, "DELETE": False}),
+        (None, None, False, {"UPDATE": True, "DELETE": True}),
     ],
     ids=[
         "same-day-correction",
@@ -389,8 +395,9 @@ async def test_event_dates_gate_update_and_delete(
     cand_day: int | None,
     target_day: int | None,
     correction: bool,
-    applied: bool,
+    applied_by_op: dict[str, bool],
 ) -> None:
+    applied = applied_by_op[op]
     c = _Ctx()
     store = InMemoryMemoryStore()
     counted: list[str] = []
@@ -407,6 +414,8 @@ async def test_event_dates_gate_update_and_delete(
     )
     assert _untouched(store, target) is not applied
     assert ("refused_event_date" in counted) is not applied
+    one_sided = (cand_day is None) != (target_day is None)
+    assert (f"event_date_one_sided_{op.lower()}" in counted) is (applied and one_sided)
     written = [m.id for m in result.direct]
     if applied:
         # 更新落成新行;带更正的删除照旧把候选存下,不带的不存。
