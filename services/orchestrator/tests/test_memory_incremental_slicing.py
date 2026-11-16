@@ -766,6 +766,6 @@ async def test_blocked_items_are_audited_even_when_reconcile_fails(
         assert outcome.failed and dlq.enqueued == [[("fact", "assistant found tea")]]
     else:
         with pytest.raises(memory_module.ReconcileFailedError):
-            await flush
+            _ = await flush
     assert sorted(counted) == ["reconcile_update", "writeback"]
     assert sorted(e.details["source"] for e in audits.entries) == ["reconcile_update", "writeback"]
