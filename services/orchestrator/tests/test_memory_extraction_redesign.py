@@ -6,7 +6,8 @@
 * 第二次:``basis`` + ``turn`` 由程序核对 —— 挂在新段里的 ``[user]`` 行、上一行是 ``[assistant]``
   → ``user_confirmed``(置信度 ≤ 0.8);否则降为 ``assistant_derived``(≤ 0.6)并按原因计数;
 * 第一次的产出永远是 ``user_stated``,第二次的永远不是;
-* 证据指针 = ``turn`` 那一行对应的消息 id + 序号;指向上下文、越界、缺失 → 留空、计数,记忆照写;
+* 证据指针 = ``turn`` 那一行对应的消息 id + 序号;越界、缺失 → 留空、计数,记忆照写;指向上下文行
+  → 整条丢弃、计数 ``context_line_dropped``(测试验收 11-16);
 * 事件日期:解析不了、晚于那一行的日期 → 置空、计数;与类型无关(读数是「事实」,各智能体共享;
   「去掉自检,读数共享」,用户 2026-11-16);
 * ``line_at`` = 那一行的发送时间;``in_new_segment`` = 那一行属于本次写回负责的轮次(切片之前 =
@@ -786,8 +787,8 @@ async def _extracted(
 
 
 async def test_line_time_and_new_segment_follow_the_turn_line() -> None:
-    """PR S —— 「新段」= 不是上下文行:从第二轮起切片,第一轮的行在标记之上(上下文),它们再被判成
-    「重复」不能算用户又说了一次。"""
+    """PR S —— 「新段」= 不是上下文行:从第二轮起切片,第一轮的行在标记之上(上下文);落在上下文行
+    的产出丢弃(测试验收 11-16),新段里的带那一行的发送时间。"""
     llm = _ByPassLLM(
         user_reply=_reply(
             {"kind": "fact", "content": "早先说的", "turn": 1},
@@ -801,12 +802,9 @@ async def test_line_time_and_new_segment_follow_the_turn_line() -> None:
     by_content = {
         m.content: m for m in await _extracted(_qa(), llm, segment=SegmentStart(message_index=2))
     }
-    assert by_content["早先说的"].line_at == datetime(2026, 3, 2, 1, 0, tzinfo=UTC)
-    assert by_content["早先说的"].in_new_segment is False
+    assert set(by_content) == {"本轮说的", "本轮的回答"}
     assert by_content["本轮说的"].line_at == datetime(2026, 3, 2, 1, 1, tzinfo=UTC)
     assert by_content["本轮说的"].in_new_segment is True
-    assert by_content["上一轮的回答"].line_at == datetime(2026, 3, 2, 1, 0, 5, tzinfo=UTC)
-    assert by_content["上一轮的回答"].in_new_segment is False
     assert by_content["本轮的回答"].line_at == datetime(2026, 3, 2, 1, 1, tzinfo=UTC)
     assert by_content["本轮的回答"].in_new_segment is True
 
@@ -983,7 +981,7 @@ def test_rendering_puts_context_above_the_mark() -> None:
     assert memory_lines.render_lines(lines) == "[1] [assistant] a\n=== new ===\n[2] [user] b"
 
 
-async def test_a_context_line_is_neither_confirmed_nor_pointed_at(
+async def test_a_context_line_is_dropped_but_may_be_the_question(
     checks: list[tuple[str, str]],
 ) -> None:
     lines = [
@@ -991,13 +989,12 @@ async def test_a_context_line_is_neither_confirmed_nor_pointed_at(
         ExtractionLine(text="18号", tag="[user]", context=True, message_index=1),
         ExtractionLine(text="好的", tag="[assistant]", message_index=2),
     ]
-    settled = memory_lines.settle_conversation("user_answer", 2, None, lines, today=_TODAY)
-    assert settled.origin == "assistant_derived"
-    assert (settled.evidence_message_id, settled.evidence_message_index) == (None, None)
-    assert settled.checks == ("downgraded_context_line", "pointer_missing")
+    # 测试验收 11-16:落在上下文行的不再降级照写,整条丢弃(由调用方计数)。
+    assert memory_lines.settle_conversation("user_answer", 2, None, lines, today=_TODAY) is None
     # 上一行可以是上下文行(问题常在上一轮末尾)。
     asked = [lines[0], ExtractionLine(text="18号", tag="[user]", message_id="u", message_index=1)]
     settled = memory_lines.settle_conversation("user_answer", 2, None, asked, today=_TODAY)
+    assert settled is not None
     assert (settled.origin, settled.evidence_message_id, settled.checks) == (
         "user_confirmed",
         "u",

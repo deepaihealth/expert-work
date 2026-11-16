@@ -142,7 +142,8 @@ _memory_extraction_total = expert_work_counter(
 # B-300 redesign §4 / §5.4 — what the program changed after checking a reply's ``basis`` /
 # ``turn`` / ``event_date``: ``downgraded_<reason>`` (a user answer / agreement that does
 # not anchor on a user line, so it is stored as from the assistant), ``pointer_missing``
-# (no evidence pointer), ``event_date_dropped``.
+# (no evidence pointer), ``event_date_dropped``, ``context_line_dropped`` (``turn`` is a
+# context line above ``=== new ===``: not stored — B-300 test acceptance 11-16).
 _memory_extraction_check_total = expert_work_counter(
     "expert_work_memory_extraction_check_total",
     "Extraction results the program changed after checking them, by pass and check (B-300).",
@@ -513,14 +514,20 @@ def record_memory_reconcile(*, op: str) -> None:
     ``refused_event_date`` / ``refused_older_line`` = an UPDATE / DELETE the program
     turned into an ADD (another kind or agent; not among the 2 nearest by cosine in
     the cell; the event-date rule; the candidate's line is older than the target's
-    record); ``noop_out_of_scope`` = a NOOP whose target the candidate could not be
+    evidence message — its record time when that is unknown — or its last restatement);
+    ``noop_out_of_scope`` = a NOOP whose target the candidate could not be
     recalled through, written instead; ``noop_refreshed`` = a NOOP that moved the
     user-side target's confirmed date. ``event_date_one_sided_update`` /
     ``event_date_one_sided_delete`` (user 2026-11-16) = an UPDATE / DELETE where only one side
     has an event date was actually applied (the event-date rule refuses only when both have
     one, or a DELETE of a dated target by an undated non-correction); ``noop_other_event_date``
     = a NOOP between two memories with different event dates, written as an ADD (different
-    occasions). ``degraded`` now only
+    occasions). B-300 test acceptance (11-16):
+    ``noop_same_evidence`` = a user-confirmed candidate judged a duplicate / update of a
+    user-side memory taken from the same message (a restatement: nothing written, no
+    refresh); ``blocked_update_added_confirmed`` = a user-confirmed candidate (not a
+    correction) whose UPDATE the tier rule blocked, stored next to the old memory (user
+    11-16 「被拦时与旧的并存」). ``degraded`` now only
     means the model gave no usable decision for that candidate (or the UPDATE / DELETE target
     was already gone). ``reconcile_failed`` = one reconcile call failed inside (lookup, model,
     unusable reply, store error): nothing of that batch is written directly; the
@@ -563,9 +570,10 @@ def record_memory_extraction(*, pass_name: str, outcome: str) -> None:
 
 def record_memory_extraction_check(*, pass_name: str, check: str) -> None:
     """Bump ``expert_work_memory_extraction_check_total{extraction_pass, check}`` (B-300
-    redesign §5.4): ``downgraded_out_of_range`` / ``downgraded_context_line`` /
-    ``downgraded_not_user_line`` / ``downgraded_previous_not_assistant``,
-    ``pointer_missing``, ``event_date_dropped``."""
+    redesign §5.4): ``downgraded_out_of_range`` / ``downgraded_not_user_line`` /
+    ``downgraded_previous_not_assistant``, ``pointer_missing``, ``event_date_dropped``,
+    ``context_line_dropped`` (the memory's ``turn`` is a context line: dropped, both passes;
+    replaces ``downgraded_context_line``, B-300 test acceptance 11-16)."""
     _memory_extraction_check_total.labels(extraction_pass=pass_name, check=check).inc()
 
 

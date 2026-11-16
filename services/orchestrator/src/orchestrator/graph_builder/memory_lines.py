@@ -5,7 +5,9 @@
 ``=== new ===`` 之上(``context``,上下文行,PR S 的切片)。不是上下文行的就在本次写回负责的新段里
 (交给去重合并的 ``in_new_segment``)。
 
-程序从不因为指针不对而丢掉一条记忆,只会让标签变弱或指针留空(§4 末)。
+程序从不因为指针不对而丢掉一条记忆,只会让标签变弱或指针留空(§4 末)—— 唯一的例外:``turn``
+落在上下文行上的(B-300 测试验收 11-16):上下文行只帮助理解、由之前的任务提炼过,这一条丢弃、计数
+:data:`CONTEXT_LINE_DROPPED`(§8.2)。
 """
 
 from __future__ import annotations
@@ -27,6 +29,9 @@ NEW_SEGMENT_MARK = "=== new ==="
 
 USER_TAG = "[user]"
 ASSISTANT_TAG = "[assistant]"
+
+#: 产出的 ``turn`` 落在上下文行上 → 丢弃(两次提炼都是),按这个检查名计数。
+CONTEXT_LINE_DROPPED = "context_line_dropped"
 
 #: 第二次提炼里表示「用户对助手上一句的回答 / 同意」的 ``basis``(§5.2)。
 _USER_BASES = frozenset({"user_answer", "user_agreement"})
@@ -99,6 +104,11 @@ def _line_of(turn: object, lines: Sequence[ExtractionLine]) -> ExtractionLine | 
     return lines[turn - 1]
 
 
+def _on_context_line(turn: object, lines: Sequence[ExtractionLine]) -> bool:
+    line = _line_of(turn, lines)
+    return line is not None and line.context
+
+
 def _event_date(claimed: object, line: ExtractionLine | None, today: date) -> date | None:
     """能解析成 ``YYYY-MM-DD``、不晚于那一行的发送日期(那一行没有日期时不查这一条),且不晚于
     智能体时区的「今天」(``turn`` 挂不上、那一行没日期时也查;审查 L3)。"""
@@ -117,12 +127,10 @@ def _event_date(claimed: object, line: ExtractionLine | None, today: date) -> da
 
 def _downgrade_reason(turn: object, lines: Sequence[ExtractionLine]) -> str | None:
     """用户回答 / 同意挂不挂得上(§5.4):新段里的 ``[user]`` 行,上一行是 ``[assistant]``
-    (上一行可以是上下文行)。挂不上 → 原因。"""
+    (上一行可以是上下文行)。挂不上 → 原因。``turn`` 落在上下文行的在这之前已被丢弃。"""
     line = _line_of(turn, lines)
     if line is None:
         return "out_of_range"
-    if line.context:
-        return "context_line"
     if line.tag != USER_TAG:
         return "not_user_line"
     position = cast(int, turn) - 1
@@ -140,13 +148,12 @@ def _settle(
     today: date,
     downgraded: tuple[str, ...] = (),
 ) -> Settled:
-    line = _line_of(turn, lines)
-    new_line = line if line is not None and not line.context else None
-    pointer = evidence_pointer(new_line)
+    line = _line_of(turn, lines)  # 不会是上下文行(调用方已丢弃)
+    pointer = evidence_pointer(line)
     event_date = _event_date(claimed_event_date, line, today)
     checks = (
         *downgraded,
-        *(("pointer_missing",) if new_line is None else ()),
+        *(("pointer_missing",) if line is None else ()),
         *(("event_date_dropped",) if claimed_event_date is not None and event_date is None else ()),
     )
     return Settled(
@@ -156,15 +163,18 @@ def _settle(
         evidence_message_index=pointer[1],
         event_date=event_date,
         line_at=line.sent_at if line is not None else None,
-        in_new_segment=new_line is not None,
+        in_new_segment=line is not None,
         checks=checks,
     )
 
 
 def settle_user_text(
     turn: object, claimed_event_date: object, lines: Sequence[ExtractionLine], *, today: date
-) -> Settled:
-    """第一次提炼:来源永远是 ``user_stated``(第一次只看得到用户的字),与 ``turn`` 对不对无关。"""
+) -> Settled | None:
+    """第一次提炼:来源永远是 ``user_stated``(第一次只看得到用户的字),与 ``turn`` 对不对无关;
+    ``turn`` 缺失、越界 → 照写、指针留空。``turn`` 落在上下文行 → ``None``(丢弃)。"""
+    if _on_context_line(turn, lines):
+        return None
     return _settle("user_stated", None, turn, claimed_event_date, lines, today)
 
 
@@ -175,9 +185,12 @@ def settle_conversation(
     lines: Sequence[ExtractionLine],
     *,
     today: date,
-) -> Settled:
+) -> Settled | None:
     """第二次提炼:``basis`` 为用户回答 / 同意且挂得上 → ``user_confirmed``(≤ 0.8);其余一律
-    ``assistant_derived``(≤ 0.6),挂不上的计一次降级与原因。"""
+    ``assistant_derived``(≤ 0.6),挂不上的计一次降级与原因。``turn`` 落在上下文行 → ``None``
+    (丢弃,不论 ``basis``)。"""
+    if _on_context_line(turn, lines):
+        return None
     downgraded: tuple[str, ...] = ()
     if basis in _USER_BASES:
         reason = _downgrade_reason(turn, lines)

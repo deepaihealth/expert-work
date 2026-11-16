@@ -691,12 +691,13 @@ async def test_an_identical_restatement_refreshes_without_asking_the_model(
 # ─── 层级拦截 ───────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(("correction", "kept"), [(False, False), (True, True)])
+@pytest.mark.parametrize(("correction", "kept"), [(False, True), (True, True)])
 @pytest.mark.asyncio
 async def test_user_confirmed_cannot_update_a_less_certain_user_stated(
     correction: bool, kept: bool
 ) -> None:
-    """审查 H2:0.8 的用户确认改不动 0.5 的用户说的;带更正的按新增并存,不带的丢弃。"""
+    """审查 H2:0.8 的用户确认改不动 0.5 的用户说的;被拦后按新增并存 —— 带更正的一向如此,不带的
+    自用户 2026-11-16「被拦时与旧的并存」起也是(以前丢弃)。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     target = c.mem("the car is a hatchback", _at(0.95), origin="user_stated", confidence=0.5)
