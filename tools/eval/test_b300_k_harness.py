@@ -833,3 +833,18 @@ def test_on_v9_code_a_duplicate_of_an_assistant_row_still_retires_it() -> None:
     out, _items = kchk.checks({"key": "u", "result": result}, s)
     assert out["user_stated_y_reworded"] is True and out["counts"]["weaker_y_retired"] == 1
     assert out["counts"]["weaker_y_coexists_linked"] == 0
+
+
+def test_on_v9_code_a_restatement_that_matches_a_member_is_not_a_synonym_row() -> None:
+    """K-s 再说一遍:提炼出的话与成员 B 原文一字不差 → 撞上那条成员(它让出位置、连到新行),
+    新写一行;这一行单独计数,不算进「多出一行同义的」。"""
+    s = next(x for x in K if x.cls == "K-s" and x.variant == "restate")
+    member = ks.item_of(s).trio.b.memory
+    result = _run(s, _scripted(member, ""))
+    rows = {m["id"]: m for m in result["memories"]}
+    b = rows[result["seeded"]["b"]]
+    new = rows[b["superseded_by"]]
+    assert not b["live"] and new["live"] and new["content"] == member
+    out, _items = kchk.checks({"key": "u", "result": result}, s)
+    assert out["counts"]["restate_member_verbatim"] == 1 and out["synonym_added"] is False
+    assert out["rewrite_marked"] is False and out["summary_changed"] is False

@@ -21,7 +21,8 @@ K_LINES: tuple[tuple[str, str, str, float, int, float | None], ...] = (
     ("G-ALL", "write_guarantee_broken", "max", 0, 1, None),
     ("G-ALL", "reconcile_reply_error", "max", 0, 40, None),
     # §11.3 K 组
-    # 用户 11-16:带事件日期的 2 个场景(6 个单元)剔出 K-a 的线、单独报数;线按原 24 / 30 同比例
+    # 用户 11-16:带事件日期的 2 个场景(6 个单元)剔出 K-a 的线、单独报数;线按原 24 / 30 同比例,
+    # 三个数(19 / 24、漏记 ≤ 2 / 24、闸门 ≥ 6 / 8)与逐领域三分之二都由用户 11-16 确认
     ("K-a", "retired_to_new", "min", 19, 24, None),
     ("K-a", "missed", "max", 2, 24, None),
     ("K-ap", "new_valid", "min", 24, 30, None),
@@ -134,13 +135,16 @@ _NOTES: tuple[str, ...] = (
     "用户 11-16 定:这 6 个单元不进 K-a 的线,只在 counts 里报数(dated_units / "
     "dated_retired_to_new / dated_retired / dated_coexists / dated_missed),不设线;K-a 的线按原 "
     "24 / 30 同比例改成 19 / 24(漏记 ≤ 2 / 24),逐领域按做到的不少于三分之二(6 个单元的领域 ≥ 4、"
-    "3 个单元的 ≥ 2)。闸门里同理:8 个单元、≥ 6。",
+    "3 个单元的 ≥ 2)。闸门里同理:8 个单元、≥ 6。这几个数用户 11-16 确认。",
     "K-s 否认的那一半,场景不改、照实量(用户 11-16)。汇总行与两条近邻争「同格前 2 名」,排不进去"
     "时模型列了它也不打标、不重写,「B 仍在汇总句里」就会不达标 —— 原因是名次规则,不是重写。所以"
     "每个单元走到哪一步在 counts 里分开报:deny_not_listed(模型没列汇总行)、deny_listed_blocked"
     "(列了、程序没让打标)、deny_marked_not_rewritten(打了标、重写没落库)、deny_rewritten;不达标的"
     "次数再按这四种分:<指标>_bad_<原因>(如 b_still_in_summary_bad_listed_blocked = 被名次等规则"
     "挡下,b_still_in_summary_bad_rewritten = 重写本身错)。线的判定照旧。",
+    "K-s 再说一遍的那一半(用户 11-16):提炼出的话与某条已并入汇总的成员原文归一后相同、撞上那条"
+    "成员(它被作废并连到新行)而新写的一行,单独计数(counts 的 restate_member_verbatim),不算进"
+    "「多出一行同义的 ≤ 2 / 15」;那条线只算其它原因多出来的同义行。",
     "K-e2 那条用户确认的 Y(用户 11-16 定的规则,审查 M-2):模型判用户的整句与它「重复」时,用户的"
     "话一定写下;归一后内容相同 → 那条用户确认作废、连到新行;内容不同(换说法的那一半常见)→ 两条"
     "都有效(新行的 supersedes 只记一条:同一次也退了 X 时记的是 X)。所以「用户确认的那条 Y 作废」"

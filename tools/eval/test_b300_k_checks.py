@@ -590,3 +590,57 @@ def test_k_s_denial_tells_where_each_unit_stopped() -> None:
         kchk.SUMMARY_CAUSES
     )
     assert "info" not in _check(_s("K-s", "restate"), [], rewrite=_before())
+
+
+# --------------------------------------------------------------------------- K-s 撞上成员原文
+
+
+def test_k_s_restatement_matching_a_member_verbatim_is_counted_apart() -> None:
+    """用户 11-16:新行与某条成员原文归一后相同、那条成员被作废并连到新行 → 单独计数,
+    不算同义多行。"""
+    s = _s("K-s", "restate")
+    member = ks.item_of(s).trio.b.memory
+    same = _row("n1", f"  {member.upper()}  ")  # 归一后相同:大小写、首尾空白
+    out = _check(s, [same], retire={"b": "n1"}, rewrite=_before())
+    assert out["synonym_added"] is False and out["counts"]["restate_member_verbatim"] == 1
+    trailing = _row("n1", member.rstrip("。.") + "。")
+    assert _check(s, [trailing], retire={"b": "n1"}, rewrite=_before())["synonym_added"] is False
+
+
+def test_k_s_restatement_counts_only_when_both_conditions_hold() -> None:
+    s = _s("K-s", "restate")
+    member = ks.item_of(s).trio.b.memory
+    # 内容相同,但成员没被作废(没撞上):照样是同义多行
+    kept = _check(s, [_row("n1", member)], rewrite=_before())
+    assert kept["synonym_added"] is True and kept["counts"].get("restate_member_verbatim", 0) == 0
+    # 成员作废了,但连到的不是这一行
+    other = _check(s, [_row("n1", member)], retire={"b": "elsewhere"}, rewrite=_before())
+    assert other["synonym_added"] is True
+    # 成员连到这一行,但内容不同(句中改了一个字)
+    changed = _check(s, [_row("n1", member + " again")], retire={"b": "n1"}, rewrite=_before())
+    assert changed["synonym_added"] is True
+    # 撞上成员的一行与另一条同义行同时出现:另一条照样算
+    both = _check(
+        s, [_row("n1", member), _row("n2", "said again")], retire={"b": "n1"}, rewrite=_before()
+    )
+    assert both["synonym_added"] is True and both["counts"]["restate_member_verbatim"] == 1
+
+
+def test_content_norm_matches_the_platform_rule() -> None:
+    """与平台 ``normalized_memory_text`` 同一口径(同一组输入逐个比)。"""
+    from orchestrator.graph_builder.memory import normalized_memory_text
+
+    wide = "".join(chr(ord(c) + 0xFEE0) for c in "Full width!")  # 全角字母与感叹号
+    samples = [
+        f"{wide}\u3002",
+        "abc!!",
+        "x;y;",
+        "用户 的 文具\u3002\u3002",
+        "H\u2082O \u2460",  # 下标、带圈数字:不折
+        "Hello?",
+        "  tabs\tand  spaces ",
+        "x\u2026",
+        f"{wide}\uff1b",
+    ]
+    for text in samples:
+        assert kchk._content_norm(text) == normalized_memory_text(text), text

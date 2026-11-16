@@ -20,6 +20,7 @@ K-b2「犹豫的措辞是否留在正文里」、K-p「没被否认的那一半�
 
 from __future__ import annotations
 
+import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -370,6 +371,44 @@ def _late(
     out["counts"]["earlier_not_stored"] += int(not earlier)
 
 
+def _content_norm(text: object) -> str:
+    """判「内容相同」的口径,与平台 ``normalized_memory_text`` 一致:NFC、折全角半角、casefold、
+    空白合并、去掉末尾的句末标点(反复)。句中的标点不动。"""
+    folded = "".join(_fold_width(ch) for ch in unicodedata.normalize("NFC", str(text)))
+    folded = folded.casefold()
+    out = " ".join(folded.split())
+    while out and out[-1] in _SENTENCE_END:
+        out = out[:-1].rstrip()
+    return out
+
+
+_SENTENCE_END = frozenset(".!;。")
+
+
+def _fold_width(ch: str) -> str:
+    """只折全角 / 半角(兼容分解标 ``<wide>`` / ``<narrow>`` 的);别的兼容分解不折。"""
+    decomposition = unicodedata.decomposition(ch)
+    if decomposition.startswith(("<wide>", "<narrow>")):
+        return "".join(chr(int(code, 16)) for code in decomposition.split()[1:])
+    return ch
+
+
+def _summary_seed(s: Scenario) -> object:
+    return next((x for x in s.seeds if x.key == "summary"), None)
+
+
+def _restates_member(row: Mapping[str, Any], members: Sequence[Mapping[str, Any]]) -> bool:
+    """新行与某条成员原文归一后相同,且那条成员已被作废、连到这一行(撞唯一索引时让出位置)。"""
+    text = _content_norm(row.get("content", ""))
+    return any(
+        m
+        and _content_norm(m.get("content", "")) == text
+        # superseded_by 有值 = 已作废(``b300_live._live``),不用再看 live
+        and m.get("superseded_by") == row.get("id")
+        for m in members
+    )
+
+
 #: K-s 否认的那一半,每个单元走到了哪一步(``b300_outcomes`` 按它把不达标的次数分开报)。
 SUMMARY_CAUSES = ("not_listed", "listed_blocked", "marked_not_rewritten", "rewritten")
 _REWRITTEN = frozenset({"rewritten", "emptied", "collided"})
@@ -406,7 +445,12 @@ def _summary(
     if s.variant == "restate":
         out["rewrite_marked"] = marked
         out["summary_changed"] = not seed.get("live")
-        out["synonym_added"] = bool(rows.new_live)
+        # 用户 11-16:提炼出的话与某条成员原文归一后相同、撞上那条成员(它被作废并连到新行)而多出
+        # 的一行,单独计数、不算进同义多行那条线;线只算其它原因多出来的。
+        members = [rows.seed(k) for k in getattr(_summary_seed(s), "summary_of", ())]
+        verbatim = [m for m in rows.new_live if _restates_member(m, members)]
+        counts["restate_member_verbatim"] += int(bool(verbatim))
+        out["synonym_added"] = any(m not in verbatim for m in rows.new_live)
         return
     out["new_stored"] = _user_statement_stored(rows)
     out["info"] = {"cause": _summary_cause(result, trio.summary, marked, rewrites)}
