@@ -123,3 +123,69 @@ def test_platform_text_has_no_domain_words() -> None:
     ).split()
     for text in (base.GROUNDED_WORDING, base.EVENT_DATE_WORDING):
         assert not [w for w in words if w in text.lower()], text
+
+
+# ------------------------------------------------------------ 有据程度的证据(闸门 11-16)
+
+_EVIDENCE = (
+    "[1] [user] [2026-11-15] Let's complete the records.\n"
+    "[2] [assistant] What is the reading?\n"
+    "=== new ===\n"
+    "[3] [user] [2026-11-16] 6.8\n"
+    "[4] [assistant] OK, I have the reading as 6.8."
+)
+
+
+def test_grounded_wording_says_stamped_dates_and_shown_context_are_not_added() -> None:
+    """闸门 11-16:判官只看两行、看不到发送日期与上文,把正当的日期和上文细节当成「多加的」。"""
+    w = base.GROUNDED_WORDING
+    assert "the day that line was sent" in w and '"=== new ==="' in w
+    assert (
+        "A date taken from a line's send date, and details stated in any shown line, context "
+        "lines included, are not added content." in w
+    )
+
+
+def test_grounded_prompt_shows_the_extractor_evidence_when_given() -> None:
+    memory = ["The reading was 6.8 on 2026-11-16."]
+    prompt = base.grounded_prompt("q", "a", memory, evidence=_EVIDENCE)
+    head = prompt.split("Memories:\n")[0]
+    assert _EVIDENCE in head and "[2026-11-16]" in head and "=== new ===" in head
+    assert head.index(_EVIDENCE) < head.index(base.GROUNDED_WORDING) < head.index("Question:")
+
+
+def test_grounded_prompt_without_evidence_numbers_the_two_lines() -> None:
+    prompt = base.grounded_prompt("What is the limit?", "600 calls", ["m"])
+    assert "=== new ===\n[1] [assistant] What is the limit?\n[2] [user] 600 calls" in prompt
+
+
+def test_confirmed_check_uses_the_pass2_input_of_the_round_that_wrote_the_row() -> None:
+    other = "=== new ===\n[1] [user] [2026-11-14] earlier round"
+    rows = [{"id": "r", "content": "the reading is 6.8", "origin": "user_confirmed", "live": True}]
+    rounds: list[dict[str, Any]] = [
+        {"calls": [{"kind": "pass2", "input": other, "reply": '{"memories": []}'}]},
+        {
+            "calls": [
+                {
+                    "kind": "pass2",
+                    "input": _EVIDENCE,
+                    "reply": '{"memories": [{"content": "the reading is 6.8"}]}',
+                }
+            ]
+        },
+        {"calls": [{"kind": "pass2", "input": other, "reply": '{"memories": []}'}]},
+    ]
+    caps = dict.fromkeys(base.CAPABILITIES, True)
+    record = {"key": "k", "result": {"capabilities": caps, "memories": rows, "rounds": rounds}}
+    out: dict[str, Any] = {}
+    items: list[base.JudgeItem] = []
+    base.confirmed_check(out, items, record, metric="m", key="6.8", lines=("q", "a"))
+    (item,) = items
+    assert _EVIDENCE in item.prompt and "earlier round" not in item.prompt
+    # 记录里没有提炼输入(老记录)→ 退回两行
+    for rnd in rounds:
+        for c in rnd["calls"]:
+            c.pop("input")
+    items = []
+    base.confirmed_check(out, items, record, metric="m", key="6.8", lines=("q", "a"))
+    assert "[1] [assistant] q\n[2] [user] a" in items[0].prompt

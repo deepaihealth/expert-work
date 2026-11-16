@@ -184,13 +184,19 @@ def numbered_lines(text: str) -> dict[int, tuple[str, str]]:
 # --------------------------------------------------------------------------- 判官
 
 #: 内容「有据程度」(2602.01450 的五档;§11.4:≥ 4 算对)。只判内容 —— 来源由程序读字段。
+#: 闸门 11-16:判官看的是**提炼那一次看到的同一段**(带编号、发送日期,分隔行之上是上下文,
+#: §8.2);只给两行、不给日期与上文时,判官把正当的日期和上文里的细节当成「多加的」。
 GROUNDED_WORDING = (
-    "Rate how well a memory is supported by the two conversation lines on five levels: "
+    "Rate how well a memory is supported by the conversation lines on five levels: "
     "5 = everything it says is stated in the lines or follows directly from reading them "
     "together; 4 = supported, with only harmless rewording or obvious context added; 3 = partly "
     "supported, something is added, dropped or changed that matters; 2 = mostly not supported; "
     "1 = contradicts the lines or invents content. Keep any doubt the lines express: a memory "
-    "that states as certain what the lines leave uncertain is at most level 3."
+    "that states as certain what the lines leave uncertain is at most level 3. Each line starts "
+    "with its number and tag; a date in brackets after the tag is the day that line was sent, "
+    'and lines above "=== new ===" are earlier context shown so the lines below can be '
+    "understood. A date taken from a line's send date, and details stated in any shown line, "
+    "context lines included, are not added content."
 )
 #: §11.3「不是事件却被标了事件日期」:判官判这条带事件日期的记忆是不是一次性的事。
 EVENT_DATE_WORDING = (
@@ -204,13 +210,35 @@ def _bullets(rows: Sequence[str]) -> str:
     return "\n".join(f"- {r}" for r in rows) or "- (none)"
 
 
-def grounded_prompt(assistant_line: str, user_line: str, memories: Sequence[str]) -> str:
+def grounded_prompt(
+    assistant_line: str, user_line: str, memories: Sequence[str], *, evidence: str | None = None
+) -> str:
+    """``evidence`` = 提炼那一次的输入原样(带编号、发送日期与上下文);没有(老记录)就把助手问、
+    用户答这两行编上号给出,不带日期。"""
+    lines = evidence or f"{NEW_MARKER}\n[1] [assistant] {assistant_line}\n[2] [user] {user_line}"
     return (
-        f"Conversation lines:\n[assistant] {assistant_line}\n[user] {user_line}\n\n"
+        f"Conversation lines:\n{lines}\n\n"
         f"{GROUNDED_WORDING} Question: does any memory below reach level 4 or 5? yes = it does. "
         "Give the level you chose in the reason.\n"
         f"Memories:\n{_bullets(memories)}"
     )
+
+
+def extraction_evidence(result: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> str | None:
+    """写出这几条的那一次第二次提炼看到的输入(闸门 11-16):从后往前找产出里有同样正文的那一次;
+    找不到就取最后一次记了输入的第二次提炼;都没有(老记录不记输入)= ``None``。"""
+    contents = {str(m.get("content", "")) for m in rows}
+    calls = [
+        c
+        for rnd in result.get("rounds", [])
+        for c in rnd.get("calls", [])
+        if c.get("kind") == "pass2" and "input" in c
+    ]
+    for call in reversed(calls):
+        made = {str(m.get("content", "")) for m in parse_extraction(str(call.get("reply", "")))}
+        if made & contents:
+            return str(call["input"])
+    return str(calls[-1]["input"]) if calls else None
 
 
 def confirmed_check(
@@ -235,7 +263,12 @@ def confirmed_check(
         out[metric] = False
         return
     out[metric] = None
-    prompt = grounded_prompt(lines[0], lines[1], [str(m["content"]) for m in rows])
+    prompt = grounded_prompt(
+        lines[0],
+        lines[1],
+        [str(m["content"]) for m in rows],
+        evidence=extraction_evidence(result, rows),
+    )
     items.append(JudgeItem(f"{record['key']}|{metric}", metric, prompt))
 
 
