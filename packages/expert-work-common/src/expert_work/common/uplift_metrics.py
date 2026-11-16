@@ -142,11 +142,14 @@ _memory_extraction_total = expert_work_counter(
 # B-300 redesign §4 / §5.4 — what the program changed after checking a reply's ``basis`` /
 # ``turn`` / ``event_date``: ``downgraded_<reason>`` (a user answer / agreement that does
 # not anchor on a user line, so it is stored as from the assistant), ``pointer_missing``
-# (no evidence pointer), ``event_date_dropped``, ``context_line_dropped`` (``turn`` is a
-# context line above ``=== new ===``: not stored — B-300 test acceptance 11-16),
-# ``context_line_downgraded`` (the one exception: a user answer / agreement whose ``turn`` is
-# the last context line, an assistant line right before a new-segment user line — stored as
-# from the assistant, no evidence pointer; user 11-16).
+# (no evidence pointer because ``turn`` is missing or out of range; a ``turn`` on a context
+# line is never counted here — it is ``context_line_*``), ``event_date_dropped``,
+# ``context_line_dropped`` (``turn`` is a context line above ``=== new ===``: not stored —
+# B-300 test acceptance 11-16), and the one exception, user 11-16: a user answer / agreement
+# whose ``turn`` is the last context line, an assistant line, is re-anchored to the first
+# new-segment line and checked again — ``context_line_reanchored`` (passed: stored as
+# user-confirmed, pointer on that line) or ``context_line_downgraded`` (failed: stored as from
+# the assistant, no evidence pointer).
 _memory_extraction_check_total = expert_work_counter(
     "expert_work_memory_extraction_check_total",
     "Extraction results the program changed after checking them, by pass and check (B-300).",
@@ -498,11 +501,12 @@ def record_memory_reconcile(*, op: str) -> None:
     "target_changed", "blocked_update_added", "blocked_update_dropped",
     "blocked_delete", "blocked_delete_added", "lower_confidence_update_added",
     "lower_confidence_update_dropped", "lower_confidence_delete",
-    "lower_confidence_delete_added"}`` — the operation actually applied per
-    extracted candidate; ``degraded`` = the reconcile decision failed and the
-    candidate fell back to a direct ADD (never lose a memory); ``target_changed``
-    (B-300) = the UPDATE's target was folded into a summary / expired meanwhile,
-    so the candidate was written as a direct ADD instead. ``blocked_*`` (B-300
+    "lower_confidence_delete_added", "lower_confidence_update_added_confirmed", ...}``
+    — the operation actually applied per extracted candidate; ``degraded`` = the
+    reconcile decision failed and the candidate fell back to a direct ADD (never lose a
+    memory); ``target_changed`` (B-300) = the UPDATE's target was folded into a
+    summary / expired meanwhile, so the candidate was written as a direct ADD
+    instead. ``blocked_*`` (B-300
     PR 2) = an assistant-derived candidate was refused an UPDATE / DELETE of a
     memory the user stated or corrected: the target is untouched; a correction
     candidate is stored as a new memory (``*_update_added`` /
@@ -531,7 +535,10 @@ def record_memory_reconcile(*, op: str) -> None:
     restatement: nothing written, no refresh; an UPDATE with the same evidence takes the
     normal path, user 11-16 「只拦真重复」); ``blocked_update_added_confirmed`` = a
     user-confirmed candidate (not a correction) whose UPDATE the tier rule blocked, stored
-    next to the old memory (user 11-16 「被拦时与旧的并存」). ``degraded`` now only
+    next to the old memory (user 11-16 「被拦时与旧的并存」);
+    ``lower_confidence_update_added_confirmed`` = the same for a user-confirmed candidate
+    blocked as less certain than a same-tier user-side memory (user 11-16 「也和旧的并存」;
+    both the pre-check and the in-lock recheck). ``degraded`` now only
     means the model gave no usable decision for that candidate (or the UPDATE / DELETE target
     was already gone). ``reconcile_failed`` = one reconcile call failed inside (lookup, model,
     unusable reply, store error): nothing of that batch is written directly; the
@@ -575,13 +582,18 @@ def record_memory_extraction(*, pass_name: str, outcome: str) -> None:
 def record_memory_extraction_check(*, pass_name: str, check: str) -> None:
     """Bump ``expert_work_memory_extraction_check_total{extraction_pass, check}`` (B-300
     redesign §5.4): ``downgraded_out_of_range`` / ``downgraded_not_user_line`` /
-    ``downgraded_previous_not_assistant``, ``pointer_missing``, ``event_date_dropped``,
+    ``downgraded_previous_not_assistant``, ``pointer_missing`` (``turn`` missing or out of
+    range only; context-line cases are counted under ``context_line_*`` instead),
+    ``event_date_dropped``,
     ``context_line_dropped`` (the memory's ``turn`` is a context line: dropped, both passes;
-    replaces ``downgraded_context_line``, B-300 test acceptance 11-16),
-    ``context_line_downgraded`` (second pass only, user 11-16 「这种情况照旧保存」: a
-    ``user_answer`` / ``user_agreement`` whose ``turn`` is the last context line, an
-    ``[assistant]`` line directly followed by the first new-segment line, a ``[user]`` line —
-    stored as ``assistant_derived`` with no evidence pointer instead of dropped)."""
+    replaces ``downgraded_context_line``, B-300 test acceptance 11-16). Second pass only,
+    user 11-16 「这种情况照旧保存」「按用户确认重新核对」: a ``user_answer`` /
+    ``user_agreement`` whose ``turn`` is the last context line, an ``[assistant]`` line with
+    new-segment lines after it, is re-anchored to the first new-segment line and checked like
+    any user answer — ``context_line_reanchored`` (it is a ``[user]`` line: stored as
+    ``user_confirmed`` with that line's evidence pointer, in the new segment) or
+    ``context_line_downgraded`` (it is not: stored as ``assistant_derived`` with no evidence
+    pointer). Both take time and event-date checks from the re-anchored line."""
     _memory_extraction_check_total.labels(extraction_pass=pass_name, check=check).inc()
 
 

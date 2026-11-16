@@ -513,17 +513,77 @@ async def test_a_user_confirmed_update_blocked_under_the_lock_is_added_alongside
 
 
 @pytest.mark.asyncio
-async def test_a_less_certain_user_confirmed_of_the_same_tier_is_still_dropped() -> None:
-    """同一层级、置信度更低(``lower_confidence``)不在本次决定里,照旧丢弃。"""
+async def test_a_less_certain_user_confirmed_of_the_same_tier_is_added_alongside() -> None:
+    """审查 M-3(用户 11-16「也和旧的并存」):用户确认过猫叫蛋黄(0.8);后来又同意了助手提的
+    「布丁」,这次没那么确定(0.7),去重合并判「更新」→ 同层级、置信度更低被拦 —— 以前丢弃,
+    现在与旧的并存,计数 ``lower_confidence_update_added_confirmed``。重试时内容相同的不再多一行。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     old = c.mem("用户的猫叫蛋黄", _at(0.9), origin="user_confirmed", confidence=0.8)
     await store.write([old])
-    cand = c.mem("用户的猫好像叫蛋黄", origin="user_confirmed", confidence=0.5)
+    cand = c.mem("用户的猫叫布丁", origin="user_confirmed", confidence=0.7)
+    added, dropped = (
+        _count("lower_confidence_update_added_confirmed"),
+        _count("lower_confidence_update_dropped"),
+    )
+    result = await _reconcile(store, _FixedLLM(_ops((0, "UPDATE", "e0"))), _Candidate(cand))
+    assert [m.id for m in result.direct] == [cand.id]
+    assert _count("lower_confidence_update_added_confirmed") == added + 1
+    assert _count("lower_confidence_update_dropped") == dropped
+    await store.write(result.direct)
+    assert sorted(r.content for r in _live(store)) == ["用户的猫叫布丁", "用户的猫叫蛋黄"]
+
+    again = c.mem("用户的猫叫布丁", origin="user_confirmed", confidence=0.7)
+    retry = await _reconcile(store, _FixedLLM(_ops((0, "UPDATE", "e0"))), _Candidate(again))
+    assert retry.direct == []
+
+
+@pytest.mark.asyncio
+async def test_a_less_certain_user_stated_of_the_same_tier_is_still_dropped() -> None:
+    """只改用户确认的候选;用户说的候选同层级、置信度更低照旧丢弃。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    old = c.mem("用户的猫叫蛋黄", _at(0.9), origin="user_stated", confidence=0.9)
+    await store.write([old])
+    cand = c.mem("用户的猫好像叫蛋黄", origin="user_stated", confidence=0.5)
     before = _count("lower_confidence_update_dropped")
     result = await _reconcile(store, _FixedLLM(_ops((0, "UPDATE", "e0"))), _Candidate(cand))
     assert result.direct == []
     assert _count("lower_confidence_update_dropped") == before + 1
+
+
+@dataclass
+class _MoreCertainMeanwhileLLM:
+    """判的那几秒里目标变得更确定(同层级):预判放行,锁里重判时被拦。"""
+
+    store: InMemoryMemoryStore
+    target: MemoryItem
+
+    async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
+        del messages, tools
+        await self.store.update_content(
+            tenant_id=self.target.tenant_id,
+            user_id=self.target.user_id,
+            memory_id=self.target.id,
+            content=self.target.content,
+            embedding=self.target.embedding,
+            confidence=0.8,
+        )
+        return AIMessage(content=_ops((0, "UPDATE", "e0")))
+
+
+@pytest.mark.asyncio
+async def test_a_less_certain_user_confirmed_blocked_under_the_lock_is_added_alongside() -> None:
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    target = c.mem("用户的猫叫蛋黄", _at(0.9), origin="user_confirmed", confidence=0.6)
+    await store.write([target])
+    cand = c.mem("用户的猫叫布丁", origin="user_confirmed", confidence=0.7)
+    before = _count("lower_confidence_update_added_confirmed")
+    result = await _reconcile(store, _MoreCertainMeanwhileLLM(store, target), _Candidate(cand))
+    assert ([m.id for m in result.direct], result.superseded) == ([cand.id], 0)
+    assert [r.content for r in _live(store)] == ["用户的猫叫蛋黄"]
+    assert _count("lower_confidence_update_added_confirmed") == before + 1
 
 
 @pytest.mark.parametrize(
@@ -702,33 +762,37 @@ async def test_a_same_message_update_of_the_same_tier_is_applied() -> None:
     assert _count("noop_same_evidence") == same
 
 
-def _pending(cand: MemoryItem, target: MemoryItem) -> memory_module._Pending:
-    return memory_module._Pending(_Candidate(cand), (target,), frozenset())
-
-
 @pytest.mark.parametrize(
     ("op", "cand_day", "writes"),
     [
-        ("NOOP", None, False),  # 同一条消息的重述:失败收尾也不写
-        ("NOOP", _TODAY, True),  # 事件日期不同:另一次,收尾时按新增写
-        ("UPDATE", None, True),  # 判「更新」的照常(还没执行的更新按新增写)
+        ("NOOP", None, False),  # 同一条消息的重述:不写
+        ("NOOP", _TODAY, True),  # 事件日期不同:另一次,按新增写
+        ("UPDATE", None, True),  # 判「更新」、层级拦下的用户确认:与旧的并存
     ],
     ids=["noop", "noop-other-date", "update"],
 )
-def test_would_write_follows_the_same_evidence_rule(
+@pytest.mark.asyncio
+async def test_a_failed_reconcile_writes_what_applying_would_write_for_the_same_message(
     op: str, cand_day: object, writes: bool
 ) -> None:
-    """L-1:去重合并出错时,还没落完的候选要不要写与落库时同一条规矩 —— 不进 DLQ 写成重复。"""
+    """L-1:去重合并中途出错时,还没落完的候选按 ``_would_write`` 收尾(写或进失败队列)—— 它必须与
+    真正落库时对同一条消息的判法一致:落库不写的(重述)收尾也不写,落库会写的(并存)收尾也写。
+    第 8 版初稿正是两边不一致(落库把「更新」当重述吞掉,收尾却写)。"""
     c = _Ctx()
+    store = InMemoryMemoryStore()
     target = c.mem(
-        "昨天测得读数 130", origin="user_stated", confidence=0.9, evidence_message_id="u2",
-        occurred_on=_TODAY - timedelta(days=1),
+        "昨天测得读数 130", _at(0.95), origin="user_stated", confidence=0.9,
+        evidence_message_id="u2", occurred_on=_TODAY - timedelta(days=1),
     )  # fmt: skip
+    await store.write([target])
     cand = c.mem(
         "读数 130", origin="user_confirmed", confidence=0.8, evidence_message_id="u2",
         occurred_on=cand_day or (_TODAY - timedelta(days=1)),
     )  # fmt: skip
-    assert memory_module._would_write(_pending(cand, target), op, "e0", {"e0": target.id}) is writes
+    applied = await _reconcile(store, _FixedLLM(_ops((0, op, "e0"))), _Candidate(cand))
+    pending = memory_module._Pending(_Candidate(cand), (target,), frozenset())
+    on_failure = memory_module._would_write(pending, op, "e0", {"e0": target.id})
+    assert (cand.id in [m.id for m in applied.direct], on_failure) == (writes, writes)
 
 
 def test_message_times_include_superseded_messages() -> None:
@@ -806,28 +870,59 @@ async def test_unknown_conversations_are_not_the_same_conversation() -> None:
     assert _count("noop_same_evidence") == same
 
 
-def _named_across_the_mark() -> list[ExtractionLine]:
+def _named_across_the_mark(next_line: ExtractionLine | None = None) -> list[ExtractionLine]:
+    """上一轮 23:50 以助手的提议结束;新段第一行是用户 00:10(第二天)的回答。"""
     return [
-        ExtractionLine(text="帮我想个猫名", tag="[user]", context=True, message_id="u1"),
-        ExtractionLine(text="建议叫它蛋黄", tag="[assistant]", context=True, message_id="a1"),
-        ExtractionLine(text="好", tag="[user]", message_id="u2"),
-        ExtractionLine(text="好的", tag="[assistant]", message_id="a2"),
-    ]
+        ExtractionLine(text="帮我想个猫名", tag="[user]", context=True, message_id="u1",
+                       message_index=0, sent_at=_LATE, sent_day=_LATE.date()),
+        ExtractionLine(text="建议叫它蛋黄", tag="[assistant]", context=True, message_id="a1",
+                       message_index=1, sent_at=_LATE, sent_day=_LATE.date()),
+        next_line or ExtractionLine(text="好,就叫这个", tag="[user]", message_id="u2",
+                                    message_index=2, sent_at=_AFTER, sent_day=_AFTER.date()),
+        ExtractionLine(text="好的", tag="[assistant]", message_id="a2", message_index=3,
+                       sent_at=_AFTER, sent_day=_AFTER.date()),
+    ]  # fmt: skip
+
+
+_LATE = datetime(2026, 3, 1, 23, 50, tzinfo=UTC)
+_AFTER = datetime(2026, 3, 2, 0, 10, tzinfo=UTC)
 
 
 @pytest.mark.parametrize("basis", ["user_answer", "user_agreement"])
-def test_an_answer_put_on_the_last_context_assistant_line_is_kept_as_assistant_derived(
+def test_an_answer_put_on_the_last_context_assistant_line_is_reanchored_to_the_user_line(
     basis: str,
 ) -> None:
-    """M-3(用户 11-16「这种情况照旧保存」):上一轮以「[assistant] 建议叫它蛋黄」结束,新段第一行是
-    「[user] 好」,模型把 ``turn`` 指在助手那一行 → 照旧存成来自助手(≤ 0.6)、指针留空,计数
-    ``context_line_downgraded``。"""
+    """M-3 → 审查 M-1(用户 11-16「按用户确认重新核对」):上一轮以「[assistant] 建议叫它蛋黄」结束,
+    新段第一行是「[user] 好,就叫这个」,模型把 ``turn`` 指在助手那一行 → 程序改挂到那一行用户行、
+    照常核对:过了 → 用户确认(≤ 0.8)、证据指针 = 用户那条消息、算新段,计数
+    ``context_line_reanchored``。时间与事件日期按用户那一行(00:10,第二天),不按助手那一行
+    (23:50):「今天」的事件日期不被当成「晚于那一行」清掉(审查 LOW-2)。"""
     settled = memory_lines.settle_conversation(
-        basis, 2, None, _named_across_the_mark(), today=_TODAY
+        basis, 2, _AFTER.date().isoformat(), _named_across_the_mark(), today=_TODAY
+    )
+    assert settled is not None
+    assert (settled.origin, settled.max_confidence) == ("user_confirmed", 0.8)
+    assert (settled.evidence_message_id, settled.evidence_message_index) == ("u2", 2)
+    assert (settled.in_new_segment, settled.line_at) == (True, _AFTER)
+    assert settled.event_date == _AFTER.date()
+    assert settled.checks == ("context_line_reanchored",)
+
+
+def test_a_reanchored_answer_that_fails_the_check_is_downgraded() -> None:
+    """改挂之后核对不过(新段第一行不是用户输入,例如另一条助手消息)→ 照旧降为来自助手
+    (≤ 0.6)、指针留空、不算新段,计数 ``context_line_downgraded``;时间仍按改挂的那一行。"""
+    lines = _named_across_the_mark(
+        ExtractionLine(text="提醒:该喂猫了", tag="[assistant]", message_id="a1b", message_index=2,
+                       sent_at=_AFTER, sent_day=_AFTER.date()),
+    )  # fmt: skip
+    settled = memory_lines.settle_conversation(
+        "user_agreement", 2, _AFTER.date().isoformat(), lines, today=_TODAY
     )
     assert settled is not None
     assert (settled.origin, settled.max_confidence) == ("assistant_derived", 0.6)
-    assert (settled.evidence_message_id, settled.in_new_segment) == (None, False)
+    assert (settled.evidence_message_id, settled.evidence_message_index) == (None, None)
+    assert (settled.in_new_segment, settled.line_at) == (False, _AFTER)
+    assert settled.event_date == _AFTER.date()
     assert settled.checks == ("context_line_downgraded",)
 
 
@@ -848,11 +943,9 @@ def test_near_misses_of_the_answer_shape_are_still_dropped() -> None:
     assert (
         memory_lines.settle_conversation("user_agreement", 2, None, user_last, today=_TODAY) is None
     )
-    # 新段第一行不是用户
-    assistant_next = [*lines[:2], ExtractionLine(text="继续", tag="[assistant]", message_id="a2")]
+    # 新段里没有行
     assert (
-        memory_lines.settle_conversation("user_agreement", 2, None, assistant_next, today=_TODAY)
-        is None
+        memory_lines.settle_conversation("user_agreement", 2, None, lines[:2], today=_TODAY) is None
     )
     # 第一次提炼不受影响:上下文行一律丢
     first = [ExtractionLine(text="帮我想个猫名", context=True), ExtractionLine(text="好")]
@@ -860,32 +953,72 @@ def test_near_misses_of_the_answer_shape_are_still_dropped() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_answer_shape_is_stored_through_the_write_back(
+async def test_the_reanchored_answer_is_kept_alongside_what_the_user_said_before(
     checks: list[tuple[str, str]],
 ) -> None:
+    """端到端:用户先前说过「猫还没起名字」(``user_stated``);上一轮以「建议叫它蛋黄」结束,新段
+    「好,就叫这个」;模型把 ``turn`` 指在助手那一行,去重合并判「更新」那条用户说的 → 改挂成用户
+    确认,层级拦下 → 与旧的并存:名字存下了,不丢。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
+    old = c.mem(
+        "用户的猫还没起名字", _at(0.9), origin="user_stated", confidence=0.9,
+        created_at=_LATE - timedelta(days=1),
+    )  # fmt: skip
+    await store.write([old])
     messages = [
-        _user("帮我想个猫名", _T0, "u1"),
-        _assistant("建议叫它蛋黄", _T0 + timedelta(seconds=5), "a1"),
-        _user("好", _T0 + timedelta(minutes=1), "u2"),
-        _assistant("好的,就叫蛋黄。", _T0 + timedelta(minutes=1, seconds=5), "a2"),
+        _user("帮我想个猫名", _LATE - timedelta(minutes=1), "u1"),
+        _assistant("建议叫它蛋黄", _LATE, "a1"),
+        _user("好,就叫这个", _AFTER, "u2"),
+        _assistant("好的,就叫蛋黄。", _AFTER + timedelta(seconds=5), "a2"),
     ]
     llm = _RoutingLLM(
         conversation_reply=_reply(
             {"kind": "fact", "content": "用户的猫叫蛋黄", "basis": "user_agreement", "turn": 2,
              "confidence": 0.9},
         ),
+        ops=[_ops((0, "UPDATE", "e0"))],
     )  # fmt: skip
+    added = _count("blocked_update_added_confirmed")
     outcome = await _flush(
         c, store, messages, llm, {"用户的猫叫蛋黄": _E}, SegmentStart(message_index=2)
     )
-    [row] = _live(store)
-    assert (row.content, row.origin, row.evidence_message_id) == (
-        "用户的猫叫蛋黄",
-        "assistant_derived",
-        None,
+    rows = {r.content: r for r in _live(store)}
+    assert sorted(rows) == ["用户的猫叫蛋黄", "用户的猫还没起名字"]
+    named = rows["用户的猫叫蛋黄"]
+    assert (named.origin, named.evidence_message_id, named.evidence_message_index) == (
+        "user_confirmed",
+        "u2",
+        2,
     )
-    assert row.confidence <= 0.6
+    assert named.confidence <= 0.8
     assert outcome.written == 1
-    assert checks == [("conversation", "context_line_downgraded")]
+    assert _count("blocked_update_added_confirmed") == added + 1
+    assert checks == [("conversation", "context_line_reanchored")]
+
+
+# ─── 5. 第二轮审查(11-16):同层级置信度更低的用户确认也与旧的并存;逐字重述 ──────────────
+
+
+@pytest.mark.asyncio
+async def test_identical_content_from_the_same_message_counts_as_same_evidence() -> None:
+    """审查 LOW-4:第二次把同一条消息逐字又给了一遍(内容相同 → 不问模型的确定性「重复」)—— 也是
+    同一句话的重述:计 ``noop_same_evidence``,不刷新确认日期。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    stated = c.mem("用户的猫叫蛋黄", origin="user_stated", confidence=0.9, evidence_message_id="u2")
+    await store.write([stated])
+    cand = c.mem(
+        "用户的猫叫蛋黄", origin="user_confirmed", confidence=0.8, evidence_message_id="u2"
+    )
+    same, refreshed = _count("noop_same_evidence"), _count("noop_refreshed")
+    result = await _reconcile(
+        store,
+        _FixedLLM(_ops()),
+        _Candidate(cand, line_at=_T0 + timedelta(minutes=1), in_new_segment=True),
+        {"u2": _T0 + timedelta(minutes=1)},
+    )
+    assert result.direct == []
+    assert (_count("noop_same_evidence"), _count("noop_refreshed")) == (same + 1, refreshed)
+    [row] = _live(store)
+    assert row.confirmed_at is None

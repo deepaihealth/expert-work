@@ -1520,14 +1520,16 @@ def _blocked_by_user_side(
 
     用户 2026-11-16「被拦时与旧的并存」(测试验收 run 8e5a1f0d):被层级拦下的「更新」、候选是用户
     确认的(不是更正)→ 也按新增存下,计数 ``blocked_update_added_confirmed`` —— 用户同意过的事不丢,
-    代价是偶尔多一条换了说法的重复。来自助手的候选、同层级置信度更低的照旧丢弃。"""
+    代价是偶尔多一条换了说法的重复。同层级、置信度更低被拦下的用户确认同样并存(用户 11-16「也和
+    旧的并存」),计数 ``lower_confidence_update_added_confirmed``;预判与锁里重判走这同一个函数。
+    来自助手的候选、用户说的候选照旧丢弃。"""
     prefix = "lower_confidence" if lower_confidence else "blocked"
     verb = "update" if op == "UPDATE" else "delete"
     if is_correction:
         record_memory_reconcile(op=f"{prefix}_{verb}_added")
         return item
-    if op == "UPDATE" and not lower_confidence and effective_origin(item) == "user_confirmed":
-        record_memory_reconcile(op="blocked_update_added_confirmed")
+    if op == "UPDATE" and effective_origin(item) == "user_confirmed":
+        record_memory_reconcile(op=f"{prefix}_update_added_confirmed")
         return item
     record_memory_reconcile(op=f"{prefix}_update_dropped" if op == "UPDATE" else f"{prefix}_delete")
     return None
@@ -2040,7 +2042,14 @@ async def _reconcile_into(
             # 11-14 重跑 118.5 —— 内容相同(归一后)、层级不低的已有记忆:不问模型,直接 NOOP。
             # 带更正的候选照旧问模型(审查 MEDIUM):它可能要删掉旁边一条与之冲突的记忆。
             logger.debug("%s_reconcile_identical_noop", deps.log_label)
-            await _noop(candidate, identical[0], deps)
+            restated = next(
+                (n for n in identical if _restates_same_message(candidate.item, n)), None
+            )
+            if restated is not None:
+                # 审查 LOW-4 —— 同一条消息逐字又给了一遍:重述,不刷新确认日期(§7.1 第 12 行)。
+                record_memory_reconcile(op="noop_same_evidence")
+            else:
+                await _noop(candidate, identical[0], deps)
         elif neighbors:
             ids = frozenset(n.id for n in identical)
             progress.pending.append(_Pending(candidate, tuple(neighbors), ids))
