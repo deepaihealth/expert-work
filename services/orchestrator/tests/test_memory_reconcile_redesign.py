@@ -3,8 +3,10 @@
 * 没有相似度门槛:相似度 0.3 的邻居也交给模型;每条候选按向量取召回范围内(带智能体名)最近 5 条;
 * 材料带类型、来源、日期、事件日期,已有记忆用本次调用内的短编号 ``e0, e1, …``,程序映射回去,
   不认识的编号按没给决定;
-* 更新 / 删除:跨格、不是同一格里按余弦(不是检索顺序)最近的前 2 条 → 新增;事件日期相同且候选
-  带更正才可以,相同不是更正、不同、一边没有 → 新增;候选那一行早于目标的记录时间的「更新」→ 新增;
+* 更新 / 删除:跨格、不是同一格里按余弦(不是检索顺序)最近的前 2 条 → 新增;两边都有事件日期时,
+  相同且候选带更正才可以,相同不是更正、不同 → 新增;只有一边有 → 不按这条拒绝(「方案三:折中」,
+  用户 2026-11-16),只有不带日期、不是更正的候选删一条带日期的仍拒绝;放行的按 ``update`` /
+  ``delete`` 计 ``event_date_one_sided_*``;候选那一行早于目标的记录时间的「更新」→ 新增;
 * 「重复」要带目标、目标要在候选的召回范围内;只在用户一方对用户一方、候选那一行在新段里时把目标
   的确认日期刷新为那一行的发送时间,确定性「重复」同样;
 * 层级拦截:用户确认改不动用户说的;用户说的可以改用户确认的;
@@ -60,11 +62,17 @@ For each candidate choose one operation:
 - "ADD": anything else. A memory that is only related — the same topic but another subject,
   person, item or occasion — is not a target; the candidate is an ADD.
 UPDATE and DELETE apply only to an existing memory of the same kind.
-Two memories with different event dates are different occasions: ADD. A memory with an
-"event_date" is changed only by a candidate with "is_correction": true about the same day;
-any other candidate about that day is a NOOP when it says the same thing and an ADD
-otherwise. A reading, count or status that refers to a different date or time than an
-existing memory is a new memory (ADD), not an UPDATE of the earlier one.
+An "event_date" marks something that happened or was measured on one day, such as a
+reading or a count. Two such memories with different event dates are different occasions:
+ADD. When both have the same "event_date", the existing memory is changed only by a
+candidate with "is_correction": true; any other candidate about that day is a NOOP when it
+says the same thing and an ADD otherwise. A reading or count taken on a different date or
+time than an existing one is a new memory (ADD), not an UPDATE of the earlier one, whether
+or not either has an "event_date": the date written in its content counts too.
+For a state, a date written in the content, such as "(as of <date>)", does not make another
+occasion: a changed state of the same thing is an UPDATE, and the same state said again is
+a NOOP.
+When only one of the two has an "event_date", decide by what they say.
 A candidate with "is_correction": true changes something said earlier: when an existing
 memory still says the earlier value, the candidate is an UPDATE of that memory.
 A candidate's "is_correction" says what the candidate does, not where it comes from; its
@@ -355,20 +363,28 @@ async def test_targets_are_ranked_by_cosine_not_by_retrieval_order() -> None:
 
 
 @pytest.mark.parametrize(
-    ("cand_day", "target_day", "correction", "applied"),
+    ("cand_day", "target_day", "correction", "applied_by_op"),
     [
-        (1, 1, True, True),
-        (1, 1, False, False),
-        (1, 2, True, False),
-        (1, None, True, False),
-        (None, 1, True, False),
-        (None, None, False, True),
+        (1, 1, True, {"UPDATE": True, "DELETE": True}),
+        (1, 1, False, {"UPDATE": False, "DELETE": False}),
+        (1, 2, True, {"UPDATE": False, "DELETE": False}),
+        (1, 2, False, {"UPDATE": False, "DELETE": False}),
+        # 「方案三:折中」(用户 2026-11-16):只有一边有事件日期 → 不按这条拒绝,由模型照常判;
+        # 例外:不带日期、不是更正的候选删不掉一条带日期的(过去的读数不会变得不成立)。
+        (1, None, True, {"UPDATE": True, "DELETE": True}),
+        (1, None, False, {"UPDATE": True, "DELETE": True}),
+        (None, 1, True, {"UPDATE": True, "DELETE": True}),
+        (None, 1, False, {"UPDATE": True, "DELETE": False}),
+        (None, None, False, {"UPDATE": True, "DELETE": True}),
     ],
     ids=[
         "same-day-correction",
         "same-day-again",
+        "other-day-correction",
         "other-day",
+        "candidate-only-correction",
         "candidate-only",
+        "target-only-correction",
         "target-only",
         "no-event-date",
     ],
@@ -376,10 +392,18 @@ async def test_targets_are_ranked_by_cosine_not_by_retrieval_order() -> None:
 @pytest.mark.parametrize("op", ["UPDATE", "DELETE"])
 @pytest.mark.asyncio
 async def test_event_dates_gate_update_and_delete(
-    op: str, cand_day: int | None, target_day: int | None, correction: bool, applied: bool
+    monkeypatch: pytest.MonkeyPatch,
+    op: str,
+    cand_day: int | None,
+    target_day: int | None,
+    correction: bool,
+    applied_by_op: dict[str, bool],
 ) -> None:
+    applied = applied_by_op[op]
     c = _Ctx()
     store = InMemoryMemoryStore()
+    counted: list[str] = []
+    monkeypatch.setattr(memory_module, "record_memory_reconcile", lambda *, op: counted.append(op))
 
     def day(n: int | None) -> date | None:
         return None if n is None else date(2026, 11, n)
@@ -391,12 +415,131 @@ async def test_event_dates_gate_update_and_delete(
         store, _LLM([_ops((0, op, "e0"))]), _Candidate(cand, is_correction=correction)
     )
     assert _untouched(store, target) is not applied
+    assert ("refused_event_date" in counted) is not applied
+    one_sided = (cand_day is None) != (target_day is None)
+    assert (f"event_date_one_sided_{op.lower()}" in counted) is (applied and one_sided)
     written = [m.id for m in result.direct]
     if applied:
         # 更新落成新行;带更正的删除照旧把候选存下,不带的不存。
         assert written == ([cand.id] if op == "DELETE" and correction else [])
     else:
         assert written == [cand.id]
+
+
+def _day(n: int | None) -> date | None:
+    return None if n is None else date(2026, 11, n)
+
+
+@pytest.mark.parametrize(
+    ("cand_day", "target_day", "added"),
+    [(1, 2, True), (1, 1, False), (1, None, False), (None, 1, False), (None, None, False)],
+    ids=["other-day", "same-day", "candidate-only", "target-only", "no-event-date"],
+)
+@pytest.mark.asyncio
+async def test_a_noop_across_different_event_dates_is_an_add(
+    monkeypatch: pytest.MonkeyPatch, cand_day: int | None, target_day: int | None, added: bool
+) -> None:
+    """复审 MEDIUM(11-16,「方案三」在「重复」这条路上的落法):两边都有事件日期且不同 = 不同的
+    两次,模型判「重复」也改为新增并计数;其余照旧是重复。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    counted: list[str] = []
+    monkeypatch.setattr(memory_module, "record_memory_reconcile", lambda *, op: counted.append(op))
+    target = c.mem("the meter read 310", _at(0.95), occurred_on=_day(target_day))
+    await store.write([target])
+    cand = c.mem("the meter reading was 310", occurred_on=_day(cand_day))
+    result = await _reconcile(store, _LLM([_ops((0, "NOOP", "e0"))]), _Candidate(cand))
+    assert _untouched(store, target)
+    assert [m.id for m in result.direct] == ([cand.id] if added else [])
+    assert ("noop_other_event_date" in counted) is added
+
+
+@pytest.mark.parametrize(
+    ("target_day", "deterministic"),
+    [(2, False), (1, True), (None, True)],
+    ids=["other-day", "same-day", "target-undated"],
+)
+@pytest.mark.asyncio
+async def test_identical_text_on_another_event_date_is_not_a_deterministic_noop(
+    target_day: int | None, deterministic: bool
+) -> None:
+    """内容相同、事件日期不同 = 不同的两次:不走确定性「重复」,交给模型(判「重复」也改为新增)。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    target = c.mem("the meter read 310", occurred_on=_day(target_day))
+    await store.write([target])
+    cand = c.mem("the meter read 310", occurred_on=_day(1))
+    llm = _LLM([_ops((0, "NOOP", "e0"))])
+    result = await _reconcile(store, llm, _Candidate(cand))
+    assert (llm.calls == []) is deterministic
+    assert [m.id for m in result.direct] == ([] if deterministic else [cand.id])
+
+
+def test_an_unapplied_noop_across_different_event_dates_is_still_written() -> None:
+    """收尾时(去重合并出错)还没落的「重复」:日期不同的按新增写,同一天的不写。"""
+    c = _Ctx()
+    target = c.mem("the meter read 310", occurred_on=_day(2))
+    by_short_id = {"e0": target.id}
+    other = memory_module._Pending(
+        _Candidate(c.mem("read 310", occurred_on=_day(1))), (target,), frozenset()
+    )
+    same = memory_module._Pending(
+        _Candidate(c.mem("read 310", occurred_on=_day(2))), (target,), frozenset()
+    )
+    assert memory_module._would_write(other, "NOOP", "e0", by_short_id) is True
+    assert memory_module._would_write(same, "NOOP", "e0", by_short_id) is False
+
+
+@pytest.mark.parametrize(
+    ("op", "cand_day", "target_day"), [("UPDATE", None, 1), ("DELETE", 1, None)]
+)
+@pytest.mark.asyncio
+async def test_the_one_sided_count_needs_the_write_to_happen(
+    monkeypatch: pytest.MonkeyPatch, op: str, cand_day: int | None, target_day: int | None
+) -> None:
+    """复审 LOW(11-16):只有一边有事件日期的计数只在更新 / 删除真的落了之后才记;被层级拦下的不记。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    counted: list[str] = []
+    monkeypatch.setattr(memory_module, "record_memory_reconcile", lambda *, op: counted.append(op))
+    target = c.mem(
+        "the meter read 310", _at(0.95), origin="user_stated", confidence=0.9,
+        occurred_on=_day(target_day),
+    )  # fmt: skip
+    await store.write([target])
+    cand = c.mem(
+        "the meter read 301", origin="assistant_derived", confidence=0.5, occurred_on=_day(cand_day)
+    )
+    await _reconcile(store, _LLM([_ops((0, op, "e0"))]), _Candidate(cand))
+    assert _untouched(store, target)
+    assert [o for o in counted if o.startswith("blocked_")]
+    assert [o for o in counted if o.startswith("event_date_one_sided")] == []
+
+
+@pytest.mark.parametrize(
+    ("op", "cand_day", "target_day"), [("UPDATE", None, 1), ("DELETE", 1, None)]
+)
+@pytest.mark.asyncio
+async def test_the_one_sided_count_skips_a_write_that_did_not_land(
+    monkeypatch: pytest.MonkeyPatch, op: str, cand_day: int | None, target_day: int | None
+) -> None:
+    """取代 / 作废没成(目标已不在,存储返回「没写」)→ 只记 ``degraded``,不记一边有日期。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    counted: list[str] = []
+    monkeypatch.setattr(memory_module, "record_memory_reconcile", lambda *, op: counted.append(op))
+
+    async def not_written(*_args: Any, **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(memory_module, "_apply_update", not_written)
+    monkeypatch.setattr(memory_module, "_apply_delete", not_written)
+    target = c.mem("the meter read 310", _at(0.95), occurred_on=_day(target_day))
+    await store.write([target])
+    cand = c.mem("the meter read 301", occurred_on=_day(cand_day))
+    await _reconcile(store, _LLM([_ops((0, op, "e0"))]), _Candidate(cand))
+    assert "degraded" in counted
+    assert [o for o in counted if o.startswith("event_date_one_sided")] == []
 
 
 @pytest.mark.parametrize(

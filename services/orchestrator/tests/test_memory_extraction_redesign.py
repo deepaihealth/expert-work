@@ -7,7 +7,8 @@
   → ``user_confirmed``(置信度 ≤ 0.8);否则降为 ``assistant_derived``(≤ 0.6)并按原因计数;
 * 第一次的产出永远是 ``user_stated``,第二次的永远不是;
 * 证据指针 = ``turn`` 那一行对应的消息 id + 序号;指向上下文、越界、缺失 → 留空、计数,记忆照写;
-* 事件日期:解析不了、晚于那一行的日期 → 置空、计数;
+* 事件日期:解析不了、晚于那一行的日期 → 置空、计数;与类型无关(读数是「事实」,各智能体共享;
+  「去掉自检,读数共享」,用户 2026-11-16);
 * ``line_at`` = 那一行的发送时间;``in_new_segment`` = 那一行属于本次写回负责的轮次(切片之前 =
   最后一轮,即落这个写回任务的那一轮)。
 """
@@ -82,7 +83,14 @@ write both what it was and what it is now.
 A value that happened or was observed on one day — a reading, a count, a payment made —
 gets "event_date": the day it refers to, as YYYY-MM-DD, counted from the date on its line
 when the line says "today", "this morning", "yesterday" and the like. Plans, arrangements,
-preferences and states get "event_date": null.
+preferences and states get "event_date": null. A date alone does not make something an
+event, and neither does the day something was said or asked about: a current status is
+written with "(as of <date>)" in the content, and that date is not an "event_date". For
+example:
+- "The kitchen renovation is waiting for the tiles (as of 2026-04-03)." — a state:
+  "event_date": null.
+- "On 2026-04-03 the tiles for the kitchen were delivered." — it happened that day:
+  "event_date": "2026-04-03".
 Passwords, one-time codes, bank card or bank account numbers and other secrets are never
 recorded, even when the user gives one in reply to the assistant.
 Write each memory as one sentence that can be understood on its own, in the language of
@@ -281,6 +289,23 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
     )
     assert "a line that starts with a date in brackets was sent on that date" not in system
     assert "The input is every message one user typed" not in system
+    # 「方案三:折中」(用户 2026-11-16):写进内容的日期不是事件日期;成对的对照例子。
+    assert (
+        "- A value the user states about themselves or their own things, with the same message "
+        "saying what it is — a reading or measurement, an id or number, a current status — is "
+        "recorded even though it may change, except passwords, one-time codes, bank card or bank "
+        "account numbers and other secrets, which are never recorded. Write a date in the "
+        "content so that it is not later taken for a current value: a current status with "
+        '"(as of <date>)", and a reading or count with the day it was measured ("measured on '
+        '<date>"); an id or a number that names something gets no date. For that date, a date '
+        'in brackets after the line number is the day that line was sent, so turn "this '
+        'morning", "yesterday" and the like in that line into a date counted from it; in a line '
+        "without a date, leave such words as they are. A date written in the content is not by "
+        'itself an "event_date" (see below). - A message that only agrees' in system
+    )
+    # 复审 MEDIUM(11-16):「(as of <date>)」只给当前状态;读数写测得那天;编号不带日期。
+    assert 'such as "(as of <date>)", so it is not later taken' not in system
+    assert "Write it with the date or time it refers to, so it is not later taken" not in system
     assert (
         '- "is_correction": true ONLY when the same message itself says what is being corrected '
         "and gives the new value (e.g. the user says they moved, changed jobs, renamed a thing); "
@@ -288,8 +313,12 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
         "for a value that happened or was observed on one day (a reading, a count, a payment "
         "made), that day as YYYY-MM-DD; null for anything else, including an id, a number that "
         "names something, or a current status, even when its date is written in the content. "
-        "Respond with ONLY a JSON object" in system
+        "A date alone does not make something an event, and neither does the day something was "
+        'said or asked about. For example: "鱼缸的水泵在等配件(截至 2026-04-03)" — a state: '
+        '"event_date": null. "2026-04-03 测得鱼缸水温 26 度" — measured that day: "event_date": '
+        '"2026-04-03". Respond with ONLY a JSON object' in system
     )
+    assert "episodic" not in system.split('"event_date": only')[1].split("Respond with")[0]
     assert (
         '"expected_valid_days": <int or null>, "is_correction": <bool>, "turn": <line number>, '
         '"event_date": "<YYYY-MM-DD>" or null}]}' in system
@@ -688,6 +717,28 @@ async def test_an_unresolved_turn_still_checks_today(checks: list[tuple[str, str
     assert rows["过去的读数"].occurred_on == date(2026, 3, 1)
     assert rows["将来的读数"].occurred_on is None
     assert checks.count(("user", "event_date_dropped")) == 1
+
+
+@pytest.mark.parametrize("kind", ["fact", "episodic"])
+async def test_a_dated_memory_keeps_its_date_whatever_its_kind(
+    checks: list[tuple[str, str]], kind: str
+) -> None:
+    """「去掉自检,读数共享」(用户 2026-11-16):读数是「事实」(经历只在本智能体召回),事件日期
+    不因类型被清空,也不计数。"""
+    llm = _ByPassLLM(
+        conversation_reply=_reply(
+            {"kind": kind, "content": "电表读数 18342", "basis": "user_answer", "turn": 3,
+             "event_date": "2026-03-02"},
+        ),
+        user_reply=_reply(
+            {"kind": kind, "content": "鱼缸水温 26 度", "turn": 2, "event_date": "2026-03-02"},
+        ),
+    )  # fmt: skip
+    _, store = await _flush(_qa(), llm)
+    rows = await _rows(store)
+    assert rows["电表读数 18342"].occurred_on == date(2026, 3, 2)
+    assert rows["鱼缸水温 26 度"].occurred_on == date(2026, 3, 2)
+    assert [c for c in checks if c[1].startswith("event_date")] == []
 
 
 def test_the_today_guard_uses_the_given_day() -> None:

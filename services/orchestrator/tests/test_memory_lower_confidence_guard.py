@@ -809,7 +809,16 @@ async def test_reconcile_prompt_keeps_new_values_and_dated_readings() -> None:
         '"DELETE": the candidate says that one existing memory is no longer true and gives '
         "nothing to put in its place." in system
     )
+    # 用户 2026-11-16「改窄这句」:「不同日子是新的一条」只管读数、计数;状态按内容判。
     assert (
-        "A reading, count or status that refers to a different date or time than an existing "
-        "memory is a new memory (ADD), not an UPDATE of the earlier one." in system
+        "A reading or count taken on a different date or time than an existing one is a new "
+        "memory (ADD), not an UPDATE of the earlier one, whether or not either has an "
+        '"event_date": the date written in its content counts too.' in system
+    )
+    # 复审 MEDIUM(11-16):「(as of)」不算另一次只对状态说。
+    assert (
+        'For a state, a date written in the content, such as "(as of <date>)", does not make '
+        "another occasion: a changed state of the same thing is an UPDATE, and the same state "
+        'said again is a NOOP. When only one of the two has an "event_date", decide by what they '
+        "say." in system
     )

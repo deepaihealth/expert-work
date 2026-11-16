@@ -1,6 +1,6 @@
 # B-300 长期记忆提炼与去重合并重做 —— 设计
 
-- **日期**:2026-11-15(第 6 版,五轮独立审查后,写入用户对 §15 的拍板) · **状态**:定稿;方向与三项决定、§15 的七条都已由用户 11-15 拍板。用户 11-15:「开设计 PR 并开工」。
+- **日期**:2026-11-15(第 6 版,五轮独立审查后,写入用户对 §15 的拍板);2026-11-16 第 7 版(事件日期规则「方案三:折中」,§15 第 8 条) · **状态**:定稿;方向与三项决定、§15 的七条都已由用户 11-15 拍板。用户 11-15:「开设计 PR 并开工」。
 - **读者**:产品负责人(看 §0、§13、§14、§15 拍板记录)、开发工程师(全文)、评测执行人(§11、附录)。
 - **它替换什么**:[B-300 设计(2026-11-11 第 7 版)](2026-11-11-b300-memory-provenance-design.md)(下称「原设计」)里提炼第二次的指令(§4.2 第二段及 11-14 的追加句)、去重合并(§6.2 拦截规则的写法、`memory.py` 的 0.80 门槛)、§6.5「不做第三个来源值」、§4.4 / §6.5「不改每轮整段重抽」。原设计其余部分(白名单、语言、召回提醒、整理、并入的十五样、评测组织)照旧有效;本文改到的地方在 §14 逐条列出。
 - **代码事实**:本文写的我们自己的 `文件:行号` 都在 `origin/main` `16ec43eb1` 上打开核过(调研笔记用的也是这个提交,main 此后没有前进);第 2 版新引的行号另经独立审查核过。调研笔记里有三处行号对不上当前代码,本文用的是核对后的(§1.3 末)。外部项目与论文的出处取自 11-15 调研笔记(源码在会话草稿目录,`graphiti` / `langmem` / `letta-code` 下载了,其余在 `~/src/github/` 只读),本文没有重新打开。
@@ -15,6 +15,8 @@
 > **用户拍板(11-15,看过第 5 版 §15 之后)**:第 1 条失败队列「留一半」;第 2~7 条「全部按建议」;下一步「开设计 PR 并开工」。见 §15。
 
 ## 修订记录
+
+**第 7 版(11-16,用户拍板「方案三:折中」)**:回归闸门 `5b8588d0e` 里带事件日期的 9 条错了 6 条(把状态当成了事件)。事件日期规则改为只在两边都有时拒绝更新,不带日期、不是更正的候选仍删不掉带日期的(§7.1 第 7 行、§7.4),只有一边有而放行的计 `event_date_one_sided_update` / `_delete`;两次提炼的指令加「写进内容的日期不是事件日期」与一对对照例子(附录 A、附录 C);去重合并指令「改窄这句」:「不同日子是新的一条」只管读数、计数,内容里的「(as of <date>)」不算另一次,状态变了是更新、同样的状态再说是重复,只有一边有时按内容判(附录 B)。审查后用户 11-16「去掉自检,读数共享」:不做「事实带事件日期就清空」的自检,例子 7 的读数仍是「事实」(经历只在本智能体召回)。复审(11-16):第一次指令「写上日期」拆成状态 / 读数 / 编号三种;去重合并指令里读数的「换日子是新的一条」不看有没有事件日期,「(as of) 不算另一次」只对状态;两边日期不同的「重复」改为新增;一边有日期的计数落了才记(§7.1、§7.4、附录 B、附录 C、§15 第 8 条)。§11.6、§14 第 11 行相应改;§15 加第 8 条。
 
 **第 6 版(11-15,用户拍板)**:§15 由「需要用户定的」改为拍板记录,写入用户原话与日期;各处「待用户确认」改为已定;§0、§14 相应更新。设计内容没有变。
 
@@ -253,7 +255,7 @@ A 组已花 ¥4.58,用户批的这份报价是 ¥16。实验分支那一列不�
 - **用户一方的回答**:把 `[user]` 行和它正上方的 `[assistant]` 行合起来读,写出两行一起定下来的完整事实,像用户自己会说的那样写,保留用户自己的犹豫。一行里有几个回答就记几条;用户只同意了助手一句里的某一项提议,只有那一项算用户同意,同一句里其它结论仍是助手的(例子 2)。
 - **助手一方的**:内容里说清是助手查到 / 判断 / 提议的,并保留助手自己的保留措辞(「大约」「看起来」「可能」)。**不给英文句式模板**(原指令里的「the assistant found ...」「asked by the assistant, the user answered ...」删掉,调研笔记 C 节推断它们可能把记忆拉成英文);怎么说由例子示范,例子用中、英、西三种语言写,内容跟着对话的语言走。
 - **更正**:回复改掉或否掉前面说过的,`is_correction` 为真,内容里写出原来是什么、现在是什么(mem0 V3「从 X 换成 Y」)。
-- **事件日期**:只给「某一天发生或观测到的一次性值」(一次读数、一笔已付的款、一次计数),按那一行的日期换算「今天」「今天早上」「昨天」;计划、安排、偏好、状态都给 `null`。
+- **事件日期**:只给「某一天发生或观测到的一次性值」(一次读数、一笔已付的款、一次计数),按那一行的日期换算「今天」「今天早上」「昨天」;计划、安排、偏好、状态都给 `null`。11-16「方案三:折中」加:光有日期不算事件,说起或问起的那一天也不算;当前状态写成内容里的「(as of <date>)」,那不是事件日期;一对同主题的对照例子(附录 A)。类型照旧由模型定,读数可以是「事实」(各智能体共享)。
 - **例子代替规则**:9 个「输入 → 输出 → 一句为什么」,覆盖调研给出的 8 种情形加秘密值(§5.5)。
 
 ### 5.4 程序怎么定来源,以及它到底保证了什么
@@ -285,6 +287,8 @@ A 组已花 ¥4.58,用户批的这份报价是 ¥16。实验分支那一列不�
 | 9 | 用户按助手要求给出验证码 —— 不记 | 账号登录 | 秘密值 | 英文 |
 
 先例:mem0 V3 的 11 个带「为什么」的例子、OpenViking 的好例 / 坏例 / 为什么坏、Claude Code 的每类 2~3 个例子(§1.3)。**和它们的出入**:我们的例子不教「来源怎么定」(那由字段和程序管),只教「依据哪一行、属于哪一类、内容怎么写」;每个例子一个领域,任何领域 1 / 9。**个数比用户说的 6~8 多一个**,多的是秘密值那一个(C1),列入 §15。
+
+11-16(「方案三:折中」,§15 第 8 条)另加两对**对照句**,不是完整例子(没有输入行与输出):第二次指令一对「厨房装修在等瓷砖(截至某日)」→ 状态、不给事件日期 /「某日瓷砖送到了」→ 事件日期是那一天(家装,英文);第一次指令一对「鱼缸的水泵在等配件(截至某日)」→ 状态 /「某日测得鱼缸水温 26 度」→ 事件日期是那一天(养鱼,中文)。两个领域都不与 9 个例子重复,9 个例子各 1 / 9 不变。
 
 ### 5.6 为什么不选别的
 
@@ -368,7 +372,7 @@ A 组已花 ¥4.58,用户批的这份报价是 ¥16。实验分支那一列不�
 | 4 | 邻居检索不带智能体名(`:1452-1459`;`sql.py` 只有传了才过滤),会取到别的智能体的经历 | **检索带上本次的智能体名**:邻居 = 共享的事实 + 本智能体的经历,就是召回范围 | 审查 H5;等于提前做 B-176 M0-1 ①(比对带作用域) |
 | 5 | 「重复」可以指向任何邻居 | 「重复」的目标必须是候选能被召回到的:事实候选只能与事实重复(否则别的智能体就召回不到这件事);经历候选可与事实或本智能体的经历重复。不满足 → 改为新增并计数 | 审查 H5:跨格的「重复」会让候选凭空消失 |
 | 6 | 更新 / 删除可以落到任何邻居上 | 程序拒绝并改为新增:① 跨「格」(格 = 类型 + 智能体名,与确定性「重复」同一格,`:1371-1390`);② 目标不是同一格里与候选**余弦相似度**最高的前 2 条之一(检索返回的顺序乘了时间衰减、频次、重要度,`sql.py:325-336`,内存实现同样,所以要按 `_reconcile_cosine` 重排后再取名次)。被选目标的名次与相似度都进计数 | ① 11-15 第一条违规就是「更新」落到经历上,用户拍板「跨类型拒绝改为新增」;② 审查 H4:没了门槛,「更新」落错目标会误伤一条无关的有效记忆。用名次不用相似度数值,因为数值跟着向量模型变(拒绝 0.80 的同一条理由)。本文安排;评测有「误伤」指标(§11.3) |
-| 7 | 读数不同日子是新的一条,只写在指令里(`:1171-1172`) | **事件日期规则**:候选与目标事件日期**相同、且候选带 `is_correction`** → 可以更新 / 删除(同一次的更正);相同但不是更正(例如同一天晚上又量了一次,事件日期只精确到天)→ 新增;两边事件日期不同,或只有一边有 → 更新 / 删除改为新增。完全相同仍是「重复」。指令保留「不同日子是新的一条」那句,管没有事件日期的老行 | 用户拍板「带日期的一次性事件只新增」;mem0 V3、Graphiti「周二 / 周三跑步」、OpenViking 事件只新增。同一天的更正可以更新是审查提的,偏离了用户字面,列入 §15 |
+| 7 | 读数不同日子是新的一条,只写在指令里(`:1171-1172`) | **事件日期规则**(11-16「方案三:折中」改):只在候选与目标**两边都有**事件日期时起作用 —— 相同、且候选带 `is_correction` → 可以更新 / 删除(同一次的更正);相同但不是更正(例如同一天晚上又量了一次,事件日期只精确到天)→ 新增;两边事件日期不同 → 更新 / 删除改为新增。**只有一边有**(或两边都没有)→ 不按这条拒绝,由模型照常判;例外:不带日期、不是更正的候选**删除**一条带日期的 → 改为新增(过去的读数不会变得不成立)。只有一边有日期、真的落了的更新 / 删除计 `event_date_one_sided_update` / `_delete`。**「重复」也一样**(复审 11-16,「方案三」在「重复」这条路上的落法):两边都有事件日期且不同,模型判「重复」也改为新增,计 `noop_other_event_date`。其余程序规则(同一格、前 2 名、候选那一行早于目标、层级拦截)照样管。完全相同仍是「重复」。指令(附录 B,11-16「改窄这句」):事件日期只标某天发生或测得的(读数、计数);读数、计数换了日子 / 时间是新的一条,带不带事件日期都算(内容里写的日期也算);对状态,内容里的「(as of <date>)」不算另一次 —— 同一件事的状态变了是更新,同样的状态再说一遍是重复;只有一边有事件日期时按内容判 | 用户拍板「带日期的一次性事件只新增」;mem0 V3、Graphiti「周二 / 周三跑步」、OpenViking 事件只新增。同一天的更正可以更新是审查提的,偏离了用户字面,列入 §15。**11-16 再偏一步**:回归闸门里带事件日期的 9 条错了 6 条(把状态当成了事件),按旧规则只有一边有就拒绝,这样一条被误标了日期的状态永远改不动、旧值一直当现值;用户 11-16 定「方案三:折中」,只有一边有时不再拒绝(§15 第 8 条)。Graphiti「两件事可以同时成立」、mem0 只新增是另两种取舍,见 §15 第 8 条「没选的」 |
 | 8 | 「重复」不带目标 | 「重复」要带目标。**只有当候选是用户一方、目标也是用户一方、且候选的 `turn` 落在新段里时**,程序把目标的确认日期刷新为那一行的发送时间;确定性「重复」(不问模型的)按同样的条件刷新 | OpenViking 画像「(截至某日)」再次确认时刷新。**出入**:来自助手的候选判成重复时不刷新 —— 否则正是 B-300 要防的「助手再得出一次就算又印证一次」;`turn` 不在新段(上下文行、没给)时也不刷新,免得一句旧话被反复算成「又说了一次」 |
 | 9 | 一段:两次提炼的产出合在一批里,批内互不比较 | **两段**:先合并、写入第一次的产出;再合并第二次的产出,这时第一段刚写的已经能被取成邻居 | 第二次不再被告诫「别记用户说的」,它会把用户说的再抽一遍(例子 5),必须能与第一次的产出比到 |
 | 10 | 指令(`:1153-1190`) | 按 mem0 / OpenViking 重写,附录 B:「只是换说法、没有新信息 → 重复;信息更多 → 更新那一条」;「只是相关不算更新对象,必须是同一主体、同一次」;「更新会替换原文,所以只有当候选仍然说着原文里还成立的每一件事时才选更新,否则新增」;删除的说明改成与代码一致 | mem0 `prompts.py:176-185,216-219`;OpenViking `merge_policy.py:7-16` |
@@ -389,11 +393,13 @@ A 组已花 ¥4.58,用户批的这份报价是 ¥16。实验分支那一列不�
 
 ### 7.4 事件日期:边界
 
-- **谁算**:提炼给了合法事件日期的(§5.4)。计划、安排、状态、偏好没有事件日期,照常可被更新。
+- **谁算**:提炼给了合法事件日期的(§5.4),不看类型 —— 读数常是「事实」,要各智能体共享(经历只在本智能体召回,`memory.py` 的召回范围)。计划、安排、状态、偏好没有事件日期,照常可被更新。11-16 审查后用户「去掉自检,读数共享」:不做「事实带事件日期就清空」的自检。
+- **规则只看两边都有的**(11-16「方案三:折中」):两边都有事件日期时,不同 → 新增,相同 → 只有更正能更新;只有一边有时不按事件日期拒绝,由模型照常判;真的落了(取代 / 作废成功)才计 `event_date_one_sided_update` / `_delete`,被层级拦下的、目标已不在的不计。不带日期的候选**更新**一条带日期的,新行没有事件日期(候选给什么存什么;本文安排)。**删除例外**:目标带日期、候选不带也不是更正 → 删除改为新增 —— 一次过去的读数不会变得不成立,一条不带日期的说法没有理由作废它;**状态那一面**:一条被误标了日期的状态,同样不能被一条不带日期、不是更正的候选删掉,只能被更新(换成新的说法)或被更正删掉。代价:一条真正的读数可能被一条不带日期的同主题候选**更新**掉;去重合并指令说读数、计数换了日子就是新的一条(内容里的日期也算),对状态才说内容里的「(as of <date>)」不算另一次,程序不再兜。
+- **「重复」**(复审 11-16,「方案三」在「重复」这条路上的落法,协调人转告用户):两边都有事件日期且不同 = 不同的两次,模型判「重复」程序也改为新增,计 `noop_other_event_date`;程序在问模型之前做的确定性「重复」(内容相同,`_identical_neighbors`)也不认这样的邻居,交给模型;同一天、只有一边有、两边都没有的「重复」照旧。
 - **同一天的更正**:用户说「今天早上是 7.4,刚才说错了」—— 事件日期相同且是更正,可以更新,原值作废(双时间轴里还在)。同一天晚上又量了一次(不是更正)→ 新增。用短回答做的更正(用户确认,层级 1)仍改不动用户说的那条读数(层级 2),两条并存 —— 层级规则优先(§6.3)。评测把整句更正与短回答更正分开报(§11.3)。
 - **不同天**:各存一条,永不互相覆盖。
-- **一条长期事实被误标了日期**:它就只能被同一天的候选更新,之后的说法都会作为新的一条存下 —— 所以要量「不是事件却被标了日期」的比例(§11.3),并由程序挡掉晚于那一行日期的。
-- **第一次与第二次的口径一致**:第一次指令里「读数、编号、当前状态要写上日期」是写在**内容**里的(防止日后被当成现值);`event_date` 字段只给一次性事件,当前状态、编号的 `event_date` 为空(附录 C 写明)。
+- **一条长期事实或状态被误标了日期**:11-16 之前,它只能被同一天的候选更新,之后不带日期的说法都会作为新的一条存下、旧值一直当现值;11-16 起,不带日期的候选可以照常更新它(带了另一天日期的候选仍新增)。仍要量「不是事件却被标了日期」的比例(§11.3),并由程序挡掉晚于那一行日期的。
+- **第一次与第二次的口径一致**:第一次指令里「读数、编号、当前状态要写上日期」是写在**内容**里的(防止日后被当成现值);复审 11-16 起分开写:当前状态写「(as of <date>)」,读数、计数写测得那天(「measured on <date>」),编号、起名字的号码不带日期;`event_date` 字段只给一次性事件,当前状态、编号的 `event_date` 为空(附录 A、附录 C 写明,并各有一对对照例子;11-16 加)。第二次指令的「(as of <date>)」只点当前状态,不点编号 —— 与例子 3(订单号不带日期)一致。
 - **汇总行**:事件日期为空(本文安排),照常可被更新。
 
 ### 7.5 成本
@@ -541,6 +547,7 @@ B-176 计划 M2-1 写的是「写回任务加 `from_message_index`」;本版连�
 | 内容形态 | 数字(例 5、7)、人名(例 2)、编号(例 3)、型号(例 4)、日期(例 1、7)、结论性短语(例 2、6)、状态 / 水平(例 3、8)、更正(例 4)、秘密值(例 9)—— 值类不过半 |
 | 语言 | 中文 4 个、英文 4 个、西班牙文 1 个;内容都跟着那段对话的语言 |
 | 英文出处句式模板 | 规则部分 0 处 |
+| 11-16 加的对照句 | 领域词 0 处命中(单元测试 `test_extraction_prompts_have_no_industry_words` 照跑);家装、养鱼各一对,不与例子重复 |
 
 **机制是否对任何内容形态都成立**(逐条看程序做的判断看不看内容):
 
@@ -638,9 +645,9 @@ B-176 计划 M2-1 写的是「写回任务加 `from_message_index`」;本版连�
 | 降级 | `basis` 为用户回答 / 同意、但 `turn` 指向助手行 / `[task]` 行 / 上下文行 / 越界,或上一行不是 `[assistant]` → 一律 `assistant_derived`、≤ 0.6 |
 | 用户确认的前提 | 只有「新段里的 `[user]` 行、上一行是 `[assistant]`」才产出 `user_confirmed`;第一次提炼的产出永远是 `user_stated`,第二次的永远不是 |
 | 上限 | `user_confirmed` ≤ 0.8;`assistant_derived` ≤ 0.6,无论模型回什么 |
-| 事件日期 | 晚于那一行日期的、解析不了的 → 空 |
+| 事件日期 | 晚于那一行日期的、解析不了的 → 空;类型不影响(「事实」的读数照样带日期,11-16) |
 | 层级拦截 | 五个层级两两组合的更新 / 删除:低改高一律拒;同层用户一方按置信度;用户确认 0.8 改不动 0.5 的用户说的(审查 H2 的反例);汇总行按成员最高层级 |
-| 去重合并 | 没有相似度门槛(相似度 0.3 的邻居也交给模型);最多 5 条;检索带智能体名;跨格、非前 2 名的更新 / 删除 → 新增;事实候选「重复」到经历 → 新增;事件日期相同且候选是更正才可更新,相同不是更正、不同或一边没有 → 新增;前 2 名按余弦重排后算;「重复」只在用户一方对用户一方且 `turn` 在新段时刷新,确定性「重复」同样;短编号映射,不认识的编号按没给决定;第二段能取到第一段刚写的行 |
+| 去重合并 | 没有相似度门槛(相似度 0.3 的邻居也交给模型);最多 5 条;检索带智能体名;跨格、非前 2 名的更新 / 删除 → 新增;事实候选「重复」到经历 → 新增;两边都有事件日期时,相同且候选是更正才可更新,相同不是更正、不同 → 新增;只有一边有 → 不按事件日期拒绝、落了才计 `event_date_one_sided_*`,不带日期的非更正删除带日期的仍拒绝;两边日期不同的「重复」→ 新增、计 `noop_other_event_date`(11-16「方案三:折中」与复审);前 2 名按余弦重排后算;「重复」只在用户一方对用户一方且 `turn` 在新段时刷新,确定性「重复」同样;短编号映射,不认识的编号按没给决定;第二段能取到第一段刚写的行 |
 | 失败语义 | 模型调用出错、解析失败、截断、取邻居失败、去重合并的模型调用失败、执行更新 / 删除时库出错、向量化 / 写库失败 → 处理器一律抛错(不再退回直接写入或新增);配置类错误不重试、直接收尾并计数;退回 `pending` 的任务带最早可领时间(30 秒、5 分钟),到点前领不到;新落的任务(`lease_until` 为空)立刻可领;等待重试的任务只挡同一对话里更晚的任务,不挡同一用户别的对话;第 2 次及以后的尝试对半分块;本轮内写回提炼成功后出错 → 同最后一次尝试;最后一次尝试在提炼成功后出错 → 进失败队列(用户 11-15「留一半」),其余尝试不进 |
 | 整理 | `user_confirmed` + 来自助手 → 不汇总;用户一方不同层级同簇 → 不汇总;汇总行受用户确认成员保护 |
 | 渲染 | 五种标签;提醒第二条点名三种;只有用户一方的行显示确认日期;提示词与 `MEMORY.md` 一致 |
@@ -681,7 +688,7 @@ B-176 计划 M2-1 写的是「写回任务加 `from_message_index`」;本版连�
 | T23 | 一个对话聊 8 轮 | 每次写回的提炼输入不随轮数增长(看用量与日志);同一件事有效行 ≤ 1 | S |
 | T24 | 发版前开的一个对话,发版后接着聊一轮 | 只提炼了最后一轮;旧记忆没变 | S |
 | T25 | 重新生成上一轮;再跑一次草稿运行;再触发一次审批续跑 | 重新生成的那轮被提炼、日期是原来那天;草稿轮没进任何记忆;续跑结束后整轮被提炼一次 | S |
-| T26 | 同一天先说一个读数,再整句更正;另起一次,用短回答更正;同一天晚上再说一个读数;第二天再说一个 | 整句更正取代原值;短回答更正与原值并存;晚上的、第二天的各另存一条 | R / X |
+| T26 | 同一天先说一个读数,再整句更正;另起一次,用短回答更正;同一天晚上再说一个读数;第二天再说一个;另起一次,先说一个带「截至今天」的状态、下一轮说它变了(11-16 加) | 整句更正取代原值;短回答更正与原值并存;晚上的、第二天的各另存一条;状态不带事件日期,误标了日期的那条不因只有一边有日期被拒绝,更新与新增分开报(11-16「方案三:折中」) | R / X |
 | T27 | 压缩前抢存触发的一轮 | 抢存没有调模型;轮末写回覆盖了被折掉的中段 | S |
 | T28 | 滚动发布期间新旧副本各跑一轮 | 无报错;旧副本写的行没有新字段 | 全部 |
 | T29 | 助手说「已向你手机发了验证码,请告诉我」,用户答出 | 没有任何记忆含这个值 | X |
@@ -767,7 +774,7 @@ E ‖ M → R → X → S。M、R、X、S 都改 `graph_builder/memory.py` 或�
 | 8 | CM-H4「无近邻(cosine < 0.80)直接新增、零模型成本」(`docs/streams/STREAM-CM-DESIGN.md:970`) | 去掉门槛,召回范围内最近 5 条;更新目标限前 2 名 | 用户 11-15 拍板 1;前 2 名是审查 H4 |
 | 9 | CM-H4「一切失败回落直写 ADD」中的失败队列 | 出错(含去重合并内部出错,现在是退回直接写入)改由任务自己重试,重试之间有 30 秒、5 分钟的间隔;失败队列只在最后一次尝试、提炼成功之后出错时兜底(用户 11-15「留一半」);重试用完的段不再有人补 | 审查 H3 与第 2 轮,§7.6 |
 | 10 | 去重合并指令里「读数不同日子是新的一条」(只是一句指令) | 由程序按事件日期执行;指令里保留这一句管老行 | 用户 11-15 拍板 1;审查 M2 |
-| 11 | 用户 11-15「带日期的一次性事件只新增」 | 不同天只新增;**同一天只有更正可以更新**(同一次的更正取代原值,同一天再量一次仍新增)—— 偏离字面,用户 11-15 按建议定(§15 第 3 条) | 审查 M2 与第 2 轮 |
+| 11 | 用户 11-15「带日期的一次性事件只新增」 | 不同天只新增;**同一天只有更正可以更新**(同一次的更正取代原值,同一天再量一次仍新增)—— 偏离字面,用户 11-15 按建议定(§15 第 3 条)。11-16 再改:只有一边有事件日期时不再拒绝(§15 第 8 条) | 审查 M2 与第 2 轮;回归闸门 `5b8588d0e` |
 | 11a | 原设计 / PR 2:整理时「来自助手 + 用户一方」的簇不汇总 | 用户一方里层级不同的成员同簇也不汇总;用户更正与用户说的同簇以前会汇总,现在不汇总 | 审查第 2 轮:防误标的用户确认借汇总升层 |
 | 12 | 去重合并指令里「删除时候选本身不存」 | 改成与 #2125 之后的代码一致 | 消除不一致 |
 | 13 | 原设计 §5.1 召回块:四种标签、说明行写 `date recorded`、提醒开头写「records made on the dates shown」 | 五种标签;用户一方的行日期取记录与最后再说里晚的,说明行写 `date recorded or last restated by the user`;提醒第二条点名三种用户一方来源 | 随拍板 1、2;审查 M4 |
@@ -780,7 +787,7 @@ E ‖ M → R → X → S。M、R、X、S 都改 `graph_builder/memory.py` 或�
 
 ---
 
-## 15. 用户拍板记录(2026-11-15)
+## 15. 用户拍板记录(2026-11-15;第 8 条 2026-11-16)
 
 > 用户 2026-11-15 看过第 5 版本节后:第 1 条「留一半」;第 2~7 条「全部按建议」;下一步「开设计 PR 并开工」。
 
@@ -793,6 +800,7 @@ E ‖ M → R → X → S。M、R、X、S 都改 `graph_builder/memory.py` 或�
 | 5 | 评测规模与新线(S 组 225 单元、形状留出集、A13~A15、§11.3 各线) | 按表 | 用户改数 |
 | 6 | 例子从「6~8 个」变成 9 个 | 9 个:秘密值那一个是既定规矩需要的示范;回归闸门若空列表回升先怀疑它(§11.1) | 去掉另一个例子凑回 8 个(建议不去:8 种情形都在用户 11-15 认可的清单上) |
 | 7 | 被重新生成 / 编辑重发取代的那一轮已写下的记忆 | 不清理(与现在一样);证据指针让以后能找出它们 | 本项顺带清理(要另设计) |
+| 8 | **只有一边有事件日期时,还拒不拒绝更新**(2026-11-16 新增)。回归闸门(`eval-out/b300/gate-5b8588d0e`):带事件日期的 9 条错了 6 条 —— 5 条是第一次产出的「经历 / 用户说的」状态(数据库迁移进度、「某日用户请助手确认 X」),1 条是第二次产出的「事实 / 用户确认」(构建失败的原因)。按第 3 条落下的规则,只有一边有日期就拒绝更新,一条被误标了日期的状态永远改不动,旧值一直当现值 | **「方案三:折中」(用户 2026-11-16)**。① 程序只在**两边都有**事件日期时按日期拒绝:不同 → 新增;相同但不是更正 → 新增;只有一边有 → 不按这条拒绝,由模型照常判,同一格、前 2 名、候选那一行早于目标、层级拦截照样管(§7.1 第 7 行)。去重合并指令里「同一天只有更正能改」那句限定为两边都有(附录 B)。② 两次提炼的指令:写进内容的日期写成「(as of <date>)」、不是事件日期;光有日期不算事件,说起 / 问起的那一天也不算;加一对同主题的对照例子(OpenViking 画像「截至某日」与事件分开的写法)。**审查后用户 2026-11-16 再定两条**:③「改窄这句」—— 去重合并指令里「不同日子是新的一条」「不同事件日期是不同的两次」只管某天发生或测得的(读数、计数,即带事件日期的);内容里写的「(as of <date>)」不算另一次,同一件事的状态变了是更新,同样的状态再说一遍是重复,只有一边有事件日期时按内容判。④「去掉自检,读数共享」—— 撤掉「事实带事件日期就清空」的自检(代码、计数、测试),例子 7 的读数仍是「事实」:经历只在本智能体召回,读数要各智能体共享。另按审查的低级别项:只有一边有而放行的更新 / 删除计 `event_date_one_sided_update` / `_delete`;不带日期、不是更正的候选删除一条带日期的仍拒绝(过去的读数不会变得不成立);第二次指令的「(as of <date>)」不点编号,与例子 3 一致。**复审(11-16)**:⑤ 第一次指令「写上日期」拆开 —— 当前状态写「(as of <date>)」,读数、计数写测得那天,编号不带日期;去重合并指令里「读数、计数换了日子是新的一条」带不带事件日期都管(内容里的日期也算),「(as of) 不算另一次」只对状态说 —— 否则没有事件日期的读数会被第二天的读数更新或判重复掉。⑥ 「方案三」在「重复」这条路上的落法:两边事件日期不同时,模型判的「重复」程序也改为新增(计 `noop_other_event_date`),与「不同日子是不同的两次」一致(协调人转告用户)。只有一边有日期的计数改为真的落了才记。**理由**:被误标的状态必须能被后来的说法更新;两边都有日期的读数仍按日分开(Graphiti「周二 / 周三跑步」两件都成立)。**偏离**:原来的字面是「带日期的一次性事件只新增」(mem0 只新增、OpenViking 事件只新增),第 3 条已放开同一天的更正;本条再放开「只有一边有」—— 一条真正带日期的读数,可能被一条不带日期的同主题候选更新(删除仍拒绝),只靠去重合并按内容判,程序不再兜。**先例依据**:调研过的系统里,只有 OpenAI cookbook 按模型打的「事件」标记硬拦写入(没有兜底、没有量过);零样本大模型分「事件 / 状态」的准确率约 0.7(CMCL 2024) | 方案一「只改问法」:规则不动,改问法、加成对的对照例子;仍靠模型,一旦误标,那条状态照样永远改不动。方案二「硬规则不看标记」:`event_date` 只用于显示与排序,「能不能更新」全交给去重合并比对新旧(Graphiti / mem0 的做法);「只新增」变成模型判断加一条评测线 |
 
 评测花费另报:开发完先报回归闸门的价,再报正式一轮的价,每份单独批(§11.7)。
 
@@ -845,7 +853,14 @@ write both what it was and what it is now.
 A value that happened or was observed on one day — a reading, a count, a payment made —
 gets "event_date": the day it refers to, as YYYY-MM-DD, counted from the date on its line
 when the line says "today", "this morning", "yesterday" and the like. Plans, arrangements,
-preferences and states get "event_date": null.
+preferences and states get "event_date": null. A date alone does not make something an
+event, and neither does the day something was said or asked about: a current status is
+written with "(as of <date>)" in the content, and that date is not an "event_date". For
+example:
+- "The kitchen renovation is waiting for the tiles (as of 2026-04-03)." — a state:
+  "event_date": null.
+- "On 2026-04-03 the tiles for the kitchen were delivered." — it happened that day:
+  "event_date": "2026-04-03".
 Passwords, one-time codes, bank card or bank account numbers and other secrets are never
 recorded, even when the user gives one in reply to the assistant.
 Write each memory as one sentence that can be understood on its own, in the language of
@@ -997,11 +1012,17 @@ For each candidate choose one operation:
 - "ADD": anything else. A memory that is only related — the same topic but another subject,
   person, item or occasion — is not a target; the candidate is an ADD.
 UPDATE and DELETE apply only to an existing memory of the same kind.
-Two memories with different event dates are different occasions: ADD. A memory with an
-"event_date" is changed only by a candidate with "is_correction": true about the same day;
-any other candidate about that day is a NOOP when it says the same thing and an ADD
-otherwise. A reading, count or status that refers to a different date or time than an
-existing memory is a new memory (ADD), not an UPDATE of the earlier one.
+An "event_date" marks something that happened or was measured on one day, such as a
+reading or a count. Two such memories with different event dates are different occasions:
+ADD. When both have the same "event_date", the existing memory is changed only by a
+candidate with "is_correction": true; any other candidate about that day is a NOOP when it
+says the same thing and an ADD otherwise. A reading or count taken on a different date or
+time than an existing one is a new memory (ADD), not an UPDATE of the earlier one, whether
+or not either has an "event_date": the date written in its content counts too.
+For a state, a date written in the content, such as "(as of <date>)", does not make another
+occasion: a changed state of the same thing is an UPDATE, and the same state said again is
+a NOOP.
+When only one of the two has an "event_date", decide by what they say.
 A candidate with "is_correction": true changes something said earlier: when an existing
 memory still says the earlier value, the candidate is an UPDATE of that memory.
 A candidate's "is_correction" says what the candidate does, not where it comes from; its
@@ -1036,16 +1057,17 @@ Respond with ONLY a JSON object, no prose and no code fences:
 
 ## 附录 C:第一次提炼指令的改动(逐句)
 
-只改下面几处,`memory.py:185-227` 其余文字一字不动(含「密码、验证码、卡号不记」那句),末尾照旧接「Output language」。
+只改下面几处,`_USER_TEXT_EXTRACTION_HEADER` 与 `_SCORING_TAIL`(原写的 `memory.py:185-227` 是 `16ec43eb1` 上的行号;本分支在 `memory.py:204-260`)其余文字一字不动(含「密码、验证码、卡号不记」那句),末尾照旧接「Output language」。
 
 | 位置 | 现在 | 改为 |
 |---|---|---|
 | 第一句 | `The input is every message one user typed in a conversation, one per line, oldest first. The other side of the conversation is not shown.` | `The input is messages one user typed in a conversation, one per line, oldest first, each starting with its number in brackets. The other side of the conversation is not shown. Lines above the line "=== new ===" were handled earlier and are there only so you can understand the lines below it; take every memory from the lines below it.` |
-| 日期那一句 | `a line that starts with a date in brackets was sent on that date, so turn "this morning", "yesterday" and the like in that line into a date counted from it; in a line without a date, leave such words as they are.` | `a date in brackets after the line number is the day that line was sent, so turn "this morning", "yesterday" and the like in that line into a date counted from it; in a line without a date, leave such words as they are.` |
-| 打分段(`_SCORING_TAIL`)里字段说明处加两条 | — | `- "turn": the number of the line that states it.`<br>`- "event_date": only for a value that happened or was observed on one day (a reading, a count, a payment made), that day as YYYY-MM-DD; null for anything else, including an id, a number that names something, or a current status, even when its date is written in the content.` |
+| 「写上日期」那一句(11-16「方案三:折中」改,复审 11-16 拆开) | `Write it with the date or time it refers to, so it is not later taken for a current value:` | `Write a date in the content so that it is not later taken for a current value: a current status with "(as of <date>)", and a reading or count with the day it was measured ("measured on <date>"); an id or a number that names something gets no date. For that date,` |
+| 日期那一句 | `a line that starts with a date in brackets was sent on that date, so turn "this morning", "yesterday" and the like in that line into a date counted from it; in a line without a date, leave such words as they are.` | `a date in brackets after the line number is the day that line was sent, so turn "this morning", "yesterday" and the like in that line into a date counted from it; in a line without a date, leave such words as they are. A date written in the content is not by itself an "event_date" (see below).`(末句 11-16「方案三:折中」加) |
+| 打分段(`_SCORING_TAIL`)里字段说明处加两条(`event_date` 一条 11-16「方案三:折中」改) | — | `- "turn": the number of the line that states it.`<br>`- "event_date": only for a value that happened or was observed on one day (a reading, a count, a payment made), that day as YYYY-MM-DD; null for anything else, including an id, a number that names something, or a current status, even when its date is written in the content. A date alone does not make something an event, and neither does the day something was said or asked about. For example:`<br>`  "鱼缸的水泵在等配件(截至 2026-04-03)" — a state: "event_date": null.`<br>`  "2026-04-03 测得鱼缸水温 26 度" — measured that day: "event_date": "2026-04-03".` |
 | JSON 格式 | `{"kind": …, "content": …, "importance": …, "confidence": …, "expected_valid_days": …, "is_correction": …}` | 同左,另加 `"turn": <line number>, "event_date": "<YYYY-MM-DD>" or null` |
 
-第一次里「读数、编号、当前状态要写上日期」写的是**内容**(防止日后被当成现值);`event_date` 只给一次性事件 —— 新加那一条把两者分开(审查 M2)。`_SCORING_TAIL` 只有第一次用(第二次的指令自成一体,`memory.py:235-277`),改它不影响第二次。
+第一次里「读数、编号、当前状态要写上日期」写的是**内容**(防止日后被当成现值);`event_date` 只给一次性事件 —— 新加那一条把两者分开(审查 M2)。回归闸门(`5b8588d0e`,11-16)里这一条没有拉住:9 条带事件日期的记忆错了 6 条,其中 5 条是第一次产出的「状态」(「截至某日在预发环境验证中」、「某日用户请助手确认一次迁移」),模型把写进内容的日期当成了事件日期。11-16「方案三:折中」因此在「写上日期」那句里点明写成「(as of <date>)」、写进内容的日期不是事件日期,并在 `event_date` 一条后加一对同主题的对照例子(OpenViking 画像「(截至某日)」与事件分开的写法):「截至某日 X 是 Y」→ 状态、不给事件日期;「某日测得 / 发生了 Y」→ 事件日期是那一天;并写明「光有日期不算事件,说起或问起的那一天也不算」。例子用的是家庭养鱼,不带行业词。复审(11-16)又把「写上日期」那句拆开:当前状态写「(as of <date>)」;读数、计数写测得那天(「measured on <date>」,与对照例子「2026-04-03 测得鱼缸水温 26 度」一致);编号、起名字的号码不带日期 —— 因为去重合并指令对状态说「内容里的 (as of) 日期不算另一次」,读数若也写成 (as of),没有事件日期的读数(`0190` 之前的行、模型漏给的)就会被第二天的读数更新或判重复掉。`_SCORING_TAIL` 只有第一次用(第二次的指令自成一体,`_CONVERSATION_EXTRACTION_SYSTEM`,本分支 `memory.py:273-432`),改它不影响第二次。
 
 ## 附录 D:召回渲染文字的改动
 

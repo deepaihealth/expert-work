@@ -198,7 +198,9 @@ _CONVERSATION_EXTRACTION = "conversation"
 # P1(用户 11-14「记,带上日期」):用户说自己的读数 / 编号 / 当前状态要记、带日期;审查后(11-14)
 # 日期按每行自己的发送日期(行首方括号)换算,不按重读那天,密码 / 验证码 / 卡号一类不记。
 # B-300 重做(设计 2026-11-15 附录 C,逐句):行带编号、``=== new ===`` 之上是上下文;打分段加
-# ``turn`` 与 ``event_date`` 两条(``_SCORING_TAIL`` 只有第一次用)。
+# ``turn`` 与 ``event_date`` 两条(``_SCORING_TAIL`` 只有第一次用)。「方案三:折中」(用户
+# 2026-11-16):写进内容的日期不是事件日期;事件日期一条加一对对照例子。复审(11-16):当前状态写
+# 「(as of <date>)」,读数 / 计数写测得那天,编号不带日期(去重合并按内容里的日期分开读数)。
 _USER_TEXT_EXTRACTION_HEADER = """You are a memory extraction module. The input is messages one user typed in a
 conversation, one per line, oldest first, each starting with its number in brackets.
 The other side of the conversation is not shown. Lines above the line "=== new ===" were
@@ -212,10 +214,13 @@ Only extract what these messages state on their own.
 - A value the user states about themselves or their own things, with the same message saying
   what it is — a reading or measurement, an id or number, a current status — is recorded even
   though it may change, except passwords, one-time codes, bank card or bank account numbers
-  and other secrets, which are never recorded. Write it with the date or time it refers to, so
-  it is not later taken for a current value: a date in brackets after the line number is the
-  day that line was sent, so turn "this morning", "yesterday" and the like in that line into a
-  date counted from it; in a line without a date, leave such words as they are.
+  and other secrets, which are never recorded. Write a date in the content so that it is not
+  later taken for a current value: a current status with "(as of <date>)", and a reading or
+  count with the day it was measured ("measured on <date>"); an id or a number that names
+  something gets no date. For that date, a date in brackets after the line number is the day
+  that line was sent, so turn "this morning", "yesterday" and the like in that line into a
+  date counted from it; in a line without a date, leave such words as they are. A date
+  written in the content is not by itself an "event_date" (see below).
 - A message that only agrees with, answers or refers to something that is not shown here
   (a bare "yes", "ok, do that", or a value or name with nothing saying what it is) states
   nothing by itself: skip it, and do not guess what it was about.
@@ -243,7 +248,10 @@ _SCORING_TAIL = (
     '- "event_date": only for a value that happened or was observed on one day (a '
     "reading, a count, a payment made), that day as YYYY-MM-DD; null for anything else, "
     "including an id, a number that names something, or a current status, even when its "
-    "date is written in the content.\n"
+    "date is written in the content. A date alone does not make something an event, and "
+    "neither does the day something was said or asked about. For example:\n"
+    '  "鱼缸的水泵在等配件(截至 2026-04-03)" — a state: "event_date": null.\n'
+    '  "2026-04-03 测得鱼缸水温 26 度" — measured that day: "event_date": "2026-04-03".\n'
     "Respond with ONLY a JSON object, no prose and no code fences:\n"
     '{"memories": [{"kind": "fact" | "episodic", "content": "<one concise '
     'sentence>", "importance": <0-1>, "confidence": <0-1>, '
@@ -259,7 +267,9 @@ _USER_TEXT_EXTRACTION_SYSTEM = _USER_TEXT_EXTRACTION_HEADER + "\n" + _SCORING_TA
 # 什么:原来那几句「不要记 X」全部删掉,重复交给去重合并;唯一保留的「不记」是秘密值(用户 11-14 定
 # 的既定规矩)。来源由程序写:「用户确认」跟着模型给的 ``basis``,程序只把它锚定到一条真实的用户
 # 输入行(挂不上就降为「来自助手」,``memory_lines``)。回归闸门里空列表若回升,先怀疑例子 9
-# (验证码 → 空列表,设计 §11.1)。
+# (验证码 → 空列表,设计 §11.1)。「方案三:折中」(用户 2026-11-16):事件日期那段加「写进内容的
+# 日期不是事件日期」与一对对照例子。例子 7 的读数仍是「事实」:经历只在本智能体召回,读数要各
+# 智能体共享(「去掉自检,读数共享」,用户 2026-11-16)。
 _CONVERSATION_EXTRACTION_SYSTEM = """You are a memory extraction module. The input is part of a conversation, one message per
 line. Each line starts with its number in brackets and a tag:
 - [user] — text the user typed, followed by the date it was sent.
@@ -291,7 +301,14 @@ write both what it was and what it is now.
 A value that happened or was observed on one day — a reading, a count, a payment made —
 gets "event_date": the day it refers to, as YYYY-MM-DD, counted from the date on its line
 when the line says "today", "this morning", "yesterday" and the like. Plans, arrangements,
-preferences and states get "event_date": null.
+preferences and states get "event_date": null. A date alone does not make something an
+event, and neither does the day something was said or asked about: a current status is
+written with "(as of <date>)" in the content, and that date is not an "event_date". For
+example:
+- "The kitchen renovation is waiting for the tiles (as of 2026-04-03)." — a state:
+  "event_date": null.
+- "On 2026-04-03 the tiles for the kitchen were delivered." — it happened that day:
+  "event_date": "2026-04-03".
 Passwords, one-time codes, bank card or bank account numbers and other secrets are never
 recorded, even when the user gives one in reply to the assistant.
 Write each memory as one sentence that can be understood on its own, in the language of
@@ -1356,7 +1373,11 @@ _RECONCILE_NEIGHBOR_LIMIT = 5
 _RECONCILE_TARGET_TOP = 2
 
 #: 附录 B(最终英文原文)。指令里没写的规则由程序执行:层级拦截、同一格、余弦前 2 名、召回范围、
-#: 事件日期、候选那一行早于目标的记录时间。
+#: 事件日期、候选那一行早于目标的记录时间。「方案三:折中」(用户 2026-11-16):同一天只有更正
+#: 能改的那句限定为两边都有事件日期,与程序规则一致;「改窄这句」(用户 2026-11-16):「不同日子
+#: 是新的一条」管读数、计数(带不带事件日期都管,内容里的日期也算);对状态,写进内容的
+#: 「(as of <date>)」不算另一次,状态变了是更新、同样的状态再说一遍是重复;只有一边有事件日期时
+#: 按内容判(复审 11-16)。程序另把「两边事件日期不同」的「重复」改为新增。
 _RECONCILE_SYSTEM = """\
 You compare newly extracted memories ("candidates") with existing memories about the same
 user and decide what to store. Each candidate comes with up to five existing memories that
@@ -1375,11 +1396,17 @@ For each candidate choose one operation:
 - "ADD": anything else. A memory that is only related — the same topic but another subject,
   person, item or occasion — is not a target; the candidate is an ADD.
 UPDATE and DELETE apply only to an existing memory of the same kind.
-Two memories with different event dates are different occasions: ADD. A memory with an
-"event_date" is changed only by a candidate with "is_correction": true about the same day;
-any other candidate about that day is a NOOP when it says the same thing and an ADD
-otherwise. A reading, count or status that refers to a different date or time than an
-existing memory is a new memory (ADD), not an UPDATE of the earlier one.
+An "event_date" marks something that happened or was measured on one day, such as a
+reading or a count. Two such memories with different event dates are different occasions:
+ADD. When both have the same "event_date", the existing memory is changed only by a
+candidate with "is_correction": true; any other candidate about that day is a NOOP when it
+says the same thing and an ADD otherwise. A reading or count taken on a different date or
+time than an existing one is a new memory (ADD), not an UPDATE of the earlier one, whether
+or not either has an "event_date": the date written in its content counts too.
+For a state, a date written in the content, such as "(as of <date>)", does not make another
+occasion: a changed state of the same thing is an UPDATE, and the same state said again is
+a NOOP.
+When only one of the two has an "event_date", decide by what they say.
 A candidate with "is_correction": true changes something said earlier: when an existing
 memory still says the earlier value, the candidate is an UPDATE of that memory.
 A candidate's "is_correction" says what the candidate does, not where it comes from; its
@@ -1579,13 +1606,16 @@ def _identical_neighbors(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> l
     比写入去重严:SQL 唯一索引那一格是 (tenant, user, content_hash, agent_name),不含 kind)、来源
     层级不低于候选(重做 §6.3,:func:`origin_tier`)的有效邻居。不带更正的候选碰上这样的邻居 →
     确定性 NOOP,不问模型;层级更低的相同内容(用户说的候选对上用户确认 / 来自助手的)照旧交给模型
-    (应更新、升格)。"""
+    (应更新、升格)。两边事件日期不同的不算(不同的两次,§7.4;复审 11-16)。"""
     text = _normalized_text(item.content)
     tier = origin_tier(item)
     return [
         n
         for n in neighbors
-        if _same_cell(n, item) and origin_tier(n) >= tier and _normalized_text(n.content) == text
+        if _same_cell(n, item)
+        and origin_tier(n) >= tier
+        and _normalized_text(n.content) == text
+        and not _other_event_dates(item, n)
     ]
 
 
@@ -1608,13 +1638,27 @@ def _in_recall_scope(item: MemoryItem, target: MemoryItem) -> bool:
     return item.kind == "episodic" and target.agent_name == item.agent_name
 
 
-def _event_dates_allow(candidate: _Candidate, target: MemoryItem) -> bool:
-    """重做 §7.1 第 7 行 —— 两边都没有事件日期 → 照常;事件日期相同、且候选带更正 → 可以
-    (同一次的更正);相同但不是更正(同一天又量了一次)、不同、只有一边有 → 不可以。"""
+def _other_event_dates(item: MemoryItem, target: MemoryItem) -> bool:
+    """两边都有事件日期、且不同 = 不同的两次(§7.1 第 7 行)。"""
+    ours, theirs = item.occurred_on, target.occurred_on
+    return ours is not None and theirs is not None and ours != theirs
+
+
+def _one_sided_event_date(item: MemoryItem, target: MemoryItem) -> bool:
+    return (item.occurred_on is None) != (target.occurred_on is None)
+
+
+def _event_dates_allow(op: str, candidate: _Candidate, target: MemoryItem) -> bool:
+    """重做 §7.1 第 7 行 —— 两边都有事件日期:相同、且候选带更正 → 可以(同一次的更正);相同但
+    不是更正(同一天又量了一次)、不同 → 不可以。只有一边有、两边都没有 → 不按这条拒绝,由模型
+    照常判(「方案三:折中」,用户 2026-11-16:被误标了日期的状态也要能被更新,§15);例外:不带
+    日期、不是更正的候选「删除」一条带日期的 → 不可以(过去的读数不会变得不成立,§7.4)。"""
     ours, theirs = candidate.item.occurred_on, target.occurred_on
-    if ours is None and theirs is None:
-        return True
-    return ours == theirs and candidate.is_correction
+    if ours is not None and theirs is not None:
+        return ours == theirs and candidate.is_correction
+    if op == "DELETE" and theirs is not None:
+        return candidate.is_correction
+    return True
 
 
 def _refusal(op: str, pending: _Pending, target: MemoryItem) -> str | None:
@@ -1626,7 +1670,7 @@ def _refusal(op: str, pending: _Pending, target: MemoryItem) -> str | None:
     same_cell = [n.id for n in pending.neighbors if _same_cell(n, item)]
     if same_cell.index(target.id) >= _RECONCILE_TARGET_TOP:
         return "rank"
-    if not _event_dates_allow(candidate, target):
+    if not _event_dates_allow(op, candidate, target):
         return "event_date"
     # 目标的记录时间与材料里给的日期同一个口径;没有时区的按 UTC 读。
     recorded = restated_at(target)
@@ -1876,8 +1920,13 @@ def _would_write(
     if entry.identical:
         return False
     op, target = _resolve_target(entry, op, short, by_short_id)
-    in_scope = target is not None and _in_recall_scope(entry.candidate.item, target)
-    return not (op == "NOOP" and in_scope)
+    item = entry.candidate.item
+    kept_as_noop = (
+        target is not None
+        and _in_recall_scope(item, target)
+        and not _other_event_dates(item, target)
+    )
+    return not (op == "NOOP" and kept_as_noop)
 
 
 async def _reconcile_into(
@@ -1953,6 +2002,10 @@ async def _apply_decision(
         if not _in_recall_scope(item, target):
             record_memory_reconcile(op="noop_out_of_scope")
             return _Reconciled([item], [])
+        if _other_event_dates(item, target):
+            # 复审 11-16(「方案三」在「重复」这条路上):事件日期不同 = 不同的两次 → 新增。
+            record_memory_reconcile(op="noop_other_event_date")
+            return _Reconciled(keep, [])
         await _noop(candidate, target, deps)
         return _Reconciled([], [])
     refusal = _refusal(op, entry, target)
@@ -1971,9 +2024,10 @@ async def _apply_decision(
             lower_confidence=target_standing.tier == standing.tier,
         )
         return _Reconciled([kept] if kept is not None else [], [])
+    one_sided = _one_sided_event_date(item, target)
     if op == "UPDATE":
-        return await _update(entry, target.id, standing, positions, deps)
-    return await _delete(entry, target.id, standing, deps)
+        return await _update(entry, target.id, standing, positions, deps, one_sided=one_sided)
+    return await _delete(entry, target.id, standing, deps, one_sided=one_sided)
 
 
 async def _update(
@@ -1982,7 +2036,10 @@ async def _update(
     standing: OriginStanding,
     positions: Mapping[UUID, int],
     deps: _ReconcileDeps,
+    *,
+    one_sided: bool = False,
 ) -> _Reconciled:
+    """``one_sided`` = 只有一边有事件日期;真的取代了才计 ``event_date_one_sided_update``。"""
     item = entry.candidate.item
     adds_when_blocked = entry.candidate.is_correction and not entry.identical
     try:
@@ -2016,12 +2073,20 @@ async def _update(
         record_memory_reconcile(op="target_changed")
         return _Reconciled([item], [])
     record_memory_reconcile(op="update" if updated else "degraded")
+    if updated and one_sided:
+        record_memory_reconcile(op="event_date_one_sided_update")
     return _Reconciled([] if updated else [item], [], 1 if updated else 0)
 
 
 async def _delete(
-    entry: _Pending, target: UUID, standing: OriginStanding, deps: _ReconcileDeps
+    entry: _Pending,
+    target: UUID,
+    standing: OriginStanding,
+    deps: _ReconcileDeps,
+    *,
+    one_sided: bool = False,
 ) -> _Reconciled:
+    """``one_sided`` 同 :func:`_update`:真的作废了才计 ``event_date_one_sided_delete``。"""
     item = entry.candidate.item
     adds_when_blocked = entry.candidate.is_correction and not entry.identical
     try:
@@ -2041,6 +2106,8 @@ async def _delete(
             lower_confidence=isinstance(exc, UserSideHigherConfidenceError),
         )
         return _Reconciled([kept] if kept is not None else [], [])
+    if deleted and one_sided:
+        record_memory_reconcile(op="event_date_one_sided_delete")
     if adds_when_blocked:
         # 审查 MEDIUM-4(11-14):带新值的更正被判成「删除」—— 旧的作废,新值照样存下,
         # 不能两样都没了(删除没成也存:不丢新值)。
