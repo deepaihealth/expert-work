@@ -1131,3 +1131,184 @@ async def test_a_failure_hands_back_everything_that_is_not_a_duplicate() -> None
     # 第一条已落库;第二条(出错的那条)还没写;第三条判成重复,不算要写。
     assert [m.id for m in raised.value.unwritten] == [second.id]
     assert raised.value.superseded == 1
+
+
+# ─── 独立审查(11-16)之后 ───────────────────────────────────────────────
+
+
+async def test_a_noop_of_a_weaker_user_side_row_keeps_it_and_links() -> None:
+    """用户 2026-11-16(审查 M-2):模型的「重复」含「说得更少」。目标是用户一方、层级更低、内容
+    又不完全相同时,整条退掉会丢旧行里多出的信息 —— 候选照写、目标不退、两条并存并连线。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    fuller = c.mem(
+        "prefers morning lessons because of the afternoon pickup",
+        _at(0.95),
+        origin="user_confirmed",
+    )
+    await store.write([fuller])
+    cand = c.mem("prefers morning lessons", origin="user_stated")
+    counts = _Counts("noop_weaker_user_side_kept", "noop_weaker_target_written", "retired")
+    assert await _reconcile(store, _LLM([_ops(_noop("e0"))]), _said(cand)) == 1
+    assert _stored(store, cand) and _untouched(store, fuller)
+    assert _row(store, cand.id).supersedes == fuller.id  # 只是连着:指向的行仍有效
+    assert counts.delta() == {
+        "noop_weaker_user_side_kept": 1,
+        "noop_weaker_target_written": 0,
+        "retired": 0,
+    }
+    recalled = await store.retrieve(
+        tenant_id=c.tenant, user_id=c.user, query_embedding=_E, limit=10
+    )
+    assert {r.id for r in recalled} == {cand.id, fuller.id}
+
+
+async def test_a_noop_with_an_unknown_target_uses_neither_list() -> None:
+    """「重复」的编号不认识 = 没给决定:写下、什么都不退,它给的两张清单也不用(§7.1 第 3 行)。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    old = c.mem("the weekly sync is on Tuesday", _at(0.9))
+    await store.write([old])
+    cand = c.mem("the weekly sync moved to Thursday")
+    reply = _ops({"index": 0, "op": "NOOP", "target_id": "e9", "replaces": ["e0"]})
+    counts = _Counts("degraded", "retired")
+    assert await _reconcile(store, _LLM([reply]), _said(cand)) == 1
+    assert _stored(store, cand) and _untouched(store, old)
+    assert counts.delta() == {"degraded": 1, "retired": 0}
+
+
+async def test_a_duplicate_that_denies_part_of_a_summary_flags_it_by_the_row_it_repeats() -> None:
+    """候选判成「重复」一条有效的用户一方行,同时把汇总行列进 replaces:候选不写,但用户确实否认了
+    汇总里的事 —— 用它重复的那条作依据打标并连上。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    summary = await _summary(store, c, "commutes by metro; lives downtown", "user_stated")
+    said = c.mem("now drives to work", _at(0.99), created_at=datetime.now(UTC))
+    await store.write([said])
+    cand = c.mem("drives to work these days")
+    counts = _Counts("retire_refused_summary", "summary_rewrite_marked")
+    # 邻居按余弦:said(e0)、summary(e1)。
+    reply = _ops(_noop("e0", replaces=["e1"]))
+    assert await _reconcile(store, _LLM([reply]), _now_said(cand)) == 0
+    assert not _stored(store, cand)
+    assert _row(store, summary.id).review_flagged_at is not None
+    assert _row(store, said.id).supersedes == summary.id
+    assert counts.delta() == {"retire_refused_summary": 1, "summary_rewrite_marked": 1}
+
+
+async def test_a_duplicate_of_an_assistant_row_does_not_flag_a_summary() -> None:
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    summary = await _summary(store, c, "commutes by metro; lives downtown", "assistant_derived")
+    noted = c.mem("now drives to work", _at(0.99), origin="assistant_derived")
+    await store.write([noted])
+    cand = c.mem("drives to work these days", origin="assistant_derived")
+    counts = _Counts("summary_rewrite_marked")
+    reply = _ops(_noop("e0", replaces=["e1"]))
+    assert await _reconcile(store, _LLM([reply]), _now_said(cand)) == 0
+    assert _row(store, summary.id).review_flagged_at is None
+    assert counts.delta() == {"summary_rewrite_marked": 0}
+
+
+async def test_only_the_first_of_two_summaries_is_flagged() -> None:
+    """一句话点了两条汇总行:新行只有一个 ``supersedes`` 可以连,连不上的那条重写时找不到这句
+    说法 —— 只给第一条打标,第二条只计数(不加迁移的取舍)。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    first = await _summary(store, c, "commutes by metro; lives downtown", "user_stated")
+    members = [c.mem(f"member {uuid4()}", (0.0, 1.0, 0.0, 0.0))]
+    await store.write(members)
+    second = await store.write_consolidated(
+        tenant_id=c.tenant,
+        user_id=c.user,
+        content="takes line 2; has a monthly pass",
+        embedding=_at(0.8),
+        source_ids=[m.id for m in members],
+        source_hashes={m.id: hash_content(m.content) for m in members},
+    )
+    cand = c.mem("now drives to work")
+    counts = _Counts("retire_refused_summary", "summary_rewrite_marked")
+    reply = _ops(_add(replaces=["e0", "e1"]))
+    assert await _reconcile(store, _LLM([reply]), _now_said(cand)) == 1
+    assert _row(store, first.id).review_flagged_at is not None
+    assert _row(store, second.id).review_flagged_at is None
+    assert _row(store, cand.id).supersedes == first.id
+    assert counts.delta() == {"retire_refused_summary": 2, "summary_rewrite_marked": 1}
+
+
+@pytest.mark.parametrize(("later", "written"), [(False, False), (True, True)])
+async def test_a_value_retired_earlier_in_the_batch_is_not_brought_back(
+    later: bool, written: bool
+) -> None:
+    """同一批里:c1「搬到北京」刚把旧行 D「住在上海」退了,c2 与 D 内容相同。c2 那句话不晚于
+    c1 → 它只是在重复一个已被推翻的旧值,不写回有效行(D 已经是连着 c1 的历史行);c2 确实更晚
+    (用户又改回去了)→ 照写。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    shanghai = c.mem("lives in Shanghai", source_thread_id=_THREAD, evidence_message_id="m-0")
+    other = c.mem("has a cat", (0.0, 1.0, 0.0, 0.0))
+    await store.write([shanghai, other])
+    t1 = _LATER
+    beijing = c.mem(
+        "moved to Beijing", _at(0.95), source_thread_id=_THREAD, evidence_message_id="m-2"
+    )
+    again = c.mem("lives in Shanghai", source_thread_id=_THREAD, evidence_message_id="m-x")
+    t_again = t1 + timedelta(minutes=5) if later else t1 - timedelta(minutes=5)
+    counts = _Counts("noop_already_superseded")
+    # c1 的邻居按余弦:shanghai(e0)、other(e1)。c2 与 shanghai 相同、旁边还有 other → 照样进模型。
+    reply = _ops(_add(0, replaces=["e0"]), _add(1))
+    stored = await _reconcile(
+        store,
+        _LLM([reply]),
+        _said(beijing, at=t1),
+        _said(again, at=t_again),
+        message_times={"m-0": _T0, "m-2": t1, "m-x": t_again},
+    )
+    assert _retired_into(store, shanghai, beijing)
+    assert _stored(store, again) is written
+    assert stored == (2 if written else 1)
+    assert counts.delta() == {"noop_already_superseded": 0 if written else 1}
+
+
+async def test_a_failed_model_call_does_not_hand_back_a_candidate_that_is_a_duplicate() -> None:
+    """M-4:内容相同、只为「问退谁」进了模型调用的候选,模型调用失败时不算「还没写的」。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    current = c.mem(
+        "governed by Singapore law", source_thread_id=_THREAD, evidence_message_id="m-1"
+    )
+    await store.write([current, c.mem("governed by Shanghai law", _at(0.9))])
+    duplicate = c.mem(
+        "governed by Singapore law", source_thread_id=_THREAD, evidence_message_id="m-9"
+    )
+    fresh = c.mem("signed in 2021", _at(0.8))
+
+    class _BrokenLLM:
+        async def __call__(self, **kwargs: Any) -> AIMessage:
+            raise TimeoutError("model timed out")
+
+    with pytest.raises(ReconcileFailedError) as raised:
+        await _reconcile_and_apply(
+            [_said(duplicate), _said(fresh)],
+            agent_name=_AGENT,
+            positions={},
+            memory_store=store,
+            llm_caller=_BrokenLLM(),  # type: ignore[arg-type]
+            token=CancellationToken(),
+            log_label="test",
+        )
+    assert [m.id for m in raised.value.unwritten] == [fresh.id]
+
+
+async def test_a_retry_after_the_history_row_landed_adds_no_second_one() -> None:
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    later, earlier, times = _two_turns(c)
+    await store.write([later])
+    reply = _ops(_add(replaces=["e0"]))
+    assert await _reconcile(store, _LLM([reply]), _said(earlier, at=_T0), message_times=times) == 1
+    retried = earlier.model_copy(update={"id": uuid4()})
+    counts = _Counts("written_as_history")
+    assert await _reconcile(store, _LLM([reply]), _said(retried, at=_T0), message_times=times) == 0
+    assert len([r for r in store._rows if r.content == earlier.content]) == 1
+    assert counts.delta() == {"written_as_history": 0}

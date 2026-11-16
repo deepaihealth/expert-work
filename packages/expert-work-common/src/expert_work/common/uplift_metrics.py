@@ -514,8 +514,13 @@ def record_memory_reconcile(*, op: str) -> None:
     stored, no refresh); ``noop_out_of_scope`` (the model's duplicate target is one the
     candidate could not be recalled through: stored); ``noop_other_event_date`` (the
     duplicate target has another event date — another occasion: stored);
-    ``noop_weaker_target_written`` (the model judged it a duplicate of a memory with a
-    weaker source: stored, and that memory joins the ones to retire);
+    ``noop_weaker_target_written`` (the model judged it a duplicate of an assistant-side
+    memory: stored, and that memory joins the ones to retire);
+    ``noop_weaker_user_side_kept`` (the model judged it a duplicate of a user-side memory
+    with a weaker source whose text is not the same: stored, that memory is kept — the
+    model's "duplicate" includes "says less" — and the new row links to it);
+    ``noop_already_superseded`` (it repeats a memory that a statement not older than it
+    has just retired: not stored, so the overturned value is not brought back);
     ``written_as_history`` (stored as an already-superseded row linked to a later
     statement of the same conversation); ``collision_weaker_replaced`` (the same text was
     held by a live row with a weaker source: that row retired, the candidate stored);
@@ -795,7 +800,8 @@ def record_memory_summary_rewrite(*, outcome: str) -> None:
     nothing stored), ``blocked`` (the new sentence was refused by the write scan: flag
     cleared), ``abandoned`` (flagged for 7 days without success: flag cleared),
     ``corrected_member`` (a member was corrected in the console meanwhile: summary kept,
-    flag cleared)."""
+    flag cleared), ``statement_gone`` (the user's statement the flag was set by was deleted
+    and has no valid successor: nothing to rewrite by, flag cleared, no model call)."""
     _memory_summary_rewrite_total.labels(outcome=outcome).inc()
 
 

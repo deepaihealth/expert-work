@@ -81,7 +81,7 @@ from expert_work.protocol import AuditAction, AuditResult, MemoryItem, Structure
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.middleware import LLMOutputValidationError
 from orchestrator.context.memory_render import as_utc, origin_label
-from orchestrator.graph_builder.memory import _normalized_text
+from orchestrator.graph_builder.memory import normalized_memory_text
 from orchestrator.llm import Embedder, embed_with_model
 
 if TYPE_CHECKING:
@@ -620,7 +620,9 @@ class _SummaryRewrite:
 
 def _parse_summary_rewrite_reply(reply: ConsolidatorLLMReply) -> _SummaryRewrite | None:
     """Validate the summary-rewrite LLM reply; ``None`` on malformed (the caller counts a
-    failed attempt and keeps the flag). An empty sentence is read as "nothing remains"."""
+    failed attempt and keeps the flag). Only ``null`` means "nothing remains" (appendix
+    E): an empty or blank sentence is malformed — reading it as "nothing remains" would
+    retire a whole summary on a model slip (review M-1)."""
     try:
         if reply.parsed is not None:
             data = _SummaryRewriteReplyModel.model_validate(reply.parsed)
@@ -628,8 +630,10 @@ def _parse_summary_rewrite_reply(reply: ConsolidatorLLMReply) -> _SummaryRewrite
             data = _SummaryRewriteReplyModel.model_validate_json(reply.text)
     except ValidationError:
         return None
-    text_out = data.summary.strip() if data.summary is not None else ""
-    return _SummaryRewrite(summary=text_out or None)
+    if data.summary is None:
+        return _SummaryRewrite(summary=None)
+    revised = data.summary.strip()
+    return _SummaryRewrite(summary=revised) if revised else None
 
 
 # ---------------------------------------------------------------------------
@@ -797,9 +801,15 @@ class SummaryRewriter:
         self._actor_id = actor_id
         self._clock = clock
 
-    async def rewrite_for_user(self, *, tenant_id: UUID, user_id: UUID) -> list[str]:
+    async def rewrite_for_user(
+        self, *, tenant_id: UUID, user_id: UUID, limit: int | None = None
+    ) -> list[str]:
         """重写这个用户**所有**打了标、仍有效的汇总行(不只是本次写回打的 —— 任务重试时候选走
         确定性「重复」、不会再打标,但上一次尝试留下的标还在)。返回各条的结果(计数名)。
+
+        ``limit``:这一次最多处理几条(标得最早的先做;没轮到的留给下一次)。写回任务收尾时给
+        一个小上限 —— 它占着那条任务的租约;巡检不给(每个用户至多
+        :data:`_MAX_SUMMARY_REWRITES_PER_USER` 条)。
 
         落库时发现标记时间变了(重写期间又有新的否认连上来,``stale``)→ 紧接着重做一遍,这次会
         读到两条新说法;仍不一样就留给下一次。"""
@@ -808,6 +818,8 @@ class SummaryRewriter:
             flagged = await self._flagged(tenant_id, user_id)
             stale: set[UUID] = set()
             for entry in flagged:
+                if limit is not None and len(outcomes) >= limit:
+                    break
                 outcome = await self._attempt(entry, tenant_id=tenant_id, user_id=user_id)
                 if outcome is None:
                     continue
@@ -880,8 +892,13 @@ class SummaryRewriter:
             # 上一次失败之后 4 小时内不再试;期间有新的否认连上来(标记时间更晚)则立刻再试。
             return None
         if not entry.statements:
-            # 连着它的用户说法已经不在了(被删、被更晚的一句退掉):没有可拿去重写的,不调模型。
-            return None
+            # 连着它的用户说法已经不在了(被用户删掉,又没有仍有效的后继 —— 被更晚一句退掉的
+            # 存储已经顺连线走过一步):没有可拿去重写的。当场清标并计数,不调模型,也不让标挂到
+            # 7 天(审查 M-3);之后用户再否认会重新打标。
+            await self._memory.mark_reviewed(
+                tenant_id=tenant_id, user_id=user_id, memory_id=summary.id
+            )
+            return "statement_gone"
         try:
             reply = await self._aux(
                 prompt=_build_summary_rewrite_prompt(entry, today=now.date()),
@@ -913,9 +930,9 @@ class SummaryRewriter:
             )
             return "failed"
         revised = verdict.summary
-        unchanged = revised is not None and _normalized_text(revised) == _normalized_text(
-            summary.content
-        )
+        unchanged = revised is not None and normalized_memory_text(
+            revised
+        ) == normalized_memory_text(summary.content)
         embedding: tuple[float, ...] = ()
         embedding_model: str | None = None
         if revised is not None and not unchanged:

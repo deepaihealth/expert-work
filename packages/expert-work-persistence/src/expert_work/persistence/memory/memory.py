@@ -528,6 +528,12 @@ class InMemoryMemoryStore(MemoryStore):
         self._retire_rows(retired, new_item.id, now)
         clash = self._dedup_clash(new_item, content_hash)
         replaced: UUID | None = None
+        if clash is not None and not _currently_valid(clash, now=now):
+            # 审查 H-1 —— the holder occupies the dedup slot but is not recalled (a member
+            # folded into a summary): the sentence is NOT "already there". It gives up the
+            # slot and the new row is written as usual.
+            self._retire_rows([clash.id], new_item.id, now)
+            clash = None
         if clash is not None:
             load = self._member_loader(tenant_id, user_id)
             if await origin_standing(clash, load) >= tier_of(candidate):
@@ -594,9 +600,27 @@ class InMemoryMemoryStore(MemoryStore):
         if self._current(tenant_id, user_id, anchor_id) is None:
             return None
         now = datetime.now(UTC)
+        content_hash = new_item.content_hash or hash_content(new_item.content)
+        # A retried job must not add the same history row again.
+        existing = next(
+            (
+                r
+                for r in self._rows
+                if r.tenant_id == tenant_id
+                and r.user_id == user_id
+                and r.superseded_by == anchor_id
+                and r.invalid_at is not None
+                and r.deleted_at is None
+                and (r.agent_name or "") == (new_item.agent_name or "")
+                and (r.content_hash or hash_content(r.content)) == content_hash
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
         written = new_item.model_copy(
             update={
-                "content_hash": new_item.content_hash or hash_content(new_item.content),
+                "content_hash": content_hash,
                 "valid_at": now,
                 "created_at": now,
                 "last_used_at": now,
@@ -609,6 +633,20 @@ class InMemoryMemoryStore(MemoryStore):
         )
         self._rows.append(written)
         return written
+
+    async def flag_summary(
+        self, *, tenant_id: UUID, user_id: UUID, summary_id: UUID, statement_id: UUID
+    ) -> UUID | None:
+        statement = self._current(tenant_id, user_id, statement_id)
+        if statement is None:
+            return None
+        flagged = await self._flag_summaries(
+            tenant_id, user_id, [summary_id], effective_origin(statement), datetime.now(UTC)
+        )
+        if not flagged:
+            return None
+        self._change([statement_id], supersedes=flagged[0])
+        return flagged[0]
 
     async def expire(
         self,
@@ -968,19 +1006,30 @@ class InMemoryMemoryStore(MemoryStore):
         return out
 
     def _later_statements(self, summary: MemoryItem, now: datetime) -> list[MemoryItem]:
+        """Mirrors the SQL store: user-side rows linked to the summary and recorded or last
+        restated after it; one that was replaced is followed one step to its currently
+        valid user-side successor."""
         floor = datetime.min.replace(tzinfo=UTC)
-        found = [
+
+        def owned_user_side(r: MemoryItem) -> bool:
+            return (
+                r.tenant_id == summary.tenant_id
+                and r.user_id == summary.user_id
+                and r.deleted_at is None
+                and effective_origin(r) in USER_SIDE_ORIGINS
+            )
+
+        linked = [
             r
             for r in self._rows
-            if r.tenant_id == summary.tenant_id
-            and r.user_id == summary.user_id
+            if owned_user_side(r)
             and r.supersedes == summary.id
-            and r.deleted_at is None
-            and _currently_valid(r, now=now)
-            and effective_origin(r) in USER_SIDE_ORIGINS
-            and (r.created_at or floor) > (summary.created_at or floor)
+            and max(r.created_at or floor, r.confirmed_at or floor) > (summary.created_at or floor)
         ]
-        return sorted(found, key=lambda r: (r.created_at or floor, r.id))
+        linked.sort(key=lambda r: (r.created_at or floor, r.id))
+        wanted = [r.superseded_by if r.invalid_at is not None else r.id for r in linked]
+        by_id = {r.id: r for r in self._rows if owned_user_side(r) and _currently_valid(r, now=now)}
+        return [by_id[i] for i in dict.fromkeys(wanted) if i is not None and i in by_id]
 
     async def rewrite_summary(
         self,
@@ -1018,13 +1067,19 @@ class InMemoryMemoryStore(MemoryStore):
 
         if content is None:
             statements = self._later_statements(old, now)
-            close(statements[-1].id if statements else None)
+            if not statements:
+                return "stale"  # nothing to link the retired summary to: change nothing
+            close(statements[-1].id)
             return "emptied"
         probe = old.model_copy(update={"agent_name": None})
         clash = self._dedup_clash(probe, hash_content(content))
         if clash is not None and clash.id != old.id:
-            close(clash.id)
-            return "collided"
+            if _currently_valid(clash, now=now):
+                close(clash.id)
+                return "collided"
+            # 审查 H-2 —— the holder is not recalled (typically one of this summary's own
+            # members): it gives up the slot and the new summary is stored.
+            self._retire_rows([clash.id], new_id, now)
         members = list(await load(list(old.consolidated_from)))
         inherited = summary_fields(members) if members else None
         close(new_id)

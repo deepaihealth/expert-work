@@ -1660,7 +1660,7 @@ def _fold_width(ch: str) -> str:
     return ch
 
 
-def _normalized_text(text: str) -> str:
+def normalized_memory_text(text: str) -> str:
     """11-14 —— 判「内容相同」的口径,只忽略不改变意思的差别(用户 11-14):NFC;只折宽度;
     casefold;空白合并成一个、去首尾;再去掉**末尾**的句末标点(反复)。句中标点、连字符、括号、
     符号、上标、带圈数字一律不动,中文旁边的空格也不动。宁可判不同、交给模型。"""
@@ -1669,6 +1669,10 @@ def _normalized_text(text: str) -> str:
     while out and out[-1] in _TRAILING_SENTENCE_PUNCTUATION:
         out = out[:-1].rstrip()
     return out
+
+
+#: 本模块里沿用的旧名;别的服务(整理一侧的汇总行重写)用公开的 :func:`normalized_memory_text`。
+_normalized_text = normalized_memory_text
 
 
 def _same_cell(a: MemoryItem, b: MemoryItem) -> bool:
@@ -2032,13 +2036,15 @@ class _Progress:
 class _WritePlan:
     """§7.3 第一步的结果。``duplicate``:不写时它重复的那一条;``merged``:模型判它重复、而层级
     更低的那条目标(候选写下,它并入要退的清单,§7.1 第 16 行);``count``:这一步的计数名;
-    ``refresh``:不写时按 §7.1 第 8 行决定刷不刷新确认日期(同一条消息的重述不刷新)。"""
+    ``refresh``:不写时按 §7.1 第 8 行决定刷不刷新确认日期(同一条消息的重述不刷新);
+    ``link``:候选写下、那条目标不退,新行只是连着它(第 16 行里目标是用户一方的那一半)。"""
 
     write: bool
     duplicate: MemoryItem | None = None
     merged: MemoryItem | None = None
     count: str | None = None
     refresh: bool = False
+    link: UUID | None = None
 
 
 def _own_neighbor(
@@ -2072,7 +2078,13 @@ def _plan_write(entry: _Pending, target: MemoryItem | None, decision: _Decision)
             # 复审 11-16:事件日期不同 = 不同的两次 → 写下。
             return _WritePlan(True, count="noop_other_event_date")
         if entry.tiers[target.id] < origin_tier(item):
-            # 审查 H-1:候选不能被一条来源更弱的行吞掉。
+            # 审查 H-1:候选不能被一条来源更弱的行吞掉 —— 写下。
+            if entry.tiers[target.id] > 0:
+                # 用户 2026-11-16(审查 M-2):模型的「重复」含「说得更少」。目标是用户一方
+                # (这里只可能是用户确认,或成员里有用户一方的汇总行)、内容又不完全相同(完全相同
+                # 的已由 ``entry.weaker`` 那条路退掉)→ 不退它,免得丢掉旧行里多出的信息:两条
+                # 并存,新行连着它。
+                return _WritePlan(True, count="noop_weaker_user_side_kept", link=target.id)
             return _WritePlan(True, merged=target, count="noop_weaker_target_written")
         if _restates_same_message(item, target):
             return _WritePlan(False, duplicate=target, count="noop_same_evidence")
@@ -2214,8 +2226,15 @@ def _judge_listed(
             # 写回不直接退汇总行(§7.1 第 18 行)。用户一方的候选、模型自己把它列进 replaces、
             # 其余各项都过(成员里有控制台更正过的过不了来源那一项)→ 打「要重写」的标记。
             record_memory_reconcile(op="retire_refused_summary")
+            # 候选不写(重复)时,拿它重复的那条有效的用户一方行作依据(用户确实否认了汇总里的事,
+            # 不该因为这句话以前记过就不重写);那条不是用户一方的 → 只计数。一条候选只给第一条
+            # 汇总行打标:新行只有一个 ``supersedes`` 可连,连不上的重写时找不到这句说法。
+            basis = plan.write or (
+                plan.duplicate is not None and effective_origin(plan.duplicate) in USER_SIDE_ORIGINS
+            )
             if (
-                plan.write
+                basis
+                and not verdict.flag
                 and one.kind == "replaces"
                 and origin in USER_SIDE_ORIGINS
                 and refusal is None
@@ -2297,6 +2316,10 @@ async def _store(
                 )
             )
             if history is not None:
+                if history.id != item.id:
+                    # 任务重试:上一次尝试已经写过这条历史行,不再多一条。
+                    record_memory_reconcile(op="noop")
+                    return _Reconciled([], [])
                 record_memory_reconcile(op="written_as_history")
                 return _Reconciled([], [], 1)
             # 加锁时锚点已不在 → 候选写成有效行(§7.1 第 11 行 ⑤)。
@@ -2334,18 +2357,49 @@ async def _store(
     return _Reconciled([], [])
 
 
-async def _still_current(target: MemoryItem, deps: _ReconcileDeps) -> bool:
-    """候选重复的那一条此刻是否仍有效(读邻居到现在的几秒里可能被删、被退、被汇总)。"""
-    row = await deps.token.run_cancellable(
-        deps.memory_store.get_live(
-            tenant_id=target.tenant_id, user_id=target.user_id, memory_id=target.id
-        )
-    )
+def _recallable(row: MemoryItem | None) -> bool:
+    """这一行此刻是否仍有效(召回得到):没删、没作废、没过期、没被并入汇总、没归档。"""
     if row is None or row.invalid_at is not None or row.status == "archived":
         return False
     if row.expired_at is not None and as_utc(row.expired_at) <= datetime.now(UTC):
         return False
     return row.status == "consolidated" or row.consolidated_into is None
+
+
+async def _live_row(memory_id: UUID, like: MemoryItem, deps: _ReconcileDeps) -> MemoryItem | None:
+    """按 id 重读一行(没删的;是否仍有效另看 :func:`_recallable`)。"""
+    return await deps.token.run_cancellable(
+        deps.memory_store.get_live(
+            tenant_id=like.tenant_id, user_id=like.user_id, memory_id=memory_id
+        )
+    )
+
+
+async def _written_instead(
+    entry: _Pending,
+    duplicate: MemoryItem,
+    verdict: _Verdict,
+    positions: Mapping[UUID, int],
+    deps: _ReconcileDeps,
+) -> _Reconciled:
+    """候选重复的那一条此刻已不在了(读邻居到现在的几秒里被删、被退、被汇总)→ 候选改为写下
+    (§7.3「读邻居到加锁之间目标没了」)。
+
+    一种情形不写:那一条是被一句**不早于候选**的说法退掉的(同一批里更靠前的候选刚把它退了,或
+    另一个写回退的)—— 候选只是在重复一个已被推翻的旧值,写回有效行会把它复活;那条旧行已经
+    连着取代它的那条留作历史。候选确实更晚(用户又改回去了)→ 照写。"""
+    candidate = entry.candidate
+    row = await _live_row(duplicate.id, duplicate, deps)
+    successor_id = row.superseded_by if row is not None and row.invalid_at is not None else None
+    if successor_id is not None:
+        successor = await _live_row(successor_id, duplicate, deps)
+        if successor is not None and _recallable(successor):
+            said = _said_at(successor, candidate.item, deps.message_times)
+            line = candidate.line_at
+            if line is None or said is None or as_utc(line) <= said:
+                record_memory_reconcile(op="noop_already_superseded")
+                return _Reconciled([], [])
+    return await _store(entry, verdict, "add", positions, deps)
 
 
 async def _settle_duplicate(
@@ -2356,7 +2410,8 @@ async def _settle_duplicate(
     deps: _ReconcileDeps,
 ) -> _Reconciled:
     """候选不写(重复):过了预判的旧行只退不写、连到重复的那一条(``retire``);按 §7.1 第 8 行
-    刷新确认日期。重复的那一条此刻已不在了 → 候选改为写下(§7.3「读邻居到加锁之间目标没了」)。"""
+    刷新确认日期;它点到的汇总行用重复的那一条作依据打标(§7.12 第 1 步)。重复的那一条此刻已
+    不在了 → :func:`_written_instead`。"""
     candidate, duplicate = entry.candidate, plan.duplicate
     if duplicate is None:  # 调用方只在 plan.write 为假时进来,此时一定有
         return await _store(entry, verdict, "add", positions, deps)
@@ -2374,17 +2429,30 @@ async def _settle_duplicate(
             )
         )
         if not result.anchor_live:
-            return await _store(entry, verdict, "add", positions, deps)
+            return await _written_instead(entry, duplicate, verdict, positions, deps)
         _record_retired(result.retired, verdict)
         _record_refusals(result.refused)
-    elif not await _still_current(duplicate, deps):
-        return await _store(entry, verdict, "add", positions, deps)
+    elif not _recallable(await _live_row(duplicate.id, duplicate, deps)):
+        return await _written_instead(entry, duplicate, verdict, positions, deps)
     if plan.count is not None:
         record_memory_reconcile(op=plan.count)
     elif plan.refresh:
         await _noop(candidate, duplicate, deps)
     else:
         record_memory_reconcile(op="noop")
+    for summary_id in verdict.flag:
+        if deps.before_store is not None:
+            await deps.before_store()
+        flagged = await deps.token.run_cancellable(
+            deps.memory_store.flag_summary(
+                tenant_id=item.tenant_id,
+                user_id=item.user_id,
+                summary_id=summary_id,
+                statement_id=duplicate.id,
+            )
+        )
+        if flagged is not None:
+            record_memory_reconcile(op="summary_rewrite_marked")
     return _Reconciled([], [])
 
 
@@ -2461,6 +2529,9 @@ async def _apply_decision(
 ) -> _Reconciled:
     """一条候选按 §7.3 的两步落库:先定写不写,再逐条定退不退。退不掉不影响写。"""
     target = _own_neighbor(entry, decision.target, by_short_id)
+    if decision.op == "NOOP" and target is None:
+        # 「重复」的编号不认识(或没给)= 没给决定(§7.1 第 3 行):它的两张清单也不用。
+        decision = _NO_DECISION
     plan = _plan_write(entry, target, decision)
     if decision.legacy:
         record_memory_reconcile(op="legacy_op")
@@ -2470,6 +2541,7 @@ async def _apply_decision(
     for _short in range(unknown):
         record_memory_reconcile(op="retire_unknown_id")
     verdict = _judge_listed(entry, listed, plan, deps)
+    verdict.link = verdict.link or plan.link
     if plan.write:
         return await _store(entry, verdict, plan.count, positions, deps)
     return await _settle_duplicate(entry, plan, verdict, positions, deps)

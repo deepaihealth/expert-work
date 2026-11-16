@@ -781,3 +781,163 @@ async def test_a_denial_of_a_summary_just_rewritten_flags_the_new_summary(
     )
     assert got.flagged == (replacement,) and got.item.supersedes == replacement
     assert (await _row(store, t, u, replacement)).review_flagged_at is not None
+
+
+# ─── 独立审查(11-16):占着唯一索引 ≠ 有效(可召回)───────────────────────────
+
+
+async def test_a_folded_member_holding_the_same_text_does_not_swallow_the_new_row(
+    store: MemoryStore,
+) -> None:
+    """H-1:已并入汇总的成员行仍占唯一索引、但召回不到。用户把那句话原样再说一遍时,它不算
+    「已经在了」:让出索引、新行照常插入,要退的旧行连到新行。"""
+    t, u = uuid4(), uuid4()
+    member = _item(t, u, "lives in Shanghai", origin="user_stated")
+    summary = await _summary(store, t, u, "lives in Shanghai; has a cat", member)
+    current = _item(t, u, "moved to Beijing", origin="user_stated")
+    await store.write([current])
+    new = _item(t, u, "lives in Shanghai", origin="user_stated")
+    got = await store.supersede(tenant_id=t, user_id=u, new_item=new, old_ids=[current.id])
+    assert got.inserted and got.item.id == new.id
+    assert got.retired == (current.id,) and got.collision_replaced is None
+    assert (await _row(store, t, u, current.id)).superseded_by == new.id
+    recalled = await store.retrieve(tenant_id=t, user_id=u, query_embedding=_vec(1.0), limit=10)
+    assert new.id in {r.id for r in recalled}
+    folded = await _row(store, t, u, member.id)
+    assert folded.invalid_at is not None and folded.consolidated_into == summary.id
+
+
+async def test_a_holder_of_the_same_tier_keeps_the_sentence(store: MemoryStore) -> None:
+    """M-4:撞上的那条层级与候选**相同**(不只是更高)→ 那句话已经在了,不插入。"""
+    t, u = uuid4(), uuid4()
+    holder = _item(t, u, "prefers morning lessons", origin="user_stated", kind="episodic")
+    await store.write([holder])
+    new = _item(t, u, "prefers morning lessons", origin="user_stated")
+    got = await store.supersede(tenant_id=t, user_id=u, new_item=new)
+    assert (got.inserted, got.item.id) == (False, holder.id)
+    assert await _live_ids(store, t, u) == {holder.id}
+
+
+async def test_a_rewrite_equal_to_a_members_text_is_stored_not_collided(
+    store: MemoryStore,
+) -> None:
+    """H-2:重写出的句子等于某条成员的原文 —— 成员行占着索引但召回不到,不算撞上:新汇总行
+    照常插入,否则那句话从召回里消失。"""
+    t, u = uuid4(), uuid4()
+    summary, members, _said = await _flagged_summary(store, t, u)
+    assert summary.review_flagged_at is not None
+    outcome = await store.rewrite_summary(
+        tenant_id=t,
+        user_id=u,
+        summary_id=summary.id,
+        flagged_at=summary.review_flagged_at,
+        content=members[0].content,
+        embedding=_vec(1.0),
+    )
+    assert outcome == "rewritten"
+    old = await _row(store, t, u, summary.id)
+    assert old.superseded_by is not None
+    new = await _row(store, t, u, old.superseded_by)
+    assert (new.status, new.content, new.invalid_at) == ("consolidated", members[0].content, None)
+    for member in members:
+        assert (await _row(store, t, u, member.id)).consolidated_into == new.id
+    recalled = await store.retrieve(tenant_id=t, user_id=u, query_embedding=_vec(1.0), limit=10)
+    assert new.id in {r.id for r in recalled}
+
+
+async def test_a_history_row_is_not_written_twice(store: MemoryStore) -> None:
+    """任务在写完历史行之后失败重试:同一个锚点、同样内容的历史行不再多一条。"""
+    t, u = uuid4(), uuid4()
+    anchor = _item(t, u, "the cat is called Songfeng", origin="user_stated")
+    await store.write([anchor])
+    first = await store.write_history(
+        tenant_id=t,
+        user_id=u,
+        anchor_id=anchor.id,
+        new_item=_item(t, u, "the cat is called Nanzhi", origin="user_confirmed"),
+    )
+    again = await store.write_history(
+        tenant_id=t,
+        user_id=u,
+        anchor_id=anchor.id,
+        new_item=_item(t, u, "the cat is called Nanzhi", origin="user_confirmed"),
+    )
+    assert first is not None and again is not None and again.id == first.id
+    rows = await store.list_for_user(tenant_id=t, user_id=u, limit=50)
+    assert len([r for r in rows if r.content == "the cat is called Nanzhi"]) == 1
+
+
+async def test_nothing_left_without_a_statement_to_link_to_changes_nothing(
+    store: MemoryStore,
+) -> None:
+    """「什么都不剩」而用户的说法已不在:不作废(否则旧汇总行作废却没有连线),按 ``stale``。"""
+    t, u = uuid4(), uuid4()
+    summary, _members, said = await _flagged_summary(store, t, u)
+    assert summary.review_flagged_at is not None
+    await store.soft_delete(tenant_id=t, user_id=u, memory_id=said.id)
+    outcome = await store.rewrite_summary(
+        tenant_id=t,
+        user_id=u,
+        summary_id=summary.id,
+        flagged_at=summary.review_flagged_at,
+        content=None,
+    )
+    assert outcome == "stale"
+    assert (await _row(store, t, u, summary.id)).invalid_at is None
+
+
+async def test_a_retired_statement_is_followed_one_step_to_its_successor(
+    store: MemoryStore,
+) -> None:
+    """M-3:连着汇总行的那句用户说法后来被更晚的一句退掉 —— 顺 ``superseded_by`` 走一步,取仍
+    有效的用户一方后继;说法被删掉、没有后继 → 没有可用的说法。"""
+    t, u = uuid4(), uuid4()
+    summary, _members, said = await _flagged_summary(store, t, u)
+    later = _item(t, u, "now cycles to work", origin="user_stated")
+    await store.supersede(tenant_id=t, user_id=u, new_item=later, old_ids=[said.id])
+    [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
+    assert flagged.summary.id == summary.id
+    assert [s.id for s in flagged.statements] == [later.id]
+    await store.soft_delete(tenant_id=t, user_id=u, memory_id=later.id)
+    [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
+    assert flagged.statements == ()
+
+
+async def test_a_restated_row_can_flag_a_summary(store: MemoryStore) -> None:
+    """判「重复」的候选否认了汇总行里的一件事:候选不写,用它重复的那条有效的用户一方行作依据
+    打标并连上;那条行是在汇总之前记下、之后用户又说了一遍的(确认日期更晚)也算「后来的说法」。"""
+    t, u = uuid4(), uuid4()
+    said = _item(t, u, "now drives to work", origin="user_stated", created_at=_T0)
+    await store.write([said])
+    summary = await _summary(
+        store, t, u, "commutes by metro; lives downtown", _item(t, u, "m", origin="user_stated")
+    )
+    now = datetime.now(UTC) + timedelta(seconds=5)
+    await store.refresh_confirmed_at(tenant_id=t, user_id=u, memory_id=said.id, confirmed_at=now)
+    flagged_id = await store.flag_summary(
+        tenant_id=t, user_id=u, summary_id=summary.id, statement_id=said.id
+    )
+    assert flagged_id == summary.id
+    assert (await _row(store, t, u, summary.id)).review_flagged_at is not None
+    assert (await _row(store, t, u, said.id)).supersedes == summary.id
+    [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
+    assert [s.id for s in flagged.statements] == [said.id]
+
+
+@pytest.mark.parametrize("why", ["assistant_statement", "corrected_member", "statement_gone"])
+async def test_a_restated_row_does_not_flag_when_it_must_not(store: MemoryStore, why: str) -> None:
+    t, u = uuid4(), uuid4()
+    origin = "assistant_derived" if why == "assistant_statement" else "user_stated"
+    said = _item(t, u, "now drives to work", origin=origin)
+    await store.write([said])
+    member_origin = "corrected" if why == "corrected_member" else "user_stated"
+    summary = await _summary(
+        store, t, u, "commutes by metro; lives downtown", _item(t, u, "m", origin=member_origin)
+    )
+    if why == "statement_gone":
+        await store.soft_delete(tenant_id=t, user_id=u, memory_id=said.id)
+    got = await store.flag_summary(
+        tenant_id=t, user_id=u, summary_id=summary.id, statement_id=said.id
+    )
+    assert got is None
+    assert (await _row(store, t, u, summary.id)).review_flagged_at is None

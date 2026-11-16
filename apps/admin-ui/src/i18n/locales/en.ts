@@ -7567,7 +7567,7 @@ const en: TranslationKeys = {
     origin_user_corrected: "corrected by the user",
     origin_unrecorded: "source not recorded",
     superseded: "superseded",
-    superseded_by_tip: "Jump to the memory that replaced it",
+    superseded_by_tip: "Jump to the memory that replaced it (it may not be on this page)",
     col_content: "Content",
     col_score: "Scores",
     col_user: "User",

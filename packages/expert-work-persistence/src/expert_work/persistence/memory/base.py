@@ -280,8 +280,9 @@ class RetireResult:
 @dataclass(frozen=True)
 class FlaggedSummary:
     """B-300 重做 §7.12 —— 一条打了「要重写」标记、仍有效的汇总行,连同重写要看的材料:它的成员
-    (不论此刻是否有效)与用户后来的说法(``supersedes`` 指向它、仍有效、用户一方、记录时间晚于它,
-    按记录时间从早到晚)。"""
+    (不论此刻是否有效)与用户后来的说法(``supersedes`` 指向它、用户一方、记录或最后再说的时间
+    晚于它,按记录时间从早到晚;其中已被更晚一句取代的,顺 ``superseded_by`` 走一步取仍有效的用户
+    一方后继;被删掉的、没有这样后继的不算)。"""
 
     summary: MemoryItem
     members: tuple[MemoryItem, ...]
@@ -497,10 +498,14 @@ class MemoryStore(abc.ABC):
         summary rule has its one exception (same sentence, weaker source).
 
         Dedup index (tenant + user + content hash + agent name, kind and origin not
-        included): when another live row already holds the same content, its tier decides
-        — not lower than the new row's → nothing is inserted, the retired rows link to it
-        and it is returned (``inserted=False``); lower → it is retired as well
-        (``collision_replaced``) and the new row is inserted.
+        included): when another row already holds the same content **and is currently
+        valid** (the recall predicate), its tier decides — not lower than the new row's →
+        nothing is inserted, the retired rows link to it and it is returned
+        (``inserted=False``); lower → it is retired as well (``collision_replaced``) and
+        the new row is inserted. A holder that only occupies the index — a member folded
+        into a summary is not recalled — does not count as "already there": it is marked
+        superseded by the new row to give up the slot (not reported in ``retired``) and
+        the new row is inserted.
 
         ``flag_summary_ids`` (§7.12 step 1; the caller passes summaries the model itself
         listed as no longer true, for a user-side candidate — a new row that is not on
@@ -545,7 +550,25 @@ class MemoryStore(abc.ABC):
         superseded when it lands (``invalid_at=now``, ``superseded_by=anchor_id``), no
         other row touched. ``None`` (nothing written) when the anchor is no longer this
         user's currently valid row — the caller then writes a normal row. A history row
-        does not take part in the dedup index. Strict scan as :meth:`supersede`."""
+        does not take part in the dedup index. Idempotent: when a history row with the
+        same content already hangs off this anchor (a retried job), that row is returned
+        and nothing is written — its ``id`` differs from ``new_item.id``. Strict scan as
+        :meth:`supersede`."""
+
+    @abc.abstractmethod
+    async def flag_summary(
+        self, *, tenant_id: UUID, user_id: UUID, summary_id: UUID, statement_id: UUID
+    ) -> UUID | None:
+        """B-300 redesign §7.12 step 1, for a candidate that is **not written** because it
+        repeats ``statement_id``: the user denied something the summary says, so the
+        summary is flagged all the same, with the row the candidate repeats as the
+        statement to rewrite by. That row must be this user's currently valid user-side
+        row; the summary is judged as in :meth:`supersede` (members without a console
+        correction; one step along ``superseded_by`` when it was rewritten meanwhile).
+        Sets the statement's ``supersedes`` to the flagged summary (the link the rewrite
+        reads; what the statement itself retired is still found through those rows'
+        ``superseded_by``). Returns the flagged summary's id, or ``None`` when nothing
+        was flagged."""
 
     @abc.abstractmethod
     async def expire(
@@ -836,9 +859,12 @@ class MemoryStore(abc.ABC):
           ``corrected_member``: summary untouched, flag cleared;
         * ``unchanged`` → flag cleared, nothing else;
         * ``content is None`` (nothing of it remains true) → the summary is retired with
-          ``superseded_by`` = the user's latest later statement; ``emptied``;
-        * another live row already holds ``content`` → nothing inserted, the summary is
-          retired with ``superseded_by`` = that row, members untouched; ``collided``;
+          ``superseded_by`` = the user's latest later statement; ``emptied``. With no
+          such statement left there is nothing to link it to: ``stale``, nothing changes;
+        * another **currently valid** row already holds ``content`` → nothing inserted,
+          the summary is retired with ``superseded_by`` = that row, members untouched;
+          ``collided``. A holder that is not recalled (one of the summary's own members,
+          say) gives up the index slot instead and the new summary is stored;
         * otherwise a new summary row is inserted (same ``consolidated_from``; source and
           scores recomputed from the members, :func:`summary_fields`), the old one is
           retired and linked to it, the members' ``consolidated_into`` moves to it and

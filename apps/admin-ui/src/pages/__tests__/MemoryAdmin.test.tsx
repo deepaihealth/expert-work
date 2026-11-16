@@ -629,6 +629,7 @@ describe("MemoryAdmin — superseded rows (B-300 redesign rev 9)", () => {
     );
     const link = screen.getByTestId("memory-superseded-link-old1");
     expect(link).toHaveAttribute("href", "#memory-row-new1");
+    expect(link).toHaveAttribute("title", i18n.t("memory.superseded_by_tip"));
     // The link's target exists on the page: the replacing row carries that anchor.
     expect(document.getElementById("memory-row-new1")).not.toBeNull();
 
@@ -642,6 +643,11 @@ describe("MemoryAdmin — superseded rows (B-300 redesign rev 9)", () => {
   it("names the mark in both locales", () => {
     expect(i18n.t("memory.superseded", { lng: "zh-CN" })).toBe("已被取代");
     expect(i18n.t("memory.superseded", { lng: "en" })).toBe("superseded");
+    // The link only jumps within the page: the hover text says so.
+    expect(i18n.t("memory.superseded_by_tip", { lng: "zh-CN" })).toContain("可能不在当前页");
+    expect(i18n.t("memory.superseded_by_tip", { lng: "en" })).toContain(
+      "may not be on this page",
+    );
   });
 });
 

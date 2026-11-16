@@ -215,7 +215,6 @@ def test_the_rewrite_prompt_has_no_industry_words() -> None:
     [
         ('{"summary": " kept part "}', "kept part"),
         ('{"summary": null}', None),
-        ('{"summary": "  "}', None),
     ],
 )
 def test_parse_reads_the_revised_sentence_or_nothing(text: str, expected: str | None) -> None:
@@ -223,7 +222,11 @@ def test_parse_reads_the_revised_sentence_or_nothing(text: str, expected: str | 
     assert parsed is not None and parsed.summary == expected
 
 
-@pytest.mark.parametrize("text", ["{}", "not json", '{"summary": 3}', '{"keep": false}'])
+@pytest.mark.parametrize(
+    "text",
+    # 附录 E 只约定 null 表示「什么都不剩」;空字符串、纯空白不是(审查 M-1)。
+    ["{}", "not json", '{"summary": 3}', '{"keep": false}', '{"summary": ""}', '{"summary": "  "}'],
+)
 def test_a_malformed_reply_is_not_a_verdict(text: str) -> None:
     assert _parse_summary_rewrite_reply(ConsolidatorLLMReply(text=text, model="m")) is None
 
@@ -438,13 +441,67 @@ async def test_a_blocked_sentence_clears_the_flag_and_is_audited() -> None:
     assert await _run(rewriter) == [] and len(aux.calls) == 1
 
 
-async def test_a_summary_whose_linked_statement_is_gone_costs_no_model_call() -> None:
+async def test_an_empty_sentence_is_a_failed_attempt_not_nothing_left() -> None:
+    """审查 M-1:回复是空字符串 → 当失败(标留着、按重试间隔再试),不能把整条汇总作废。"""
     store = InMemoryMemoryStore()
-    _summary, said = await _flagged(store)
+    summary, _said = await _flagged(store)
+    rewriter, _audit = _rewriter(store, _ScriptedAuxModel([_reply("")]))
+    assert await _run(rewriter) == ["failed"]
+    row = _row(store, summary.id)
+    assert row.invalid_at is None and row.review_flagged_at == summary.review_flagged_at
+    assert row.last_reviewed_at is not None
+
+
+async def test_a_summary_whose_statement_was_deleted_is_unflagged_at_once() -> None:
+    """审查 M-3:连着它的那句用户说法被用户删掉、又没有后继 —— 没有可拿去重写的,当场清标并
+    计数(``statement_gone``),不调模型,也不挂 7 天。"""
+    store = InMemoryMemoryStore()
+    summary, said = await _flagged(store)
     await store.soft_delete(tenant_id=_TENANT, user_id=_USER, memory_id=said.id)
     aux = _ScriptedAuxModel([_reply(_REVISED)])
     rewriter, _audit = _rewriter(store, aux)
-    assert await _run(rewriter) == [] and aux.calls == []
+    before = _count("statement_gone")
+    assert await _run(rewriter) == ["statement_gone"] and aux.calls == []
+    row = _row(store, summary.id)
+    assert (row.invalid_at, row.review_flagged_at) == (None, None)
+    assert _count("statement_gone") == before + 1
+
+
+async def test_a_statement_replaced_by_a_later_one_is_followed_to_it() -> None:
+    """审查 M-3:那句说法后来被更晚的一句退掉(模型没再点汇总行)→ 顺连线走一步,拿仍有效的
+    后继去重写。"""
+    store = InMemoryMemoryStore()
+    summary, said = await _flagged(store)
+    later = _item("now cycles to work")
+    await store.supersede(tenant_id=_TENANT, user_id=_USER, new_item=later, old_ids=[said.id])
+    aux = _ScriptedAuxModel([_reply(_REVISED)])
+    rewriter, _audit = _rewriter(store, aux)
+    assert await _run(rewriter) == ["rewritten"]
+    assert "now cycles to work" in aux.calls[0] and "now drives to work" not in aux.calls[0]
+    assert _row(store, summary.id).invalid_at is not None
+
+
+async def test_a_limit_leaves_the_rest_for_the_sweep() -> None:
+    """任务收尾时的重写有条数上限(它占着写回任务的租约);剩下的留给巡检。"""
+    store = InMemoryMemoryStore()
+    first, _said = await _flagged(store)
+    members = [_item("keeps a tortoise"), _item("waters the plants on Sundays")]
+    await store.write(members)
+    second = await store.write_consolidated(
+        tenant_id=_TENANT,
+        user_id=_USER,
+        content="keeps a tortoise; waters the plants on Sundays",
+        embedding=(0.0, 1.0),
+        source_ids=[m.id for m in members],
+        source_hashes={m.id: hash_content(m.content) for m in members},
+    )
+    await _deny(store, second.id, "gave the tortoise away")
+    aux = _ScriptedAuxModel([_reply(_REVISED), _reply("waters the plants on Sundays")])
+    rewriter, _audit = _rewriter(store, aux)
+    outcomes = await rewriter.rewrite_for_user(tenant_id=_TENANT, user_id=_USER, limit=1)
+    assert outcomes == ["rewritten"] and len(aux.calls) == 1
+    assert _row(store, first.id).invalid_at is not None  # 标得最早的那条先做
+    assert _row(store, second.id).review_flagged_at is not None
 
 
 # ─── 巡检的子步骤 ───────────────────────────────────────────────────────
@@ -531,10 +588,12 @@ async def test_a_rewrite_failure_does_not_fail_the_sweep() -> None:
 class _RecordingRewrite:
     def __init__(self, *, fail: bool = False) -> None:
         self.calls: list[tuple[UUID, UUID]] = []
+        self.limits: list[int | None] = []
         self._fail = fail
 
-    async def __call__(self, *, tenant_id: UUID, user_id: UUID) -> object:
+    async def __call__(self, *, tenant_id: UUID, user_id: UUID, limit: int | None = None) -> object:
         self.calls.append((tenant_id, user_id))
+        self.limits.append(limit)
         if self._fail:
             raise RuntimeError("aux model is down")
         return []
@@ -565,6 +624,9 @@ async def test_the_job_rewrites_the_users_flagged_summaries_when_it_finishes(fai
     # 写回任务照常收尾;重写出错不让它失败(标留着,等重试或巡检)。
     assert (outcome.written_count, outcome.failed, outcome.discarded) == (1, False, False)
     assert rewrite.calls == [(h.tenant, h.user)]
+    # 收尾时的重写带条数上限:它占着这条任务的租约,剩下的留给巡检。
+    assert rewrite.limits == [processor_module.SUMMARY_REWRITES_PER_JOB]
+    assert 0 < processor_module.SUMMARY_REWRITES_PER_JOB <= 5
 
 
 async def test_a_retry_that_writes_nothing_still_rewrites_what_the_last_attempt_flagged() -> None:
