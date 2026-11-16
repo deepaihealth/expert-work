@@ -63,7 +63,14 @@ export interface MemoryItem {
   source_run_id?: string | null;
   valid_at?: string | null;
   expired_at?: string | null;
+  /** Set when a newer memory replaced this row — the one test for "superseded"
+   *  (B-300 redesign rev 9). */
   invalid_at?: string | null;
+  /** The row that replaced this one (set together with ``invalid_at``). */
+  superseded_by?: string | null;
+  /** The older row this one is linked to. That row is not necessarily replaced:
+   *  it may still be valid (the two sit side by side) — read its ``invalid_at``. */
+  supersedes?: string | null;
   expected_valid_days?: number | null;
   /** B-300 PR 2 — absent on rows read from an older backend. */
   origin?: MemoryOrigin | null;

@@ -2112,11 +2112,11 @@ def _listed(
     unknown = 0
     for kind, shorts in (("replaces", decision.replaces), ("restates", decision.restates)):
         for short in shorts:
-            n = _own_neighbor(entry, short, by_short_id)
-            if n is None:
+            named = _own_neighbor(entry, short, by_short_id)
+            if named is None:
                 unknown += 1
-            elif plan.duplicate is None or n.id != plan.duplicate.id:
-                out.setdefault(n.id, _Listed(n, kind))
+            elif plan.duplicate is None or named.id != plan.duplicate.id:
+                out.setdefault(named.id, _Listed(named, kind))
     return list(out.values()), unknown
 
 

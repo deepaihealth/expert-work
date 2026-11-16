@@ -40,8 +40,8 @@ _HEAD = (
     'by the user" or "corrected by the user", do not quietly adopt your new result: tell '
     "the user both and let them decide. For other memories, prefer what you can check now.\n"
     "- When two memories about the same thing disagree, a later one that records the user's "
-    "own answer is not overridden by an earlier one. A later one marked \"stated in user "
-    "messages\" is not overridden even by an earlier one marked \"corrected by the user\"; "
+    'own answer is not overridden by an earlier one. A later one marked "stated in user '
+    'messages" is not overridden even by an earlier one marked "corrected by the user"; '
     "in that case tell the user about both."
 )
 _FROM_ASSISTANT = (

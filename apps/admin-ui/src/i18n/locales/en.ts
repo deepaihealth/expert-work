@@ -3399,6 +3399,8 @@ export interface TranslationKeys {
     origin_assistant_derived: string;
     origin_user_corrected: string;
     origin_unrecorded: string;
+    superseded: string;
+    superseded_by_tip: string;
     col_content: string;
     col_score: string;
     col_user: string;
@@ -7564,6 +7566,8 @@ const en: TranslationKeys = {
     origin_assistant_derived: "from the assistant",
     origin_user_corrected: "corrected by the user",
     origin_unrecorded: "source not recorded",
+    superseded: "superseded",
+    superseded_by_tip: "Jump to the memory that replaced it",
     col_content: "Content",
     col_score: "Scores",
     col_user: "User",
