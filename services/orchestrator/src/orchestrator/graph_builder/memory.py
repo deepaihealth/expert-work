@@ -2083,8 +2083,10 @@ def _plan_write(entry: _Pending, target: MemoryItem | None, decision: _Decision)
                 # 用户 2026-11-16(审查 M-2):模型的「重复」含「说得更少」。目标是用户一方
                 # (这里只可能是用户确认,或成员里有用户一方的汇总行)、内容又不完全相同(完全相同
                 # 的已由 ``entry.weaker`` 那条路退掉)→ 不退它,免得丢掉旧行里多出的信息:两条
-                # 并存,新行连着它。
-                return _WritePlan(True, count="noop_weaker_user_side_kept", link=target.id)
+                # 并存,新行连着它。目标是汇总行时不连线:否则这句「换个说法的重述」以后会被当成
+                # 用户后来的说法喂给汇总行的重写,可能删掉汇总里说得更全的部分。
+                link = None if target.consolidated_from else target.id
+                return _WritePlan(True, count="noop_weaker_user_side_kept", link=link)
             return _WritePlan(True, merged=target, count="noop_weaker_target_written")
         if _restates_same_message(item, target):
             return _WritePlan(False, duplicate=target, count="noop_same_evidence")
@@ -2227,18 +2229,12 @@ def _judge_listed(
             # 其余各项都过(成员里有控制台更正过的过不了来源那一项)→ 打「要重写」的标记。
             record_memory_reconcile(op="retire_refused_summary")
             # 候选不写(重复)时,拿它重复的那条有效的用户一方行作依据(用户确实否认了汇总里的事,
-            # 不该因为这句话以前记过就不重写);那条不是用户一方的 → 只计数。一条候选只给第一条
-            # 汇总行打标:新行只有一个 ``supersedes`` 可连,连不上的重写时找不到这句说法。
+            # 不该因为这句话以前记过就不重写);那条不是用户一方的行(例如它本身是一条汇总行)→
+            # 只计数。一条候选点到几条汇总行就打几条:依据记在各条汇总行自己的 ``supersedes`` 上。
             basis = plan.write or (
                 plan.duplicate is not None and effective_origin(plan.duplicate) in USER_SIDE_ORIGINS
             )
-            if (
-                basis
-                and not verdict.flag
-                and one.kind == "replaces"
-                and origin in USER_SIDE_ORIGINS
-                and refusal is None
-            ):
+            if basis and one.kind == "replaces" and origin in USER_SIDE_ORIGINS and refusal is None:
                 verdict.flag.append(target.id)
             continue
         if refusal is not None:
@@ -2385,18 +2381,22 @@ async def _written_instead(
     """候选重复的那一条此刻已不在了(读邻居到现在的几秒里被删、被退、被汇总)→ 候选改为写下
     (§7.3「读邻居到加锁之间目标没了」)。
 
-    一种情形不写:那一条是被一句**不早于候选**的说法退掉的(同一批里更靠前的候选刚把它退了,或
-    另一个写回退的)—— 候选只是在重复一个已被推翻的旧值,写回有效行会把它复活;那条旧行已经
-    连着取代它的那条留作历史。候选确实更晚(用户又改回去了)→ 照写。"""
+    一种情形不写:那一条是被一句**不早于候选**的说法退掉的(同一批里更靠前的候选刚把它退了)——
+    候选只是在重复一个已被推翻的旧值,写回有效行会把它复活;那条旧行已经连着取代它的那条留作
+    历史。**只在先后能用真实消息时间证明时**才不写(取代者的证据消息在本对话里、知道它的发送时间,
+    候选那一行的时间也知道):候选那一行时间不知道、取代者的证据时间不知道、取代者在别的对话或是
+    一条只有记录时间的行(记录时间 ≈ 此刻,候选几乎必然显得更早)都证明不了 → 候选照写,与取代者
+    并存 —— 用户的话不能因为证明不了先后就丢(与 §7.1 第 11 行「目标在别的对话、只有记录时间的,
+    不算」同一个方向)。候选确实更晚(用户又改回去了)→ 照写。"""
     candidate = entry.candidate
     row = await _live_row(duplicate.id, duplicate, deps)
     successor_id = row.superseded_by if row is not None and row.invalid_at is not None else None
     if successor_id is not None:
         successor = await _live_row(successor_id, duplicate, deps)
         if successor is not None and _recallable(successor):
-            said = _said_at(successor, candidate.item, deps.message_times)
+            said = _evidence_at(successor, candidate.item, deps.message_times)
             line = candidate.line_at
-            if line is None or said is None or as_utc(line) <= said:
+            if line is not None and said is not None and as_utc(line) <= said:
                 record_memory_reconcile(op="noop_already_superseded")
                 return _Reconciled([], [])
     return await _store(entry, verdict, "add", positions, deps)

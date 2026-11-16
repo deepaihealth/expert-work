@@ -184,7 +184,10 @@ class MemoryItem(BaseModel):
         "and the others are found through their ``superseded_by``); that row is still "
         "valid — the two are about the same thing and the older one was not retired "
         "(a user-confirmed row next to a user-stated one, an earlier statement that "
-        "arrived late, a summary waiting to be rewritten).",
+        "arrived late, a summary waiting to be rewritten). On a **summary** row "
+        "(``consolidated_from`` set) it means something else: the row holding the "
+        "user's statement the summary was flagged by — the basis of its rewrite; "
+        "written when the flag is set, never inherited by the rewritten summary.",
     )
     superseded_by: UUID | None = Field(
         default=None,

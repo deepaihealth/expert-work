@@ -149,6 +149,10 @@ def summary_fields(members: Sequence[MemoryItem]) -> SummaryFields:
 #: 嵌套汇总向下查成员的层数上限;查到上限还有没查的成员,按「受保护」处理(保守方向)。
 MAX_SUMMARY_DEPTH = 8
 
+#: 取「用户后来的说法」时顺取代链(``superseded_by``)最多走这么多步去找仍有效的那条;走不到就
+#: 当作没有可用的说法(也防环)。
+MAX_STATEMENT_HOPS = 5
+
 #: 按 id 取一批记忆(不看是否仍有效、是否已删):受保护判断向下查汇总成员用。
 MemberLoader = Callable[[Sequence[UUID]], Awaitable[Sequence[MemoryItem]]]
 
@@ -280,9 +284,10 @@ class RetireResult:
 @dataclass(frozen=True)
 class FlaggedSummary:
     """B-300 重做 §7.12 —— 一条打了「要重写」标记、仍有效的汇总行,连同重写要看的材料:它的成员
-    (不论此刻是否有效)与用户后来的说法(``supersedes`` 指向它、用户一方、记录或最后再说的时间
-    晚于它,按记录时间从早到晚;其中已被更晚一句取代的,顺 ``superseded_by`` 走一步取仍有效的用户
-    一方后继;被删掉的、没有这样后继的不算)。"""
+    (不论此刻是否有效)与用户后来的说法:``supersedes`` 指向它的用户一方的行(记录或最后再说的
+    时间晚于它),加上它自己的 ``supersedes`` 指着的那一行(打标时记下的依据);其中已被更晚一句
+    取代的,顺 ``superseded_by`` 走到仍有效的用户一方后继(至多 :data:`MAX_STATEMENT_HOPS` 步);
+    被删掉的、走不到这样后继的不算。"""
 
     summary: MemoryItem
     members: tuple[MemoryItem, ...]
@@ -509,10 +514,12 @@ class MemoryStore(abc.ABC):
 
         ``flag_summary_ids`` (§7.12 step 1; the caller passes summaries the model itself
         listed as no longer true, for a user-side candidate — a new row that is not on
-        the user's side flags nothing): each still-current summary
-        whose members hold no console correction gets ``review_flagged_at=now``; one that
-        was rewritten meanwhile is followed one step along ``superseded_by`` to the
-        current summary. Only when the new row is inserted.
+        the user's side flags nothing): **each** still-current summary
+        whose members hold no console correction gets ``review_flagged_at=now`` and its
+        own ``supersedes`` set to the new row's id — the row the rewrite goes by (the
+        column has no other use on a summary row; a rewritten summary does not inherit
+        it); one that was rewritten meanwhile is followed one step along
+        ``superseded_by`` to the current summary. Only when the new row is inserted.
 
         The new row's ``supersedes``: the first flagged summary (the rewrite finds the
         user's statement through this link; what the row retired is still found through
@@ -565,10 +572,9 @@ class MemoryStore(abc.ABC):
         statement to rewrite by. That row must be this user's currently valid user-side
         row; the summary is judged as in :meth:`supersede` (members without a console
         correction; one step along ``superseded_by`` when it was rewritten meanwhile).
-        Sets the statement's ``supersedes`` to the flagged summary (the link the rewrite
-        reads; what the statement itself retired is still found through those rows'
-        ``superseded_by``). Returns the flagged summary's id, or ``None`` when nothing
-        was flagged."""
+        The basis is recorded on the **summary** (its ``supersedes`` = ``statement_id``);
+        the statement row itself is not changed. Returns the flagged summary's id, or
+        ``None`` when nothing was flagged."""
 
     @abc.abstractmethod
     async def expire(

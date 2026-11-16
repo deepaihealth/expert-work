@@ -905,21 +905,25 @@ async def test_a_retired_statement_is_followed_one_step_to_its_successor(
 
 async def test_a_restated_row_can_flag_a_summary(store: MemoryStore) -> None:
     """判「重复」的候选否认了汇总行里的一件事:候选不写,用它重复的那条有效的用户一方行作依据
-    打标并连上;那条行是在汇总之前记下、之后用户又说了一遍的(确认日期更晚)也算「后来的说法」。"""
+    打标。依据记在**汇总行自己的** ``supersedes`` 上(那一列在汇总行上别无用途);依据那一行的
+    连线不动,它记录得比汇总行早也照样是这次重写的依据。"""
     t, u = uuid4(), uuid4()
+    earlier = _item(t, u, "drove to the old office", origin="user_stated", created_at=_T0)
+    await store.write([earlier])
     said = _item(t, u, "now drives to work", origin="user_stated", created_at=_T0)
-    await store.write([said])
+    await store.supersede(tenant_id=t, user_id=u, new_item=said, old_ids=[earlier.id])
+    kept_link = (await _row(store, t, u, said.id)).supersedes
+    assert kept_link == earlier.id
     summary = await _summary(
         store, t, u, "commutes by metro; lives downtown", _item(t, u, "m", origin="user_stated")
     )
-    now = datetime.now(UTC) + timedelta(seconds=5)
-    await store.refresh_confirmed_at(tenant_id=t, user_id=u, memory_id=said.id, confirmed_at=now)
     flagged_id = await store.flag_summary(
         tenant_id=t, user_id=u, summary_id=summary.id, statement_id=said.id
     )
     assert flagged_id == summary.id
-    assert (await _row(store, t, u, summary.id)).review_flagged_at is not None
-    assert (await _row(store, t, u, said.id)).supersedes == summary.id
+    row = await _row(store, t, u, summary.id)
+    assert row.review_flagged_at is not None and row.supersedes == said.id
+    assert (await _row(store, t, u, said.id)).supersedes == kept_link  # 原有连线不动
     [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
     assert [s.id for s in flagged.statements] == [said.id]
 
@@ -941,3 +945,52 @@ async def test_a_restated_row_does_not_flag_when_it_must_not(store: MemoryStore,
     )
     assert got is None
     assert (await _row(store, t, u, summary.id)).review_flagged_at is None
+
+
+async def test_one_row_can_be_the_basis_of_two_flagged_summaries(store: MemoryStore) -> None:
+    """复审 L-2:一句话点到两条汇总行 —— 每条都打标、各自记下依据(汇总行的 ``supersedes``),
+    都找得到这句说法;新行自己只连得上第一条。"""
+    t, u = uuid4(), uuid4()
+    first = await _summary(
+        store, t, u, "commutes by metro; lives downtown", _item(t, u, "m1", origin="user_stated")
+    )
+    second = await _summary(
+        store, t, u, "takes line 2; has a monthly pass", _item(t, u, "m2", origin="user_stated")
+    )
+    new = _item(t, u, "now drives to work", origin="user_stated")
+    got = await store.supersede(
+        tenant_id=t, user_id=u, new_item=new, flag_summary_ids=[first.id, second.id]
+    )
+    assert set(got.flagged) == {first.id, second.id}
+    for summary in (first, second):
+        assert (await _row(store, t, u, summary.id)).supersedes == new.id
+    flagged = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
+    assert {f.summary.id for f in flagged} == {first.id, second.id}
+    assert all([s.id for s in f.statements] == [new.id] for f in flagged)
+
+
+async def test_a_statement_replaced_several_times_is_followed_to_the_valid_one(
+    store: MemoryStore,
+) -> None:
+    """复审 L-4:s1 → s2 → s3,顺取代链(有界)走到仍有效的那条。"""
+    t, u = uuid4(), uuid4()
+    summary, _members, s1 = await _flagged_summary(store, t, u)
+    s2 = _item(t, u, "now cycles to work", origin="user_stated")
+    await store.supersede(tenant_id=t, user_id=u, new_item=s2, old_ids=[s1.id])
+    s3 = _item(t, u, "now walks to work", origin="user_stated")
+    await store.supersede(tenant_id=t, user_id=u, new_item=s3, old_ids=[s2.id])
+    [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
+    assert flagged.summary.id == summary.id
+    assert [s.id for s in flagged.statements] == [s3.id]
+
+
+async def test_the_walk_along_replaced_statements_is_bounded(store: MemoryStore) -> None:
+    t, u = uuid4(), uuid4()
+    _summary_row, _members, said = await _flagged_summary(store, t, u)
+    last = said
+    for i in range(6):  # one hop more than the walk follows
+        nxt = _item(t, u, f"commutes in way number {i}", origin="user_stated")
+        await store.supersede(tenant_id=t, user_id=u, new_item=nxt, old_ids=[last.id])
+        last = nxt
+    [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
+    assert flagged.statements == ()  # 超过上限:不再追,按「没有可用的说法」

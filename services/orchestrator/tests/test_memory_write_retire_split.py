@@ -1191,8 +1191,9 @@ async def test_a_duplicate_that_denies_part_of_a_summary_flags_it_by_the_row_it_
     reply = _ops(_noop("e0", replaces=["e1"]))
     assert await _reconcile(store, _LLM([reply]), _now_said(cand)) == 0
     assert not _stored(store, cand)
-    assert _row(store, summary.id).review_flagged_at is not None
-    assert _row(store, said.id).supersedes == summary.id
+    flagged = _row(store, summary.id)
+    assert flagged.review_flagged_at is not None and flagged.supersedes == said.id
+    assert _row(store, said.id).supersedes is None  # 依据那一行自己的连线不动
     assert counts.delta() == {"retire_refused_summary": 1, "summary_rewrite_marked": 1}
 
 
@@ -1210,9 +1211,9 @@ async def test_a_duplicate_of_an_assistant_row_does_not_flag_a_summary() -> None
     assert counts.delta() == {"summary_rewrite_marked": 0}
 
 
-async def test_only_the_first_of_two_summaries_is_flagged() -> None:
-    """一句话点了两条汇总行:新行只有一个 ``supersedes`` 可以连,连不上的那条重写时找不到这句
-    说法 —— 只给第一条打标,第二条只计数(不加迁移的取舍)。"""
+async def test_every_summary_a_candidate_denies_is_flagged() -> None:
+    """复审 L-2:一句话点了两条汇总行 —— 两条都打标,各自的 ``supersedes`` 记下依据(这条新行),
+    都能重写;新行自己连着第一条。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     first = await _summary(store, c, "commutes by metro; lives downtown", "user_stated")
@@ -1230,19 +1231,24 @@ async def test_only_the_first_of_two_summaries_is_flagged() -> None:
     counts = _Counts("retire_refused_summary", "summary_rewrite_marked")
     reply = _ops(_add(replaces=["e0", "e1"]))
     assert await _reconcile(store, _LLM([reply]), _now_said(cand)) == 1
-    assert _row(store, first.id).review_flagged_at is not None
-    assert _row(store, second.id).review_flagged_at is None
+    for summary in (first, second):
+        row = _row(store, summary.id)
+        assert row.review_flagged_at is not None and row.supersedes == cand.id
     assert _row(store, cand.id).supersedes == first.id
-    assert counts.delta() == {"retire_refused_summary": 2, "summary_rewrite_marked": 1}
+    assert counts.delta() == {"retire_refused_summary": 2, "summary_rewrite_marked": 2}
 
 
-@pytest.mark.parametrize(("later", "written"), [(False, False), (True, True)])
+@pytest.mark.parametrize(
+    ("offset", "written"),
+    [(-5, False), (0, False), (5, True)],
+    ids=["earlier", "same-moment", "later"],
+)
 async def test_a_value_retired_earlier_in_the_batch_is_not_brought_back(
-    later: bool, written: bool
+    offset: int, written: bool
 ) -> None:
-    """同一批里:c1「搬到北京」刚把旧行 D「住在上海」退了,c2 与 D 内容相同。c2 那句话不晚于
-    c1 → 它只是在重复一个已被推翻的旧值,不写回有效行(D 已经是连着 c1 的历史行);c2 确实更晚
-    (用户又改回去了)→ 照写。"""
+    """同一批里:c1「搬到北京」刚把旧行 D「住在上海」退了,c2 与 D 内容相同。能用真实消息时间
+    证明 c2 那句话不晚于 c1 → 它只是在重复一个已被推翻的旧值,不写回有效行(D 已经是连着 c1 的
+    历史行);c2 确实更晚(用户又改回去了)→ 照写。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     shanghai = c.mem("lives in Shanghai", source_thread_id=_THREAD, evidence_message_id="m-0")
@@ -1253,7 +1259,7 @@ async def test_a_value_retired_earlier_in_the_batch_is_not_brought_back(
         "moved to Beijing", _at(0.95), source_thread_id=_THREAD, evidence_message_id="m-2"
     )
     again = c.mem("lives in Shanghai", source_thread_id=_THREAD, evidence_message_id="m-x")
-    t_again = t1 + timedelta(minutes=5) if later else t1 - timedelta(minutes=5)
+    t_again = t1 + timedelta(minutes=offset)
     counts = _Counts("noop_already_superseded")
     # c1 的邻居按余弦:shanghai(e0)、other(e1)。c2 与 shanghai 相同、旁边还有 other → 照样进模型。
     reply = _ops(_add(0, replaces=["e0"]), _add(1))
@@ -1268,6 +1274,45 @@ async def test_a_value_retired_earlier_in_the_batch_is_not_brought_back(
     assert _stored(store, again) is written
     assert stored == (2 if written else 1)
     assert counts.delta() == {"noop_already_superseded": 0 if written else 1}
+
+
+@pytest.mark.parametrize("unknown", ["candidate_time", "successor_time", "other_conversation"])
+async def test_a_user_statement_is_written_when_the_order_cannot_be_proven(unknown: str) -> None:
+    """复审 M-1:「不写」只在先后能用**真实消息时间**证明时成立。候选那一行的时间不知道、取代者的
+    证据消息时间不知道、取代者在别的对话(只有记录时间 ≈ 此刻)—— 都证明不了,候选照写(与
+    取代者并存),不能把用户的话丢掉。场景:对话 B 的写回把「住在上海」退成「搬到北京」;对话 A
+    里用户又说「住在上海」,A 的写回在 B 提交前读邻居、提交后落库。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    shanghai = c.mem("lives in Shanghai", source_thread_id="thread-b", evidence_message_id="b-0")
+    other = c.mem("has a cat", (0.0, 1.0, 0.0, 0.0))
+    await store.write([shanghai, other])
+    in_thread = _THREAD if unknown != "other_conversation" else "thread-b"
+    beijing = c.mem(
+        "moved to Beijing", _at(0.95), source_thread_id=in_thread, evidence_message_id="m-2"
+    )
+    again = c.mem("lives in Shanghai", source_thread_id=_THREAD, evidence_message_id="m-x")
+    times = {"m-x": _LATER} if unknown == "successor_time" else {"m-x": _LATER, "m-2": _LATER}
+    line_at = None if unknown == "candidate_time" else _LATER - timedelta(minutes=5)
+
+    class _RetiringMeanwhileLLM(_LLM):
+        """模型「想」的那几秒里,另一个写回把「住在上海」退成了「搬到北京」。"""
+
+        async def __call__(self, **kwargs: Any) -> AIMessage:
+            await store.supersede(
+                tenant_id=c.tenant, user_id=c.user, new_item=beijing, old_ids=[shanghai.id]
+            )
+            return await super().__call__(**kwargs)
+
+    counts = _Counts("noop_already_superseded")
+    candidate = _Candidate(again, line_at=line_at, in_new_segment=True)
+    stored = await _reconcile(
+        store, _RetiringMeanwhileLLM([_ops(_add())]), candidate, message_times=times
+    )
+    assert stored == 1 and _stored(store, again)
+    assert _stored(store, beijing)  # 与取代者并存
+    assert counts.delta() == {"noop_already_superseded": 0}
+    assert _write_guarantee_holds(store, again)
 
 
 async def test_a_failed_model_call_does_not_hand_back_a_candidate_that_is_a_duplicate() -> None:
@@ -1312,3 +1357,52 @@ async def test_a_retry_after_the_history_row_landed_adds_no_second_one() -> None
     assert await _reconcile(store, _LLM([reply]), _said(retried, at=_T0), message_times=times) == 0
     assert len([r for r in store._rows if r.content == earlier.content]) == 1
     assert counts.delta() == {"written_as_history": 0}
+
+
+async def test_a_restatement_of_a_summary_with_a_weaker_tier_is_not_linked_to_it() -> None:
+    """复审 L-3:M-2 的并存连线,目标是汇总行时不连线(新行 ``supersedes`` 留空)—— 否则这句
+    「换个说法的重述」以后会被当成用户后来的说法喂给重写,可能删掉汇总里说得更全的部分。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    summary = await _summary(
+        store, c, "prefers morning lessons because of the afternoon pickup", "user_confirmed"
+    )
+    cand = c.mem("prefers morning lessons", origin="user_stated")
+    counts = _Counts("noop_weaker_user_side_kept")
+    assert await _reconcile(store, _LLM([_ops(_noop("e0"))]), _now_said(cand)) == 1
+    assert _stored(store, cand) and _valid(_row(store, summary.id))
+    assert _row(store, cand.id).supersedes is None
+    assert _row(store, summary.id).review_flagged_at is None
+    assert counts.delta() == {"noop_weaker_user_side_kept": 1}
+
+
+async def test_only_a_user_side_row_is_borrowed_as_the_basis_of_a_flag() -> None:
+    """复审 L-5:候选不写时,只有它重复的那条是**用户一方的行**才借它给汇总行打标。重复的那条
+    本身是一条汇总行(来源为空)→ 不借,存储的打标入口不被调用。"""
+    c = _Ctx()
+
+    class _SpyStore(InMemoryMemoryStore):
+        flag_calls = 0
+
+        async def flag_summary(self, **kwargs: Any) -> Any:
+            type(self).flag_calls += 1
+            return await super().flag_summary(**kwargs)
+
+    store = _SpyStore()
+    repeated = await _summary(store, c, "drives to work these days", "user_stated")
+    members = [c.mem(f"member {uuid4()}", (0.0, 1.0, 0.0, 0.0))]
+    await store.write(members)
+    denied = await store.write_consolidated(
+        tenant_id=c.tenant,
+        user_id=c.user,
+        content="commutes by metro; lives downtown",
+        embedding=_at(0.8),
+        source_ids=[m.id for m in members],
+        source_hashes={m.id: hash_content(m.content) for m in members},
+    )
+    cand = c.mem("now drives to work")
+    reply = _ops(_noop("e0", replaces=["e1"]))
+    assert await _reconcile(store, _LLM([reply]), _now_said(cand)) == 0
+    assert _SpyStore.flag_calls == 0
+    assert _row(store, denied.id).review_flagged_at is None
+    assert _row(store, repeated.id).review_flagged_at is None

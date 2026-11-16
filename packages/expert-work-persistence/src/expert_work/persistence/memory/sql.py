@@ -22,6 +22,7 @@ from expert_work.persistence.bulk_delete import count_where, delete_where
 from expert_work.persistence.knowledge.text_search import tokenize_for_search
 from expert_work.persistence.memory.base import (
     FAIL_CLOSED_TIER,
+    MAX_STATEMENT_HOPS,
     USER_SIDE_ORIGINS,
     ConsolidationSourcesChangedError,
     FlaggedSummary,
@@ -367,21 +368,53 @@ _USER_SIDE_ROW = or_(
 )
 
 
+async def _valid_statement(
+    session: AsyncSession, tenant_id: UUID, user_id: UUID, start: UUID
+) -> MemoryItemRow | None:
+    """``start``, or — when it was replaced — the row at the end of its ``superseded_by``
+    chain, as long as that row is currently valid and on the user's side; at most
+    :data:`MAX_STATEMENT_HOPS` steps (also the guard against a loop). A deleted row, or a
+    chain that does not get there, gives ``None``."""
+    wanted: UUID | None = start
+    for _hop in range(MAX_STATEMENT_HOPS + 1):
+        if wanted is None:
+            return None
+        row = (
+            await session.execute(
+                select(MemoryItemRow).where(
+                    MemoryItemRow.id == wanted,
+                    *_owned(tenant_id, user_id),
+                    MemoryItemRow.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        user_side = effective_origin(_row_to_item(row)) in USER_SIDE_ORIGINS
+        if user_side and await _current_ids(session, tenant_id, user_id, [row.id]):
+            return row
+        wanted = row.superseded_by
+    return None
+
+
 async def _later_statements(session: AsyncSession, summary: MemoryItemRow) -> list[MemoryItem]:
-    """B-300 redesign §7.12 — what the user said after a summary was written and that was
-    linked to it: user-side rows whose ``supersedes`` is the summary and that were recorded
-    or last restated after it, oldest first. A statement that a later one replaced is
-    followed one step along ``superseded_by`` to its currently valid user-side successor
-    (the same one-step walk the flag itself takes); a deleted one, or one without such a
-    successor, contributes nothing."""
-    owned = _owned(summary.tenant_id, summary.user_id)
+    """B-300 redesign §7.12 — what the user said that a summary is to be rewritten by,
+    oldest first: user-side rows whose ``supersedes`` is the summary and that were
+    recorded or last restated after it, plus the row the summary's own ``supersedes``
+    names (the basis recorded when it was flagged — it reaches a summary a statement
+    could not link to itself: the second summary one sentence denied, or one flagged by
+    a candidate that was not written). A statement that later ones replaced is followed
+    along ``superseded_by`` to its currently valid user-side successor
+    (:func:`_valid_statement`); a deleted one, or one without such a successor,
+    contributes nothing."""
+    tenant_id, user_id = summary.tenant_id, summary.user_id
     said_at = func.greatest(MemoryItemRow.created_at, MemoryItemRow.confirmed_at)
     linked = (
         (
             await session.execute(
-                select(MemoryItemRow)
+                select(MemoryItemRow.id)
                 .where(
-                    *owned,
+                    *_owned(tenant_id, user_id),
                     MemoryItemRow.supersedes == summary.id,
                     MemoryItemRow.deleted_at.is_(None),
                     said_at > summary.created_at,
@@ -393,27 +426,13 @@ async def _later_statements(session: AsyncSession, summary: MemoryItemRow) -> li
         .scalars()
         .all()
     )
-    wanted = [row.superseded_by if row.invalid_at is not None else row.id for row in linked]
-    ids = list(dict.fromkeys(i for i in wanted if i is not None))
-    if not ids:
-        return []
-    valid = (
-        (
-            await session.execute(
-                select(MemoryItemRow).where(
-                    MemoryItemRow.id.in_(ids),
-                    *owned,
-                    MemoryItemRow.deleted_at.is_(None),
-                    _USER_SIDE_ROW,
-                    *_retrieve_filter(),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    by_id = {row.id: row for row in valid}
-    return [_row_to_item(by_id[i]) for i in ids if i in by_id]
+    starts = [*linked, *([summary.supersedes] if summary.supersedes is not None else [])]
+    found: dict[UUID, MemoryItem] = {}
+    for start in starts:
+        row = await _valid_statement(session, tenant_id, user_id, start)
+        if row is not None:
+            found.setdefault(row.id, _row_to_item(row))
+    return list(found.values())
 
 
 async def _flag_summaries(
@@ -425,8 +444,10 @@ async def _flag_summaries(
     current: set[UUID],
     candidate: EffectiveOrigin,
     now: datetime,
+    basis_id: UUID,
 ) -> list[UUID]:
-    """B-300 redesign §7.12 step 1 — mark each summary "to rewrite"; one already rewritten
+    """B-300 redesign §7.12 step 1 — mark each summary "to rewrite" and record on it the
+    row to rewrite by (its own ``supersedes``); one already rewritten
     is followed one step along ``superseded_by`` to the summary that replaced it. Takes
     no lock of its own: the caller locked the summaries and their successors
     (:func:`_successor_ids`) in id order."""
@@ -444,6 +465,7 @@ async def _flag_summaries(
         if may_retire(candidate, tier, target_is_summary=False) is not None:
             continue
         row.review_flagged_at = now
+        row.supersedes = basis_id
         flagged.append(row.id)
     return flagged
 
@@ -947,7 +969,15 @@ class SqlMemoryStore(MemoryStore):
             # flush, which is not a documented contract (no behaviour test can pin it).
             await session.flush()
             flagged = await _flag_summaries(
-                session, tenant_id, user_id, flag_summary_ids, locked, current, candidate, now
+                session,
+                tenant_id,
+                user_id,
+                flag_summary_ids,
+                locked,
+                current,
+                candidate,
+                now,
+                new_item.id,
             )
             coexisting = next((i for i, r in refused.items() if r == "confirmed_vs_stated"), None)
             linked: UUID | None = None
@@ -1066,11 +1096,18 @@ class SqlMemoryStore(MemoryStore):
                 return None
             origin = effective_origin(_row_to_item(statement))
             flagged = await _flag_summaries(
-                session, tenant_id, user_id, [summary_id], locked, current, origin, now
+                session,
+                tenant_id,
+                user_id,
+                [summary_id],
+                locked,
+                current,
+                origin,
+                now,
+                statement_id,
             )
             if not flagged:
                 return None
-            statement.supersedes = flagged[0]
             await session.commit()
             return flagged[0]
 

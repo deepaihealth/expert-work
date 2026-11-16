@@ -520,7 +520,8 @@ def record_memory_reconcile(*, op: str) -> None:
     with a weaker source whose text is not the same: stored, that memory is kept — the
     model's "duplicate" includes "says less" — and the new row links to it);
     ``noop_already_superseded`` (it repeats a memory that a statement not older than it
-    has just retired: not stored, so the overturned value is not brought back);
+    has just retired — provably, by the send times of both messages: not stored, so the
+    overturned value is not brought back; when the order cannot be proven it is stored);
     ``written_as_history`` (stored as an already-superseded row linked to a later
     statement of the same conversation); ``collision_weaker_replaced`` (the same text was
     held by a live row with a weaker source: that row retired, the candidate stored);

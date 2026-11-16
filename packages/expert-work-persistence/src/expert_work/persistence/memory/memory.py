@@ -17,6 +17,7 @@ from expert_work.common.search.rrf import rrf_fuse_scored
 from expert_work.persistence.knowledge.text_search import tokenize_for_search
 from expert_work.persistence.memory.base import (
     FAIL_CLOSED_TIER,
+    MAX_STATEMENT_HOPS,
     USER_SIDE_ORIGINS,
     ConsolidationSourcesChangedError,
     FlaggedSummary,
@@ -483,9 +484,11 @@ class InMemoryMemoryStore(MemoryStore):
         ids: Sequence[UUID],
         candidate: EffectiveOrigin,
         now: datetime,
+        basis_id: UUID,
     ) -> list[UUID]:
-        """B-300 redesign §7.12 step 1 — mark each summary "to rewrite"; one already
-        rewritten is followed one step to the summary that replaced it."""
+        """B-300 redesign §7.12 step 1 — mark each summary "to rewrite" and record on it
+        the row to rewrite by (its own ``supersedes``); one already rewritten is followed
+        one step to the summary that replaced it."""
         load = self._member_loader(tenant_id, user_id)
         flagged: list[UUID] = []
         if candidate not in USER_SIDE_ORIGINS:
@@ -501,7 +504,7 @@ class InMemoryMemoryStore(MemoryStore):
             tier = await origin_standing(row, load)
             if may_retire(candidate, tier, target_is_summary=False) is not None:
                 continue
-            self._change([row.id], review_flagged_at=now)
+            self._change([row.id], review_flagged_at=now, supersedes=basis_id)
             flagged.append(row.id)
         return flagged
 
@@ -545,7 +548,9 @@ class InMemoryMemoryStore(MemoryStore):
             replaced = clash.id
             self._retire_rows([clash.id], new_item.id, now)
             retired = [*retired, clash.id]
-        flagged = await self._flag_summaries(tenant_id, user_id, flag_summary_ids, candidate, now)
+        flagged = await self._flag_summaries(
+            tenant_id, user_id, flag_summary_ids, candidate, now, new_item.id
+        )
         coexisting = next((i for i, r in refused.items() if r == "confirmed_vs_stated"), None)
         known = link_id is not None and self._index_of(tenant_id, user_id, link_id) is not None
         linked = link_id if known else None
@@ -641,12 +646,14 @@ class InMemoryMemoryStore(MemoryStore):
         if statement is None:
             return None
         flagged = await self._flag_summaries(
-            tenant_id, user_id, [summary_id], effective_origin(statement), datetime.now(UTC)
+            tenant_id,
+            user_id,
+            [summary_id],
+            effective_origin(statement),
+            datetime.now(UTC),
+            statement_id,
         )
-        if not flagged:
-            return None
-        self._change([statement_id], supersedes=flagged[0])
-        return flagged[0]
+        return flagged[0] if flagged else None
 
     async def expire(
         self,
@@ -1007,29 +1014,43 @@ class InMemoryMemoryStore(MemoryStore):
 
     def _later_statements(self, summary: MemoryItem, now: datetime) -> list[MemoryItem]:
         """Mirrors the SQL store: user-side rows linked to the summary and recorded or last
-        restated after it; one that was replaced is followed one step to its currently
-        valid user-side successor."""
+        restated after it, plus the row the summary's own ``supersedes`` names (the basis
+        recorded when it was flagged); one that was replaced is followed along
+        ``superseded_by`` to its currently valid user-side successor, at most
+        :data:`MAX_STATEMENT_HOPS` steps."""
         floor = datetime.min.replace(tzinfo=UTC)
+        owned = {
+            r.id: r
+            for r in self._rows
+            if r.tenant_id == summary.tenant_id
+            and r.user_id == summary.user_id
+            and r.deleted_at is None
+        }
 
-        def owned_user_side(r: MemoryItem) -> bool:
-            return (
-                r.tenant_id == summary.tenant_id
-                and r.user_id == summary.user_id
-                and r.deleted_at is None
-                and effective_origin(r) in USER_SIDE_ORIGINS
-            )
+        def user_side(r: MemoryItem) -> bool:
+            return effective_origin(r) in USER_SIDE_ORIGINS
 
         linked = [
             r
-            for r in self._rows
-            if owned_user_side(r)
+            for r in owned.values()
+            if user_side(r)
             and r.supersedes == summary.id
             and max(r.created_at or floor, r.confirmed_at or floor) > (summary.created_at or floor)
         ]
         linked.sort(key=lambda r: (r.created_at or floor, r.id))
-        wanted = [r.superseded_by if r.invalid_at is not None else r.id for r in linked]
-        by_id = {r.id: r for r in self._rows if owned_user_side(r) and _currently_valid(r, now=now)}
-        return [by_id[i] for i in dict.fromkeys(wanted) if i is not None and i in by_id]
+        starts = [r.id for r in linked]
+        if summary.supersedes is not None:
+            starts.append(summary.supersedes)
+        found: dict[UUID, MemoryItem] = {}
+        for start in starts:
+            row = owned.get(start)
+            for _hop in range(MAX_STATEMENT_HOPS):
+                if row is None or (user_side(row) and _currently_valid(row, now=now)):
+                    break
+                row = owned.get(row.superseded_by) if row.superseded_by is not None else None
+            if row is not None and user_side(row) and _currently_valid(row, now=now):
+                found.setdefault(row.id, row)
+        return list(found.values())
 
     async def rewrite_summary(
         self,
