@@ -1054,3 +1054,56 @@ async def test_the_statements_are_ordered_by_when_they_were_said(store: MemorySt
     )
     assert outcome == "emptied"
     assert (await _row(store, t, u, summary.id)).superseded_by == later.id
+
+
+async def test_an_expired_statement_leaves_nothing_to_rewrite_by(store: MemoryStore) -> None:
+    """依据那一行被过期(整理巡检的到期复核会这样处理带复核期的行)—— 它说的事不再成立,没有
+    可用的说法:取到的说法为空(整理一侧据此计 ``statement_gone`` 并清标),「什么都不剩」也
+    不作废(没有可连的),按 ``stale``。"""
+    t, u = uuid4(), uuid4()
+    summary, _members, said = await _flagged_summary(store, t, u)
+    assert await store.expire(tenant_id=t, user_id=u, memory_id=said.id)
+    [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
+    assert flagged.summary.id == summary.id
+    assert flagged.statements == ()
+    assert summary.review_flagged_at is not None
+    outcome = await store.rewrite_summary(
+        tenant_id=t,
+        user_id=u,
+        summary_id=summary.id,
+        flagged_at=summary.review_flagged_at,
+        content=None,
+    )
+    assert outcome == "stale"
+    assert (await _row(store, t, u, summary.id)).invalid_at is None
+
+
+async def test_a_statement_restated_later_sorts_by_when_it_was_said_again(
+    store: MemoryStore,
+) -> None:
+    """记录得早、用户后来又说了一遍(``confirmed_at`` 更晚)的说法,按「再说」的时间排在后面;
+    「什么都不剩」时旧汇总连到它。"""
+    t, u = uuid4(), uuid4()
+    restated = _item(t, u, "drives to work", origin="user_stated", created_at=_T0)
+    await store.write([restated])
+    summary = await _summary(
+        store, t, u, "commutes by metro; lives downtown", _item(t, u, "m", origin="user_stated")
+    )
+    linked = _item(t, u, "sold the metro card", origin="user_stated")
+    await store.supersede(tenant_id=t, user_id=u, new_item=linked, link_id=summary.id)
+    assert await store.flag_summary(
+        tenant_id=t, user_id=u, summary_id=summary.id, statement_id=restated.id
+    )
+    later = datetime.now(UTC) + timedelta(hours=1)
+    assert await store.refresh_confirmed_at(
+        tenant_id=t, user_id=u, memory_id=restated.id, confirmed_at=later
+    )
+    [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
+    assert [s.id for s in flagged.statements] == [linked.id, restated.id]
+    flagged_at = flagged.summary.review_flagged_at
+    assert flagged_at is not None
+    outcome = await store.rewrite_summary(
+        tenant_id=t, user_id=u, summary_id=summary.id, flagged_at=flagged_at, content=None
+    )
+    assert outcome == "emptied"
+    assert (await _row(store, t, u, summary.id)).superseded_by == restated.id
