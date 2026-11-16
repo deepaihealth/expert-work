@@ -201,17 +201,17 @@ def _user_statement_stored(rows: Rows) -> bool:
 # --------------------------------------------------------------------------- 跨类:近邻、写的保证
 
 
-def _reconciled(result: Mapping[str, Any], *, finished_only: bool = False) -> list[dict[str, Any]]:
-    """各次写回里去重合并的决定。``finished_only``:跳过没做完的那几次写回(``failed`` 或记下了被吞的
-    错 —— 写的保证只对「正常做完」的尝试成立,§7.3)。"""
+def _round_decisions(rnd: Mapping[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for rnd in result.get("rounds", []):
-        if finished_only and (rnd.get("failed") or rnd.get("errors")):
-            continue
-        for call in rnd.get("calls", []):
-            if call.get("kind") == "reconcile" and "input" in call:
-                out += parse_reconcile(str(call["input"]), str(call.get("reply", "")))
+    for call in rnd.get("calls", []):
+        if call.get("kind") == "reconcile" and "input" in call:
+            out += parse_reconcile(str(call["input"]), str(call.get("reply", "")))
     return out
+
+
+def _reconciled(result: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """各次写回里去重合并的决定。"""
+    return [d for rnd in result.get("rounds", []) for d in _round_decisions(rnd)]
 
 
 def neighbour_checks(out: dict[str, Any], result: Mapping[str, Any]) -> None:
@@ -243,19 +243,34 @@ def write_guarantee(out: dict[str, Any], result: Mapping[str, Any]) -> None:
         return
     labels = result.get("origin_labels") or {}
     rows, counts = Rows(result), out["counts"]
-    unfinished = [r for r in result.get("rounds", []) if r.get("failed") or r.get("errors")]
-    counts["guarantee_rounds_skipped"] += len(unfinished)  # 没做完的写回不查,只报数
-    broken = False
-    for decision in _reconciled(result, finished_only=True):
-        origin = labels.get(decision["source"])
-        if origin not in USER_SIDE:
+    broken = skipped = False
+    for rnd in result.get("rounds", []):
+        if rnd.get("errors"):
+            # 写回里出了错(被吞的异常):这一次没做完,保证不适用(§7.3);只按出错跳过 ——
+            # 写入扫描拦下一条也会 failed,但那一轮其实做完了(复审 LOW-1)
+            counts["guarantee_rounds_skipped"] += 1
+            skipped = True
             continue
-        counts["guarantee_candidates"] += 1
-        tier = _TIER.get(str(origin), 0)
-        if not _guaranteed(rows, decision, tier):
-            broken = True
-            counts["guarantee_broken_candidates"] += 1
-    out["write_guarantee_broken"] = broken
+        scan_blocked = {_content_norm(c) for c in rnd.get("scan_blocked") or []}
+        for decision in _round_decisions(rnd):
+            origin = labels.get(decision["source"])
+            if origin not in USER_SIDE:
+                continue
+            if _content_norm(decision["content"]) in scan_blocked:
+                counts["guarantee_scan_blocked"] += 1  # 写入扫描拦下的那一条另计(§7.3 的出口)
+                continue
+            counts["guarantee_candidates"] += 1
+            tier = _TIER.get(str(origin), 0)
+            if not _guaranteed(rows, decision, tier):
+                broken = True
+                counts["guarantee_broken_candidates"] += 1
+    if broken:
+        out["write_guarantee_broken"] = True
+    elif skipped:
+        # 有一次写回没做完、量的部分又都没坏:不当成「没坏」,报没量到(复审 LOW-2)
+        out["missing"]["write_guarantee_broken"] = "writeback_error"
+    else:
+        out["write_guarantee_broken"] = False
 
 
 def _guaranteed(rows: Rows, decision: Mapping[str, Any], tier: int) -> bool:

@@ -344,6 +344,21 @@ class GuardedAux:
         )
 
 
+def scan_blocked(calls: Sequence[Mapping[str, Any]]) -> list[str]:
+    """这一次写回里进了去重合并的候选,哪些会被平台的写入扫描拦下(同一个扫描函数)。写的保证把
+    它们剔出去单独计数(§7.3「写入扫描」那个出口)。"""
+    from expert_work.persistence.memory.base import scan_memory_content
+
+    out: list[str] = []
+    for call in calls:
+        if call.get("kind") != "reconcile" or "input" not in call:
+            continue
+        for cand in parse_reconcile(str(call["input"]), ""):
+            if scan_memory_content(uuid4(), cand["content"]) is not None:
+                out.append(cand["content"])
+    return out
+
+
 # --------------------------------------------------------------------------- 去重合并的回复(A9)
 
 

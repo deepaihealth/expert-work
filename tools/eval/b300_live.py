@@ -508,6 +508,7 @@ async def run_extraction(
                 "written": outcome.written,
                 "failed": outcome.failed,
                 "errors": list(swallowed),
+                "scan_blocked": kp.scan_blocked(caller.calls),
                 "calls": caller.calls,
                 "message_count": len(messages),
                 "sliced": bool(slice_arg),

@@ -180,9 +180,13 @@ async def _backdate(
     SQL 存储在调用方的作用域里用它自己的 session 改;内存存储(测试)直接改行。"""
     rows = getattr(store, "_rows", None)
     if isinstance(rows, list):
+        hits = 0
         for i, row in enumerate(rows):
             if row.id == memory_id and row.tenant_id == tenant_id and row.user_id == user_id:
                 rows[i] = row.model_copy(update={"created_at": when, "last_used_at": when})
+                hits += 1
+        if hits != 1:
+            raise SystemExit(f"b300 in-pod: could not backdate memory {memory_id}; stopped")
         return
     from sqlalchemy import update
 
@@ -198,8 +202,13 @@ async def _backdate(
         .values(created_at=when, last_used_at=when)
     )
     async with store._sf() as session:
-        await session.execute(stmt)
+        result = await session.execute(stmt)
         await session.commit()
+    if getattr(result, "rowcount", 1) != 1:
+        raise SystemExit(
+            f"b300 in-pod: could not backdate memory {memory_id} (rows changed: "
+            f"{getattr(result, 'rowcount', None)}); stopped"
+        )
 
 
 async def seed_days(

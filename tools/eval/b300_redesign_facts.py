@@ -347,16 +347,16 @@ S7_ITEMS: tuple[Proposal, ...] = (
         "我方",
     ),
     Proposal(
-        "doc-owner",
+        "export-timeout",
         "coding",
         "en",
         (
             Finding("the slowest endpoint", "the export report", "export report"),
             Finding("the library flagged as outdated", "the PDF renderer", "pdf renderer"),
         ),
-        "the reviewer for the API reference",
-        "Ines Carvalho",
-        "carvalho",
+        "the request timeout for the export job",
+        "45 seconds",
+        "45 seconds|45s|45-second",
     ),
     Proposal(
         "next-visit",
