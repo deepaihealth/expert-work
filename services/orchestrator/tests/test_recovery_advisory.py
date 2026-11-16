@@ -670,10 +670,11 @@ async def test_summariser_and_memory_flush_never_see_the_attached_advisory() -> 
         "失败那条不在被压缩的中段, 测试本身无效"
     )
     assert all(RECOVERY_ADVISORY_OPEN not in s for s in summaries)
-    extraction = _extraction_inputs(middle, ())
+    turns = _extraction_inputs(middle, ())
     assert all(
         RECOVERY_ADVISORY_OPEN not in line.text
-        for line in [*extraction.user.lines, *extraction.conversation.lines]
+        for turn in turns
+        for line in [*turn.user, *turn.conversation]
     )
 
 

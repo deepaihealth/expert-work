@@ -5171,9 +5171,10 @@ const en: TranslationKeys = {
       "The tail is whatever's currently being worked on — set it too low and recent details get lost.\nExample: set to 6 — when summarizing, the 6 most recent messages stay untouched, so the model doesn't lose track of what just happened.",
     cc_tail_keep_default: "6",
     cc_flush_before_compaction_label: "Flush to memory before compacting",
-    cc_flush_before_compaction_brief: "Saves key points before dropping them",
+    cc_flush_before_compaction_brief:
+      "Currently has no effect (long-term memories are now extracted after each turn)",
     cc_flush_before_compaction_impact:
-      "Keeps important decisions from being lost after repeated compressions.\nOnly actually does anything when 'Learn (remember new info)' is on — otherwise this switch is a no-op.\nExample: the user confirmed an important decision somewhere in the middle of the conversation — before that stretch gets summarized away, the key point gets saved to long-term memory first, so it's still findable later.",
+      "This switch currently has no effect, on or off; it is kept so saved configurations stay valid.\nLong-term memories are now extracted when each turn finishes, from that turn's new messages. Compaction only shortens what is sent to the model — the conversation record itself is unchanged — so anything compaction folds away is still extracted at the end of its turn, and nothing is extracted before compacting.\nExample: the user confirms an important decision in the middle of a conversation. When that turn finishes it is saved to long-term memory (with 'Learn (remember new info)' on); compacting that stretch later doesn't affect what was saved.",
     cc_flush_before_compaction_default: "true",
     cc_max_passes_label: "Max compression passes",
     cc_max_passes_brief: "Currently has no effect (reserved)",

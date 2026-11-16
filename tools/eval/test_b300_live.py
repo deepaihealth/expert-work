@@ -158,7 +158,9 @@ async def test_run_extraction_end_to_end_with_fakes() -> None:
                 "is_correction": True,
             }
             return _chat(json.dumps({"memories": [memory]}))
-        return _chat(json.dumps({"operations": []}))
+        # 去重合并的回复要用得上(``{"ops": [...]}``):用不了的回复是出错(B-300 重做 §7.6),
+        # 写回不再把候选直接写下。空的 ``ops`` = 没给决定,候选照写。
+        return _chat(json.dumps({"ops": []}))
 
     guard = _guard()
     async with _client(handler) as http:

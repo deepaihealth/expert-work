@@ -1,9 +1,10 @@
 """Stream CM-3 — pre-compaction flush wiring (graph-level).
 
 Drives the flush through the compiled graph: when ``agent_node``'s
-compressor preflight fires, the bound ``pre_compaction_flush`` extracts the
-about-to-be-discarded middle into long-term memory before the summariser
-runs. A graph without the callback compresses but flushes nothing.
+compressor preflight fires, the bound ``pre_compaction_flush`` is called with
+the about-to-be-discarded middle before the summariser runs (since B-300 PR S
+it no longer extracts — the run-end write-back slice covers that middle). A
+graph without the callback compresses but flushes nothing.
 """
 
 from __future__ import annotations
@@ -16,13 +17,13 @@ from uuid import uuid4
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from prometheus_client import REGISTRY
 
 from expert_work.persistence import InMemoryMemoryStore
 from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import GraphRunner, ToolRegistry, build_react_graph
 from orchestrator.context import ContextCompressor
 from orchestrator.graph_builder import make_pre_compaction_flush
-from orchestrator.llm import FakeEmbedder
 from orchestrator.tools.registry import ToolSpec
 
 _DIM = 32
@@ -80,32 +81,29 @@ async def _run(graph: object, *, tenant: object, user: object) -> None:
 
 
 @pytest.mark.asyncio
-async def test_compaction_flushes_middle_to_memory() -> None:
-    store = InMemoryMemoryStore()
+async def test_compaction_calls_the_flush_which_no_longer_extracts() -> None:
+    """B-300 重做 PR S(§8.4)—— 压缩前照旧调抢存回调(按结果记 ``empty``),但它不再提炼:被折掉的
+    中段由轮末写回的切片覆盖。"""
     tenant, user = uuid4(), uuid4()
-    embedder = FakeEmbedder(dim=_DIM)
-    # Separate LLM for the flush extraction so its JSON reply is unambiguous.
-    flush_llm = _FixedLLM(
-        reply=AIMessage(content='{"memories": [{"kind": "fact", "content": "decided to use RRF"}]}')
-    )
     agent_llm = _FixedLLM(reply=AIMessage(content="done"))
     graph = build_react_graph(
         llm_caller=agent_llm,
         tool_registry=ToolRegistry(),
         context_compressor=_compressor(),
-        pre_compaction_flush=make_pre_compaction_flush(
-            memory_store=store, embedder=embedder, llm_caller=flush_llm
-        ),
+        pre_compaction_flush=make_pre_compaction_flush(),
     )
+    before = _flush_count("empty")
 
     await _run(graph, tenant=tenant, user=user)
 
-    # The discarded middle was flushed to long-term memory before the summary.
-    assert flush_llm.calls == 1
-    stored = await store.retrieve(
-        tenant_id=tenant, user_id=user, query_embedding=(0.0,) * _DIM, limit=10
+    assert _flush_count("empty") == before + 1
+
+
+def _flush_count(outcome: str) -> float:
+    value = REGISTRY.get_sample_value(
+        "expert_work_cm_precompaction_flush_total", {"outcome": outcome}
     )
-    assert [m.content for m in stored] == ["decided to use RRF"]
+    return value or 0.0
 
 
 @pytest.mark.asyncio

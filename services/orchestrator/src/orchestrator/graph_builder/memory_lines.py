@@ -2,8 +2,8 @@
 ``event_date`` 的核对与证据指针(设计 §4、§5.1、§5.4、§7.4)。
 
 两次提炼各自一份带编号的输入。每行记着它来自哪条消息(id + 在整段对话里的序号)、发送时间、在不在
-``=== new ===`` 之上(``context``,上下文行;切片是 PR S 的事,之前没有上下文行),以及在不在本次
-写回负责的轮次里(``fresh``,交给去重合并的 ``in_new_segment``)。
+``=== new ===`` 之上(``context``,上下文行,PR S 的切片)。不是上下文行的就在本次写回负责的新段里
+(交给去重合并的 ``in_new_segment``)。
 
 程序从不因为指针不对而丢掉一条记忆,只会让标签变弱或指针留空(§4 末)。
 """
@@ -48,9 +48,7 @@ class ExtractionLine:
     sent_day: date | None = None
     message_id: str | None = None
     message_index: int | None = None
-    #: 在本次写回负责的轮次里(切片之前 = 最后一轮)。
-    fresh: bool = False
-    #: 在 ``=== new ===`` 之上(PR S 的上下文行)。
+    #: 在 ``=== new ===`` 之上(PR S 的上下文行);其余的行都在新段里。
     context: bool = False
 
     def body(self) -> str:
@@ -70,20 +68,6 @@ def render_lines(lines: Sequence[ExtractionLine]) -> str:
     if not marked:
         out.append(NEW_SEGMENT_MARK)
     return "\n".join(out)
-
-
-def cap_lines(lines: Sequence[ExtractionLine], cap: int) -> tuple[list[ExtractionLine], bool]:
-    """B-300 D3 —— 总量上限:从最近的一行往前收,超了就停(更早的丢掉)。每行按带编号的样子量
-    (编号按最宽的算),标记一行也算。返回 ``(留下的行, 是否超了)``。"""
-    prefix = len(f"[{len(lines)}] ")
-    used = len(NEW_SEGMENT_MARK)
-    kept: list[ExtractionLine] = []
-    for line in reversed(lines):
-        used += 1 + prefix + len(line.body())
-        if used > cap:
-            return kept[::-1], True
-        kept.append(line)
-    return kept[::-1], False
 
 
 def evidence_pointer(line: ExtractionLine | None) -> tuple[str | None, int | None]:
@@ -172,7 +156,7 @@ def _settle(
         evidence_message_index=pointer[1],
         event_date=event_date,
         line_at=line.sent_at if line is not None else None,
-        in_new_segment=new_line is not None and new_line.fresh,
+        in_new_segment=new_line is not None,
         checks=checks,
     )
 

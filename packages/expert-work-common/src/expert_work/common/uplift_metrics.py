@@ -148,10 +148,11 @@ _memory_extraction_check_total = expert_work_counter(
     "Extraction results the program changed after checking them, by pass and check (B-300).",
     label_names=("extraction_pass", "check"),
 )
-_memory_extraction_input_capped_total = expert_work_counter(
-    "expert_work_memory_extraction_input_capped_total",
-    "Extraction inputs that went over the total character cap; oldest lines dropped (B-300).",
-    label_names=("extraction_pass",),
+# B-300 redesign PR S (B-176 M2-1) — what incremental slicing did to a write-back segment.
+_memory_writeback_segment_total = expert_work_counter(
+    "expert_work_memory_writeback_segment_total",
+    "Write-back segment events (incremental slicing, retries, config errors), by event (B-300).",
+    label_names=("event",),
 )
 _memory_extraction_message_truncated_total = expert_work_counter(
     "expert_work_memory_extraction_message_truncated_total",
@@ -516,9 +517,10 @@ def record_memory_reconcile(*, op: str) -> None:
     recalled through, written instead; ``noop_refreshed`` = a NOOP that moved the
     user-side target's confirmed date. ``degraded`` now only means the model gave no
     usable decision for that candidate (or the UPDATE / DELETE target was already
-    gone). ``reconcile_failed_direct`` = one reconcile call failed inside (lookup,
-    model, unusable reply, store error): the candidates of that batch not written yet
-    were written directly with their own fields (once per failed call).
+    gone). ``reconcile_failed`` = one reconcile call failed inside (lookup, model,
+    unusable reply, store error): nothing of that batch is written directly; the
+    write-back raises to the job's retry, and on the last attempt the candidates not
+    written yet go to the DLQ (redesign PR S, §7.6).
     """
     _memory_reconcile_total.labels(op=op).inc()
 
@@ -562,9 +564,21 @@ def record_memory_extraction_check(*, pass_name: str, check: str) -> None:
     _memory_extraction_check_total.labels(extraction_pass=pass_name, check=check).inc()
 
 
-def record_memory_extraction_input_capped(*, pass_name: str) -> None:
-    """Bump ``expert_work_memory_extraction_input_capped_total{extraction_pass}`` (B-300 D3)."""
-    _memory_extraction_input_capped_total.labels(extraction_pass=pass_name).inc()
+def record_memory_writeback_segment(*, event: str, count: int = 1) -> None:
+    """Add ``count`` to ``expert_work_memory_writeback_segment_total{event}`` (B-300 redesign
+    PR S): ``empty`` (nothing new since the previous job — no model call),
+    ``straddling_turn_skipped`` (a turn began before the start and ended after it; it belongs to
+    the previous job), ``turns_older_than_window`` (with no earlier job, turns opened more than
+    30 days ago or with no timestamp — left out), ``turns_over_cap_dropped`` (older whole turns
+    dropped to keep the segment
+    within the extraction cap; replaces the line-level ``input_capped`` counter), ``halved`` (a
+    retry split the segment into two halves), ``precompaction_flush_skipped`` (the pre-compaction
+    flush no longer extracts), ``already_done`` (another job at the same message count is done),
+    ``config_error`` (a configuration-class error: finished without a retry),
+    ``lease_expired_failed`` (a job whose last attempt died mid-way and whose lease ran out was
+    settled ``failed`` by the next claim — its segment is abandoned)."""
+    if count:
+        _memory_writeback_segment_total.labels(event=event).inc(count)
 
 
 def record_memory_extraction_message_truncated(*, pass_name: str, count: int) -> None:
@@ -813,7 +827,6 @@ __all__ = [
     "record_memory_drift",
     "record_memory_extraction",
     "record_memory_extraction_check",
-    "record_memory_extraction_input_capped",
     "record_memory_extraction_message_truncated",
     "record_memory_inject_mode",
     "record_memory_predictive_review",
@@ -821,6 +834,7 @@ __all__ = [
     "record_memory_redacted",
     "record_memory_retrieval",
     "record_memory_reviewed_durable",
+    "record_memory_writeback_segment",
     "record_skill_blocked",
     "record_skill_drift",
     "record_skill_high_risk_event",
