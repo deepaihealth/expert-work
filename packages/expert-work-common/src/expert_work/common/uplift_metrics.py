@@ -517,8 +517,10 @@ def record_memory_reconcile(*, op: str) -> None:
     recalled through, written instead; ``noop_refreshed`` = a NOOP that moved the
     user-side target's confirmed date. ``event_date_one_sided_update`` /
     ``event_date_one_sided_delete`` (user 2026-11-16) = an UPDATE / DELETE where only one side
-    has an event date passed the program rules (the event-date rule refuses only when both have
-    one, or a DELETE of a dated target by an undated non-correction). ``degraded`` now only
+    has an event date was actually applied (the event-date rule refuses only when both have
+    one, or a DELETE of a dated target by an undated non-correction); ``noop_other_event_date``
+    = a NOOP between two memories with different event dates, written as an ADD (different
+    occasions). ``degraded`` now only
     means the model gave no usable decision for that candidate (or the UPDATE / DELETE target
     was already gone). ``reconcile_failed`` = one reconcile call failed inside (lookup, model,
     unusable reply, store error): nothing of that batch is written directly; the

@@ -67,9 +67,11 @@ reading or a count. Two such memories with different event dates are different o
 ADD. When both have the same "event_date", the existing memory is changed only by a
 candidate with "is_correction": true; any other candidate about that day is a NOOP when it
 says the same thing and an ADD otherwise. A reading or count taken on a different date or
-time than an existing one is a new memory (ADD), not an UPDATE of the earlier one.
-A date written in the content, such as "(as of <date>)", does not make another occasion: a
-changed state of the same thing is an UPDATE, and the same state said again is a NOOP.
+time than an existing one is a new memory (ADD), not an UPDATE of the earlier one, whether
+or not either has an "event_date": the date written in its content counts too.
+For a state, a date written in the content, such as "(as of <date>)", does not make another
+occasion: a changed state of the same thing is an UPDATE, and the same state said again is
+a NOOP.
 When only one of the two has an "event_date", decide by what they say.
 A candidate with "is_correction": true changes something said earlier: when an existing
 memory still says the earlier value, the candidate is an UPDATE of that memory.
@@ -422,6 +424,101 @@ async def test_event_dates_gate_update_and_delete(
         assert written == ([cand.id] if op == "DELETE" and correction else [])
     else:
         assert written == [cand.id]
+
+
+def _day(n: int | None) -> date | None:
+    return None if n is None else date(2026, 11, n)
+
+
+@pytest.mark.parametrize(
+    ("cand_day", "target_day", "added"),
+    [(1, 2, True), (1, 1, False), (1, None, False), (None, 1, False), (None, None, False)],
+    ids=["other-day", "same-day", "candidate-only", "target-only", "no-event-date"],
+)
+@pytest.mark.asyncio
+async def test_a_noop_across_different_event_dates_is_an_add(
+    monkeypatch: pytest.MonkeyPatch, cand_day: int | None, target_day: int | None, added: bool
+) -> None:
+    """复审 MEDIUM(11-16,「方案三」在「重复」这条路上的落法):两边都有事件日期且不同 = 不同的
+    两次,模型判「重复」也改为新增并计数;其余照旧是重复。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    counted: list[str] = []
+    monkeypatch.setattr(memory_module, "record_memory_reconcile", lambda *, op: counted.append(op))
+    target = c.mem("the meter read 310", _at(0.95), occurred_on=_day(target_day))
+    await store.write([target])
+    cand = c.mem("the meter reading was 310", occurred_on=_day(cand_day))
+    result = await _reconcile(store, _LLM([_ops((0, "NOOP", "e0"))]), _Candidate(cand))
+    assert _untouched(store, target)
+    assert [m.id for m in result.direct] == ([cand.id] if added else [])
+    assert ("noop_other_event_date" in counted) is added
+
+
+def test_an_unapplied_noop_across_different_event_dates_is_still_written() -> None:
+    """收尾时(去重合并出错)还没落的「重复」:日期不同的按新增写,同一天的不写。"""
+    c = _Ctx()
+    target = c.mem("the meter read 310", occurred_on=_day(2))
+    by_short_id = {"e0": target.id}
+    other = memory_module._Pending(
+        _Candidate(c.mem("read 310", occurred_on=_day(1))), (target,), frozenset()
+    )
+    same = memory_module._Pending(
+        _Candidate(c.mem("read 310", occurred_on=_day(2))), (target,), frozenset()
+    )
+    assert memory_module._would_write(other, "NOOP", "e0", by_short_id) is True
+    assert memory_module._would_write(same, "NOOP", "e0", by_short_id) is False
+
+
+@pytest.mark.parametrize(
+    ("op", "cand_day", "target_day"), [("UPDATE", None, 1), ("DELETE", 1, None)]
+)
+@pytest.mark.asyncio
+async def test_the_one_sided_count_needs_the_write_to_happen(
+    monkeypatch: pytest.MonkeyPatch, op: str, cand_day: int | None, target_day: int | None
+) -> None:
+    """复审 LOW(11-16):只有一边有事件日期的计数只在更新 / 删除真的落了之后才记;被层级拦下的不记。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    counted: list[str] = []
+    monkeypatch.setattr(memory_module, "record_memory_reconcile", lambda *, op: counted.append(op))
+    target = c.mem(
+        "the meter read 310", _at(0.95), origin="user_stated", confidence=0.9,
+        occurred_on=_day(target_day),
+    )  # fmt: skip
+    await store.write([target])
+    cand = c.mem(
+        "the meter read 301", origin="assistant_derived", confidence=0.5, occurred_on=_day(cand_day)
+    )
+    await _reconcile(store, _LLM([_ops((0, op, "e0"))]), _Candidate(cand))
+    assert _untouched(store, target)
+    assert [o for o in counted if o.startswith("blocked_")]
+    assert [o for o in counted if o.startswith("event_date_one_sided")] == []
+
+
+@pytest.mark.parametrize(
+    ("op", "cand_day", "target_day"), [("UPDATE", None, 1), ("DELETE", 1, None)]
+)
+@pytest.mark.asyncio
+async def test_the_one_sided_count_skips_a_write_that_did_not_land(
+    monkeypatch: pytest.MonkeyPatch, op: str, cand_day: int | None, target_day: int | None
+) -> None:
+    """取代 / 作废没成(目标已不在,存储返回「没写」)→ 只记 ``degraded``,不记一边有日期。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    counted: list[str] = []
+    monkeypatch.setattr(memory_module, "record_memory_reconcile", lambda *, op: counted.append(op))
+
+    async def not_written(*_args: Any, **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(memory_module, "_apply_update", not_written)
+    monkeypatch.setattr(memory_module, "_apply_delete", not_written)
+    target = c.mem("the meter read 310", _at(0.95), occurred_on=_day(target_day))
+    await store.write([target])
+    cand = c.mem("the meter read 301", occurred_on=_day(cand_day))
+    await _reconcile(store, _LLM([_ops((0, op, "e0"))]), _Candidate(cand))
+    assert "degraded" in counted
+    assert [o for o in counted if o.startswith("event_date_one_sided")] == []
 
 
 @pytest.mark.parametrize(

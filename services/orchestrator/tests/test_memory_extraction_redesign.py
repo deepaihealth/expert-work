@@ -294,13 +294,17 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
         "- A value the user states about themselves or their own things, with the same message "
         "saying what it is — a reading or measurement, an id or number, a current status — is "
         "recorded even though it may change, except passwords, one-time codes, bank card or bank "
-        "account numbers and other secrets, which are never recorded. Write it with the date or "
-        'time it refers to in the content, such as "(as of <date>)", so it is not later taken '
-        "for a current value: a date in brackets after the line number is the day that line was "
-        'sent, so turn "this morning", "yesterday" and the like in that line into a date counted '
-        "from it; in a line without a date, leave such words as they are. A date written in the "
-        'content is not an "event_date" (see below). - A message that only agrees' in system
+        "account numbers and other secrets, which are never recorded. Write a date in the "
+        "content so that it is not later taken for a current value: a current status with "
+        '"(as of <date>)", and a reading or count with the day it was measured ("measured on '
+        '<date>"); an id or a number that names something gets no date. For that date, a date '
+        'in brackets after the line number is the day that line was sent, so turn "this '
+        'morning", "yesterday" and the like in that line into a date counted from it; in a line '
+        "without a date, leave such words as they are. A date written in the content is not by "
+        'itself an "event_date" (see below). - A message that only agrees' in system
     )
+    # 复审 MEDIUM(11-16):「(as of <date>)」只给当前状态;读数写测得那天;编号不带日期。
+    assert 'such as "(as of <date>)", so it is not later taken' not in system
     assert "Write it with the date or time it refers to, so it is not later taken" not in system
     assert (
         '- "is_correction": true ONLY when the same message itself says what is being corrected '
