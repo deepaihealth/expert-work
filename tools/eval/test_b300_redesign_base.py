@@ -296,3 +296,51 @@ def test_copied_detail_from_another_assistant_line_is_outside_the_anchor_pair() 
     assert "2026-11-10" in lines[1][1] and "2026-11-10" not in anchor_pair
     assert "The user line is line [4]." in prompt
     assert "only in other assistant lines, activity lines or tool results counts as added" in prompt
+
+
+# ------------------------------------------------------------ 第二轮审查(11-16)
+
+
+def test_grounded_wording_does_not_count_statements_about_the_exchange() -> None:
+    """用户在 gate-01 / gate-05 上答「是」:「助手记下了」这类说这次往来本身的话不算多加的事实。"""
+    assert (
+        "Statements about the exchange itself (that the assistant asked, proposed or recorded "
+        "it) are not added facts." in base.GROUNDED_WORDING
+    )
+
+
+def test_cap_keeps_the_line_right_above_the_named_user_line() -> None:
+    """截证据时,点名的用户行正上方那一行(可能在很早的上下文里)始终留着。"""
+    question = "[1] [assistant] What is the reading?"
+    context = "\n".join(f"[{i}] [user] [2026-11-15] c{i}" for i in range(2, 400))
+    text = f"{question}\n{context}\n=== new ===\n[400] [user] [2026-11-16] 6.8"
+    capped = base.cap_evidence(text, keep=(1,))
+    assert question in capped and "earlier context lines dropped" in capped
+
+
+def test_line_cap_counts_the_text_not_the_prefix() -> None:
+    prefix = "[12] [user] [2026-11-16] "
+    line = prefix + "z" * (base.EVIDENCE_LINE_CAP + 10)
+    capped = base.cap_evidence(f"=== new ===\n{line}")
+    kept = capped.splitlines()[1]
+    assert kept.startswith(prefix + "z" * base.EVIDENCE_LINE_CAP + " [")
+    assert "[... 10 characters cut]" in kept
+    exact = prefix + "z" * base.EVIDENCE_LINE_CAP
+    assert base.cap_evidence(f"=== new ===\n{exact}") == f"=== new ===\n{exact}"
+
+
+def test_turn_given_as_a_numeric_string_is_named() -> None:
+    made = [{"content": "the reading is 6.8", "turn": "3"}]
+    item = _judge(_record([_round(_EVIDENCE, made, [])], "the reading is 6.8"))
+    assert item.evidence == "exact" and "The user line is line [3]." in item.prompt
+
+
+def test_fallback_names_the_last_user_line_of_that_input_or_says_not_named() -> None:
+    rounds = [_round(_EVIDENCE, [{"content": "other"}], ["the reading is 6.8"])]
+    item = _judge(_record(rounds, "the reading is 6.8"))
+    assert item.evidence == "fallback" and "The user line is line [3]." in item.prompt
+    no_user = "=== new ===\n[1] [assistant] The reading is 6.8."
+    item = _judge(
+        _record([_round(no_user, [{"content": "x"}], ["the reading is 6.8"])], "the reading is 6.8")
+    )
+    assert "The user line is not named." in item.prompt
