@@ -215,6 +215,15 @@ def test_k_e2_and_k_w_want_a_valid_user_stated_y(cls: str) -> None:
         good = _check(s, [_row("n1", "said " + _y(s))], retire={"x": "n1", "y": "n1"})
         assert good[f"user_stated_y_{variant}"] is True and good["x_retired_ok"] is True
         assert good["counts"]["weaker_y_retired"] == 1
+        assert good["counts"]["weaker_y_coexists_linked"] == 0
+        side = _check(s, [_row("n1", "said " + _y(s), supersedes="seed-y")], retire={"x": "n1"})
+        assert side[f"user_stated_y_{variant}"] is True  # 并存连线:线照样过
+        assert side["counts"]["weaker_y_coexists_linked"] == 1
+        assert side["counts"]["weaker_y_retired"] == 0
+        loose = _check(s, [_row("n1", "said " + _y(s))], retire={"x": "n1"})
+        assert loose["counts"]["weaker_y_coexists_linked"] == 0  # 连线记在 X 上时
+        assert loose["counts"]["weaker_y_coexists"] == side["counts"]["weaker_y_coexists"] == 1
+        assert good["counts"]["weaker_y_coexists"] == 0
         other = "reworded" if variant == "verbatim" else "verbatim"
         assert f"user_stated_y_{other}" not in good
         swallowed = _check(s, [])  # 用户的话被弱的那条吞掉:库里只有种下的用户确认 / 来自助手

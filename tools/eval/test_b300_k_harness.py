@@ -578,9 +578,10 @@ def _user_line(body: Any) -> int:
     return int([n for n in numbers if n.isdigit()][-1])
 
 
-def _scripted(content: str, listed: str, rewritten: str = "") -> Any:
+def _scripted(content: str, listed: str, rewritten: str = "", *, duplicate_of: str = "") -> Any:
     """假模型:第一次提炼把 ``content`` 记成用户说的(带 ``turn``);去重合并 ``ADD`` 并把正文是
-    ``listed`` 的那条已有记忆列进 ``replaces``;重写回 ``rewritten``。"""
+    ``listed`` 的那条已有记忆列进 ``replaces``(给了 ``duplicate_of`` 就判 ``NOOP``、目标是正文为它
+    的那条);重写回 ``rewritten``。"""
 
     def reply(kind: str, body: Any) -> str:
         if kind == "pass1":
@@ -592,7 +593,11 @@ def _scripted(content: str, listed: str, rewritten: str = "") -> Any:
             ops = []
             for cand in material["candidates"]:
                 ids = [e["id"] for e in cand["existing"] if e["content"] == listed]
-                ops.append({"index": cand["index"], "op": "ADD", "replaces": ids, "restates": []})
+                op = {"index": cand["index"], "op": "ADD", "replaces": ids, "restates": []}
+                same = [e["id"] for e in cand["existing"] if e["content"] == duplicate_of]
+                if same:
+                    op.update(op="NOOP", target_id=same[0])
+                ops.append(op)
             return json.dumps({"ops": ops})
         if kind == "other":
             return json.dumps({"summary": rewritten}, ensure_ascii=False)
@@ -767,3 +772,58 @@ def test_labels_todo_suggests_at_most_four_per_domain(
     assert summary["items"] == 6 and summary["suggested_by_domain"] == {"office": 4}
     monkeypatch.setattr(rep, "label_check", lambda _prompt: None)  # 认不出题型的题不进清单
     assert cli.labels_todo(out, ["k"], tmp_path / "todo.jsonl", 20)["items"] == 0
+
+
+# --------------------------------------------------------------------------- 审查 M-2 的规则
+
+
+def _e2(variant: str) -> sc.Scenario:
+    return next(s for s in K if s.cls == "K-e2" and s.variant == variant)
+
+
+def test_on_v9_code_a_reworded_statement_judged_duplicate_of_a_confirmed_row_coexists() -> None:
+    """模型判用户的整句与那条用户确认「重复」、内容不同:用户的话照写,两条都有效、新行连着它;
+    X 被列进清单照旧被退。K-e2 的线照样过,那条用户确认只报数。"""
+    s = _e2("reworded")
+    it = ks.item_of(s)
+    said = f"{it.y.memory} (said again in other words)"
+    result = _run(s, _scripted(said, it.x.memory, duplicate_of=it.y.memory))
+    rows = {m["id"]: m for m in result["memories"]}
+    confirmed = rows[result["seeded"]["y"]]
+    new = next(m for m in result["memories"] if m["content"] == said)
+    assert confirmed["live"] and confirmed["superseded_by"] is None
+    assert new["live"] and new["origin"] == "user_stated"
+    assert new["supersedes"] == result["seeded"]["x"]  # 只记一条:同一次退掉的 X
+    assert not rows[result["seeded"]["x"]]["live"]
+    out, _items = kchk.checks({"key": "u", "result": result}, s)
+    assert out["user_stated_y_reworded"] is True and out["write_guarantee_broken"] is False
+    assert out["counts"]["weaker_y_retired"] == 0 and out["neighbour_retired"] is False
+    assert out["counts"]["weaker_y_coexists"] == 1 and out["x_retired_ok"] is True
+
+
+def test_on_v9_code_the_same_sentence_retires_the_confirmed_row() -> None:
+    """内容相同:那条用户确认作废、连到用户说的新行(程序定,不看模型怎么判)。"""
+    s = _e2("verbatim")
+    it = ks.item_of(s)
+    result = _run(s, _scripted(it.y.memory, it.x.memory, duplicate_of=it.y.memory))
+    rows = {m["id"]: m for m in result["memories"]}
+    confirmed = rows[result["seeded"]["y"]]
+    assert not confirmed["live"]
+    assert rows[confirmed["superseded_by"]]["origin"] == "user_stated"
+    out, _items = kchk.checks({"key": "u", "result": result}, s)
+    assert out["user_stated_y_verbatim"] is True and out["counts"]["weaker_y_retired"] == 1
+    assert out["counts"]["verbatim_extracted"] == 1 and out["write_guarantee_broken"] is False
+
+
+def test_on_v9_code_a_duplicate_of_an_assistant_row_still_retires_it() -> None:
+    """K-w:那条 Y 来自助手 → 模型判重复时用户的话写下、助手那条被退并连到新行(与之前相同)。"""
+    s = next(x for x in K if x.cls == "K-w" and x.variant == "reworded")
+    it = ks.item_of(s)
+    said = f"{it.y.memory} (in the user's own words)"
+    result = _run(s, _scripted(said, it.x.memory, duplicate_of=it.y.memory))
+    rows = {m["id"]: m for m in result["memories"]}
+    weak = rows[result["seeded"]["y"]]
+    assert not weak["live"] and rows[weak["superseded_by"]]["content"] == said
+    out, _items = kchk.checks({"key": "u", "result": result}, s)
+    assert out["user_stated_y_reworded"] is True and out["counts"]["weaker_y_retired"] == 1
+    assert out["counts"]["weaker_y_coexists_linked"] == 0

@@ -314,6 +314,15 @@ def _stated_y(out: dict[str, Any], result: Mapping[str, Any], s: Scenario, rows:
     out[f"user_stated_y_{s.variant}"] = hit
     out["x_retired_ok"] = not rows.seed_live("x")
     out["counts"]["weaker_y_retired"] += int(not rows.seed_live("y"))
+    # 用户定的规则(审查 M-2):模型判「重复」、那条弱的 Y 是用户一方(用户确认)、归一后内容不同 →
+    # 两条都有效。只报数;新行的 supersedes 只记一条:同一次也退了 X 时记的是 X,所以「连着它」
+    # (``_linked``)只是并存里的一部分。
+    y_id = rows.seeded.get("y")
+    coexists = rows.seed_live("y") and hit
+    out["counts"]["weaker_y_coexists"] += int(coexists)
+    out["counts"]["weaker_y_coexists_linked"] += int(
+        coexists and any(m.get("supersedes") == y_id for m in rows.new_live)
+    )
     if s.variant == "verbatim":
         # 前提:提炼写出的正文确实与种下的那条逐字相同(否则这一个不算「程序定」的,报数)
         extracted = {

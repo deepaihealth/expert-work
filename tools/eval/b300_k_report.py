@@ -141,6 +141,13 @@ _NOTES: tuple[str, ...] = (
     "(列了、程序没让打标)、deny_marked_not_rewritten(打了标、重写没落库)、deny_rewritten;不达标的"
     "次数再按这四种分:<指标>_bad_<原因>(如 b_still_in_summary_bad_listed_blocked = 被名次等规则"
     "挡下,b_still_in_summary_bad_rewritten = 重写本身错)。线的判定照旧。",
+    "K-e2 那条用户确认的 Y(用户 11-16 定的规则,审查 M-2):模型判用户的整句与它「重复」时,用户的"
+    "话一定写下;归一后内容相同 → 那条用户确认作废、连到新行;内容不同(换说法的那一半常见)→ 两条"
+    "都有效(新行的 supersedes 只记一条:同一次也退了 X 时记的是 X)。所以「用户确认的那条 Y 作废」"
+    "不设线,counts 里分开报 weaker_y_retired、weaker_y_coexists 与其中的 "
+    "weaker_y_coexists_linked;K-w 里那条 Y 来自助手,照旧被退。K-s:判成重复的候选若把汇总行列进 "
+    "replaces、而它重复的是一条有效的用户一方行,汇总行会由那条行打标 —— 这时没有新写的行,"
+    "new_stored 不达标的那几次看 new_stored_bad_<原因>。",
     "K-e2 / K-w「逐字相同必须全中」的前提是提炼写出的正文与种下的那条一字不差,这由模型决定;"
     "counts 的 verbatim_extracted 报这个前提成立了几次,不成立的那几次这条线量的是模型而不是程序。",
     "写的保证只查进了去重合并模型调用的用户一方候选(材料里看得到的那些);写入扫描拦下的在本机"
