@@ -647,7 +647,7 @@ def _message_times(
     messages: Sequence[BaseMessage], explicit_user_text: Sequence[BaseMessage]
 ) -> dict[str, datetime]:
     """本对话里会成为带日期的行(``[user]`` / ``[assistant]``)的消息的发送时间,消息 id → UTC;与
-    提炼行的 ``line_at`` 同一个取法。去重合并比「更新」的先后时用(测试验收 run 7ee5144b)。
+    提炼行的 ``line_at`` 同一个取法。去重合并比先后时用(测试验收 run 7ee5144b)。
 
     审查 L-2:取**全部**消息,含被重新生成 / 编辑重发取代的(``_segments`` 会跳过它们)—— 已有
     记忆的证据可能正指着被取代的那条。"""
@@ -2748,7 +2748,7 @@ async def flush_messages_with_outcome(
     Best-effort, mirroring the original write-back contract:
 
     * ``RunCancelledError`` propagates (cancellation is never swallowed).
-    * B-300 D2 —— 写入扫描按条拦:被拦的那几条不落库(被判「更新」的不作废旧记忆),
+    * B-300 D2 —— 写入扫描按条拦:被拦的那几条不落库(它要退的旧记忆一条不退),
       其余照写;每条被拦的发一行 ``MEMORY_INJECTION_BLOCKED`` 审计(``audit_logger``
       给了才发;只记序号、长度、命中的规则类别,不记正文),``failed`` 置真。内容是
       确定的,重试也一样被拦,所以不进 DLQ。
@@ -2761,7 +2761,8 @@ async def flush_messages_with_outcome(
 
     ``reconcile`` (Stream CM-7, Mini-ADR CM-H3/H4) — when set, extracted
     items are reconciled against similar existing memories
-    (ADD / UPDATE / DELETE / NOOP) before persisting instead of written
+    (stored or not — ADD / NOOP — and, separately, which older memories each one
+    retires; redesign rev 9 §7.3) before persisting instead of written
     blindly. Only the run-end write-back sets it; the CM-3 pre-compaction
     flush stays a direct write (latency-sensitive, inside a turn). B-300
     redesign §7.1 row 9: two stages — the first pass's output is reconciled
@@ -2776,7 +2777,7 @@ async def flush_messages_with_outcome(
     reconstructed items keep the original run's provenance.
 
     ``before_store`` (B-168) —— 后台写回传进来:**每一次**改记忆库之前都调用(写入,
-    以及去重合并里的 supersede / expire —— 去重合并还要调一次模型,清除可能就发生在那
+    以及去重合并里的 supersede / retire / 刷新确认日期 —— 去重合并还要调一次模型,清除可能就发生在那
     几秒里)。它抛 ``RunCancelledError`` 就整批放弃 —— 不写、也不进 DLQ(任务行已被清除,
     DLQ 重试会把内容又写回去)。它不许抛别的异常:下面的 ``except Exception`` 会把这批
     送进 DLQ。run 内的写回不传。
@@ -2800,8 +2801,8 @@ async def flush_messages_with_outcome(
     尝试)提炼出错只记日志,提炼成功之后出错进失败队列。
 
     B-300 D12 —— 返回的条数是实际落库的条数(与库里已有同内容的、被拦的都不算;去重合并里
-    「更新」由 ``supersede`` 取代出来的新行要算,「删除」只作废旧行、不算)。出错走失败分支时
-    条数一律是 0、``failed`` 为真 —— 即使去重合并里已有取代落了库、之后的 ``write`` 才抛错。
+    去重合并里经 ``supersede`` 写下的新行、历史行要算;只退不写的不算)。出错走失败分支时
+    条数一律是 0、``failed`` 为真 —— 即使去重合并里已有新行落了库、之后的 ``write`` 才抛错。
     """
     extracted: list[ExtractedMemory] = []
     blocked: list[_BlockedWrite] = []
@@ -2907,13 +2908,13 @@ async def flush_messages_with_outcome(
                     # 去重);最后一次尝试 / 本轮内写回时,失败队列只收这一批还没写的与后面几段的。
                     record_memory_reconcile(op="reconcile_failed")
                     retry_pairs = [(str(item.kind), item.content) for item in exc.unwritten] + later
-                    # 审查 LOW-1 —— 出错前被写入扫描拦下的(「更新」的新内容)照样计数、发审计。
+                    # 审查 LOW-1 —— 出错前被写入扫描拦下的照样计数、发审计。
                     blocked.extend(exc.blocked)
                     raise
                 to_write, written = done.direct, written + done.superseded
                 blocked.extend(done.blocked)
-                # 审查 LOW-1 —— 去重合并之后,失败重试只该重建本来要写的这几条:被拦下丢弃的
-                # 更新、删除事件、跳过的重复都不进失败队列(已经取代 / 作废的也已落库)。
+                # 审查 LOW-1 —— 去重合并之后,失败重试只该重建还没写的这几条:已经在去重合并里
+                # 落库的、跳过的重复都不进失败队列。
                 retry_pairs = [(str(item.kind), item.content) for item in to_write] + later
             if to_write:
                 if before_store is not None:
@@ -3191,7 +3192,7 @@ def make_memory_writeback_node(
     adapter (resolve config scope → flush the full trajectory).
 
     Stream CM-7 — ``reconcile`` forwards to the flush so run-end writes
-    go through the Mem0-style ADD / UPDATE / DELETE / NOOP decision.
+    go through the Mem0-style reconcile decision (store or not, and what to retire).
 
     B-168 —— ``writeback_jobs`` 给了就是后台模式:节点只落一行任务(指针:会话 + 本轮
     结束时的检查点 + run),捅一下本副本 worker 的 ``wake_writeback`` 就返回,记忆由

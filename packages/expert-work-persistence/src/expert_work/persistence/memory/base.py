@@ -508,11 +508,13 @@ class MemoryStore(abc.ABC):
         was rewritten meanwhile is followed one step along ``superseded_by`` to the
         current summary. Only when the new row is inserted.
 
-        The new row's ``supersedes``: the first retired row; else the first flagged
-        summary; else the first target refused as ``confirmed_vs_stated``; else
-        ``link_id`` (when that row exists for this user). In the last three cases the row
-        it points at is still valid — the link only says "about the same thing"; whether
-        a row was replaced is read from that row's ``invalid_at``.
+        The new row's ``supersedes``: the first flagged summary (the rewrite finds the
+        user's statement through this link; what the row retired is still found through
+        the retired rows' ``superseded_by``); else the first retired row; else the first
+        target refused as ``confirmed_vs_stated``; else ``link_id`` (when that row exists
+        for this user). Except for a retired row, what it points at is still valid — the
+        link only says "about the same thing"; whether a row was replaced is read from
+        that row's ``invalid_at``.
 
         B-300 D2 — ``new_item`` goes through the strict scan; when blocked,
         :class:`MemoryInjectionBlockedError` is raised before anything changes.

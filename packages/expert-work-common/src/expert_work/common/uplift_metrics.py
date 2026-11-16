@@ -118,7 +118,7 @@ _memory_rewrite_total = expert_work_counter(
 _memory_reconcile_total = expert_work_counter(
     "expert_work_cm_memory_reconcile_total",
     "Run-end memory write reconciliations, partitioned by applied op.",
-    label_names=("op",),  # add | update | delete | noop | degraded
+    label_names=("op",),  # see record_memory_reconcile
 )
 
 # B-300 redesign §7.1 row 6 — the target the reconcile model picked: its cosine rank
@@ -299,6 +299,14 @@ _memory_predictive_review_total = expert_work_counter(
     "validity window (expected_valid_days) came due was re-reviewed by "
     "the aux LLM.",
     label_names=("outcome",),  # outcome ∈ renewed | expired | degraded
+)
+
+# B-300 redesign rev 9 §7.12 — a summary the user's later statement denied part of is
+# rewritten (at the end of the write-back job, or by the consolidation sweep).
+_memory_summary_rewrite_total = expert_work_counter(
+    "expert_work_memory_summary_rewrite_total",
+    "Rewrites of a summary memory flagged by a later user statement, by outcome.",
+    label_names=("outcome",),
 )
 
 _consolidator_llm_tokens_total = expert_work_counter(
@@ -495,55 +503,55 @@ def record_memory_rewrite(*, outcome: str) -> None:
 
 
 def record_memory_reconcile(*, op: str) -> None:
-    """Bump ``expert_work_cm_memory_reconcile_total{op}`` (Stream CM-7).
+    """Bump ``expert_work_cm_memory_reconcile_total{op}`` (Stream CM-7; B-300 redesign
+    rev 9 §7.9 — the write and the retirements are decided separately, so the counter no
+    longer has ``update`` / ``delete`` / ``blocked_*`` / ``lower_confidence_*`` values).
 
-    ``op`` ∈ ``{"add", "update", "delete", "delete_added", "noop", "degraded",
-    "target_changed", "blocked_update_added", "blocked_update_dropped",
-    "blocked_delete", "blocked_delete_added", "lower_confidence_update_added",
-    "lower_confidence_update_dropped", "lower_confidence_delete",
-    "lower_confidence_delete_added", "lower_confidence_update_added_confirmed", ...}``
-    — the operation actually applied per extracted candidate; ``degraded`` = the
-    reconcile decision failed and the candidate fell back to a direct ADD (never lose a
-    memory); ``target_changed`` (B-300) = the UPDATE's target was folded into a
-    summary / expired meanwhile, so the candidate was written as a direct ADD
-    instead. ``blocked_*`` (B-300
-    PR 2) = an assistant-derived candidate was refused an UPDATE / DELETE of a
-    memory the user stated or corrected: the target is untouched; a correction
-    candidate is stored as a new memory (``*_update_added`` /
-    ``*_delete_added``; the delete case since 11-14, eval group A), otherwise the
-    update is dropped and the delete does nothing. ``lower_confidence_*``
-    (B-300, user 11-14) = the same outcomes for a candidate stated in user
-    messages that was less certain than the user-side memory it would change.
-    ``delete_added`` (B-300, 11-14) = a correction candidate whose DELETE was not
-    blocked: the target was retracted and the candidate stored as well.
+    Whether the candidate is written: ``add`` (stored); ``degraded`` (the model gave no
+    usable decision for it: stored, nothing retired); ``noop`` (a duplicate, not stored);
+    ``noop_refreshed`` (a duplicate that moved the user-side target's confirmed date);
+    ``noop_same_evidence`` (a restatement of a memory taken from the same message: not
+    stored, no refresh); ``noop_out_of_scope`` (the model's duplicate target is one the
+    candidate could not be recalled through: stored); ``noop_other_event_date`` (the
+    duplicate target has another event date — another occasion: stored);
+    ``noop_weaker_target_written`` (the model judged it a duplicate of a memory with a
+    weaker source: stored, and that memory joins the ones to retire);
+    ``written_as_history`` (stored as an already-superseded row linked to a later
+    statement of the same conversation); ``collision_weaker_replaced`` (the same text was
+    held by a live row with a weaker source: that row retired, the candidate stored);
+    ``collision_cross_kind_not_written`` (a fact with the same text as a live event of
+    this agent whose source is not weaker: not stored — other agents cannot recall it);
+    ``legacy_op`` (the model still answered UPDATE / DELETE; read as ADD plus a list).
 
-    B-300 redesign (§7): ``refused_cross_cell`` / ``refused_rank`` /
-    ``refused_event_date`` / ``refused_older_line`` = an UPDATE / DELETE the program
-    turned into an ADD (another kind or agent; not among the 2 nearest by cosine in
-    the cell; the event-date rule; the candidate's line is older than the target's
-    evidence message — its record time when that is unknown — or its last restatement);
-    ``noop_out_of_scope`` = a NOOP whose target the candidate could not be
-    recalled through, written instead; ``noop_refreshed`` = a NOOP that moved the
-    user-side target's confirmed date. ``event_date_one_sided_update`` /
-    ``event_date_one_sided_delete`` (user 2026-11-16) = an UPDATE / DELETE where only one side
-    has an event date was actually applied (the event-date rule refuses only when both have
-    one, or a DELETE of a dated target by an undated non-correction); ``noop_other_event_date``
-    = a NOOP between two memories with different event dates, written as an ADD (different
-    occasions). B-300 test acceptance (11-16):
-    ``noop_same_evidence`` = a user-confirmed candidate the model judged a duplicate (NOOP)
-    of a user-side memory taken from the same message, same event date or none (a
-    restatement: nothing written, no refresh; an UPDATE with the same evidence takes the
-    normal path, user 11-16 「只拦真重复」); ``blocked_update_added_confirmed`` = a
-    user-confirmed candidate (not a correction) whose UPDATE the tier rule blocked, stored
-    next to the old memory (user 11-16 「被拦时与旧的并存」);
-    ``lower_confidence_update_added_confirmed`` = the same for a user-confirmed candidate
-    blocked as less certain than a same-tier user-side memory (user 11-16 「也和旧的并存」;
-    both the pre-check and the in-lock recheck). ``degraded`` now only
-    means the model gave no usable decision for that candidate (or the UPDATE / DELETE target
-    was already gone). ``reconcile_failed`` = one reconcile call failed inside (lookup, model,
-    unusable reply, store error): nothing of that batch is written directly; the
-    write-back raises to the job's retry, and on the last attempt the candidates not
-    written yet go to the DLQ (redesign PR S, §7.6).
+    Each older memory the candidate would retire: ``retired`` (done);
+    ``retire_forced_weaker`` (it had the same text and a weaker source — retired by the
+    program whatever the model said); ``event_date_one_sided_retire`` (retired where only
+    the candidate has an event date); ``summary_rewrite_marked`` (a summary the model
+    listed as no longer true was flagged for a rewrite instead); ``older_coexists`` (the
+    candidate was said earlier than the memory: both stay, linked).
+
+    Not retired — **never an error by itself**: the model wanted to, the program did not
+    let it, and the candidate was stored all the same. ``retire_refused_cross_cell``
+    (another kind or agent), ``retire_refused_rank`` (not among the 2 nearest by cosine
+    in the cell), ``retire_refused_event_date`` (both have an event date and it differs,
+    or it is the same and the candidate is no correction),
+    ``retire_refused_undated_vs_dated`` (an undated non-correction against a dated
+    memory), ``retire_refused_older_line`` (the candidate's line is older than the
+    memory's evidence message, record time or last restatement),
+    ``retire_refused_unknown_time`` (the candidate's line time is unknown),
+    ``retire_refused_same_evidence`` (second-pass output against first-pass output of the
+    same message), ``retire_refused_assistant`` (an assistant-side candidate against a
+    user-side memory), ``retire_refused_corrected`` (the memory was corrected in the
+    console), ``retire_refused_confirmed_vs_stated`` (a user-confirmed candidate against
+    a user-stated memory — the default rule; the new row links to the old one),
+    ``retire_refused_summary`` (a summary row), ``retire_target_gone`` (deleted, retired
+    or folded meanwhile). ``retire_unknown_id`` = an id in the model's lists that is not
+    one of this candidate's neighbours.
+
+    ``reconcile_failed`` = one reconcile call failed inside (lookup, model, unusable
+    reply, store error): nothing of that batch is written directly; the write-back raises
+    to the job's retry, and on the last attempt the candidates not written yet go to the
+    DLQ (redesign PR S, §7.6).
     """
     _memory_reconcile_total.labels(op=op).inc()
 
@@ -560,7 +568,9 @@ def _similarity_band(similarity: float) -> str:
 
 def record_memory_reconcile_target(*, op: str, rank: int | None, similarity: float) -> None:
     """Bump ``expert_work_memory_reconcile_target_total{op, rank, similarity}`` (B-300
-    redesign §7.1 row 6): ``rank`` is the target's cosine rank among the candidate's
+    redesign §7.1 row 6): ``op`` is ``noop`` for the memory the model said the candidate
+    repeats, ``replaces`` / ``restates`` for one it listed; ``rank`` is the target's
+    cosine rank among the candidate's
     same-cell neighbours (``"1"``, ``"2"``, ``"3+"``), ``"other_cell"`` when it is in
     another cell; ``similarity`` is a band (``"<0.4"`` … ``">=0.8"``)."""
     rank_label = "other_cell" if rank is None else (str(rank) if rank <= 2 else "3+")
@@ -774,6 +784,21 @@ def record_memory_predictive_review(*, outcome: str) -> None:
     _memory_predictive_review_total.labels(outcome=outcome).inc()
 
 
+def record_memory_summary_rewrite(*, outcome: str) -> None:
+    """Bump ``expert_work_memory_summary_rewrite_total{outcome}`` (B-300 redesign rev 9
+    §7.12): ``rewritten`` (a new summary replaced the old one), ``emptied`` (nothing of
+    it remained true: retired, no new summary), ``unchanged`` (the model returned the
+    same sentence — the reconcile model said it was denied, the rewrite found nothing to
+    remove; worth watching), ``collided`` (the new sentence already exists as a live
+    row), ``failed`` (the model call or its reply failed: the flag stays, no retry for 4
+    hours), ``stale`` (the flag moved or the summary was replaced while rewriting:
+    nothing stored), ``blocked`` (the new sentence was refused by the write scan: flag
+    cleared), ``abandoned`` (flagged for 7 days without success: flag cleared),
+    ``corrected_member`` (a member was corrected in the console meanwhile: summary kept,
+    flag cleared)."""
+    _memory_summary_rewrite_total.labels(outcome=outcome).inc()
+
+
 def record_consolidator_llm_tokens(*, model: str, input_tokens: int, output_tokens: int) -> None:
     """Bump ``expert_work_uplift_consolidator_llm_tokens_total{model,kind}``.
 
@@ -869,6 +894,7 @@ __all__ = [
     "record_memory_redacted",
     "record_memory_retrieval",
     "record_memory_reviewed_durable",
+    "record_memory_summary_rewrite",
     "record_memory_writeback_segment",
     "record_skill_blocked",
     "record_skill_drift",

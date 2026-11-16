@@ -35,7 +35,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -62,9 +62,11 @@ from expert_work.common.uplift_metrics import (
     record_memory_predictive_review,
     record_memory_purged,
     record_memory_reviewed_durable,
+    record_memory_summary_rewrite,
 )
 from expert_work.persistence.memory.base import (
     ConsolidationSourcesChangedError,
+    FlaggedSummary,
     MemoryInjectionBlockedError,
     is_mixed_origin,
 )
@@ -78,6 +80,8 @@ from expert_work.persistence.token_usage_store import TokenUsageRecord, TokenUsa
 from expert_work.protocol import AuditAction, AuditResult, MemoryItem, StructuredOutputSpec
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.middleware import LLMOutputValidationError
+from orchestrator.context.memory_render import as_utc, origin_label
+from orchestrator.graph_builder.memory import _normalized_text
 from orchestrator.llm import Embedder, embed_with_model
 
 if TYPE_CHECKING:
@@ -107,6 +111,12 @@ _MAX_USERS_PER_TICK: int = 50
 _MAX_CLUSTER_CANDIDATES_PER_USER: int = 10
 _MAX_PURGE_PER_USER: int = 100
 _MAX_TRANSIENT_SCAN_PER_USER: int = 500
+#: B-300 重做第 9 版 §7.12 —— 一次(任务收尾 / 巡检的一个用户)最多重写这么多条打了标的汇总行。
+_MAX_SUMMARY_REWRITES_PER_USER: int = 20
+#: 终审 L-1 —— 一条打了标的汇总行,上一次重写失败之后这么久内不再试(除非期间又有新的否认连上来);
+#: 打标满这么久仍没重写成的清标放弃。
+_SUMMARY_REWRITE_RETRY_AFTER = timedelta(hours=4)
+_SUMMARY_REWRITE_GIVE_UP_AFTER = timedelta(days=7)
 
 # Transient scan window — only look at items written in the last 30 d
 # for cluster-pass seeds. Older items either already consolidated, got
@@ -389,6 +399,49 @@ Respond ONLY with JSON of the exact shape:
 """
 
 
+def _recorded_day(item: MemoryItem) -> str:
+    return item.created_at.date().isoformat() if item.created_at is not None else "unknown"
+
+
+def _build_summary_rewrite_prompt(flagged: FlaggedSummary, *, today: date | None = None) -> str:
+    """B-300 重做第 9 版附录 E(最终英文原文)—— 用户的新说法否认了一条汇总句里的一件事:把
+    汇总句里被否认或替掉的部分去掉,其余原样留下。平台文字,不含任何行业或租户内容。
+
+    模型看到:汇总句与它的记录日期;每条成员的内容、来源(召回里同一套来源文字)、日期;用户后来的
+    说法与各自的日期;今天的日期。不把新说法的内容写进汇总句(它自己已经是一行)。"""
+    summary = flagged.summary
+    members = "\n".join(
+        f"- ({origin_label(m)} · {_recorded_day(m)}) {m.content}" for m in flagged.members
+    )
+    statements = "\n".join(f"- ({_recorded_day(s)}) {s.content}" for s in flagged.statements)
+    today_text = (today or datetime.now(UTC).date()).isoformat()
+    return f"""\
+You are revising one summary memory about a user. The summary was written earlier from
+the member memories listed below. Since then the user has said something new that the
+summary may no longer agree with.
+
+Summary (recorded on {_recorded_day(summary)}):
+{summary.content}
+
+Member memories it was written from:
+{members}
+
+What the user said later:
+{statements}
+
+Today's date: {today_text}
+
+Rewrite the summary so that it no longer says anything the user's later statements deny
+or replace. Keep everything else it says, in the same language and as close to the
+original wording as you can. Do not add what the later statements say: they are stored as
+memories of their own. Do not add anything that is not in the summary already.
+If nothing of the summary remains true, return null.
+
+Respond ONLY with JSON of the exact shape:
+{{"summary": "<the revised summary>" | null}}
+"""
+
+
 # ---------------------------------------------------------------------------
 # Reply parsing — Stream RT-1 PR-2: pydantic wire models + output_schema.
 # The *shape* is enforced by the models (and, through the specs below, by
@@ -435,6 +488,16 @@ class _DueReviewReplyModel(BaseModel):
     expected_valid_days: int | None = None
 
 
+class _SummaryRewriteReplyModel(BaseModel):
+    """Wire shape demanded by :func:`_build_summary_rewrite_prompt`. ``summary`` is
+    required (``null`` = nothing of the summary remains true): a reply without the key
+    is malformed, not "nothing remains"."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str | None
+
+
 _CLUSTER_OUTPUT_SPEC = StructuredOutputSpec(
     schema=_ClusterReplyModel.model_json_schema(), name="memory_cluster_verdict"
 )
@@ -443,6 +506,11 @@ _SINGLE_REVIEW_OUTPUT_SPEC = StructuredOutputSpec(
 )
 _DUE_REVIEW_OUTPUT_SPEC = StructuredOutputSpec(
     schema=_DueReviewReplyModel.model_json_schema(), name="memory_due_review_verdict"
+)
+
+
+_SUMMARY_REWRITE_OUTPUT_SPEC = StructuredOutputSpec(
+    schema=_SummaryRewriteReplyModel.model_json_schema(), name="memory_summary_rewrite"
 )
 
 
@@ -542,6 +610,28 @@ def _parse_due_reply(reply: ConsolidatorLLMReply) -> _DueVerdict | None:
     return _DueVerdict(still_valid=data.still_valid, expected_valid_days=expected_valid_days)
 
 
+@dataclass(frozen=True)
+class _SummaryRewrite:
+    """Parsed summary-rewrite response: the revised sentence, or ``None`` when nothing
+    of the summary remains true."""
+
+    summary: str | None
+
+
+def _parse_summary_rewrite_reply(reply: ConsolidatorLLMReply) -> _SummaryRewrite | None:
+    """Validate the summary-rewrite LLM reply; ``None`` on malformed (the caller counts a
+    failed attempt and keeps the flag). An empty sentence is read as "nothing remains"."""
+    try:
+        if reply.parsed is not None:
+            data = _SummaryRewriteReplyModel.model_validate(reply.parsed)
+        else:
+            data = _SummaryRewriteReplyModel.model_validate_json(reply.text)
+    except ValidationError:
+        return None
+    text_out = data.summary.strip() if data.summary is not None else ""
+    return _SummaryRewrite(summary=text_out or None)
+
+
 # ---------------------------------------------------------------------------
 # Summary types
 # ---------------------------------------------------------------------------
@@ -635,6 +725,251 @@ class ConsolidatorRunSummary:
         }
 
 
+async def _persist_aux_usage(
+    usage_store: TokenUsageStore | None,
+    reply: ConsolidatorLLMReply,
+    *,
+    default_model: str,
+    tenant_id: UUID,
+    user_id: UUID,
+) -> None:
+    """One ``token_usage`` row per consolidator aux call (never-fail).
+
+    ``usage_kind='memory_consolidation'`` keeps this spend out of every
+    agent's conversation cost while chargeback still sees it. The
+    consolidator serves the tenant, not one agent — the fixed
+    ``agent_name`` makes the rows self-describing in per-kind views.
+    """
+    if usage_store is None:
+        return
+    try:
+        await usage_store.insert(
+            TokenUsageRecord(
+                tenant_id=tenant_id,
+                agent_name="memory-consolidator",
+                agent_version="-",
+                model=reply.model or default_model,
+                user_id=user_id,
+                usage_kind="memory_consolidation",
+                trace_id=current_trace_id_hex(),
+                input_tokens=reply.input_tokens,
+                output_tokens=reply.output_tokens,
+            )
+        )
+    except Exception:
+        logger.warning("memory_consolidator.aux_usage_persist_failed", exc_info=True)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+class SummaryRewriter:
+    """B-300 重做第 9 版 §7.12 —— 用户的新说法否认了汇总行里的一件事:拿着新说法把那条汇总句
+    重写一遍。
+
+    两处调用同一个 :meth:`rewrite_for_user`:写回任务收尾时(用户早已收到回答,不在等待路径上)
+    当场做一次;整理巡检的子步骤兜底。调用方已在该租户 + 该用户的作用域里。
+
+    模型调用与整理的其它调用一样记在租户的记忆用量里(``usage_kind='memory_consolidation'``),
+    不算写回提炼的用量,也不进任何一轮对话的用量。**从不向外抛**(取消除外):失败只让标记留着,
+    写回任务不因此失败。
+    """
+
+    def __init__(
+        self,
+        *,
+        memory_store: MemoryStore,
+        aux_model: ConsolidatorAuxModel,
+        embedder: ConsolidatorEmbedder,
+        audit_logger: AuditLogger,
+        usage_store: TokenUsageStore | None = None,
+        default_aux_model_name: str = "claude-sonnet-4-6",
+        actor_id: str = "memory_consolidator",
+        clock: Callable[[], datetime] = _utcnow,
+    ) -> None:
+        self._memory = memory_store
+        self._aux = aux_model
+        self._embedder = embedder
+        self._audit = audit_logger
+        self._usage_store = usage_store
+        self._default_model = default_aux_model_name
+        self._actor_id = actor_id
+        self._clock = clock
+
+    async def rewrite_for_user(self, *, tenant_id: UUID, user_id: UUID) -> list[str]:
+        """重写这个用户**所有**打了标、仍有效的汇总行(不只是本次写回打的 —— 任务重试时候选走
+        确定性「重复」、不会再打标,但上一次尝试留下的标还在)。返回各条的结果(计数名)。
+
+        落库时发现标记时间变了(重写期间又有新的否认连上来,``stale``)→ 紧接着重做一遍,这次会
+        读到两条新说法;仍不一样就留给下一次。"""
+        outcomes: list[str] = []
+        try:
+            flagged = await self._flagged(tenant_id, user_id)
+            stale: set[UUID] = set()
+            for entry in flagged:
+                outcome = await self._attempt(entry, tenant_id=tenant_id, user_id=user_id)
+                if outcome is None:
+                    continue
+                outcomes.append(outcome)
+                if outcome == "stale":
+                    stale.add(entry.summary.id)
+            if stale:
+                for entry in await self._flagged(tenant_id, user_id):
+                    if entry.summary.id not in stale:
+                        continue
+                    outcome = await self._attempt(entry, tenant_id=tenant_id, user_id=user_id)
+                    if outcome is not None:
+                        outcomes.append(outcome)
+        except Exception:
+            logger.exception(
+                "memory_consolidator.summary_rewrite_failed tenant=%s user=%s", tenant_id, user_id
+            )
+        return outcomes
+
+    async def _flagged(self, tenant_id: UUID, user_id: UUID) -> list[FlaggedSummary]:
+        return await self._memory.list_flagged_summaries(
+            tenant_id=tenant_id, user_id=user_id, limit=_MAX_SUMMARY_REWRITES_PER_USER
+        )
+
+    async def _attempt(
+        self, entry: FlaggedSummary, *, tenant_id: UUID, user_id: UUID
+    ) -> str | None:
+        """一条汇总行的一次尝试;``None`` = 这一次不试(不计数)。出错 → 标留着、记下尝试时间。"""
+        summary_id = entry.summary.id
+        try:
+            outcome = await self._rewrite(entry, tenant_id=tenant_id, user_id=user_id)
+        except Exception:
+            logger.exception(
+                "memory_consolidator.summary_rewrite_attempt_failed tenant=%s user=%s id=%s",
+                tenant_id,
+                user_id,
+                summary_id,
+            )
+            outcome = "failed"
+            try:
+                await self._memory.defer_summary_rewrite(
+                    tenant_id=tenant_id, user_id=user_id, summary_id=summary_id
+                )
+            except Exception:
+                logger.exception("memory_consolidator.summary_rewrite_defer_failed")
+        if outcome is not None:
+            record_memory_summary_rewrite(outcome=outcome)
+        return outcome
+
+    async def _rewrite(
+        self, entry: FlaggedSummary, *, tenant_id: UUID, user_id: UUID
+    ) -> str | None:
+        summary = entry.summary
+        flagged_at = summary.review_flagged_at
+        if flagged_at is None:
+            return None
+        now = self._clock()
+        if now - as_utc(flagged_at) >= _SUMMARY_REWRITE_GIVE_UP_AFTER:
+            # 打标满 7 天仍没重写成:清标放弃。汇总行与用户的新说法继续并存。
+            await self._memory.mark_reviewed(
+                tenant_id=tenant_id, user_id=user_id, memory_id=summary.id
+            )
+            return "abandoned"
+        last = summary.last_reviewed_at
+        if (
+            last is not None
+            and as_utc(last) >= as_utc(flagged_at)
+            and now - as_utc(last) < _SUMMARY_REWRITE_RETRY_AFTER
+        ):
+            # 上一次失败之后 4 小时内不再试;期间有新的否认连上来(标记时间更晚)则立刻再试。
+            return None
+        if not entry.statements:
+            # 连着它的用户说法已经不在了(被删、被更晚的一句退掉):没有可拿去重写的,不调模型。
+            return None
+        try:
+            reply = await self._aux(
+                prompt=_build_summary_rewrite_prompt(entry, today=now.date()),
+                model=None,
+                tenant_id=tenant_id,
+                output_schema=_SUMMARY_REWRITE_OUTPUT_SPEC,
+            )
+        except LLMOutputValidationError:
+            reply = None
+        verdict = None
+        if reply is not None:
+            record_consolidator_llm_tokens(
+                model=reply.model or self._default_model,
+                input_tokens=reply.input_tokens,
+                output_tokens=reply.output_tokens,
+            )
+            await _persist_aux_usage(
+                self._usage_store,
+                reply,
+                default_model=self._default_model,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            verdict = _parse_summary_rewrite_reply(reply)
+        if verdict is None:
+            # 回复解析不了 → 当失败:标留着,记下这次尝试。
+            await self._memory.defer_summary_rewrite(
+                tenant_id=tenant_id, user_id=user_id, summary_id=summary.id
+            )
+            return "failed"
+        revised = verdict.summary
+        unchanged = revised is not None and _normalized_text(revised) == _normalized_text(
+            summary.content
+        )
+        embedding: tuple[float, ...] = ()
+        embedding_model: str | None = None
+        if revised is not None and not unchanged:
+            embedding, embedding_model = await _embed_one_with_model(
+                self._embedder, revised, tenant_id=tenant_id
+            )
+        try:
+            return await self._memory.rewrite_summary(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                summary_id=summary.id,
+                flagged_at=flagged_at,
+                content=revised,
+                embedding=embedding,
+                embedding_model=embedding_model,
+                unchanged=unchanged,
+            )
+        except MemoryInjectionBlockedError as exc:
+            # 新句子被写入扫描拦下:再试多少次结果都一样 → 清标,发与写入扫描同样的审计。
+            await self._memory.mark_reviewed(
+                tenant_id=tenant_id, user_id=user_id, memory_id=summary.id
+            )
+            for blocked in exc.blocked:
+                record_memory_blocked(source="consolidation")
+                await self._audit_blocked(tenant_id, user_id, summary.id, blocked)
+            return "blocked"
+
+    async def _audit_blocked(
+        self, tenant_id: UUID, user_id: UUID, summary_id: UUID, blocked: Any
+    ) -> None:
+        try:
+            await audit_emit(
+                self._audit,
+                tenant_id=tenant_id,
+                actor_id=self._actor_id,
+                action=AuditAction.MEMORY_INJECTION_BLOCKED,
+                resource_type="memory_item",
+                resource_id=None,
+                result=AuditResult.DENIED,
+                reason="strict_scan",
+                trace_id=current_trace_id_hex(),
+                details={
+                    "user_id": str(user_id),
+                    "source": "summary_rewrite",
+                    "source_ids": [str(summary_id)],
+                    "content_length": blocked.content_length,
+                    "categories": list(blocked.categories),
+                    "pattern_count": len(blocked.findings),
+                },
+            )
+        except Exception:
+            logger.exception("memory_consolidator.audit_emit_failed action=summary_rewrite")
+
+
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
@@ -681,6 +1016,16 @@ class MemoryConsolidator:
         # shape as ``QualityDriftWorker``). ``None`` (in-memory / single
         # process) skips the lock — matches quality_drift's degrade.
         self._session_factory = session_factory
+        # B-300 重做第 9 版 §7.12 —— 巡检兜底用的汇总行重写(与写回任务收尾时同一个函数)。
+        self._summary_rewriter = SummaryRewriter(
+            memory_store=memory_store,
+            aux_model=aux_model,
+            embedder=embedder,
+            audit_logger=audit_logger,
+            usage_store=usage_store,
+            default_aux_model_name=default_aux_model_name,
+            actor_id=actor_id,
+        )
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -1018,6 +1363,11 @@ class MemoryConsolidator:
                     )
                     summary.record_error(exc)
 
+        # SUB-PASS 4 (B-300 重做第 9 版 §7.12): 用户的新说法点到过的汇总行(``status =
+        # 'consolidated'``、打了标)—— 写回任务收尾时没重写成的,这里兜底。与上面点踩打标的临时行
+        # 是同一列的两种用途,按 ``status`` 分开,互不相干。失败不向外抛(标留着,下一轮再来)。
+        await self._summary_rewriter.rewrite_for_user(tenant_id=tenant_id, user_id=user_id)
+
     async def _find_candidate_clusters(
         self,
         *,
@@ -1077,31 +1427,14 @@ class MemoryConsolidator:
     async def _record_aux_usage(
         self, reply: ConsolidatorLLMReply, *, tenant_id: UUID, user_id: UUID
     ) -> None:
-        """One ``token_usage`` row per consolidator aux call (never-fail).
-
-        ``usage_kind='memory_consolidation'`` keeps this spend out of every
-        agent's conversation cost while chargeback still sees it. The
-        consolidator serves the tenant, not one agent — the fixed
-        ``agent_name`` makes the rows self-describing in per-kind views.
-        """
-        if self._usage_store is None:
-            return
-        try:
-            await self._usage_store.insert(
-                TokenUsageRecord(
-                    tenant_id=tenant_id,
-                    agent_name="memory-consolidator",
-                    agent_version="-",
-                    model=reply.model or self._default_model,
-                    user_id=user_id,
-                    usage_kind="memory_consolidation",
-                    trace_id=current_trace_id_hex(),
-                    input_tokens=reply.input_tokens,
-                    output_tokens=reply.output_tokens,
-                )
-            )
-        except Exception:
-            logger.warning("memory_consolidator.aux_usage_persist_failed", exc_info=True)
+        """One ``token_usage`` row per consolidator aux call (:func:`_persist_aux_usage`)."""
+        await _persist_aux_usage(
+            self._usage_store,
+            reply,
+            default_model=self._default_model,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
 
     async def _consolidate_or_reject(
         self,
@@ -1518,6 +1851,7 @@ __all__ = [
     "ConsolidatorRunSummary",
     "MemoryConsolidator",
     "SingleReviewVerdict",
+    "SummaryRewriter",
     "make_consolidator_embedder",
     "make_null_consolidator_aux_model",
 ]

@@ -342,6 +342,30 @@ async def test_a_summary_is_not_retired_but_can_be_flagged(store: MemoryStore) -
     assert got.item.supersedes == summary.id
 
 
+async def test_the_link_to_a_flagged_summary_wins_over_a_retired_row(store: MemoryStore) -> None:
+    """一句话既退了一条旧行、又点到了汇总行:新行连汇总行(重写靠这条连线找用户的新说法);
+    它退了谁按旧行的 ``superseded_by`` 反查。"""
+    t, u = uuid4(), uuid4()
+    summary = await _summary(
+        store, t, u, "commutes by metro; lives downtown", _item(t, u, "m", origin="user_stated")
+    )
+    old = _item(t, u, "takes line 2 every morning", origin="user_stated")
+    await store.write([old])
+    new = _item(t, u, "now drives to work", origin="user_stated")
+    got = await store.supersede(
+        tenant_id=t,
+        user_id=u,
+        new_item=new,
+        old_ids=[old.id],
+        flag_summary_ids=[summary.id],
+    )
+    assert got.retired == (old.id,) and got.flagged == (summary.id,)
+    assert got.item.supersedes == summary.id
+    assert (await _row(store, t, u, old.id)).superseded_by == new.id
+    [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
+    assert [s.id for s in flagged.statements] == [new.id]
+
+
 @pytest.mark.parametrize(
     ("candidate", "member"),
     [("assistant_derived", "user_stated"), ("user_stated", "corrected")],

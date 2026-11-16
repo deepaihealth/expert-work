@@ -880,7 +880,7 @@ class SqlMemoryStore(MemoryStore):
                 ).scalar()
             new_row = _new_row(new_item, tenant_id, user_id, now)
             new_row.supersedes = next(
-                (i for i in (*retired[:1], *flagged[:1], coexisting, linked) if i), None
+                (i for i in (*flagged[:1], *retired[:1], coexisting, linked) if i), None
             )
             session.add(new_row)
             await session.commit()

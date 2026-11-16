@@ -124,7 +124,7 @@ async def test_superseded_memory_does_not_join_a_cluster() -> None:
     await store.supersede(
         tenant_id=_TENANT,
         user_id=_USER,
-        old_id=old.id,
+        old_ids=[old.id],
         new_item=_item("meets on mondays and thursdays", (0.0, 1.0)),
     )
     aux = _ScriptedAuxModel([_KEEP % "meets on mondays"])
@@ -209,7 +209,7 @@ class _SupersedingAux:
         await self._store.supersede(
             tenant_id=_TENANT,
             user_id=_USER,
-            old_id=self._member.id,
+            old_ids=[self._member.id],
             new_item=_item("changed value", (0.0, 1.0)),
         )
         return ConsolidatorLLMReply(text=_KEEP % "a summary", model="fake")

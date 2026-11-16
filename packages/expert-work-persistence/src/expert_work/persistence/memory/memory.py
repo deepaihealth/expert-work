@@ -545,7 +545,7 @@ class InMemoryMemoryStore(MemoryStore):
             update={
                 "content_hash": content_hash,
                 "supersedes": next(
-                    (i for i in (*retired[:1], *flagged[:1], coexisting, linked) if i), None
+                    (i for i in (*flagged[:1], *retired[:1], coexisting, linked) if i), None
                 ),
                 "valid_at": now,
                 "created_at": now,
