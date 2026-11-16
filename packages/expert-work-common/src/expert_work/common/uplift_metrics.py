@@ -560,7 +560,8 @@ def record_memory_extraction_check(*, pass_name: str, check: str) -> None:
     """Bump ``expert_work_memory_extraction_check_total{extraction_pass, check}`` (B-300
     redesign §5.4): ``downgraded_out_of_range`` / ``downgraded_context_line`` /
     ``downgraded_not_user_line`` / ``downgraded_previous_not_assistant``,
-    ``pointer_missing``, ``event_date_dropped``."""
+    ``pointer_missing``, ``event_date_dropped``, ``event_date_on_fact`` (a valid event date on a
+    memory of kind ``fact`` — something that stays true — was cleared; user 2026-11-16)."""
     _memory_extraction_check_total.labels(extraction_pass=pass_name, check=check).inc()
 
 

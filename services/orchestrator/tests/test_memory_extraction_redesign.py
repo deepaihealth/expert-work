@@ -7,7 +7,8 @@
   → ``user_confirmed``(置信度 ≤ 0.8);否则降为 ``assistant_derived``(≤ 0.6)并按原因计数;
 * 第一次的产出永远是 ``user_stated``,第二次的永远不是;
 * 证据指针 = ``turn`` 那一行对应的消息 id + 序号;指向上下文、越界、缺失 → 留空、计数,记忆照写;
-* 事件日期:解析不了、晚于那一行的日期 → 置空、计数;
+* 事件日期:解析不了、晚于那一行的日期 → 置空、计数;「事实」带了合法的事件日期 → 清空、另计一种
+  (「方案三:折中」,用户 2026-11-16);
 * ``line_at`` = 那一行的发送时间;``in_new_segment`` = 那一行属于本次写回负责的轮次(切片之前 =
   最后一轮,即落这个写回任务的那一轮)。
 """
@@ -81,8 +82,15 @@ When a reply changes or rejects something said earlier, set "is_correction" to t
 write both what it was and what it is now.
 A value that happened or was observed on one day — a reading, a count, a payment made —
 gets "event_date": the day it refers to, as YYYY-MM-DD, counted from the date on its line
-when the line says "today", "this morning", "yesterday" and the like. Plans, arrangements,
-preferences and states get "event_date": null.
+when the line says "today", "this morning", "yesterday" and the like; its "kind" is
+"episodic". Plans, arrangements, preferences and states get "event_date": null. A date
+alone does not make something an event, and neither does the day something was said or
+asked about: a state, an id or a current status is written with "(as of <date>)" in the
+content, and that date is not an "event_date". For example:
+- "The kitchen renovation is waiting for the tiles (as of 2026-04-03)." — a state:
+  "event_date": null.
+- "On 2026-04-03 the tiles for the kitchen were delivered." — it happened that day:
+  "event_date": "2026-04-03".
 Passwords, one-time codes, bank card or bank account numbers and other secrets are never
 recorded, even when the user gives one in reply to the assistant.
 Write each memory as one sentence that can be understood on its own, in the language of
@@ -174,11 +182,11 @@ Example 7
 [1] [assistant] [2026-09-01] Sure. What did the electricity meter show this morning?
 === new ===
 [2] [user] [2026-09-01] 18342
-{"memories": [{"kind": "fact", "content": "The electricity meter read 18342 on the morning
-of 2026-09-01.", "basis": "user_answer", "turn": 2, "event_date": "2026-09-01",
+{"memories": [{"kind": "episodic", "content": "The electricity meter read 18342 on the
+morning of 2026-09-01.", "basis": "user_answer", "turn": 2, "event_date": "2026-09-01",
 "importance": 0.5, "confidence": 0.9, "expected_valid_days": null, "is_correction": false}]}
-Why: a reading taken on one day gets that day as event_date, so a reading on another day
-is kept next to it.
+Why: a reading taken on one day is episodic and gets that day as event_date, so a reading
+on another day is kept next to it.
 
 Example 8
 === new ===
@@ -281,13 +289,30 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
     )
     assert "a line that starts with a date in brackets was sent on that date" not in system
     assert "The input is every message one user typed" not in system
+    # 「方案三:折中」(用户 2026-11-16):写进内容的日期不是事件日期;成对的对照例子。
+    assert (
+        "- A value the user states about themselves or their own things, with the same message "
+        "saying what it is — a reading or measurement, an id or number, a current status — is "
+        "recorded even though it may change, except passwords, one-time codes, bank card or bank "
+        "account numbers and other secrets, which are never recorded. Write it with the date or "
+        'time it refers to in the content, such as "(as of <date>)", so it is not later taken '
+        "for a current value: a date in brackets after the line number is the day that line was "
+        'sent, so turn "this morning", "yesterday" and the like in that line into a date counted '
+        "from it; in a line without a date, leave such words as they are. A date written in the "
+        'content is not an "event_date" (see below). - A message that only agrees' in system
+    )
+    assert "Write it with the date or time it refers to, so it is not later taken" not in system
     assert (
         '- "is_correction": true ONLY when the same message itself says what is being corrected '
         "and gives the new value (e.g. the user says they moved, changed jobs, renamed a thing); "
         'otherwise false. - "turn": the number of the line that states it. - "event_date": only '
         "for a value that happened or was observed on one day (a reading, a count, a payment "
-        "made), that day as YYYY-MM-DD; null for anything else, including an id, a number that "
-        "names something, or a current status, even when its date is written in the content. "
+        'made), that day as YYYY-MM-DD, with "kind": "episodic"; null for anything else, '
+        "including an id, a number that names something, or a current status, even when its "
+        "date is written in the content. A date alone does not make something an event, and "
+        "neither does the day something was said or asked about. For example: "
+        '"鱼缸的水泵在等配件(截至 2026-04-03)" — a state: "event_date": null. '
+        '"2026-04-03 测得鱼缸水温 26 度" — measured that day: "event_date": "2026-04-03". '
         "Respond with ONLY a JSON object" in system
     )
     assert (
@@ -621,7 +646,7 @@ async def test_event_date_must_parse_and_not_be_after_its_line(
     llm = _ByPassLLM(
         conversation_reply=_reply(
             {
-                "kind": "fact",
+                "kind": "episodic",
                 "content": "电表读数 18342",
                 "basis": "user_answer",
                 "turn": 3,
@@ -629,7 +654,7 @@ async def test_event_date_must_parse_and_not_be_after_its_line(
             }
         ),
         user_reply=_reply(
-            {"kind": "fact", "content": "用户提到下周", "turn": 2, "event_date": claimed}
+            {"kind": "episodic", "content": "用户提到下周", "turn": 2, "event_date": claimed}
         ),
     )
     _, store = await _flush(_qa(), llm)
@@ -663,9 +688,9 @@ async def test_a_line_without_a_date_checks_the_format_and_today(
     """那一行没有日期:只查格式,以及不晚于智能体时区的「今天」(审查 L3)。"""
     llm = _ByPassLLM(
         conversation_reply=_reply(
-            {"kind": "fact", "content": "读数", "basis": "assistant", "turn": 2,
+            {"kind": "episodic", "content": "读数", "basis": "assistant", "turn": 2,
              "event_date": "2026-03-01"},
-            {"kind": "fact", "content": "将来的读数", "basis": "assistant", "turn": 2,
+            {"kind": "episodic", "content": "将来的读数", "basis": "assistant", "turn": 2,
              "event_date": "2030-01-01"},
         )
     )  # fmt: skip
@@ -679,8 +704,8 @@ async def test_a_line_without_a_date_checks_the_format_and_today(
 async def test_an_unresolved_turn_still_checks_today(checks: list[tuple[str, str]]) -> None:
     llm = _ByPassLLM(
         user_reply=_reply(
-            {"kind": "fact", "content": "过去的读数", "turn": 99, "event_date": "2026-03-01"},
-            {"kind": "fact", "content": "将来的读数", "turn": 99, "event_date": "2030-01-01"},
+            {"kind": "episodic", "content": "过去的读数", "turn": 99, "event_date": "2026-03-01"},
+            {"kind": "episodic", "content": "将来的读数", "turn": 99, "event_date": "2030-01-01"},
         )
     )
     _, store = await _flush(_qa(), llm)
@@ -693,10 +718,54 @@ async def test_an_unresolved_turn_still_checks_today(checks: list[tuple[str, str
 def test_the_today_guard_uses_the_given_day() -> None:
     undated = [ExtractionLine(text="读数是 5")]
     today = date(2026, 3, 2)
-    kept = memory_lines.settle_user_text(1, "2026-03-02", undated, today=today)
-    late = memory_lines.settle_user_text(1, "2026-03-03", undated, today=today)
+    kept = memory_lines.settle_user_text(1, "2026-03-02", undated, today=today, kind="episodic")
+    late = memory_lines.settle_user_text(1, "2026-03-03", undated, today=today, kind="episodic")
     assert kept.event_date == date(2026, 3, 2)
     assert (late.event_date, late.checks) == (None, ("event_date_dropped",))
+
+
+# ─── 自检:「事实」不带事件日期(「方案三:折中」,用户 2026-11-16)────────
+
+
+@pytest.mark.parametrize(
+    ("kind", "kept", "counted"),
+    [("fact", None, 1), ("episodic", date(2026, 3, 2), 0)],
+    ids=["fact-cleared", "episodic-kept"],
+)
+async def test_a_fact_with_an_event_date_has_it_cleared_and_counted(
+    checks: list[tuple[str, str]], kind: str, kept: date | None, counted: int
+) -> None:
+    """「事实」= 一直成立的;带事件日期自相矛盾 → 程序清空事件日期、按次计数,记忆照写。两次
+    提炼都管。"""
+    llm = _ByPassLLM(
+        conversation_reply=_reply(
+            {"kind": kind, "content": "构建失败的原因是缓存目录不可写", "basis": "user_answer",
+             "turn": 3, "event_date": "2026-03-02"},
+        ),
+        user_reply=_reply(
+            {"kind": kind, "content": "资料补全在预发环境验证中", "turn": 2,
+             "event_date": "2026-03-02"},
+        ),
+    )  # fmt: skip
+    _, store = await _flush(_qa(), llm)
+    rows = await _rows(store)
+    assert rows["构建失败的原因是缓存目录不可写"].occurred_on == kept
+    assert rows["资料补全在预发环境验证中"].occurred_on == kept
+    assert checks.count(("conversation", "event_date_on_fact")) == counted
+    assert checks.count(("user", "event_date_on_fact")) == counted
+    assert [c for c in checks if c[1] == "event_date_dropped"] == []
+
+
+def test_an_unusable_date_on_a_fact_counts_only_as_dropped() -> None:
+    """格式不对 / 晚于那一行的事件日期先按「置空」计;不再另记一次「事实带日期」。"""
+    lines = [ExtractionLine(text="读数是 5", sent_day=date(2026, 3, 2))]
+    for claimed in ("2026-03-03", "next tuesday"):
+        settled = memory_lines.settle_user_text(1, claimed, lines, today=_TODAY, kind="fact")
+        assert (settled.event_date, settled.checks) == (None, ("event_date_dropped",))
+    on_fact = memory_lines.settle_conversation(
+        "assistant", 1, "2026-03-01", lines, today=_TODAY, kind="fact"
+    )
+    assert (on_fact.event_date, on_fact.checks) == (None, ("event_date_on_fact",))
 
 
 async def test_the_line_date_boundary_follows_the_agent_timezone(
@@ -706,8 +775,8 @@ async def test_the_line_date_boundary_follows_the_agent_timezone(
     monkeypatch.setenv("EXPERT_WORK_TIMEZONE", "Asia/Shanghai")
     llm = _ByPassLLM(
         user_reply=_reply(
-            {"kind": "fact", "content": "当天", "turn": 1, "event_date": "2026-03-02"},
-            {"kind": "fact", "content": "次日", "turn": 1, "event_date": "2026-03-03"},
+            {"kind": "episodic", "content": "当天", "turn": 1, "event_date": "2026-03-02"},
+            {"kind": "episodic", "content": "次日", "turn": 1, "event_date": "2026-03-03"},
         )
     )
     _, store = await _flush([_user("今天的读数", "2026-03-01T17:30:00+00:00")], llm)
@@ -940,13 +1009,17 @@ async def test_a_context_line_is_neither_confirmed_nor_pointed_at(
         ExtractionLine(text="18号", tag="[user]", context=True, message_index=1),
         ExtractionLine(text="好的", tag="[assistant]", message_index=2),
     ]
-    settled = memory_lines.settle_conversation("user_answer", 2, None, lines, today=_TODAY)
+    settled = memory_lines.settle_conversation(
+        "user_answer", 2, None, lines, today=_TODAY, kind="fact"
+    )
     assert settled.origin == "assistant_derived"
     assert (settled.evidence_message_id, settled.evidence_message_index) == (None, None)
     assert settled.checks == ("downgraded_context_line", "pointer_missing")
     # 上一行可以是上下文行(问题常在上一轮末尾)。
     asked = [lines[0], ExtractionLine(text="18号", tag="[user]", message_id="u", message_index=1)]
-    settled = memory_lines.settle_conversation("user_answer", 2, None, asked, today=_TODAY)
+    settled = memory_lines.settle_conversation(
+        "user_answer", 2, None, asked, today=_TODAY, kind="fact"
+    )
     assert (settled.origin, settled.evidence_message_id, settled.checks) == (
         "user_confirmed",
         "u",

@@ -468,10 +468,11 @@ async def test_user_text_pass_records_dated_one_off_values() -> None:
         "saying what it is — a reading or measurement, an id or number, a current status — is "
         "recorded even though it may change, except passwords, one-time codes, bank card or "
         "bank account numbers and other secrets, which are never recorded. Write it with the "
-        "date or time it refers to, so it is not later taken for a current value: a date in "
-        'brackets after the line number is the day that line was sent, so turn "this morning", '
-        '"yesterday" and the like in that line into a date counted from it; in a line without '
-        "a date, leave such words as they are."
+        'date or time it refers to in the content, such as "(as of <date>)", so it is not later '
+        "taken for a current value: a date in brackets after the line number is the day that "
+        'line was sent, so turn "this morning", "yesterday" and the like in that line into a '
+        "date counted from it; in a line without a date, leave such words as they are. A date "
+        'written in the content is not an "event_date" (see below).'
     )
     assert rule in system
     assert "today is" not in system

@@ -3,8 +3,9 @@
 * 没有相似度门槛:相似度 0.3 的邻居也交给模型;每条候选按向量取召回范围内(带智能体名)最近 5 条;
 * 材料带类型、来源、日期、事件日期,已有记忆用本次调用内的短编号 ``e0, e1, …``,程序映射回去,
   不认识的编号按没给决定;
-* 更新 / 删除:跨格、不是同一格里按余弦(不是检索顺序)最近的前 2 条 → 新增;事件日期相同且候选
-  带更正才可以,相同不是更正、不同、一边没有 → 新增;候选那一行早于目标的记录时间的「更新」→ 新增;
+* 更新 / 删除:跨格、不是同一格里按余弦(不是检索顺序)最近的前 2 条 → 新增;两边都有事件日期时,
+  相同且候选带更正才可以,相同不是更正、不同 → 新增;只有一边有 → 不按这条拒绝(「方案三:折中」,
+  用户 2026-11-16);候选那一行早于目标的记录时间的「更新」→ 新增;
 * 「重复」要带目标、目标要在候选的召回范围内;只在用户一方对用户一方、候选那一行在新段里时把目标
   的确认日期刷新为那一行的发送时间,确定性「重复」同样;
 * 层级拦截:用户确认改不动用户说的;用户说的可以改用户确认的;
@@ -60,11 +61,11 @@ For each candidate choose one operation:
 - "ADD": anything else. A memory that is only related — the same topic but another subject,
   person, item or occasion — is not a target; the candidate is an ADD.
 UPDATE and DELETE apply only to an existing memory of the same kind.
-Two memories with different event dates are different occasions: ADD. A memory with an
-"event_date" is changed only by a candidate with "is_correction": true about the same day;
-any other candidate about that day is a NOOP when it says the same thing and an ADD
-otherwise. A reading, count or status that refers to a different date or time than an
-existing memory is a new memory (ADD), not an UPDATE of the earlier one.
+Two memories with different event dates are different occasions: ADD. When both have the
+same "event_date", the existing memory is changed only by a candidate with
+"is_correction": true; any other candidate about that day is a NOOP when it says the same
+thing and an ADD otherwise. A reading, count or status that refers to a different date or
+time than an existing memory is a new memory (ADD), not an UPDATE of the earlier one.
 A candidate with "is_correction": true changes something said earlier: when an existing
 memory still says the earlier value, the candidate is an UPDATE of that memory.
 A candidate's "is_correction" says what the candidate does, not where it comes from; its
@@ -360,15 +361,22 @@ async def test_targets_are_ranked_by_cosine_not_by_retrieval_order() -> None:
         (1, 1, True, True),
         (1, 1, False, False),
         (1, 2, True, False),
-        (1, None, True, False),
-        (None, 1, True, False),
+        (1, 2, False, False),
+        # 「方案三:折中」(用户 2026-11-16):只有一边有事件日期 → 不按这条拒绝,由模型照常判。
+        (1, None, True, True),
+        (1, None, False, True),
+        (None, 1, True, True),
+        (None, 1, False, True),
         (None, None, False, True),
     ],
     ids=[
         "same-day-correction",
         "same-day-again",
+        "other-day-correction",
         "other-day",
+        "candidate-only-correction",
         "candidate-only",
+        "target-only-correction",
         "target-only",
         "no-event-date",
     ],
@@ -376,10 +384,17 @@ async def test_targets_are_ranked_by_cosine_not_by_retrieval_order() -> None:
 @pytest.mark.parametrize("op", ["UPDATE", "DELETE"])
 @pytest.mark.asyncio
 async def test_event_dates_gate_update_and_delete(
-    op: str, cand_day: int | None, target_day: int | None, correction: bool, applied: bool
+    monkeypatch: pytest.MonkeyPatch,
+    op: str,
+    cand_day: int | None,
+    target_day: int | None,
+    correction: bool,
+    applied: bool,
 ) -> None:
     c = _Ctx()
     store = InMemoryMemoryStore()
+    counted: list[str] = []
+    monkeypatch.setattr(memory_module, "record_memory_reconcile", lambda *, op: counted.append(op))
 
     def day(n: int | None) -> date | None:
         return None if n is None else date(2026, 11, n)
@@ -391,6 +406,7 @@ async def test_event_dates_gate_update_and_delete(
         store, _LLM([_ops((0, op, "e0"))]), _Candidate(cand, is_correction=correction)
     )
     assert _untouched(store, target) is not applied
+    assert ("refused_event_date" in counted) is not applied
     written = [m.id for m in result.direct]
     if applied:
         # 更新落成新行;带更正的删除照旧把候选存下,不带的不存。

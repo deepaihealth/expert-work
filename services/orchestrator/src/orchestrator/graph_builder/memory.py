@@ -198,7 +198,8 @@ _CONVERSATION_EXTRACTION = "conversation"
 # P1(用户 11-14「记,带上日期」):用户说自己的读数 / 编号 / 当前状态要记、带日期;审查后(11-14)
 # 日期按每行自己的发送日期(行首方括号)换算,不按重读那天,密码 / 验证码 / 卡号一类不记。
 # B-300 重做(设计 2026-11-15 附录 C,逐句):行带编号、``=== new ===`` 之上是上下文;打分段加
-# ``turn`` 与 ``event_date`` 两条(``_SCORING_TAIL`` 只有第一次用)。
+# ``turn`` 与 ``event_date`` 两条(``_SCORING_TAIL`` 只有第一次用)。「方案三:折中」(用户
+# 2026-11-16):写进内容的日期写成「(as of <date>)」、不是事件日期;事件日期一条加一对对照例子。
 _USER_TEXT_EXTRACTION_HEADER = """You are a memory extraction module. The input is messages one user typed in a
 conversation, one per line, oldest first, each starting with its number in brackets.
 The other side of the conversation is not shown. Lines above the line "=== new ===" were
@@ -212,10 +213,12 @@ Only extract what these messages state on their own.
 - A value the user states about themselves or their own things, with the same message saying
   what it is — a reading or measurement, an id or number, a current status — is recorded even
   though it may change, except passwords, one-time codes, bank card or bank account numbers
-  and other secrets, which are never recorded. Write it with the date or time it refers to, so
-  it is not later taken for a current value: a date in brackets after the line number is the
-  day that line was sent, so turn "this morning", "yesterday" and the like in that line into a
-  date counted from it; in a line without a date, leave such words as they are.
+  and other secrets, which are never recorded. Write it with the date or time it refers to in
+  the content, such as "(as of <date>)", so it is not later taken for a current value: a date
+  in brackets after the line number is the day that line was sent, so turn "this morning",
+  "yesterday" and the like in that line into a date counted from it; in a line without a
+  date, leave such words as they are. A date written in the content is not an "event_date"
+  (see below).
 - A message that only agrees with, answers or refers to something that is not shown here
   (a bare "yes", "ok, do that", or a value or name with nothing saying what it is) states
   nothing by itself: skip it, and do not guess what it was about.
@@ -241,9 +244,13 @@ _SCORING_TAIL = (
     "changed jobs, renamed a thing); otherwise false.\n"
     '- "turn": the number of the line that states it.\n'
     '- "event_date": only for a value that happened or was observed on one day (a '
-    "reading, a count, a payment made), that day as YYYY-MM-DD; null for anything else, "
-    "including an id, a number that names something, or a current status, even when its "
-    "date is written in the content.\n"
+    'reading, a count, a payment made), that day as YYYY-MM-DD, with "kind": "episodic"; '
+    "null for anything else, including an id, a number that names something, or a current "
+    "status, even when its date is written in the content. A date alone does not make "
+    "something an event, and neither does the day something was said or asked about. For "
+    "example:\n"
+    '  "鱼缸的水泵在等配件(截至 2026-04-03)" — a state: "event_date": null.\n'
+    '  "2026-04-03 测得鱼缸水温 26 度" — measured that day: "event_date": "2026-04-03".\n'
     "Respond with ONLY a JSON object, no prose and no code fences:\n"
     '{"memories": [{"kind": "fact" | "episodic", "content": "<one concise '
     'sentence>", "importance": <0-1>, "confidence": <0-1>, '
@@ -259,7 +266,8 @@ _USER_TEXT_EXTRACTION_SYSTEM = _USER_TEXT_EXTRACTION_HEADER + "\n" + _SCORING_TA
 # 什么:原来那几句「不要记 X」全部删掉,重复交给去重合并;唯一保留的「不记」是秘密值(用户 11-14 定
 # 的既定规矩)。来源由程序写:「用户确认」跟着模型给的 ``basis``,程序只把它锚定到一条真实的用户
 # 输入行(挂不上就降为「来自助手」,``memory_lines``)。回归闸门里空列表若回升,先怀疑例子 9
-# (验证码 → 空列表,设计 §11.1)。
+# (验证码 → 空列表,设计 §11.1)。「方案三:折中」(用户 2026-11-16):事件日期那段加「写进内容的
+# 日期不是事件日期」与一对对照例子,例子 7 的读数改为「经历」(「事实」带事件日期会被程序清空)。
 _CONVERSATION_EXTRACTION_SYSTEM = """You are a memory extraction module. The input is part of a conversation, one message per
 line. Each line starts with its number in brackets and a tag:
 - [user] — text the user typed, followed by the date it was sent.
@@ -290,8 +298,15 @@ When a reply changes or rejects something said earlier, set "is_correction" to t
 write both what it was and what it is now.
 A value that happened or was observed on one day — a reading, a count, a payment made —
 gets "event_date": the day it refers to, as YYYY-MM-DD, counted from the date on its line
-when the line says "today", "this morning", "yesterday" and the like. Plans, arrangements,
-preferences and states get "event_date": null.
+when the line says "today", "this morning", "yesterday" and the like; its "kind" is
+"episodic". Plans, arrangements, preferences and states get "event_date": null. A date
+alone does not make something an event, and neither does the day something was said or
+asked about: a state, an id or a current status is written with "(as of <date>)" in the
+content, and that date is not an "event_date". For example:
+- "The kitchen renovation is waiting for the tiles (as of 2026-04-03)." — a state:
+  "event_date": null.
+- "On 2026-04-03 the tiles for the kitchen were delivered." — it happened that day:
+  "event_date": "2026-04-03".
 Passwords, one-time codes, bank card or bank account numbers and other secrets are never
 recorded, even when the user gives one in reply to the assistant.
 Write each memory as one sentence that can be understood on its own, in the language of
@@ -383,11 +398,11 @@ Example 7
 [1] [assistant] [2026-09-01] Sure. What did the electricity meter show this morning?
 === new ===
 [2] [user] [2026-09-01] 18342
-{"memories": [{"kind": "fact", "content": "The electricity meter read 18342 on the morning
-of 2026-09-01.", "basis": "user_answer", "turn": 2, "event_date": "2026-09-01",
+{"memories": [{"kind": "episodic", "content": "The electricity meter read 18342 on the
+morning of 2026-09-01.", "basis": "user_answer", "turn": 2, "event_date": "2026-09-01",
 "importance": 0.5, "confidence": 0.9, "expected_valid_days": null, "is_correction": false}]}
-Why: a reading taken on one day gets that day as event_date, so a reading on another day
-is kept next to it.
+Why: a reading taken on one day is episodic and gets that day as event_date, so a reading
+on another day is kept next to it.
 
 Example 8
 === new ===
@@ -1356,7 +1371,8 @@ _RECONCILE_NEIGHBOR_LIMIT = 5
 _RECONCILE_TARGET_TOP = 2
 
 #: 附录 B(最终英文原文)。指令里没写的规则由程序执行:层级拦截、同一格、余弦前 2 名、召回范围、
-#: 事件日期、候选那一行早于目标的记录时间。
+#: 事件日期、候选那一行早于目标的记录时间。「方案三:折中」(用户 2026-11-16):同一天只有更正
+#: 能改的那句限定为两边都有事件日期,与程序规则一致;「不同日子是新的一条」那句不动。
 _RECONCILE_SYSTEM = """\
 You compare newly extracted memories ("candidates") with existing memories about the same
 user and decide what to store. Each candidate comes with up to five existing memories that
@@ -1375,11 +1391,11 @@ For each candidate choose one operation:
 - "ADD": anything else. A memory that is only related — the same topic but another subject,
   person, item or occasion — is not a target; the candidate is an ADD.
 UPDATE and DELETE apply only to an existing memory of the same kind.
-Two memories with different event dates are different occasions: ADD. A memory with an
-"event_date" is changed only by a candidate with "is_correction": true about the same day;
-any other candidate about that day is a NOOP when it says the same thing and an ADD
-otherwise. A reading, count or status that refers to a different date or time than an
-existing memory is a new memory (ADD), not an UPDATE of the earlier one.
+Two memories with different event dates are different occasions: ADD. When both have the
+same "event_date", the existing memory is changed only by a candidate with
+"is_correction": true; any other candidate about that day is a NOOP when it says the same
+thing and an ADD otherwise. A reading, count or status that refers to a different date or
+time than an existing memory is a new memory (ADD), not an UPDATE of the earlier one.
 A candidate with "is_correction": true changes something said earlier: when an existing
 memory still says the earlier value, the candidate is an UPDATE of that memory.
 A candidate's "is_correction" says what the candidate does, not where it comes from; its
@@ -1609,10 +1625,11 @@ def _in_recall_scope(item: MemoryItem, target: MemoryItem) -> bool:
 
 
 def _event_dates_allow(candidate: _Candidate, target: MemoryItem) -> bool:
-    """重做 §7.1 第 7 行 —— 两边都没有事件日期 → 照常;事件日期相同、且候选带更正 → 可以
-    (同一次的更正);相同但不是更正(同一天又量了一次)、不同、只有一边有 → 不可以。"""
+    """重做 §7.1 第 7 行 —— 只看两边都有事件日期的:相同、且候选带更正 → 可以(同一次的更正);
+    相同但不是更正(同一天又量了一次)、不同 → 不可以。只有一边有、两边都没有 → 不按这条拒绝,
+    由模型照常判(「方案三:折中」,用户 2026-11-16:被误标了日期的状态也要能被更新,§15)。"""
     ours, theirs = candidate.item.occurred_on, target.occurred_on
-    if ours is None and theirs is None:
+    if ours is None or theirs is None:
         return True
     return ours == theirs and candidate.is_correction
 
@@ -2112,13 +2129,17 @@ def _settled(
     pass_name: str, memory: ExtractedMemory, lines: Sequence[ExtractionLine], today: date
 ) -> ExtractedMemory:
     """B-300 重做 §4 / §5.4 —— 程序按 ``turn`` 那一行定来源、置信度上限、证据指针、事件日期、
-    那一行的发送时间与在不在新段;降级、指针留空、事件日期置空各计一次。"""
+    那一行的发送时间与在不在新段;降级、指针留空、事件日期置空、「事实」带的事件日期被清空
+    (§7.4)各计一次。"""
     if pass_name == _CONVERSATION_EXTRACTION:
         settled = settle_conversation(
-            memory.basis, memory.turn, memory.claimed_event_date, lines, today=today
-        )
+            memory.basis, memory.turn, memory.claimed_event_date, lines, today=today,
+            kind=memory.kind,
+        )  # fmt: skip
     else:
-        settled = settle_user_text(memory.turn, memory.claimed_event_date, lines, today=today)
+        settled = settle_user_text(
+            memory.turn, memory.claimed_event_date, lines, today=today, kind=memory.kind
+        )
     for check in settled.checks:
         record_memory_extraction_check(pass_name=pass_name, check=check)
     confidence = memory.confidence
