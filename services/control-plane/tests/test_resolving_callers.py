@@ -22,6 +22,7 @@ from expert_work.common.credentials import CredentialsResolver, CredentialsResol
 from expert_work.protocol import TenantConfigRecord, TenantPlan
 from expert_work.runtime.secret_store import parse_secret_ref
 from expert_work.testing import InMemorySecretStore
+from tests.credential_fixtures import static_credentials_resolver
 
 _NOW_DISPLAY = "Acme"
 
@@ -54,7 +55,7 @@ def _resolver(
     record: TenantConfigRecord,
     platform_provs: dict[str, str] | None = None,
 ) -> CredentialsResolver:
-    return CredentialsResolver(
+    return static_credentials_resolver(
         platform_provider_credentials=platform_provs or {},  # type: ignore[arg-type]
         platform_tool_credentials={},  # type: ignore[arg-type]
         tenant_config_getter=_TenantConfig(record),

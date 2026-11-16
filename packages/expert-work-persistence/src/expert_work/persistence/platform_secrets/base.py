@@ -48,9 +48,12 @@ class PlatformSecretStore(abc.ABC):
         enabled: bool,
         priority: int = 100,
         actor_id: str,
+        base_url: str | None = None,
+        base_url_unverified: bool = False,
     ) -> PlatformProviderSecretRecord:
         """Insert-or-update one provider key (keyed by ``(provider, key_id)``).
-        Caller must bypass RLS."""
+        The whole row is overwritten, ``base_url`` / ``base_url_unverified``
+        (B-308) included. Caller must bypass RLS."""
 
     @abc.abstractmethod
     async def delete_provider(self, provider: Provider, key_id: str = "default") -> bool:
@@ -98,8 +101,11 @@ class PlatformSecretStore(abc.ABC):
         secret_ref: str,
         enabled: bool,
         actor_id: str,
+        base_url: str | None = None,
+        base_url_unverified: bool = False,
     ) -> TenantProviderSecretRecord:
-        """Insert-or-update a tenant provider override. Caller must bypass RLS."""
+        """Insert-or-update a tenant provider override (whole row, the B-308
+        address columns included). Caller must bypass RLS."""
 
     @abc.abstractmethod
     async def delete_tenant_provider(self, *, tenant_id: UUID, provider: Provider) -> bool:

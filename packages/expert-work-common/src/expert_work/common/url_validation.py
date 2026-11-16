@@ -17,9 +17,11 @@ common cases (literal private IPs, localhost, metadata IP) cheaply.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import re
 import socket
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 _LOCALHOST_NAMES = frozenset(
@@ -196,3 +198,182 @@ def _is_canonical_ip(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# B-308 — "public endpoint only" checks for a platform credential's request
+# address. Stricter than the guard above (which MCP / webhook callers keep
+# using unchanged): there is no allow-list, internal-looking names are refused
+# outright, and every resolved address must be publicly routable.
+# ---------------------------------------------------------------------------
+
+PublicEndpointRefusal = Literal["blocked", "unresolvable"]
+
+
+class PublicEndpointError(RemoteURLError):
+    """A host is not a public endpoint. ``reason`` says which way it failed:
+    ``blocked`` (an internal name or a non-public address) or ``unresolvable``."""
+
+    def __init__(self, message: str, *, reason: PublicEndpointRefusal) -> None:
+        super().__init__(message)
+        self.reason: PublicEndpointRefusal = reason
+
+
+#: Checked in addition to ``is_global``, whose answer differs between Python
+#: versions. ``100.64.0.0/10`` holds a cloud vendor's metadata and internal DNS.
+_NON_PUBLIC_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("fec0::/10"),  # deprecated site-local
+)
+
+_NAT64_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
+_6TO4_PREFIX = ipaddress.IPv6Network("2002::/16")
+#: IPv4-compatible (``::a.b.c.d``, deprecated) and SIIT (``::ffff:0:a.b.c.d``):
+#: the IPv4 address is the low 32 bits, as with NAT64.
+_LOW32_PREFIXES = (
+    _NAT64_PREFIX,
+    ipaddress.IPv6Network("::/96"),
+    ipaddress.IPv6Network("::ffff:0:0:0/96"),
+)
+
+#: Name suffixes that only resolve inside a host, a LAN or a cluster.
+_INTERNAL_NAME_SUFFIXES = (".local", ".internal", ".svc", ".localhost")
+
+_IPv4_BITS = 32
+
+
+def _embedded_ipv4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """The IPv4 address an IPv6 one carries (IPv4-mapped, NAT64, IPv4-compatible,
+    SIIT, 6to4), if any. ``::`` and ``::1`` come out as ``0.0.0.0`` / ``0.0.0.1``
+    — not public either way."""
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if any(ip in prefix for prefix in _LOW32_PREFIXES):
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    if ip in _6TO4_PREFIX:
+        return ipaddress.IPv4Address((int(ip) >> (128 - 16 - _IPv4_BITS)) & 0xFFFFFFFF)
+    return None
+
+
+def _in_non_public_network(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return any(ip in net for net in _NON_PUBLIC_NETWORKS if ip.version == net.version)
+
+
+def _is_global(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return ip.is_global
+
+
+def is_public_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Whether ``ip`` is a publicly routable address.
+
+    An IPv6 address that carries an IPv4 one is judged as that IPv4 address.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(ip)
+        if embedded is not None:
+            ip = embedded
+    if ip.is_multicast or ip.is_unspecified:
+        return False
+    if _in_non_public_network(ip):
+        return False
+    return _is_global(ip)
+
+
+def check_public_endpoint(host: str) -> str:
+    """Static check that ``host`` can be a public endpoint (no DNS).
+
+    Refuses a localhost name, a single-label name, an internal-only suffix
+    (``.local`` / ``.internal`` / ``.svc`` / ``.cluster.local``), a
+    non-canonical IP literal, and a non-public IP literal. Returns the
+    canonical host: IDNA label separators folded, lower-cased, punycode,
+    without a trailing dot.
+
+    :raises PublicEndpointError: ``reason="blocked"``.
+    """
+    cleaned = normalize_host(host).lower()
+    if not cleaned:
+        msg = "host is empty"
+        raise PublicEndpointError(msg, reason="blocked")
+    try:
+        ip = ipaddress.ip_address(cleaned)
+    except ValueError:
+        pass
+    else:
+        if not is_public_address(ip):
+            msg = "address is not a public address"
+            raise PublicEndpointError(msg, reason="blocked")
+        return cleaned
+    if re.fullmatch(r"[0-9.]+", cleaned) or re.fullmatch(r"0x[0-9a-f]+", cleaned):
+        msg = "non-canonical IP literal not allowed"
+        raise PublicEndpointError(msg, reason="blocked")
+    try:
+        ascii_host = cleaned.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        msg = "host name is not valid"
+        raise PublicEndpointError(msg, reason="blocked") from exc
+    if (
+        ascii_host in _LOCALHOST_NAMES
+        or "." not in ascii_host
+        or ascii_host.endswith(_INTERNAL_NAME_SUFFIXES)
+    ):
+        msg = "host is an internal name, not a public one"
+        raise PublicEndpointError(msg, reason="blocked")
+    return ascii_host
+
+
+async def _getaddrinfo(host: str, port: int) -> list[tuple[Any, ...]]:
+    """Resolve on the event loop's resolver (never blocks the loop)."""
+    loop = asyncio.get_running_loop()
+    return list(await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+
+
+async def resolve_public_addresses(
+    host: str, port: int, *, timeout_s: float | None = None
+) -> list[str]:
+    """Resolve ``host`` and return **every** address, in resolver order — all
+    of them public, or none at all. A lookup that takes longer than
+    ``timeout_s`` counts as ``unresolvable``.
+
+    The caller connects to the returned addresses (never to the name again):
+    that is what keeps a name from answering "public" to the check and
+    "internal" to the connection.
+
+    :raises PublicEndpointError: ``blocked`` when the host fails
+        :func:`check_public_endpoint` or any resolved address is not public;
+        ``unresolvable`` when the name does not resolve.
+    """
+    canonical = check_public_endpoint(host)
+    try:
+        ipaddress.ip_address(canonical)
+    except ValueError:
+        pass
+    else:
+        return [canonical]
+    try:
+        async with asyncio.timeout(timeout_s):
+            infos = await _getaddrinfo(canonical, port)
+    except (OSError, TimeoutError) as exc:
+        msg = "host name could not be resolved"
+        raise PublicEndpointError(msg, reason="unresolvable") from exc
+    addresses: list[str] = []
+    for info in infos:
+        address = str(info[4][0])
+        if not is_public_address(ipaddress.ip_address(address.split("%", 1)[0])):
+            msg = "host resolves to an address that is not public"
+            raise PublicEndpointError(msg, reason="blocked")
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        msg = "host name did not resolve to any address"
+        raise PublicEndpointError(msg, reason="unresolvable")
+    return addresses

@@ -25,6 +25,7 @@ from orchestrator import BuiltAgent, LLMActionJudge, LLMOutputJudge, ToolEnv
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools.knowledge_catalog import catalog_fingerprint
+from tests.credential_fixtures import static_credentials_resolver
 
 _SHA = "a" * 64
 
@@ -929,7 +930,7 @@ class _StubTenantConfig:
 
 
 def _anthropic_credentials_resolver() -> CredentialsResolver:
-    return CredentialsResolver(
+    return static_credentials_resolver(
         platform_provider_credentials={"anthropic": f"secret://{_ANTHROPIC_KEY_NAME}"},  # type: ignore[arg-type]
         platform_tool_credentials={},  # type: ignore[arg-type]
         tenant_config_getter=_StubTenantConfig(),  # type: ignore[arg-type]

@@ -51,6 +51,8 @@ class InMemoryPlatformSecretStore(PlatformSecretStore):
         enabled: bool,
         priority: int = 100,
         actor_id: str,
+        base_url: str | None = None,
+        base_url_unverified: bool = False,
     ) -> PlatformProviderSecretRecord:
         now = _now()
         async with self._lock:
@@ -62,6 +64,8 @@ class InMemoryPlatformSecretStore(PlatformSecretStore):
                 secret_ref=secret_ref,
                 enabled=enabled,
                 priority=priority,
+                base_url=base_url,
+                base_url_unverified=base_url_unverified,
                 created_at=created_at,
                 updated_at=now,
                 updated_by=actor_id,
@@ -128,6 +132,8 @@ class InMemoryPlatformSecretStore(PlatformSecretStore):
         secret_ref: str,
         enabled: bool,
         actor_id: str,
+        base_url: str | None = None,
+        base_url_unverified: bool = False,
     ) -> TenantProviderSecretRecord:
         now = _now()
         async with self._lock:
@@ -138,6 +144,8 @@ class InMemoryPlatformSecretStore(PlatformSecretStore):
                 provider=provider,
                 secret_ref=secret_ref,
                 enabled=enabled,
+                base_url=base_url,
+                base_url_unverified=base_url_unverified,
                 created_at=created_at,
                 updated_at=now,
                 updated_by=actor_id,

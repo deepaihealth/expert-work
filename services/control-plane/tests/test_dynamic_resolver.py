@@ -20,6 +20,7 @@ from expert_work.protocol import ModelEntry
 from expert_work.protocol.model_catalog import EmbeddingCaps
 from orchestrator.errors import AgentFactoryError
 from orchestrator.llm import DEFAULT_MAX_INPUT_BYTES, RerankCallError, RerankGuards
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.tools.knowledge import RerankRanking
 
 
@@ -38,8 +39,8 @@ class _Cfg:
 
 
 class _Resolver:
-    async def resolve_provider(self, *, tenant_id, provider):
-        return f"secret://{provider}"
+    async def resolve_provider_key(self, *, tenant_id, provider):
+        return ProviderKey(f"secret://{provider}")
 
 
 class _SecretStore:
@@ -61,7 +62,7 @@ async def test_embedder_reads_current_config_each_call(monkeypatch):
     # seam: patch the delegate the dynamic embedder constructs, plus the HTTP
     # client so NO network happens.
     monkeypatch.setattr("control_plane.runtime.OpenAICompatibleEmbedder", _FakeDelegate)
-    monkeypatch.setattr("control_plane.runtime.HTTPEmbeddingClient", lambda **kw: object())
+    monkeypatch.setattr("control_plane.runtime.embedding_client_for", lambda *a, **kw: object())
 
     cfg = _Cfg()
     emb = DynamicResolvingEmbedder(
@@ -89,7 +90,7 @@ async def test_pin_fixes_one_model_for_the_whole_unit_of_work(monkeypatch):
             return [(0.0,) for _ in texts]
 
     monkeypatch.setattr("control_plane.runtime.OpenAICompatibleEmbedder", _FakeDelegate)
-    monkeypatch.setattr("control_plane.runtime.HTTPEmbeddingClient", lambda **kw: object())
+    monkeypatch.setattr("control_plane.runtime.embedding_client_for", lambda *a, **kw: object())
 
     cfg = _Cfg()
     emb = DynamicResolvingEmbedder(
@@ -124,7 +125,7 @@ async def test_memory_embed_reports_the_model_each_call_used(monkeypatch):
 @pytest.mark.asyncio
 async def test_pinned_embedder_carries_the_input_byte_cap(monkeypatch):
     # B-200 — the deployment's cap reaches the embedder that sends the request.
-    monkeypatch.setattr("control_plane.runtime.HTTPEmbeddingClient", lambda **kw: object())
+    monkeypatch.setattr("control_plane.runtime.embedding_client_for", lambda *a, **kw: object())
     emb = DynamicResolvingEmbedder(
         config_service=_Cfg(),
         resolver=_Resolver(),
@@ -288,7 +289,7 @@ async def test_reranker_routes_dashscope_rerank_model_to_native_api(monkeypatch)
         async def rerank(self, *, model, query, documents, top_n):
             return {"output": {"results": [{"index": 1}, {"index": 0}]}}
 
-    monkeypatch.setattr("control_plane.rerank_vendors.HTTPDashScopeRerankClient", _FakeRerankClient)
+    monkeypatch.setattr("control_plane.rerank_vendors.dashscope_rerank_client", _FakeRerankClient)
 
     def _boom(*_a, **_k):
         raise AssertionError("LLM router (chat) path used for a native rerank model")
@@ -322,7 +323,7 @@ async def test_reranker_scored_keeps_the_native_api_scores(monkeypatch):
                 }
             }
 
-    monkeypatch.setattr("control_plane.rerank_vendors.HTTPDashScopeRerankClient", _FakeRerankClient)
+    monkeypatch.setattr("control_plane.rerank_vendors.dashscope_rerank_client", _FakeRerankClient)
     cfg = _Cfg()
     cfg.rerank = ("qwen", "qwen3-vl-rerank")
     rr = DynamicResolvingReranker(
@@ -346,7 +347,7 @@ async def test_resolving_rerankers_pass_the_task_instruction_to_the_native_api(m
             instructions.append(instruction)
             return {"output": {"results": [{"index": 0, "relevance_score": 0.5}]}}
 
-    monkeypatch.setattr("control_plane.rerank_vendors.HTTPDashScopeRerankClient", _FakeRerankClient)
+    monkeypatch.setattr("control_plane.rerank_vendors.dashscope_rerank_client", _FakeRerankClient)
     cfg = _Cfg()
     cfg.rerank = ("qwen", "qwen3-vl-rerank")
     dynamic = DynamicResolvingReranker(
@@ -363,7 +364,7 @@ async def test_resolving_rerankers_pass_the_task_instruction_to_the_native_api(m
 
 
 class _RaisingResolver:
-    async def resolve_provider(self, *, tenant_id, provider):
+    async def resolve_provider_key(self, *, tenant_id, provider):
         raise CredentialsResolverError(
             "no credential", mode="platform", kind="provider", key=provider
         )
@@ -435,7 +436,7 @@ async def test_both_resolving_rerankers_send_native_requests_through_the_guard(m
     async def _no_sleep(_delay: float) -> None:
         return None
 
-    monkeypatch.setattr("control_plane.rerank_vendors.HTTPDashScopeRerankClient", _FlakyClient)
+    monkeypatch.setattr("control_plane.rerank_vendors.dashscope_rerank_client", _FlakyClient)
     guards = RerankGuards(buckets=_buckets, sleep=_no_sleep)
     cfg = _Cfg()
     cfg.rerank = ("qwen", "qwen3-vl-rerank")

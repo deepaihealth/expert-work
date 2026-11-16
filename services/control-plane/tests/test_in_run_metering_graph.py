@@ -38,6 +38,7 @@ from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import BuiltAgent, MiddlewareEnv, ToolEnv
 from orchestrator.tools._guards import TOKEN_BUDGET_KEY, TokenBudget
 from orchestrator.tools.registry import ToolSpec
+from tests.credential_fixtures import static_credentials_resolver
 
 _TENANT = UUID("11111111-1111-1111-1111-111111111111")
 _USER = UUID("33333333-3333-3333-3333-333333333333")
@@ -132,7 +133,7 @@ class _StubTenantConfig:
 
 
 def _credentials() -> CredentialsResolver:
-    return CredentialsResolver(
+    return static_credentials_resolver(
         platform_provider_credentials={"anthropic": f"secret://{_KEY_NAME}"},
         platform_tool_credentials={},
         tenant_config_getter=_StubTenantConfig(),  # type: ignore[arg-type]

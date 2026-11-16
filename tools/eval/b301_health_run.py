@@ -285,11 +285,13 @@ def real_callers_factory(keys: Mapping[str, str]) -> CallerFactory:
             _thinking_off,
             build_llm_router,
         )
+        from orchestrator.llm.endpoints import ProviderKey
 
         store = _KeyStore(keys)
 
-        async def key_refs(name: str) -> list[str]:
-            return [f"secret://b301-health/{name}"]
+        async def key_refs(name: str) -> list[ProviderKey]:
+            # 脚本自带的密钥,不是平台凭证:没有请求地址,走官方。
+            return [ProviderKey(f"secret://b301-health/{name}")]
 
         async def router(spec: ModelSpec) -> LLMCallable:
             return await build_llm_router(

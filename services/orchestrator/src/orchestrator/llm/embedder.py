@@ -26,6 +26,7 @@ from uuid import UUID
 import httpx
 
 from expert_work.protocol.model_catalog import EmbeddingCaps
+from orchestrator.llm.endpoints import endpoint_for
 from orchestrator.llm.providers._http import client_for
 
 #: OpenAI-compatible embeddings path — qwen DashScope compatible-mode,
@@ -154,12 +155,21 @@ class HTTPEmbeddingClient:
     #: must NOT be closed here: it is owned by the control-plane lifespan and
     #: outlives every individual call.
     http: httpx.AsyncClient | None = None
+    #: B-308 — ``base_url`` is a credential's custom request address: requests
+    #: go through the address-checking client.
+    custom_endpoint: bool = False
+    #: Label for the custom-address connection log line / counter.
+    endpoint_provider: str | None = None
 
     async def embeddings(
         self, *, model: str, texts: Sequence[str], fields: Mapping[str, str] | None = None
     ) -> Mapping[str, Any]:
         async with client_for(
-            self.http, timeout=_DEFAULT_TIMEOUT_S, transport=self.transport
+            self.http,
+            timeout=_DEFAULT_TIMEOUT_S,
+            transport=self.transport,
+            custom_endpoint=self.custom_endpoint,
+            provider=self.endpoint_provider,
         ) as client:
             response = await client.post(
                 f"{self.base_url}{self.embeddings_path}",
@@ -179,6 +189,31 @@ class HTTPEmbeddingClient:
                 )
             body: Mapping[str, Any] = response.json()
             return body
+
+
+def embedding_client_for(
+    provider: str,
+    *,
+    api_key: str,
+    base_url: str | None = None,
+    http: httpx.AsyncClient | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> HTTPEmbeddingClient:
+    """The embeddings client for ``provider``, at that provider's own address
+    (B-308 §4.9) — or under the credential's request address ``base_url``.
+
+    :raises EndpointNotSupportedError: the provider has no embeddings endpoint.
+    """
+    endpoint = endpoint_for(provider, "embeddings", base_url)
+    return HTTPEmbeddingClient(
+        api_key=api_key,
+        base_url=endpoint.root,
+        embeddings_path=endpoint.path,
+        transport=transport,
+        http=http,
+        custom_endpoint=endpoint.custom,
+        endpoint_provider=provider,
+    )
 
 
 def fit_embedding_input(text: str, max_bytes: int) -> str:

@@ -31,6 +31,7 @@ import httpx
 
 from expert_work.protocol.knowledge import rerank_model_key
 from expert_work.protocol.model_catalog import catalog_entry
+from orchestrator.llm.endpoints import endpoint_for
 from orchestrator.llm.providers._http import client_for
 from orchestrator.llm.rerank_guard import (
     RerankCallError,
@@ -79,6 +80,9 @@ class HTTPDashScopeRerankClient:
     #: must NOT be closed here: it is owned by the control-plane lifespan and
     #: outlives every individual call.
     http: httpx.AsyncClient | None = None
+    #: B-308 — ``base_url`` is under a credential's custom request address:
+    #: requests go through the address-checking client.
+    custom_endpoint: bool = False
 
     async def rerank(
         self,
@@ -104,7 +108,11 @@ class HTTPDashScopeRerankClient:
             "parameters": parameters,
         }
         async with client_for(
-            self.http, timeout=self.timeout_s, transport=self.transport
+            self.http,
+            timeout=self.timeout_s,
+            transport=self.transport,
+            custom_endpoint=self.custom_endpoint,
+            provider=_CATALOG_PROVIDER,
         ) as client:
             try:
                 response = await client.post(
@@ -133,6 +141,27 @@ class HTTPDashScopeRerankClient:
             msg = f"dashscope rerank returned non-object body: {type(data).__name__}"
             raise httpx.HTTPError(msg)
         return data
+
+
+def dashscope_rerank_client(
+    *,
+    api_key: str,
+    base_url: str | None = None,
+    http: httpx.AsyncClient | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> HTTPDashScopeRerankClient:
+    """The DashScope native rerank client at the official address, or — B-308 —
+    under the credential's request address ``base_url`` (its
+    ``/compatible-mode/v1`` root with that segment replaced by the native
+    rerank path)."""
+    endpoint = endpoint_for(_CATALOG_PROVIDER, "rerank", base_url)
+    return HTTPDashScopeRerankClient(
+        api_key=api_key,
+        base_url=endpoint.url,
+        transport=transport,
+        http=http,
+        custom_endpoint=endpoint.custom,
+    )
 
 
 @dataclass(frozen=True)

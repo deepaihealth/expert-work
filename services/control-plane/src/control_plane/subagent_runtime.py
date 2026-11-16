@@ -37,8 +37,8 @@ from control_plane.runtime import (
 )
 from control_plane.tenancy import TenantConfigService
 from control_plane.tenant_mcp_pool import TenantMcpPoolProvider
+from control_plane.tenant_secret_overlay import TenantOverlayCredentialsResolver
 from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolProvider
-from expert_work.common.credentials import CredentialsResolver
 from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.persistence.agent_spec import AgentSpecStore
@@ -339,7 +339,7 @@ def make_child_agent_builder(
     base_tool_env: ToolEnv,
     middleware_env: MiddlewareEnv | None = None,
     memory_env: MemoryEnv | None = None,
-    credentials_resolver: CredentialsResolver | None = None,
+    credentials_resolver: TenantOverlayCredentialsResolver | None = None,
     tenant_mcp_pool_provider: TenantMcpPoolProvider | None = None,
     platform_mcp_pool_provider: PlatformMcpPoolProvider | None = None,
     user_mcp_oauth_pool_provider: UserMcpOAuthPoolProvider | None = None,
@@ -717,7 +717,7 @@ def make_worker_build_fn(
     allowed_toolsets: list[str],
     middleware_env: MiddlewareEnv | None = None,
     memory_env: MemoryEnv | None = None,
-    credentials_resolver: CredentialsResolver | None = None,
+    credentials_resolver: TenantOverlayCredentialsResolver | None = None,
     tenant_mcp_pool_provider: TenantMcpPoolProvider | None = None,
     platform_mcp_pool_provider: PlatformMcpPoolProvider | None = None,
     user_mcp_oauth_pool_provider: UserMcpOAuthPoolProvider | None = None,

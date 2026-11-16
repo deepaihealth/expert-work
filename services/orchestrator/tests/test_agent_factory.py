@@ -42,6 +42,7 @@ from orchestrator.agent_factory import (
 )
 from orchestrator.context import ToolResultPruner
 from orchestrator.llm import FakeEmbedder, RateLimitedProvider
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.llm.providers.openai_compatible import OpenAICompatibleProvider
 from orchestrator.tools import (
     KnowledgeRetriever,
@@ -110,8 +111,8 @@ _PROVIDER_KEY_NAMES = {
 }
 
 
-async def _platform_resolver(provider: str) -> list[str]:
-    return [f"secret://{_PROVIDER_KEY_NAMES[provider]}"]
+async def _platform_resolver(provider: str) -> list[ProviderKey]:
+    return [ProviderKey(f"secret://{_PROVIDER_KEY_NAMES[provider]}")]
 
 
 async def _build(spec: AgentSpec, **kwargs: Any) -> BuiltAgent:
@@ -288,9 +289,9 @@ async def test_build_llm_router_uses_provider_key_resolver_when_no_ref() -> None
     model = ModelSpec.model_validate({"provider": "anthropic", "name": "claude"})
     seen: list[str] = []
 
-    async def resolver(provider: str) -> list[str]:
+    async def resolver(provider: str) -> list[ProviderKey]:
         seen.append(provider)
-        return [f"secret://{_ANTHROPIC_KEY_NAME}"]
+        return [ProviderKey(f"secret://{_ANTHROPIC_KEY_NAME}")]
 
     router = await build_llm_router(
         model, secret_store=_secret_store(), provider_key_resolver=resolver
@@ -305,8 +306,11 @@ async def test_build_llm_router_expands_multikey_into_sibling_handles() -> None:
     ``ProviderHandle``s sharing one ``group``, with ``#idx`` breaker keys."""
     model = ModelSpec.model_validate({"provider": "anthropic", "name": "claude"})
 
-    async def resolver(provider: str) -> list[str]:
-        return [f"secret://{_ANTHROPIC_KEY_NAME}", f"secret://{_OPENAI_KEY_NAME}"]
+    async def resolver(provider: str) -> list[ProviderKey]:
+        return [
+            ProviderKey(f"secret://{_ANTHROPIC_KEY_NAME}"),
+            ProviderKey(f"secret://{_OPENAI_KEY_NAME}"),
+        ]
 
     router = await build_llm_router(
         model, secret_store=_secret_store(), provider_key_resolver=resolver
@@ -322,7 +326,7 @@ async def test_build_llm_router_empty_keylist_raises() -> None:
     """A resolver returning no keys is a configuration error, not an empty router."""
     model = ModelSpec.model_validate({"provider": "anthropic", "name": "claude"})
 
-    async def resolver(provider: str) -> list[str]:
+    async def resolver(provider: str) -> list[ProviderKey]:
         return []
 
     with pytest.raises(AgentFactoryError, match="resolved no platform credential"):
@@ -335,10 +339,10 @@ async def test_build_llm_router_manifest_ref_wins_over_resolver() -> None:
     platform resolver is not consulted when a ref is present."""
     called = False
 
-    async def resolver(provider: str) -> list[str]:
+    async def resolver(provider: str) -> list[ProviderKey]:
         nonlocal called
         called = True
-        return ["secret://unused"]
+        return [ProviderKey("secret://unused")]
 
     router = await build_llm_router(
         _spec().spec.model, secret_store=_secret_store(), provider_key_resolver=resolver
@@ -1723,9 +1727,9 @@ async def test_build_agent_ignores_manifest_api_key_ref_for_resolver(
     # proof the manifest ref was ignored and the platform path was taken.
     seen: list[str] = []
 
-    async def resolver(provider: str) -> list[str]:
+    async def resolver(provider: str) -> list[ProviderKey]:
         seen.append(provider)
-        return [f"secret://{_OPENAI_KEY_NAME}"]
+        return [ProviderKey(f"secret://{_OPENAI_KEY_NAME}")]
 
     with caplog.at_level("WARNING", logger="expert_work.orchestrator.agent_factory"):
         async with make_checkpointer("memory") as cp:

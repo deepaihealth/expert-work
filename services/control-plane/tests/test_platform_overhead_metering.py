@@ -43,10 +43,12 @@ from expert_work.persistence.token_usage_store import (
 from expert_work.protocol import AgentSpec, StructuredOutputSpec
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import BuiltAgent, LLMActionJudge, LLMOutputJudge, MiddlewareEnv, ToolEnv
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.tools._guards import TOKEN_BUDGET_KEY, TokenBudget
 from orchestrator.tools.registry import ToolSpec
 from orchestrator.usage_metering import MeteredLLMCaller, ScopedReranker, UsageIdentity
+from tests.credential_fixtures import static_credentials_resolver
 
 _TENANT = UUID("11111111-1111-1111-1111-111111111111")
 _USER = UUID("33333333-3333-3333-3333-333333333333")
@@ -122,7 +124,7 @@ class _StubTenantConfig:
 
 
 def _credentials() -> CredentialsResolver:
-    return CredentialsResolver(
+    return static_credentials_resolver(
         platform_provider_credentials={
             "anthropic": f"secret://{_KEY_NAME}",
             "qwen": f"secret://{_KEY_NAME}",
@@ -368,9 +370,9 @@ async def test_every_build_path_hands_the_usage_store_and_kind_to_the_judges(
 
 
 class _Resolver:
-    async def resolve_provider(self, *, tenant_id: UUID, provider: str) -> str:
+    async def resolve_provider_key(self, *, tenant_id: UUID, provider: str) -> ProviderKey:
         del tenant_id
-        return f"secret://{provider}"
+        return ProviderKey(f"secret://{provider}")
 
 
 class _SecretStore:

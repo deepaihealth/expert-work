@@ -46,6 +46,7 @@ from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import MemoryEnv, MiddlewareEnv, ToolEnv, build_agent
 from orchestrator.graph_builder import make_reflect_node
 from orchestrator.llm import FakeEmbedder, OpenAICompatibleEmbedder
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools._guards import TOKEN_BUDGET_KEY, TokenBudget
@@ -166,9 +167,9 @@ def _spec(extra: dict[str, Any]) -> AgentSpec:
     return AgentSpec.model_validate(doc)
 
 
-async def _any_key(provider: str) -> list[str]:
+async def _any_key(provider: str) -> list[ProviderKey]:
     del provider
-    return [f"secret://{_KEY}"]
+    return [ProviderKey(f"secret://{_KEY}")]
 
 
 def _patch_providers(monkeypatch: pytest.MonkeyPatch, brain: _Brain) -> None:

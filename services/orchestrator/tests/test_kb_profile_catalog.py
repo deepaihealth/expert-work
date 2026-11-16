@@ -23,6 +23,7 @@ from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import BuiltAgent, ToolEnv, build_agent
 from orchestrator.llm import FakeEmbedder
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools.knowledge_catalog import (
     KNOWLEDGE_CATALOG_RULES,
@@ -105,9 +106,9 @@ _MANIFEST: dict[str, Any] = {
 _KEY_NAME = "expert-work/dev/llm/anthropic"
 
 
-async def _key_resolver(provider: str) -> list[str]:
+async def _key_resolver(provider: str) -> list[ProviderKey]:
     del provider
-    return [f"secret://{_KEY_NAME}"]
+    return [ProviderKey(f"secret://{_KEY_NAME}")]
 
 
 async def _build(

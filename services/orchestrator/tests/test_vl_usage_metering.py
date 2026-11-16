@@ -33,6 +33,7 @@ from expert_work.runtime.middleware import LLMStreamStaleError
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import MiddlewareEnv, ToolEnv, build_agent
 from orchestrator.llm import LLMRouter, ProviderHandle
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.multimodal import InMemoryImageResolver, ResolvedImage
 from orchestrator.tools._guards import TOKEN_BUDGET_KEY, TokenBudget
@@ -300,9 +301,9 @@ def _vision_spec(name: str = "ai-health-plan") -> AgentSpec:
     )
 
 
-async def _any_key(provider: str) -> list[str]:
+async def _any_key(provider: str) -> list[ProviderKey]:
     del provider
-    return [f"secret://{_KEY}"]
+    return [ProviderKey(f"secret://{_KEY}")]
 
 
 @dataclass

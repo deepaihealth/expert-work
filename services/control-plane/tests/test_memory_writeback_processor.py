@@ -45,6 +45,7 @@ from orchestrator import MemoryEnv
 from orchestrator.agent_factory import memory_model
 from orchestrator.errors import PlatformNotConfiguredError
 from orchestrator.llm import AllProvidersExhaustedError, FakeEmbedder
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.tools.registry import ToolSpec
 
 _TRACE = "4bf92f3577b34da6a3ce929d0e0e4736"
@@ -312,9 +313,11 @@ class _StubResolver:
     def __init__(self) -> None:
         self.asked: list[tuple[UUID, str]] = []
 
-    async def resolve_provider(self, *, tenant_id: UUID, provider: str) -> str:
+    async def resolve_provider_key_list(
+        self, *, tenant_id: UUID, provider: str
+    ) -> list[ProviderKey]:
         self.asked.append((tenant_id, provider))
-        return "secret://glm-key"
+        return [ProviderKey("secret://glm-key")]
 
 
 @pytest.mark.asyncio
@@ -406,8 +409,8 @@ async def test_router_caller_factory_uses_the_runs_stream_timeouts() -> None:
 
     background = await factory(spec, memory_model(spec), tenant)
 
-    async def keys(provider: str) -> list[str]:
-        return ["secret://glm-key"]
+    async def keys(provider: str) -> list[ProviderKey]:
+        return [ProviderKey("secret://glm-key")]
 
     in_run = (
         await build_step_routers(spec, secret_store=secrets, provider_key_resolver=keys)

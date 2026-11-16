@@ -26,7 +26,7 @@ from expert_work.protocol import AgentSpec
 
 if TYPE_CHECKING:
     from control_plane.credential_value_cache import CredentialValueCache
-    from expert_work.common.credentials import CredentialsResolver
+    from control_plane.tenant_secret_overlay import TenantOverlayCredentialsResolver
     from expert_work.protocol import Provider
     from expert_work.runtime.secret_store import SecretStore
 
@@ -165,7 +165,7 @@ def build_delegation_policy_prompt(*, spec: AgentSpec, tools: Sequence[ToolBrief
 
 def make_delegation_policy_aux(
     *,
-    resolver: CredentialsResolver,
+    resolver: TenantOverlayCredentialsResolver,
     secret_store: SecretStore,
     default_provider: Provider,
     default_model: str,

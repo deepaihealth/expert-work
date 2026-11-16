@@ -357,11 +357,28 @@ def _eval_spec(provider: str, model: str) -> Any:
     )
 
 
+def platform_provider_key_resolver(secrets: Any, tenant_id: str | None) -> Any:
+    """按厂商取平台凭证的密钥列表(有租户就取租户生效的那份)。B-308:每一项是「密钥引用 +
+    这把密钥的请求地址」,路由按它把请求发到平台凭证上配的地址。"""
+    from uuid import UUID
+
+    from orchestrator.llm.endpoints import ProviderKey
+
+    async def provider_keys(name: str) -> list[ProviderKey]:
+        keys = (
+            await secrets.effective_provider_keys_for(UUID(tenant_id))
+            if tenant_id
+            else await secrets.effective_provider_keys()
+        )
+        return list(keys.get(name, []))
+
+    return provider_keys
+
+
 async def build_compression_caller(
     provider: str, model: str, tenant_id: str | None
 ) -> tuple[Caller, Callable[[], Awaitable[None]]]:
     """在 control-plane pod 里按生产同一取法建 ``compression`` 路由;返回(caller, 收尾)。"""
-    from uuid import UUID
 
     from control_plane.app import _build_secret_store, _build_sql_stores
     from control_plane.platform_secrets import PlatformSecretsService
@@ -373,13 +390,7 @@ async def build_compression_caller(
     secret_store = _build_secret_store(settings, stores)
     secrets = PlatformSecretsService(store=stores.platform_secret, settings=settings)
 
-    async def provider_keys(name: str) -> list[str]:
-        refs = (
-            await secrets.effective_provider_secret_refs_for(UUID(tenant_id))
-            if tenant_id
-            else await secrets.effective_provider_secret_refs()
-        )
-        return list(refs.get(name, []))  # type: ignore[call-overload]
+    provider_keys = platform_provider_key_resolver(secrets, tenant_id)
 
     routers = await build_step_routers(
         _eval_spec(provider, model),

@@ -148,6 +148,7 @@ from orchestrator.llm import (
     make_qwen_client,
     make_self_hosted_client,
 )
+from orchestrator.llm.endpoints import OFFICIAL_BASE_URLS, ProviderKey, endpoint_for
 from orchestrator.llm.failover import breaker_key_for
 from orchestrator.llm.truncation import ANTHROPIC_DEFAULT_MAX_TOKENS, served_output_cap
 from orchestrator.middleware_assembly import MiddlewareEnv, build_middleware_chains
@@ -2318,11 +2319,12 @@ def detect_subagent_cycle(
 #: orchestrator never imports expert-work-common.credentials (same decoupling as
 #: ``mcp_allowlist_provider``). Raising surfaces as ``AgentFactoryError`` —
 #: the control-plane closure translates ``CredentialsResolverError``.
-# Stream Y-MK — resolves a provider to its ORDERED list of secret_refs
-# (priority asc) for per-provider multi-key failover. Single-key platforms
-# return a 1-element list; the internal-plumbing api_key_ref path wraps its
-# pinned ref the same way.
-ProviderKeyResolver = Callable[[str], Awaitable[list[str]]]
+# Stream Y-MK — resolves a provider to its ORDERED list of keys (priority asc)
+# for per-provider multi-key failover. Single-key platforms return a 1-element
+# list; the internal-plumbing api_key_ref path wraps its pinned ref the same way.
+# B-308 — each entry is a :class:`ProviderKey` (secret ref + the request address
+# saved on that credential), so the address travels with the key it belongs to.
+ProviderKeyResolver = Callable[[str], Awaitable[list[ProviderKey]]]
 
 
 #: Stream CM-9 (Mini-ADR CM-J4/J5) — one-step effort ladder for the
@@ -2797,9 +2799,10 @@ async def build_llm_router(
         # api_key_ref is resolved per-entry so each model in the fallback chain
         # (possibly a different provider) resolves independently.
         if entry.api_key_ref is not None and not ignore_api_key_ref:
-            # Internal-plumbing path: the caller already resolved a platform
-            # secret_ref and pinned it here (Stream Q rerank/embed/aux). One key.
-            secret_refs = [entry.api_key_ref]
+            # Internal-plumbing path: a caller pinned a secret_ref here (tests,
+            # offline CLIs). One key, at the official address — B-308: a
+            # platform credential is resolved as a ProviderKey instead.
+            provider_keys = [ProviderKey(secret_ref=entry.api_key_ref)]
         else:
             if entry.api_key_ref is not None:
                 # ignore_api_key_ref is True — a manifest still carries the
@@ -2816,8 +2819,8 @@ async def build_llm_router(
                     f"model {entry.provider}:{entry.name} has no platform credential "
                     f"configured for provider {entry.provider!r}"
                 )
-            secret_refs = await provider_key_resolver(entry.provider)
-            if not secret_refs:
+            provider_keys = await provider_key_resolver(entry.provider)
+            if not provider_keys:
                 raise PlatformNotConfiguredError(
                     f"model {entry.provider}:{entry.name} resolved no platform "
                     f"credential for provider {entry.provider!r}"
@@ -2828,8 +2831,9 @@ async def build_llm_router(
         # ``"<provider>:<model>"`` breaker key (no ``#idx`` suffix) so existing
         # metrics/labels are unchanged.
         group = f"{entry.provider}:{entry.name}"
-        multikey = len(secret_refs) > 1
-        for idx, secret_ref in enumerate(secret_refs):
+        multikey = len(provider_keys) > 1
+        for idx, provider_key in enumerate(provider_keys):
+            secret_ref = provider_key.secret_ref
             api_key = await secret_store.get(parse_secret_ref(secret_ref))
             provider = _build_provider(
                 entry,
@@ -2837,6 +2841,8 @@ async def build_llm_router(
                 image_resolver=image_resolver,
                 timeout_s=provider_timeout_s,
                 http_client=http_client,
+                # B-308 — the request address saved on this very key.
+                base_url=provider_key.base_url,
             )
             key = f"{group}#{idx}" if multikey else group
             if rate_limiter_factory is None:
@@ -2859,7 +2865,12 @@ async def build_llm_router(
                     group=group,
                     # B-297 — the breaker registry is process-wide: tell two
                     # tenants' credentials / endpoints for one model apart.
-                    breaker_key=breaker_key_for(key, secret_ref, entry.base_url),
+                    # B-308 — the address actually called: the credential's
+                    # request address when it has one (two keys of one provider
+                    # behind different addresses are different health domains).
+                    breaker_key=breaker_key_for(
+                        key, secret_ref, provider_key.base_url or entry.base_url
+                    ),
                 )
             )
     return LLMRouter(
@@ -3221,6 +3232,51 @@ def _constrained_temperature(model: ModelSpec, entry: ModelEntry | None) -> floa
     return entry.temperature_fixed
 
 
+def build_provider(
+    model: ModelSpec,
+    api_key: str,
+    *,
+    base_url: str | None = None,
+    timeout_s: float | None = None,
+) -> LLMProvider:
+    """One provider adapter for one key at one address, outside any router —
+    for a single direct call to a credential (the control-plane's save-time
+    connectivity check, B-308 §4.5.3). No fallback, no breaker, no rate limit.
+
+    :raises AgentFactoryError: the model cannot be built as specified.
+    """
+    return _build_provider(model, api_key, timeout_s=timeout_s, base_url=base_url)
+
+
+def _anthropic_client(
+    api_key: str, base_url: str | None, *, timeout_s: float, http: httpx.AsyncClient | None
+) -> HTTPAnthropicClient:
+    endpoint = endpoint_for("anthropic", "chat", base_url)
+    return HTTPAnthropicClient(
+        api_key=api_key,
+        base_url=endpoint.root,
+        messages_path=endpoint.path,
+        timeout_s=timeout_s,
+        http=http,
+        custom_endpoint=endpoint.custom,
+    )
+
+
+def _openai_client(
+    api_key: str, base_url: str | None, *, timeout_s: float, http: httpx.AsyncClient | None
+) -> HTTPOpenAIClient:
+    endpoint = endpoint_for("openai", "chat", base_url)
+    return HTTPOpenAIClient(
+        api_key=api_key,
+        base_url=endpoint.root,
+        chat_completions_path=endpoint.path,
+        timeout_s=timeout_s,
+        http=http,
+        custom_endpoint=endpoint.custom,
+        endpoint_provider="openai",
+    )
+
+
 def _build_provider(
     model: ModelSpec,
     api_key: str,
@@ -3228,8 +3284,14 @@ def _build_provider(
     image_resolver: ImageResolver | None = None,
     timeout_s: float | None = None,
     http_client: httpx.AsyncClient | None = None,
+    base_url: str | None = None,
 ) -> LLMProvider:
     """Map a ``ModelSpec`` to a concrete :class:`LLMProvider` adapter.
+
+    ``base_url`` (B-308) is the request address saved on the platform
+    credential this provider is built for (``None`` = official). The address
+    comes from the endpoint table either way; ``self-hosted`` / ``azure`` take
+    theirs from the manifest and refuse a credential address.
 
     OpenAI-compatible regional vendors (kimi / glm / deepseek / qwen /
     doubao) reuse :class:`OpenAIProvider` over a vendor-configured HTTP
@@ -3253,6 +3315,11 @@ def _build_provider(
     # default; the VL router passes a larger value so a slow image call isn't
     # killed by httpx before the router deadline applies (Stream L.L3).
     timeout_eff: float = _PROVIDER_HTTP_TIMEOUT_DEFAULT_S if timeout_s is None else timeout_s
+    if base_url is not None and provider not in OFFICIAL_BASE_URLS:
+        raise AgentFactoryError(
+            f"provider {provider!r} takes its address from the manifest; "
+            "a credential request address is not supported for it"
+        )
     if provider == "anthropic":
         # Stream CM-9 (Mini-ADR CM-J3) — gate compute-control params on
         # the catalog capability bits. Off-catalog models (custom
@@ -3286,7 +3353,7 @@ def _build_provider(
                 )
             temperature = None
         return AnthropicProvider(
-            client=HTTPAnthropicClient(api_key=api_key, timeout_s=timeout_eff, http=http_client),
+            client=_anthropic_client(api_key, base_url, timeout_s=timeout_eff, http=http_client),
             model=model.name,
             max_tokens=model.max_tokens or ANTHROPIC_DEFAULT_MAX_TOKENS,
             temperature=temperature,
@@ -3342,7 +3409,7 @@ def _build_provider(
 
     if provider == "openai":
         return OpenAIProvider(
-            client=HTTPOpenAIClient(api_key=api_key, timeout_s=timeout_eff, http=http_client),
+            client=_openai_client(api_key, base_url, timeout_s=timeout_eff, http=http_client),
             model=model.name,
             temperature=compat_temperature,
             image_resolver=image_resolver,
@@ -3369,7 +3436,12 @@ def _build_provider(
         # vendors stream tool-args incrementally already — no injection.
         stream_extra_body = {"tool_stream": True} if provider == "glm" else None
         return OpenAICompatibleProvider(
-            client=make_client(api_key=api_key, timeout_s=timeout_eff, http=http_client),
+            client=make_client(
+                api_key=api_key,
+                timeout_s=timeout_eff,
+                http=http_client,
+                endpoint=endpoint_for(provider, "chat", base_url),
+            ),
             model=model.name,
             temperature=compat_temperature,
             image_resolver=image_resolver,

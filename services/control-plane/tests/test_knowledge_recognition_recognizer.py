@@ -21,6 +21,7 @@ from control_plane.knowledge.recognition.clients import (
     Reading,
     RecognitionCallError,
     RecognitionClient,
+    RecognitionCredential,
 )
 from control_plane.knowledge.recognition.figure_markup import resolve_figures
 from control_plane.knowledge.recognition.recognizer import (
@@ -602,14 +603,14 @@ async def test_one_page_blowing_up_fails_only_that_page() -> None:
 
 def test_default_client_follows_the_catalog() -> None:
     build = default_client()
-    layout = build(GLM_OCR, "k")
+    layout = build(GLM_OCR, RecognitionCredential("k"))
     assert isinstance(layout, LayoutParsingClient)
     assert layout.url == "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
-    chat = build(QWEN_FLASH, "k")
+    chat = build(QWEN_FLASH, RecognitionCredential("k"))
     assert isinstance(chat, ChatVlmClient)
     assert chat.request_fields == {"enable_thinking": False, "max_completion_tokens": 8192}
     with pytest.raises(ValueError, match="not a recognition model"):
-        build(ModelChoice("qwen", "qwen3.8-max"), "k")
+        build(ModelChoice("qwen", "qwen3.8-max"), RecognitionCredential("k"))
 
 
 async def test_a_model_without_recognition_capability_is_unsupported() -> None:

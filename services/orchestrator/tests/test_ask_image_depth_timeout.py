@@ -31,6 +31,7 @@ from expert_work.runtime.middleware.llm_error_handling import (
 )
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import MiddlewareEnv, ToolEnv, agent_factory, build_agent
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.llm.providers._errors import classify_http_error
 from orchestrator.llm.providers._streaming import LLMDelta, OpenAIStreamAssembler
 from orchestrator.multimodal import InMemoryImageResolver, ResolvedImage
@@ -424,9 +425,9 @@ class _Harness:
         return str(tool_msgs[0].content), store
 
 
-async def _any_key(provider: str) -> list[str]:
+async def _any_key(provider: str) -> list[ProviderKey]:
     del provider
-    return [f"secret://{_KEY}"]
+    return [ProviderKey(f"secret://{_KEY}")]
 
 
 def _spec(vision: dict[str, Any], *, stream_deadline_s: int | None = None) -> AgentSpec:

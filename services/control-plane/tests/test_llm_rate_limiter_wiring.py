@@ -37,9 +37,11 @@ from expert_work.protocol import AgentSpec, TenantConfigRecord, TenantPlan
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from expert_work.testing import InMemorySecretStore
 from orchestrator import BuiltAgent, LLMOutputJudge, ToolEnv
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.llm.rate_limit import AdmissionLimiter
 from orchestrator.llm.rate_limit_redis import RedisRpmLimiter
 from tests.auth_fixtures import build_test_jwt_verifier
+from tests.credential_fixtures import static_credentials_resolver
 
 _SHA = "a" * 64
 _ANTHROPIC_KEY_NAME = "anthropic-test"
@@ -80,7 +82,7 @@ class _StubTenantConfig:
 
 
 def _credentials_resolver() -> CredentialsResolver:
-    return CredentialsResolver(
+    return static_credentials_resolver(
         platform_provider_credentials={"anthropic": f"secret://{_ANTHROPIC_KEY_NAME}"},  # type: ignore[arg-type]
         platform_tool_credentials={},  # type: ignore[arg-type]
         tenant_config_getter=_StubTenantConfig(),  # type: ignore[arg-type]
@@ -214,8 +216,8 @@ async def test_judge_caller_uses_the_factory() -> None:
 
 
 class _FakeResolver:
-    async def resolve_provider(self, *, tenant_id: Any, provider: Any) -> str:
-        return f"secret://{provider}"
+    async def resolve_provider_key(self, *, tenant_id: Any, provider: Any) -> ProviderKey:
+        return ProviderKey(f"secret://{provider}")
 
 
 def _capture_router_kwargs(monkeypatch: pytest.MonkeyPatch, target: str) -> dict[str, Any]:

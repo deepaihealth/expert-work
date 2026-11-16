@@ -40,6 +40,12 @@ class PlatformProviderSecretRow(Base):
     secret_ref: Mapped[str] = mapped_column(Text, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     priority: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("100"))
+    #: B-308 — request address (``None`` = official) and the "saved without a
+    #: passing connectivity check" flag.
+    base_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    base_url_unverified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -80,6 +86,12 @@ class TenantProviderSecretRow(Base):
     provider: Mapped[str] = mapped_column(Text, primary_key=True)
     secret_ref: Mapped[str] = mapped_column(Text, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    #: B-308 — request address (``None`` = official) and the "saved without a
+    #: passing connectivity check" flag.
+    base_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    base_url_unverified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

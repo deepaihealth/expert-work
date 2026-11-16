@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Annotated, cast
 from uuid import UUID
 
@@ -34,6 +36,20 @@ from control_plane.api.tenant_config import (
     _tool_usage_counts,
 )
 from control_plane.audit import emit
+from control_plane.credential_base_url import (
+    BaseUrlRejectedError,
+    audit_fields,
+    ensure_public_address,
+    normalize_base_url,
+    official_base_url,
+    requires_new_key,
+)
+from control_plane.credential_check import (
+    CheckPlan,
+    NoCheckModelError,
+    plan_check,
+    run_check,
+)
 from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.platform_provider_uses import (
     PlatformProviderUse,
@@ -52,11 +68,16 @@ from expert_work.protocol import (
     PlatformProviderSecretRecord,
     Principal,
     Provider,
+    TenantProviderSecretRecord,
     Tool,
     validate_secret_ref,
 )
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.secret_store import SecretStore
+from expert_work.runtime.secret_store import (
+    SecretNotFoundError,
+    SecretStore,
+    parse_secret_ref,
+)
 
 logger = logging.getLogger("expert_work.control_plane.api.platform_config")
 
@@ -78,6 +99,26 @@ class PlatformSecretWrite(BaseModel):
       the catalog never holds a value (Mini-ADR Q-4/Q-6).
 
     ``value`` is a :class:`~pydantic.SecretStr` so it never renders in logs.
+
+    B-308 — provider writes may also carry the credential's **request address**:
+
+    * ``base_url`` tells "not sent" from "sent empty" (``model_fields_set``):
+      not sent keeps the row's address (so a plain enable / disable toggle never
+      clears it); ``null`` or an empty string clears it back to the official
+      address.
+    * ``force_save`` is "save anyway": store the row although the connectivity
+      check failed. It never overrides a malformed or a not-allowed address.
+
+    Sending a non-empty ``base_url`` runs the connectivity check **every time**,
+    also when it is the address the row already has — that is how an admin
+    re-tests an address and clears its "unverified" mark. A client that only
+    changes ``enabled`` / ``priority`` leaves the field out.
+
+    A pasted ``value`` overwrites the row's fixed slot in the SecretStore, as
+    before B-308. Changing the address needs a new key in the same save: a
+    pasted ``value`` or a ``secret_ref`` other than the row's current one.
+
+    Tool writes share this payload and refuse ``base_url``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -87,6 +128,10 @@ class PlatformSecretWrite(BaseModel):
     #: Stream Y-MK — failover order within a provider (lower tried first).
     #: Ignored for tool writes.
     priority: int = 100
+    #: B-308 — request address (API root up to the version segment). See class doc.
+    base_url: str | None = None
+    #: B-308 — save although the connectivity check failed.
+    force_save: bool = False
 
     @field_validator("secret_ref")
     @classmethod
@@ -117,18 +162,14 @@ def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
 
 
-async def _resolve_write_ref(
-    payload: PlatformSecretWrite, secret_store: SecretStore, *, name: str
-) -> str:
-    """Return the ref to store in the catalog.
+def _write_ref(payload: PlatformSecretWrite, *, name: str) -> str:
+    """The ref the catalog row will hold after this write — computed without
+    touching the SecretStore.
 
-    A pasted raw ``value`` is encrypted into the SecretStore under ``name`` and
-    surfaced as ``secret://<name>``; the value never reaches the catalog or the
-    audit row (Mini-ADR Q-4/Q-7). An operator-supplied ``secret_ref`` is
-    returned as-is.
+    A pasted raw ``value`` is stored under the slot ``name`` and surfaced as
+    ``secret://<name>``; an operator-supplied ``secret_ref`` is kept as-is.
     """
     if payload.value is not None:
-        await secret_store.put(name, payload.value.get_secret_value())
         return f"secret://{name}"
     if payload.secret_ref is None:
         # Unreachable: the model validator enforces exactly one of value /
@@ -141,6 +182,288 @@ async def _resolve_write_ref(
             },
         )
     return payload.secret_ref
+
+
+async def _store_pasted_value(
+    payload: PlatformSecretWrite, secret_store: SecretStore, *, name: str
+) -> None:
+    """Encrypt a pasted raw ``value`` into the SecretStore under ``name``; the
+    value never reaches the catalog or the audit row (Mini-ADR Q-4/Q-7)."""
+    if payload.value is not None:
+        await secret_store.put(name, payload.value.get_secret_value())
+
+
+def _reject(error: BaseUrlRejectedError) -> HTTPException:
+    return HTTPException(status_code=422, detail=error.detail())
+
+
+def _reject_tool_base_url(payload: PlatformSecretWrite) -> None:
+    """B-308 — a tool credential has no request address; the shared payload's
+    field is refused when sent at all."""
+    if "base_url" in payload.model_fields_set:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "BASE_URL_NOT_SUPPORTED",
+                "message": "a request address cannot be set for a tool credential",
+            },
+        )
+
+
+@dataclass(frozen=True)
+class _ProviderWrite:
+    """What a provider write will store, decided before anything is written."""
+
+    secret_ref: str
+    base_url: str | None
+    base_url_unverified: bool
+    #: Audit label: ``passed`` / ``forced:<reason>`` / ``not_run``.
+    connectivity_check: str
+    #: The vendor's HTTP status when a forced save followed a vendor error.
+    connectivity_status: int | None = None
+    #: The interface whose check failed before a forced save.
+    connectivity_interface: str | None = None
+
+    def audit(self) -> dict[str, object]:
+        """B-308 — what the audit row says about the address: host + path
+        fingerprint (never the address itself) and how the check went."""
+        details: dict[str, object] = {
+            **audit_fields(self.base_url),
+            "connectivity_check": self.connectivity_check,
+        }
+        if self.connectivity_status is not None:
+            details["connectivity_status"] = self.connectivity_status
+        if self.connectivity_interface is not None:
+            details["connectivity_interface"] = self.connectivity_interface
+        return details
+
+
+async def _plan_provider_write(
+    request: Request,
+    *,
+    provider: str,
+    payload: PlatformSecretWrite,
+    secret_name: str,
+    existing: PlatformProviderSecretRecord | TenantProviderSecretRecord | None,
+    secret_store: SecretStore,
+    usage_tenant_id: UUID,
+    audit_refusal: Callable[[dict[str, object]], Awaitable[None]],
+) -> _ProviderWrite:
+    """B-308 §4.2 — run every check of a provider write, in order, **before**
+    anything is stored:
+
+    1. the address's format, that its host is public, and "a new address
+       needs a new key";
+    2. the connectivity check, with the plaintext of this request (when none
+       was pasted, the key behind the request's ``secret_ref``).
+
+    A refusal at either step leaves the SecretStore and the catalog row exactly
+    as they were, and a refusal at step 1 sends no request anywhere. A failed
+    connectivity check did call out with the key, so it leaves an audit row of
+    its own (``audit_refusal``) even though nothing was saved.
+    """
+    address_sent = "base_url" in payload.model_fields_set
+
+    async def refused(code: str, address: str | None) -> None:
+        # A refusal that is about where a key would go is on record even though
+        # nothing was saved: host and code, never the address.
+        await audit_refusal({**audit_fields(address), "refused": code, "saved": False})
+
+    base_url: str | None
+    if not address_sent:
+        base_url = existing.base_url if existing is not None else None
+    elif payload.base_url is None or not payload.base_url.strip():
+        base_url = None
+    else:
+        try:
+            # ``None`` when the address is the provider's official root.
+            base_url = normalize_base_url(provider, payload.base_url)
+        except BaseUrlRejectedError as exc:
+            raise _reject(exc) from exc
+        if base_url is not None:
+            try:
+                await ensure_public_address(base_url)
+            except BaseUrlRejectedError as exc:
+                await refused(exc.code, base_url)
+                raise _reject(exc) from exc
+    secret_ref = _write_ref(payload, name=secret_name)
+    before = (existing.secret_ref, existing.base_url) if existing is not None else None
+    if requires_new_key(
+        before=before, after=(secret_ref, base_url), pasted=payload.value is not None
+    ):
+        await refused("BASE_URL_NEEDS_NEW_KEY", base_url)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "BASE_URL_NEEDS_NEW_KEY",
+                "message": (
+                    "the request address changed: give this service's key in the same "
+                    "save (paste it, or give another reference)"
+                ),
+            },
+        )
+    if base_url is None:
+        # Official address: nothing to check, and no "unverified" address left.
+        return _ProviderWrite(secret_ref, None, False, "not_run")
+    key_changed = payload.value is not None or (
+        existing is not None and secret_ref != existing.secret_ref
+    )
+    if not (address_sent or key_changed):
+        # Only enabled / priority changed: keep the address and its flag as they are.
+        unverified = existing.base_url_unverified if existing is not None else False
+        return _ProviderWrite(secret_ref, base_url, unverified, "not_run")
+    if payload.value is not None:
+        api_key = payload.value.get_secret_value()
+    else:
+        try:
+            api_key = await secret_store.get(parse_secret_ref(secret_ref))
+        except SecretNotFoundError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "SECRET_NOT_FOUND",
+                    "message": (
+                        "the referenced key does not exist in the secret store; "
+                        "check the reference or paste the key"
+                    ),
+                },
+            ) from exc
+    try:
+        plan = await _check_plan(request, provider)
+    except NoCheckModelError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "BASE_URL_CHECK_UNAVAILABLE",
+                "message": (
+                    "no chat model of this provider is available to test the request "
+                    "address; enable one in the model catalog, then save again"
+                ),
+            },
+        ) from exc
+    result = await run_check(
+        plan,
+        provider=cast(Provider, provider),
+        base_url=base_url,
+        api_key=api_key,
+        usage_store=getattr(request.app.state, "token_usage_store", None),
+        usage_tenant_id=usage_tenant_id,
+    )
+    if result.blocked:
+        await refused("BASE_URL_BLOCKED_HOST", base_url)
+        raise _reject(
+            BaseUrlRejectedError(
+                "BASE_URL_BLOCKED_HOST",
+                "the request address is not allowed: only public https addresses are supported",
+            )
+        )
+    if result.invalid:
+        raise _reject(
+            BaseUrlRejectedError(
+                "BASE_URL_INVALID", "the request address is not valid: it cannot be requested"
+            )
+        )
+    if result.passed:
+        return _ProviderWrite(secret_ref, base_url, False, "passed")
+    if not payload.force_save:
+        await audit_refusal(
+            {
+                **audit_fields(base_url),
+                "connectivity_check": f"failed:{result.reason}",
+                "connectivity_status": result.http_status,
+                "connectivity_interface": result.interface,
+                "saved": False,
+            }
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "BASE_URL_CHECK_FAILED",
+                "message": "the connectivity check of the request address failed",
+                "reason": result.reason,
+                "status": result.http_status,
+                # Which of the provider's interfaces did not answer.
+                "interface": result.interface,
+            },
+        )
+    return _ProviderWrite(
+        secret_ref,
+        base_url,
+        True,
+        f"forced:{result.reason}",
+        result.http_status,
+        result.interface,
+    )
+
+
+async def _check_plan(request: Request, provider: str) -> list[CheckPlan]:
+    """What the connectivity check calls for ``provider`` (see ``plan_check``)."""
+    agent_store = _get_agent_spec_store(request)
+    rate_cards = getattr(request.app.state, "model_rate_card_store", None)
+    async with bypass_rls_session():
+        specs = (
+            await agent_store.list_all_tenants(status=None, limit=1000)
+            if agent_store is not None
+            else []
+        )
+        prices = await rate_cards.list(provider=provider) if rate_cards is not None else []
+    used_by_agents = _provider_usage_counts(
+        specs, embedding_provider=_embedding_provider(request)
+    ).get(cast(Provider, provider), 0)
+    platform_uses = (await _platform_provider_uses(request)).get(provider, [])
+    return plan_check(
+        provider,
+        specs=specs,
+        used_by_agents=used_by_agents,
+        platform_uses=platform_uses,
+        prices=prices,
+    )
+
+
+async def _save_provider_key[RowT: (PlatformProviderSecretRecord, TenantProviderSecretRecord)](
+    request: Request,
+    *,
+    provider: str,
+    payload: PlatformSecretWrite,
+    canonical: str,
+    current: RowT | None,
+    secret_store: SecretStore,
+    usage_tenant_id: UUID,
+    audit_refusal: Callable[[dict[str, object]], Awaitable[None]],
+    write_row: Callable[[_ProviderWrite], Awaitable[RowT]],
+) -> tuple[RowT, _ProviderWrite]:
+    """One provider-key write, for a platform key and a tenant override alike
+    (B-308 §4.2). ``current`` is the row as read at the start.
+
+    1. every check (:func:`_plan_provider_write`) — nothing stored yet;
+    2. a pasted key overwrites the row's fixed slot ``canonical``;
+    3. then the row is written.
+
+    The key goes in before the row on purpose: a new address becomes visible
+    to other replicas only once the key that goes with it is in place, so no
+    reader pairs the new address with the old key. A failure between 2 and 3
+    leaves the old address with the new key (the save reports the error).
+    """
+    write = await _plan_provider_write(
+        request,
+        provider=provider,
+        payload=payload,
+        secret_name=canonical,
+        existing=current,
+        secret_store=secret_store,
+        usage_tenant_id=usage_tenant_id,
+        audit_refusal=audit_refusal,
+    )
+    await _store_pasted_value(payload, secret_store, name=canonical)
+    async with bypass_rls_session():
+        row = await write_row(write)
+    return row, write
+
+
+def _platform_tenant_id(request: Request, fallback: UUID) -> UUID:
+    """The platform's reserved tenant — a platform key's check is billed to it."""
+    settings = getattr(request.app.state, "settings", None)
+    return settings.platform_tenant_id if settings is not None else fallback
 
 
 def _invalidate_built_agents(request: Request, *, tenant_id: UUID | None = None) -> None:
@@ -355,9 +678,18 @@ def build_platform_config_router() -> APIRouter:
                         "secret_ref": k.secret_ref,
                         "enabled": k.enabled,
                         "priority": k.priority,
+                        # B-308 — the key's request address (``None`` =
+                        # official) and whether it was saved without a passing
+                        # connectivity check.
+                        "base_url": k.base_url,
+                        "base_url_unverified": k.base_url_unverified,
                     }
                     for k in keys
                 ],
+                # B-308 — the official root address, the form a request address
+                # takes (the edit form's placeholder); ``None`` when this
+                # provider takes no request address.
+                "official_base_url": official_base_url(provider),
                 "used_by_agents": prov_counts.get(provider, 0),
                 # B-51 —— 平台自身的依赖。``used_by_agents`` 只数 agent,
                 # 一行「未设置 + 被引用 0」曾经把「平台在用」说成「没人用」。
@@ -407,17 +739,39 @@ def build_platform_config_router() -> APIRouter:
             )
         # Stream Y-MK — multiple keys share one secret name slot per key_id so
         # rotated/extra keys never collide with the default one.
-        name = _canonical_secret_name(provider=provider, key_id=key_id)
-        secret_ref = await _resolve_write_ref(payload, secret_store, name=name)
+        canonical = _canonical_secret_name(provider=provider, key_id=key_id)
         async with bypass_rls_session():
-            row = await store.upsert_provider(
+            current = await store.get_provider(provider, key_id)
+
+        async def write_row(write: _ProviderWrite) -> PlatformProviderSecretRecord:
+            return await store.upsert_provider(
                 provider=cast(Provider, provider),
                 key_id=key_id,
-                secret_ref=secret_ref,
+                secret_ref=write.secret_ref,
                 enabled=payload.enabled,
                 priority=payload.priority,
                 actor_id=principal.subject_id,
+                base_url=write.base_url,
+                base_url_unverified=write.base_url_unverified,
             )
+
+        row, write = await _save_provider_key(
+            request,
+            provider=provider,
+            payload=payload,
+            canonical=canonical,
+            current=current,
+            secret_store=secret_store,
+            usage_tenant_id=_platform_tenant_id(request, principal.tenant_id),
+            audit_refusal=lambda details: _emit_platform_audit(
+                audit,
+                principal=principal,
+                action=AuditAction.PLATFORM_PROVIDER_CREDENTIAL_UPSERT,
+                key=f"{provider}#{key_id}",
+                details={"key_id": key_id, **details},
+            ),
+            write_row=write_row,
+        )
         service.invalidate()
         _invalidate_built_agents(request)
         await _emit_platform_audit(
@@ -427,9 +781,10 @@ def build_platform_config_router() -> APIRouter:
             key=f"{provider}#{key_id}",
             details={
                 "enabled": payload.enabled,
-                "secret_ref": secret_ref,
+                "secret_ref": write.secret_ref,
                 "key_id": key_id,
                 "priority": payload.priority,
+                **write.audit(),
             },
         )
         return {"success": True, "data": row.model_dump(mode="json"), "error": None}
@@ -499,9 +854,10 @@ def build_platform_config_router() -> APIRouter:
                 status_code=422,
                 detail={"code": "UNKNOWN_TOOL", "message": f"tool {tool!r} not in catalog"},
             )
-        secret_ref = await _resolve_write_ref(
-            payload, secret_store, name=_canonical_secret_name(tool=tool)
-        )
+        _reject_tool_base_url(payload)
+        tool_secret_name = _canonical_secret_name(tool=tool)
+        secret_ref = _write_ref(payload, name=tool_secret_name)
+        await _store_pasted_value(payload, secret_store, name=tool_secret_name)
         async with bypass_rls_session():
             row = await store.upsert_tool(
                 tool=cast(Tool, tool),
@@ -723,9 +1079,12 @@ def build_platform_config_router() -> APIRouter:
                 source, effective = "unset", None
             return {
                 "provider": provider,
+                # B-308 — the override row carries its own ``base_url`` /
+                # ``base_url_unverified``; no address = the official one.
                 "override": override.model_dump(mode="json") if override is not None else None,
                 "effective_source": source,
                 "effective_ref": effective,
+                "official_base_url": official_base_url(provider),
             }
 
         def _tool_entry(tool: Tool) -> dict[str, object]:
@@ -779,19 +1138,43 @@ def build_platform_config_router() -> APIRouter:
                 },
             )
         await _require_tenant(request, tenant_id)
-        secret_ref = await _resolve_write_ref(
-            payload,
-            secret_store,
-            name=_canonical_secret_name(tenant_id=tenant_id, provider=provider),
-        )
+        canonical = _canonical_secret_name(tenant_id=tenant_id, provider=provider)
         async with bypass_rls_session():
-            row = await store.upsert_tenant_provider(
+            current = next(
+                (r for r in await store.list_tenant_providers(tenant_id) if r.provider == provider),
+                None,
+            )
+
+        async def write_row(write: _ProviderWrite) -> TenantProviderSecretRecord:
+            return await store.upsert_tenant_provider(
                 tenant_id=tenant_id,
                 provider=cast(Provider, provider),
-                secret_ref=secret_ref,
+                secret_ref=write.secret_ref,
                 enabled=payload.enabled,
                 actor_id=principal.subject_id,
+                base_url=write.base_url,
+                base_url_unverified=write.base_url_unverified,
             )
+
+        # B-308 — same path as a platform key; the check's usage is recorded
+        # under this tenant.
+        row, write = await _save_provider_key(
+            request,
+            provider=provider,
+            payload=payload,
+            canonical=canonical,
+            current=current,
+            secret_store=secret_store,
+            usage_tenant_id=tenant_id,
+            audit_refusal=lambda details: _emit_platform_audit(
+                audit,
+                principal=principal,
+                action=AuditAction.PLATFORM_PROVIDER_CREDENTIAL_TENANT_UPSERT,
+                key=provider,
+                details={"tenant_id": str(tenant_id), **details},
+            ),
+            write_row=write_row,
+        )
         service.invalidate()
         _invalidate_built_agents(request, tenant_id=tenant_id)
         await _emit_platform_audit(
@@ -802,7 +1185,8 @@ def build_platform_config_router() -> APIRouter:
             details={
                 "tenant_id": str(tenant_id),
                 "enabled": payload.enabled,
-                "secret_ref": secret_ref,
+                "secret_ref": write.secret_ref,
+                **write.audit(),
             },
         )
         return {"success": True, "data": row.model_dump(mode="json"), "error": None}
@@ -825,11 +1209,10 @@ def build_platform_config_router() -> APIRouter:
                 detail={"code": "UNKNOWN_TOOL", "message": f"tool {tool!r} not in catalog"},
             )
         await _require_tenant(request, tenant_id)
-        secret_ref = await _resolve_write_ref(
-            payload,
-            secret_store,
-            name=_canonical_secret_name(tenant_id=tenant_id, tool=tool),
-        )
+        _reject_tool_base_url(payload)
+        tool_secret_name = _canonical_secret_name(tenant_id=tenant_id, tool=tool)
+        secret_ref = _write_ref(payload, name=tool_secret_name)
+        await _store_pasted_value(payload, secret_store, name=tool_secret_name)
         async with bypass_rls_session():
             row = await store.upsert_tenant_tool(
                 tenant_id=tenant_id,

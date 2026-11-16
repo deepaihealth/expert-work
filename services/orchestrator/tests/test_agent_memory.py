@@ -22,6 +22,7 @@ from expert_work.runtime.tokens import CharTokenEstimator
 from orchestrator import build_agent
 from orchestrator.graph_builder.agent_notes import NOTES_PATH, make_agent_notes_node
 from orchestrator.graph_builder.builder import _build_tool_context, _keep_agent_notes_block
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.tools import ToolBlockedError, ToolContext, WriteFileTool
 from orchestrator.tools._child_run import _child_config
 from orchestrator.tools.assembly import ToolEnv
@@ -57,9 +58,9 @@ _SPEC: dict[str, Any] = {
 }
 
 
-async def _resolver(provider: str) -> list[str]:
+async def _resolver(provider: str) -> list[ProviderKey]:
     del provider
-    return [f"secret://{_ANTHROPIC}"]
+    return [ProviderKey(f"secret://{_ANTHROPIC}")]
 
 
 async def _build(env: ToolEnv, **kwargs: Any) -> Any:

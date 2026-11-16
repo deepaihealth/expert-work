@@ -49,6 +49,7 @@ from orchestrator.multimodal import (
 from orchestrator.tools.knowledge import DEFAULT_RERANK_POOL, DEFAULT_RERANK_VIEW
 from orchestrator.tools.knowledge_catalog import CATALOG_UNAVAILABLE, catalog_fingerprint
 from orchestrator.tools.knowledge_log import LoggedKnowledgeRetriever
+from tests.credential_fixtures import static_credentials_resolver
 
 _MINIMAL_MANIFEST: dict[str, Any] = {
     "apiVersion": "expert_work.io/v1",
@@ -83,7 +84,7 @@ class _NeverCalledTenantConfig:
 
 
 def _resolver() -> CredentialsResolver:
-    return CredentialsResolver(
+    return static_credentials_resolver(
         platform_provider_credentials={},  # type: ignore[arg-type]
         platform_tool_credentials={},  # type: ignore[arg-type]
         tenant_config_getter=_NeverCalledTenantConfig(),
@@ -833,7 +834,7 @@ def _anthropic_credentials_resolver() -> CredentialsResolver:
     """Stream Y-2 — agent builds resolve the LLM key via the platform
     credential, so the builder needs a resolver carrying the anthropic key
     (the manifest ``api_key_ref`` is ignored for agent builds)."""
-    return CredentialsResolver(
+    return static_credentials_resolver(
         platform_provider_credentials={"anthropic": f"secret://{_ANTHROPIC_KEY_NAME}"},  # type: ignore[arg-type]
         platform_tool_credentials={},  # type: ignore[arg-type]
         tenant_config_getter=_StubTenantConfig(),  # type: ignore[arg-type]

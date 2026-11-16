@@ -62,6 +62,7 @@ from expert_work.runtime.middleware import (
     LLMServerError,
 )
 from orchestrator.llm.coalesce import coalesce_system_messages
+from orchestrator.llm.endpoints import Endpoint, redact_endpoint
 from orchestrator.llm.providers._errors import classify_http_error
 from orchestrator.llm.providers._http import client_for
 from orchestrator.llm.providers._metrics import disclosure_fallback_total
@@ -85,6 +86,7 @@ _TOOL_SEARCH_BETA = "tool-search-tool-2025-10-19"
 
 
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
+_DEFAULT_MESSAGES_PATH = "/v1/messages"
 _DEFAULT_TIMEOUT_S = 60.0
 DEFAULT_MAX_TOKENS = 4096
 _ANTHROPIC_VERSION = "2023-06-01"
@@ -302,12 +304,25 @@ class HTTPAnthropicClient:
     base_url: str = _DEFAULT_BASE_URL
     timeout_s: float = _DEFAULT_TIMEOUT_S
     transport: httpx.AsyncBaseTransport | None = None
+    #: Path appended to ``base_url``. B-308: with a root that already ends in
+    #: the version segment (the endpoint table's form) this is ``/messages``.
+    messages_path: str = _DEFAULT_MESSAGES_PATH
+    #: B-308 — ``base_url`` is a credential's custom request address: requests
+    #: go through the address-checking client and error text keeps the origin only.
+    custom_endpoint: bool = False
     #: 一期 Task 5 — process-level shared client. ``None`` falls back to the
     #: original per-call ``async with httpx.AsyncClient(...)`` behaviour
     #: (tests / eval CLI / not-yet-wired production paths). When injected it
     #: must NOT be closed here: it is owned by the control-plane lifespan and
     #: outlives every individual call.
     http: httpx.AsyncClient | None = None
+
+    def _error_text(self, exc: Exception) -> str:
+        """``exc`` as text; a custom request address is cut down to its origin."""
+        if not self.custom_endpoint:
+            return str(exc)
+        endpoint = Endpoint(root=self.base_url, path=self.messages_path, custom=True)
+        return redact_endpoint(str(exc), endpoint)
 
     async def messages(
         self,
@@ -337,10 +352,14 @@ class HTTPAnthropicClient:
 
         try:
             async with client_for(
-                self.http, timeout=self.timeout_s, transport=self.transport
+                self.http,
+                timeout=self.timeout_s,
+                transport=self.transport,
+                custom_endpoint=self.custom_endpoint,
+                provider="anthropic",
             ) as client:
                 response = await client.post(
-                    f"{self.base_url}/v1/messages",
+                    f"{self.base_url}{self.messages_path}",
                     headers={
                         "x-api-key": self.api_key,
                         "anthropic-version": _ANTHROPIC_VERSION,
@@ -353,7 +372,7 @@ class HTTPAnthropicClient:
                     timeout=self.timeout_s,  # per-request — governs even when sharing a client
                 )
         except httpx.HTTPError as exc:
-            raise LLMNetworkError(f"anthropic: {exc}") from exc
+            raise LLMNetworkError(f"anthropic: {self._error_text(exc)}") from exc
 
         status = response.status_code
         if status >= 400:
@@ -400,10 +419,16 @@ class HTTPAnthropicClient:
         # idle_timeout_s governs inter-event silence (Task 3, P1').
         timeout = httpx.Timeout(self.timeout_s, read=None)
         try:
-            async with client_for(self.http, timeout=timeout, transport=self.transport) as client:
+            async with client_for(
+                self.http,
+                timeout=timeout,
+                transport=self.transport,
+                custom_endpoint=self.custom_endpoint,
+                provider="anthropic",
+            ) as client:
                 async with client.stream(
                     "POST",
-                    f"{self.base_url}/v1/messages",
+                    f"{self.base_url}{self.messages_path}",
                     headers={
                         "x-api-key": self.api_key,
                         "anthropic-version": _ANTHROPIC_VERSION,
@@ -429,7 +454,7 @@ class HTTPAnthropicClient:
                             raise _classify_anthropic_stream_error(event)
                         yield event
         except httpx.HTTPError as exc:
-            raise LLMNetworkError(f"anthropic: {exc}") from exc
+            raise LLMNetworkError(f"anthropic: {self._error_text(exc)}") from exc
 
 
 @dataclass

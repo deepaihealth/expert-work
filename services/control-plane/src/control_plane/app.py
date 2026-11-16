@@ -306,7 +306,6 @@ from control_plane.webhook_delivery_worker import WebhookDeliveryWorker
 from control_plane.workspace_janitor import WorkspaceJanitorWorker
 from control_plane.workspace_lock import PgConversationSeedLock, PgWorkspaceLock
 from control_plane.workspace_quota import WorkspaceQuotaService
-from expert_work.common.credentials import CredentialsResolver
 from expert_work.common.health import DefaultHealthProvider
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.common.observability import current_trace_id_hex, init_logging, init_tracing
@@ -600,6 +599,8 @@ from orchestrator.llm import (
     make_redis_rate_limiter_factory,
     redis_pacing_buckets,
 )
+from orchestrator.llm.providers._checked_endpoint import make_checked_client
+from orchestrator.llm.providers._http import register_checked_client, unregister_checked_client
 from orchestrator.tools import (
     AgentSandboxClient,
     HTTPSupervisorRuntime,
@@ -1424,6 +1425,16 @@ def create_app(
             )
             _app.state.shared_http = shared_http  # ops introspection hook; no reader yet
             stack.push_async_callback(shared_http.aclose)
+            # B-308 — the one client every request to a credential's custom
+            # request address uses (each new connection re-checks that the host
+            # resolves to public addresses only and dials those). Created here,
+            # next to the shared client, and registered with ``client_for`` —
+            # which picks it at the bottom layer whatever client a caller
+            # passed. Unregistered before it is closed (LIFO).
+            checked_http = make_checked_client()
+            stack.push_async_callback(checked_http.aclose)
+            register_checked_client(checked_http)
+            stack.callback(unregister_checked_client, checked_http)
             # 波 2 线 A — 供应商 RPM 全局令牌桶。有 quota_redis_url 就把 Redis 后端的
             # 限流器工厂注入三条构建路径(主 / 子 Agent / worker)+ judge caller,
             # 每个上游凭据一只桶、所有副本共用,rate_limit_rpm 不再除副本数;
@@ -1560,35 +1571,39 @@ def create_app(
                 # all resolve per-tenant credentials through it. Stream HX-8:
                 # the overlay subclass resolves through the tenant-effective
                 # view (per-tenant override rows win, disabled rows suppress).
-                credentials_resolver: CredentialsResolver = TenantOverlayCredentialsResolver(
-                    tenant_provider_view=(
-                        resolved_platform_secrets_service.effective_provider_credentials_for
-                    ),
-                    tenant_tool_view=(
-                        resolved_platform_secrets_service.effective_tool_credentials_for
-                    ),
-                    # Stream Y-MK — tenant-effective per-provider key list for
-                    # the agent's main-model multi-key failover.
-                    tenant_provider_keys_view=(
-                        resolved_platform_secrets_service.effective_provider_secret_refs_for
-                    ),
-                    platform_provider_credentials=(
-                        resolved_settings.effective_platform_provider_credentials
-                    ),
-                    platform_tool_credentials=(
-                        resolved_settings.effective_platform_tool_credentials
-                    ),
-                    tenant_config_getter=resolved_tenant_config_service,
-                    # Stream P (Mini-ADR P-9) — live merged view (env + DB
-                    # overlay); these win over the static dicts above so a
-                    # platform admin's runtime change takes effect within the
-                    # service's TTL without a restart.
-                    platform_provider_getter=(
-                        resolved_platform_secrets_service.effective_provider_credentials
-                    ),
-                    platform_tool_getter=(
-                        resolved_platform_secrets_service.effective_tool_credentials
-                    ),
+                credentials_resolver: TenantOverlayCredentialsResolver = (
+                    TenantOverlayCredentialsResolver(
+                        # B-308 — both provider views hand out ``ProviderKey``s:
+                        # the secret ref with the request address of its row.
+                        tenant_provider_key_view=(
+                            resolved_platform_secrets_service.effective_best_provider_keys_for
+                        ),
+                        tenant_tool_view=(
+                            resolved_platform_secrets_service.effective_tool_credentials_for
+                        ),
+                        # Stream Y-MK — tenant-effective per-provider key list for
+                        # the agent's main-model multi-key failover.
+                        tenant_provider_key_list_view=(
+                            resolved_platform_secrets_service.effective_provider_keys_for
+                        ),
+                        platform_provider_credentials=(
+                            resolved_settings.effective_platform_provider_credentials
+                        ),
+                        platform_tool_credentials=(
+                            resolved_settings.effective_platform_tool_credentials
+                        ),
+                        tenant_config_getter=resolved_tenant_config_service,
+                        # Stream P (Mini-ADR P-9) — live merged view (env + DB
+                        # overlay); these win over the static dicts above so a
+                        # platform admin's runtime change takes effect within the
+                        # service's TTL without a restart.
+                        platform_provider_getter=(
+                            resolved_platform_secrets_service.effective_provider_credentials
+                        ),
+                        platform_tool_getter=(
+                            resolved_platform_secrets_service.effective_tool_credentials
+                        ),
+                    )
                 )
                 _app.state.credentials_resolver = credentials_resolver
                 # 委派增强层 3 — 配置页「生成委派策略」端点的辅助模型调用器

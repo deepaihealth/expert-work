@@ -22,6 +22,7 @@ from expert_work.protocol import ModelEntry
 from expert_work.protocol.knowledge import rerank_model_key
 from expert_work.protocol.model_catalog import MODEL_CATALOG, RerankCaps
 from orchestrator.llm import RerankGuards
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.llm.rerank_cohere import COHERE_STYLE_SHAPES, RERANK_SHAPE_BY_PROVIDER
 from orchestrator.tools.knowledge_rerank import RerankRanking
 
@@ -38,9 +39,9 @@ class _Resolver:
     def __init__(self) -> None:
         self.resolved: list[str] = []
 
-    async def resolve_provider(self, *, tenant_id: Any, provider: str) -> str:
+    async def resolve_provider_key(self, *, tenant_id: Any, provider: str) -> ProviderKey:
         self.resolved.append(provider)
-        return f"secret://{provider}"
+        return ProviderKey(f"secret://{provider}")
 
 
 class _SecretStore:
@@ -261,7 +262,7 @@ def test_catalog_rerank_rows_match_their_clients() -> None:
 
 
 class _RaisingResolver:
-    async def resolve_provider(self, *, tenant_id: Any, provider: str) -> str:
+    async def resolve_provider_key(self, *, tenant_id: Any, provider: str) -> ProviderKey:
         raise CredentialsResolverError(
             "no credential", mode="platform", kind="provider", key=provider
         )
@@ -284,7 +285,7 @@ def test_the_dashscope_client_is_only_built_for_qwen() -> None:
             provider="doubao",
             model="some-rerank",
             api_key="k",
-            secret_ref="secret://doubao",
+            provider_key=ProviderKey("secret://doubao"),
             http=None,
             guards=RerankGuards(),
         )

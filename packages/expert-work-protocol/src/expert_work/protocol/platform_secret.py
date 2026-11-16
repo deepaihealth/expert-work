@@ -45,6 +45,11 @@ class PlatformProviderSecretRecord(BaseModel):
     secret_ref: str
     enabled: bool = True
     priority: int = 100
+    #: B-308 — the request address for this key (API root, version segment
+    #: included). ``None`` = the provider's official address.
+    base_url: str | None = None
+    #: B-308 — saved although the connectivity check failed ("save anyway").
+    base_url_unverified: bool = False
     created_at: datetime
     updated_at: datetime
     updated_by: str
@@ -86,6 +91,10 @@ class TenantProviderSecretRecord(BaseModel):
     provider: Provider
     secret_ref: str
     enabled: bool = True
+    #: B-308 — see :class:`PlatformProviderSecretRecord`. An override without
+    #: an address uses the official one; it never inherits a platform key's.
+    base_url: str | None = None
+    base_url_unverified: bool = False
     created_at: datetime
     updated_at: datetime
     updated_by: str

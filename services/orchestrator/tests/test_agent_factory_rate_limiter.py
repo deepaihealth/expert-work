@@ -21,6 +21,7 @@ from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import build_agent, build_llm_router, build_step_routers
 from orchestrator.llm import RateLimitedProvider
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.llm.rate_limit import AdmissionLimiter
 
 _ANTHROPIC_REF = "secret://expert-work/dev/llm/anthropic"
@@ -61,8 +62,8 @@ def _secret_store() -> LocalDevSecretStore:
     )
 
 
-async def _platform_resolver(provider: str) -> list[str]:
-    return [{"anthropic": _ANTHROPIC_REF, "openai": _OPENAI_REF}[provider]]
+async def _platform_resolver(provider: str) -> list[ProviderKey]:
+    return [ProviderKey({"anthropic": _ANTHROPIC_REF, "openai": _OPENAI_REF}[provider])]
 
 
 @dataclass

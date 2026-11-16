@@ -35,6 +35,7 @@ import sys
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import IO, Any
+from urllib.parse import urlsplit
 
 from expert_work.common.context import (
     get_current_run_id,
@@ -222,6 +223,55 @@ def init_logging(
             root.removeHandler(existing)
     root.addHandler(handler)
     root.setLevel(level)
+    install_httpx_url_filter()
+
+
+#: ``httpx`` logs one line per request with the full URL (``HTTP Request: <method>
+#: <url> "<version> <status> <reason>"``).
+_HTTP_URL_PREFIXES = ("http://", "https://")
+
+
+class HttpxUrlFilter(logging.Filter):
+    """Cut every URL argument of an ``httpx`` log record down to its origin
+    (``scheme://host[:port]``) — B-308 §4.7.
+
+    A credential's request address may carry a token in its path, and the
+    platform root logger runs at INFO, where ``httpx`` prints each request's
+    full URL. The host stays visible (operators still see where a call went and
+    its status); nothing after it is logged. The argument is an ``httpx.URL``
+    in current httpx and a string in others; both are handled.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and args:
+            record.args = tuple(_origin_only(arg) for arg in args)
+        return True
+
+
+def _origin_only(arg: object) -> object:
+    if not isinstance(arg, str) and type(arg).__name__ != "URL":
+        return arg
+    text = str(arg)
+    if not text.startswith(_HTTP_URL_PREFIXES):
+        return arg
+    parts = urlsplit(text)
+    return f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}"
+
+
+def install_httpx_url_filter() -> None:
+    """Install :class:`HttpxUrlFilter` on the ``httpx`` logger (once) and pin
+    ``httpcore`` at WARNING — at DEBUG it logs connection detail, and a root
+    level lowered to DEBUG must not bring that back.
+
+    Safe to call repeatedly: :func:`init_logging` calls it, and so does the
+    module that owns the address-checking HTTP client, which covers processes
+    that never call ``init_logging`` (eval scripts, CLIs).
+    """
+    httpx_logger = logging.getLogger("httpx")
+    if not any(isinstance(existing, HttpxUrlFilter) for existing in httpx_logger.filters):
+        httpx_logger.addFilter(HttpxUrlFilter())
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -34,6 +34,7 @@ from orchestrator.errors import (
     SkillNotFoundError,
     SkillVersionNotFoundError,
 )
+from orchestrator.llm.endpoints import ProviderKey
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -77,11 +78,11 @@ def _secret_store() -> LocalDevSecretStore:
     return LocalDevSecretStore.from_mapping({_ANTHROPIC_KEY_NAME: "sk-ant-test"})
 
 
-async def _platform_resolver(provider: str) -> list[str]:
+async def _platform_resolver(provider: str) -> list[ProviderKey]:
     # Stream Y-2 — agent builds resolve the platform key; these specs are all
     # anthropic, so every provider maps to the seeded anthropic dev key.
     del provider
-    return [f"secret://{_ANTHROPIC_KEY_NAME}"]
+    return [ProviderKey(f"secret://{_ANTHROPIC_KEY_NAME}")]
 
 
 async def _build(spec: AgentSpec, **kwargs: Any) -> Any:

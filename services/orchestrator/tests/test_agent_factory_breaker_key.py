@@ -12,6 +12,7 @@ import pytest
 from expert_work.protocol import ModelSpec
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import build_llm_router
+from orchestrator.llm.endpoints import ProviderKey
 
 _PLATFORM_REF = "secret://expert-work/dev/llm/deepseek"
 _OVERRIDE_REF = "secret://expert-work/dev/llm/deepseek-override"
@@ -27,8 +28,8 @@ def _store() -> LocalDevSecretStore:
 
 
 def _resolver(refs: list[str]):  # type: ignore[no-untyped-def]
-    async def _resolve(_provider: str) -> list[str]:
-        return refs
+    async def _resolve(_provider: str) -> list[ProviderKey]:
+        return [ProviderKey(ref) for ref in refs]
 
     return _resolve
 

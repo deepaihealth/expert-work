@@ -21,6 +21,7 @@ from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import BuiltAgent, ToolEnv, build_agent
 from orchestrator.agent_factory import _assemble_system_prompt
 from orchestrator.llm import FakeEmbedder
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools.knowledge_catalog import (
     CATALOG_UNAVAILABLE,
@@ -54,9 +55,9 @@ def _spec(refs: list[str] | None) -> AgentSpec:
     return AgentSpec.model_validate(doc)
 
 
-async def _key_resolver(provider: str) -> list[str]:
+async def _key_resolver(provider: str) -> list[ProviderKey]:
     del provider
-    return [f"secret://{_KEY_NAME}"]
+    return [ProviderKey(f"secret://{_KEY_NAME}")]
 
 
 async def _build(spec: AgentSpec, store: InMemoryKnowledgeStore, tenant: UUID) -> BuiltAgent:

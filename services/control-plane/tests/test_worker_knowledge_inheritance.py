@@ -37,6 +37,7 @@ from orchestrator.tools import (
     build_tool_registry,
 )
 from orchestrator.tools.error_classifier import GuidedToolError
+from tests.credential_fixtures import static_credentials_resolver
 
 _KEY_NAME = "anthropic-test"
 #: A base the tenant has but the parent does not bind.
@@ -57,7 +58,7 @@ class _StubTenantConfig:
 
 
 def _credentials() -> CredentialsResolver:
-    return CredentialsResolver(
+    return static_credentials_resolver(
         platform_provider_credentials={"anthropic": f"secret://{_KEY_NAME}"},
         platform_tool_credentials={},
         tenant_config_getter=_StubTenantConfig(),

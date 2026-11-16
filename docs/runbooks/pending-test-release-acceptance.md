@@ -2719,3 +2719,22 @@ PY
 - [ ] **119.12 收尾**:删 `acc-b300r-mem`;本测试用户的记忆行按用户清除;删 119.10 加的 NetworkPolicy(若还在)。
 
 **生产**:**没有开关**,M / R / X / S 同一班车,上生产以四个 PR 都合入、付费评测过线(设计 §11.1~§11.3)为前提,用户说发再发;控制面与编排服务同一次发(不许 `--images` 只发一部分,设计 §12.3)。上去之后读 `/metrics`:`expert_work_memory_writeback_segment_total` 出现、`event="config_error"` / `"lease_expired_failed"` 为 0 或个位数;`expert_work_control_plane_memory_writeback_jobs_total{outcome="failed"}` 不涨;看几条新写入的行有证据指针。回退只能回滚镜像;回滚窗口里旧镜像整段重抽、照旧进失败队列,再发后新任务从旧镜像最后一个任务的 `message_count` 之后做起(设计 §12.4)。
+
+---
+
+## §120 平台凭证可填请求地址:发布与回滚(B-308 PR 1;验收用例随 PR 2 补)
+
+**背景**:设计 `docs/superpowers/specs/2026-11-16-b308-credential-base-url-design.md`(第 10 版·简单版,§4.10 发布与回滚)。迁移 `0191_b308_credential_base_url`(两张凭证表各加 `base_url`、`base_url_unverified`)。发布前不需要数据预查:本项不改变任何存量行的行为。验收用例(设计 §8 A1~A12)随 PR 2 写进来。
+
+- [ ] **120.1 发布顺序**:迁移先上,再滚动换镜像。**滚动完成前不要给任何密钥配请求地址**(还没换镜像的副本无视地址,会把那把密钥发到官方地址,调用失败)。
+- [ ] **120.2 回滚镜像前的核对**:先把配了地址的行**清空地址**(首选清空;只停用不够:停用的行在旧镜像上可能被重新启用,再升级回来时地址又生效),再用下面这条只打印行数的 SQL 确认两个数都是 0(经 `kubectl exec` 进控制面 pod、用应用自己的数据库连接、只读事务;测试环境开发方跑,生产用户跑):
+
+  ```sql
+  SELECT 'platform_provider_secret' AS t, count(*) FROM platform_provider_secret
+   WHERE base_url IS NOT NULL
+  UNION ALL
+  SELECT 'tenant_provider_secret', count(*) FROM tenant_provider_secret
+   WHERE base_url IS NOT NULL;
+  ```
+
+  不为 0 却必须马上回滚时:那几家厂商在回滚期间用不了(旧镜像把给转发服务的密钥发到官方地址,调用失败,不外泄)。旧镜像上切换启用不会清掉库里的地址,再升级回来时地址还在。

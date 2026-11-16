@@ -192,3 +192,58 @@ async def test_provider_multikey_round_trip(
         assert [r.key_id for r in remaining] == ["acct-b"]
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_base_url_columns_round_trip_and_are_overwritten(
+    platform_secret_store: tuple[SqlPlatformSecretStore, AsyncEngine],
+) -> None:
+    """B-308 §4.1 — both tables store ``base_url`` / ``base_url_unverified``;
+    an upsert that omits them writes the defaults (whole-row overwrite)."""
+    from uuid import UUID
+
+    tenant = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+    url = "https://proxy.example.com/api/paas/v4"
+    store, engine = platform_secret_store
+    try:
+        created = await store.upsert_provider(
+            provider="glm",
+            key_id="b308",
+            secret_ref="secret://glm",
+            enabled=True,
+            actor_id="admin",
+            base_url=url,
+            base_url_unverified=True,
+        )
+        assert (created.base_url, created.base_url_unverified) == (url, True)
+        fetched = await store.get_provider("glm", "b308")
+        assert fetched is not None
+        assert (fetched.base_url, fetched.base_url_unverified) == (url, True)
+        cleared = await store.upsert_provider(
+            provider="glm", key_id="b308", secret_ref="secret://glm", enabled=True, actor_id="a"
+        )
+        assert (cleared.base_url, cleared.base_url_unverified) == (None, False)
+
+        override = await store.upsert_tenant_provider(
+            tenant_id=tenant,
+            provider="glm",
+            secret_ref="secret://t/glm",
+            enabled=True,
+            actor_id="admin",
+            base_url=url,
+            base_url_unverified=True,
+        )
+        assert (override.base_url, override.base_url_unverified) == (url, True)
+        assert await store.list_tenant_providers(tenant) == [override]
+        reset = await store.upsert_tenant_provider(
+            tenant_id=tenant,
+            provider="glm",
+            secret_ref="secret://t/glm",
+            enabled=True,
+            actor_id="a",
+        )
+        assert (reset.base_url, reset.base_url_unverified) == (None, False)
+    finally:
+        await store.delete_provider("glm", "b308")
+        await store.delete_tenant_provider(tenant_id=tenant, provider="glm")
+        await engine.dispose()

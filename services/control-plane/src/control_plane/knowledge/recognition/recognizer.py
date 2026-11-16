@@ -38,9 +38,7 @@ from control_plane.knowledge.recognition.cleaning import (
     reading_too_large,
 )
 from control_plane.knowledge.recognition.clients import (
-    CHAT_COMPLETIONS_URLS,
     DEFAULT_OCR_MAX_TOKENS,
-    LAYOUT_PARSING_URLS,
     OCR_PROMPT_VERSION,
     OCR_TEMPERATURE,
     CallErrorKind,
@@ -49,6 +47,9 @@ from control_plane.knowledge.recognition.clients import (
     Reading,
     RecognitionCallError,
     RecognitionClient,
+    RecognitionCredential,
+    chat_vlm_endpoint,
+    layout_parsing_endpoint,
     read_with_retry,
 )
 from control_plane.knowledge.recognition.figure_images import image_size
@@ -155,8 +156,9 @@ class RecognitionSettingsSource(Protocol):
 
 
 class ApiKeySource(Protocol):
-    async def __call__(self, *, tenant_id: UUID, provider: str) -> str:
-        """The provider's API key; raises when there is none."""
+    async def __call__(self, *, tenant_id: UUID, provider: str) -> RecognitionCredential:
+        """The provider's API key with the request address saved on that key
+        (B-308); raises when there is none."""
 
 
 class UsageSink(Protocol):
@@ -181,7 +183,7 @@ PageRenderer = Callable[[list[int], int | None], Coroutine[Any, Any, list[bytes]
 BatchGuard = Callable[[], Awaitable[None]]
 
 #: Builds a client for a model from its API key (tests inject fakes).
-ClientFactory = Callable[[ModelChoice, str], RecognitionClient]
+ClientFactory = Callable[[ModelChoice, RecognitionCredential], RecognitionClient]
 
 
 class CallCheckpoint:
@@ -320,27 +322,38 @@ def default_client(
 ) -> ClientFactory:
     """The HTTP adapter for a model, by its catalog ``ocr_caps.api``."""
 
-    def build(choice: ModelChoice, api_key: str) -> RecognitionClient:
+    def build(choice: ModelChoice, credential: RecognitionCredential) -> RecognitionClient:
         caps = _ocr_caps(choice)
         if caps is None:
             msg = f"{choice.key} is not a recognition model"
             raise ValueError(msg)
+        # B-308 — the address is built from the credential's own request
+        # address (or the official root), never from a fixed table.
         if caps.api == "layout_parsing":
-            url = LAYOUT_PARSING_URLS.get(choice.provider)
-            if url is None:
+            endpoint = layout_parsing_endpoint(choice.provider, credential.base_url)
+            if endpoint is None:
                 msg = f"no layout-parsing endpoint for provider {choice.provider!r}"
                 raise ValueError(msg)
-            return LayoutParsingClient(url=url, api_key=api_key, model=choice.model, http=http)
-        url = CHAT_COMPLETIONS_URLS.get(choice.provider)
-        if url is None:
+            return LayoutParsingClient(
+                url=endpoint.url,
+                api_key=credential.api_key,
+                model=choice.model,
+                http=http,
+                custom_endpoint=endpoint.custom,
+                provider=choice.provider,
+            )
+        endpoint = chat_vlm_endpoint(choice.provider, credential.base_url)
+        if endpoint is None:
             msg = f"no chat endpoint for provider {choice.provider!r}"
             raise ValueError(msg)
         return ChatVlmClient(
-            url=url,
-            api_key=api_key,
+            url=endpoint.url,
+            api_key=credential.api_key,
             model=choice.model,
             request_fields=_chat_fields(choice, caps),
             http=http,
+            custom_endpoint=endpoint.custom,
+            provider=choice.provider,
         )
 
     return build
