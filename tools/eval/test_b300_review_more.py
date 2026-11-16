@@ -491,3 +491,43 @@ def test_calibrate_a_refuses_labels_built_with_other_wording(tmp_path: Path) -> 
         emit=out.append,
     )
     assert code == 2 and "current A-group judge wording" in out[-1]
+
+
+def test_run_judge_records_the_evidence_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """审查 LOW:有据程度题的证据从哪来,记进判分。"""
+    import asyncio
+
+    import b300_live as live
+    import b300_redesign_base as base
+
+    monkeypatch.setenv("EXPERT_WORK_EVAL_JUDGE_BASE_URL", "http://judge.invalid")
+    monkeypatch.setenv("EXPERT_WORK_EVAL_JUDGE_API_KEY", "k")
+
+    async def vote(self: Any, prompt: str, *, item: str, phase: str) -> list[Any]:
+        return [(True, {"input_tokens": 1, "output_tokens": 1})]
+
+    monkeypatch.setattr(live.Judge, "vote_with_usage", vote)
+
+    class Open:
+        def __init__(self) -> None:
+            self.prices = {plan.JUDGE_MODEL: Price(1.0, 1.0, 1.0, "test")}
+
+        def may_spend(self, phase: str) -> bool:
+            return True
+
+    out_file = tmp_path / "verdicts.jsonl"
+    items = [base.JudgeItem("a", "confirmed_grounded", "p", evidence="fallback")]
+    asyncio.run(
+        runs.run_judge(
+            items,
+            out_file=out_file,
+            guard=Open(),  # type: ignore[arg-type]
+            votes=1,
+            phase="gate",
+            emit=lambda _m: None,
+        )
+    )
+    (row,) = [json.loads(x) for x in out_file.read_text().splitlines()]
+    assert row["evidence"] == "fallback"

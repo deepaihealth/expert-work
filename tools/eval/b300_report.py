@@ -306,6 +306,10 @@ def a_judge_wording_digest() -> str:
         inspect.getsource(live.Judge),
         inspect.getsource(live.parse_vote),
         inspect.getsource(live.majority),
+        # 有据程度题的证据怎么取、怎么截(审查 LOW):改了取法或上限,也要重新校准
+        inspect.getsource(base.extraction_evidence),
+        inspect.getsource(base.cap_evidence),
+        f"{base.EVIDENCE_LINE_CAP}/{base.EVIDENCE_CAP}",
     ]
     seen: set[tuple[str, str]] = set()
     for s in sc.build_group("A"):

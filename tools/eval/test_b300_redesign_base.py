@@ -136,13 +136,15 @@ _EVIDENCE = (
 )
 
 
-def test_grounded_wording_says_stamped_dates_and_shown_context_are_not_added() -> None:
-    """闸门 11-16:判官只看两行、看不到发送日期与上文,把正当的日期和上文细节当成「多加的」。"""
+def test_grounded_wording_anchors_content_to_the_user_line_and_the_line_above() -> None:
+    """闸门 11-16 + 审查 M2(设计 §11.4 / §5.3):内容要由那一条用户行与它正上方的助手行撑住;发送
+    日期与别的用户行可以补时间与指代;只在别的助手行、活动行或工具结果里出现的事实算多加的。"""
     w = base.GROUNDED_WORDING
     assert "the day that line was sent" in w and '"=== new ==="' in w
     assert (
-        "A date taken from a line's send date, and details stated in any shown line, context "
-        "lines included, are not added content." in w
+        "Content must be supported by the user line and the assistant line right above it. "
+        "Send dates and other user lines may supply time and references. A fact that appears "
+        "only in other assistant lines, activity lines or tool results counts as added." in w
     )
 
 
@@ -157,6 +159,14 @@ def test_grounded_prompt_shows_the_extractor_evidence_when_given() -> None:
 def test_grounded_prompt_without_evidence_numbers_the_two_lines() -> None:
     prompt = base.grounded_prompt("What is the limit?", "600 calls", ["m"])
     assert "=== new ===\n[1] [assistant] What is the limit?\n[2] [user] 600 calls" in prompt
+    assert "The user line is line [2]." in prompt
+
+
+def test_grounded_prompt_names_the_user_line_when_known() -> None:
+    prompt = base.grounded_prompt("q", "a", ["m"], evidence=_EVIDENCE, user_line_no=3)
+    head = prompt.split("Memories:\n")[0]
+    assert "The user line is line [3]." in head
+    assert head.index(_EVIDENCE) < head.index("The user line is line [3].")
 
 
 def test_confirmed_check_uses_the_pass2_input_of_the_round_that_wrote_the_row() -> None:
@@ -189,3 +199,98 @@ def test_confirmed_check_uses_the_pass2_input_of_the_round_that_wrote_the_row() 
     items = []
     base.confirmed_check(out, items, record, metric="m", key="6.8", lines=("q", "a"))
     assert "[1] [assistant] q\n[2] [user] a" in items[0].prompt
+
+
+def _record(rounds: list[dict[str, Any]], content: str) -> dict[str, Any]:
+    rows = [{"id": "r", "content": content, "origin": "user_confirmed", "live": True}]
+    caps = dict.fromkeys(base.CAPABILITIES, True)
+    return {"key": "k", "result": {"capabilities": caps, "memories": rows, "rounds": rounds}}
+
+
+def _round(
+    input_text: str | None, made: list[dict[str, Any]], live_after: list[str]
+) -> dict[str, Any]:
+    call: dict[str, Any] = {"kind": "pass2", "reply": json.dumps({"memories": made})}
+    if input_text is not None:
+        call["input"] = input_text
+    return {"calls": [call], "live_after": live_after}
+
+
+def _judge(record: dict[str, Any]) -> base.JudgeItem:
+    out: dict[str, Any] = {}
+    items: list[base.JudgeItem] = []
+    base.confirmed_check(out, items, record, metric="m", key="6.8", lines=("q", "a"))
+    (item,) = items
+    return item
+
+
+def test_evidence_match_ignores_surrounding_whitespace_and_reads_the_turn() -> None:
+    """审查 LOW:两边去掉首尾空白再比;命中的那一次产出里的 ``turn`` 作为「用户行是第几行」。"""
+    made = [{"content": "  the reading is 6.8 \n", "turn": 3}]
+    item = _judge(_record([_round(_EVIDENCE, made, ["the reading is 6.8"])], "the reading is 6.8"))
+    assert item.evidence == "exact" and "The user line is line [3]." in item.prompt
+
+
+def test_evidence_fallback_takes_the_first_round_where_the_text_became_live() -> None:
+    """审查 LOW:产出里对不上(去重合并改写过)时,取这条正文**第一次**出现在有效记忆里的那一轮,
+    不是最后一轮。"""
+    first = "=== new ===\n[1] [user] [2026-11-15] first round"
+    later = "=== new ===\n[1] [user] [2026-11-16] later round"
+    rounds = [
+        _round(first, [{"content": "other"}], ["the reading is 6.8"]),
+        _round(later, [{"content": "other"}], ["the reading is 6.8"]),
+    ]
+    item = _judge(_record(rounds, "the reading is 6.8"))
+    assert item.evidence == "fallback" and "first round" in item.prompt
+    assert "later round" not in item.prompt
+
+
+def test_evidence_two_lines_when_no_round_recorded_inputs() -> None:
+    item = _judge(
+        _record([_round(None, [{"content": "the reading is 6.8"}], [])], "the reading is 6.8")
+    )
+    assert item.evidence == "two-lines" and "[1] [assistant] q\n[2] [user] a" in item.prompt
+
+
+def test_evidence_is_capped_and_says_what_was_dropped() -> None:
+    """审查 LOW:证据有上限;超长的行截短、太早的上下文行丢掉,都写明丢了什么;分隔行以下的行都留着。"""
+    long_line = "[1] [assistant] " + "x" * (base.EVIDENCE_LINE_CAP + 50)
+    context = "\n".join(f"[{i}] [user] [2026-11-15] c{i}" for i in range(2, 400))
+    text = f"{long_line}\n{context}\n=== new ===\n[400] [user] [2026-11-16] 6.8"
+    capped = base.cap_evidence(text)
+    assert len(capped) <= base.EVIDENCE_CAP + 200
+    assert "=== new ===\n[400] [user] [2026-11-16] 6.8" in capped
+    assert "earlier context lines dropped" in capped
+    short = (
+        "[1] [assistant] " + "y" * (base.EVIDENCE_LINE_CAP + 50) + "\n=== new ===\n[2] [user] 6.8"
+    )
+    assert "characters cut]" in base.cap_evidence(short)
+    assert base.cap_evidence(_EVIDENCE) == _EVIDENCE
+
+
+def test_wording_digest_covers_how_the_evidence_is_taken(monkeypatch: pytest.MonkeyPatch) -> None:
+    """审查 LOW:证据的取法与上限算进判官措辞摘要。"""
+    import b300_report as rep
+
+    before = rep.a_judge_wording_digest()
+    monkeypatch.setattr(base, "EVIDENCE_CAP", base.EVIDENCE_CAP + 1)
+    assert rep.a_judge_wording_digest() != before
+
+
+def test_copied_detail_from_another_assistant_line_is_outside_the_anchor_pair() -> None:
+    """审查 M2(合成校准题的样子):细节只在别的助手行里,不在用户行与它正上方那一行里;判官题点名用户行,
+    措辞说这种事实算多加的。"""
+    evidence = (
+        "[1] [assistant] The refund was issued to the original card on 2026-11-10.\n"
+        "=== new ===\n"
+        "[2] [user] [2026-11-16] Thanks.\n"
+        "[3] [assistant] Please confirm: is the return number RT-48213?\n"
+        "[4] [user] [2026-11-16] Yes."
+    )
+    memory = "The user confirmed return RT-48213, refunded to the original card on 2026-11-10."
+    prompt = base.grounded_prompt("q", "a", [memory], evidence=evidence, user_line_no=4)
+    lines = base.numbered_lines(evidence)
+    anchor_pair = lines[3][1] + " " + lines[4][1]
+    assert "2026-11-10" in lines[1][1] and "2026-11-10" not in anchor_pair
+    assert "The user line is line [4]." in prompt
+    assert "only in other assistant lines, activity lines or tool results counts as added" in prompt

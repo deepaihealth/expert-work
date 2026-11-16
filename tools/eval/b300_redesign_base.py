@@ -31,6 +31,8 @@ class JudgeItem:
     key: str
     check: str
     prompt: str
+    #: 有据程度题的证据从哪来(审查 LOW):``exact`` / ``fallback`` / ``two-lines``;别的题为空。
+    evidence: str = ""
 
 
 #: 用户一方的来源(设计 §6.2:用户更正、用户说的、用户确认)。``user_corrected`` 不是列值(更正靠
@@ -195,9 +197,13 @@ GROUNDED_WORDING = (
     "that states as certain what the lines leave uncertain is at most level 3. Each line starts "
     "with its number and tag; a date in brackets after the tag is the day that line was sent, "
     'and lines above "=== new ===" are earlier context shown so the lines below can be '
-    "understood. A date taken from a line's send date, and details stated in any shown line, "
-    "context lines included, are not added content."
+    "understood. Content must be supported by the user line and the assistant line right above "
+    "it. Send dates and other user lines may supply time and references. A fact that appears "
+    "only in other assistant lines, activity lines or tool results counts as added."
 )
+#: 证据的上限(审查 LOW):单行至多这么多字,整段至多这么多字;超了截短 / 丢最早的上下文行,写明丢了什么。
+EVIDENCE_LINE_CAP = 1_000
+EVIDENCE_CAP = 8_000
 #: §11.3「不是事件却被标了事件日期」:判官判这条带事件日期的记忆是不是一次性的事。
 EVENT_DATE_WORDING = (
     "A one-time event is a value that happened or was observed on one day, such as a reading, "
@@ -210,35 +216,85 @@ def _bullets(rows: Sequence[str]) -> str:
     return "\n".join(f"- {r}" for r in rows) or "- (none)"
 
 
+def _cut(line: str) -> str:
+    if len(line) <= EVIDENCE_LINE_CAP:
+        return line
+    return f"{line[:EVIDENCE_LINE_CAP]} [... {len(line) - EVIDENCE_LINE_CAP} characters cut]"
+
+
+def cap_evidence(text: str) -> str:
+    """证据截到上限:每行先截短;还超就从最早的上下文行(分隔行之上)丢起,写明丢了几行;分隔行以下的行
+    全留(那是这一次提炼的新段)。"""
+    above, marker, below = text.partition(NEW_MARKER)
+    if not marker:
+        above, below = "", text
+    context = [_cut(x) for x in above.splitlines() if x.strip()]
+    new = [_cut(x) for x in below.splitlines() if x.strip()]
+    dropped = 0
+    while context and len("\n".join([*context, NEW_MARKER, *new])) > EVIDENCE_CAP:
+        context.pop(0)
+        dropped += 1
+    note = [f"(... {dropped} earlier context lines dropped)"] if dropped else []
+    lines = [*note, *context, NEW_MARKER, *new] if marker else new
+    return "\n".join(lines) if (dropped or lines != text.splitlines()) else text
+
+
 def grounded_prompt(
-    assistant_line: str, user_line: str, memories: Sequence[str], *, evidence: str | None = None
+    assistant_line: str,
+    user_line: str,
+    memories: Sequence[str],
+    *,
+    evidence: str | None = None,
+    user_line_no: int | None = None,
 ) -> str:
-    """``evidence`` = 提炼那一次的输入原样(带编号、发送日期与上下文);没有(老记录)就把助手问、
-    用户答这两行编上号给出,不带日期。"""
-    lines = evidence or f"{NEW_MARKER}\n[1] [assistant] {assistant_line}\n[2] [user] {user_line}"
+    """``evidence`` = 提炼那一次的输入原样(带编号、发送日期与上下文,截到上限);没有(老记录)就把助手
+    问、用户答这两行编上号给出,不带日期。``user_line_no`` = 这条记忆所依的用户行(第二次产出里的
+    ``turn``);两行时就是第 2 行。"""
+    if evidence:
+        lines, anchor = cap_evidence(evidence), user_line_no
+    else:
+        lines = f"{NEW_MARKER}\n[1] [assistant] {assistant_line}\n[2] [user] {user_line}"
+        anchor = 2
+    named = f"The user line is line [{anchor}].\n" if anchor else ""
     return (
-        f"Conversation lines:\n{lines}\n\n"
+        f"Conversation lines:\n{lines}\n{named}\n"
         f"{GROUNDED_WORDING} Question: does any memory below reach level 4 or 5? yes = it does. "
         "Give the level you chose in the reason.\n"
         f"Memories:\n{_bullets(memories)}"
     )
 
 
-def extraction_evidence(result: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> str | None:
-    """写出这几条的那一次第二次提炼看到的输入(闸门 11-16):从后往前找产出里有同样正文的那一次;
-    找不到就取最后一次记了输入的第二次提炼;都没有(老记录不记输入)= ``None``。"""
-    contents = {str(m.get("content", "")) for m in rows}
-    calls = [
-        c
-        for rnd in result.get("rounds", [])
-        for c in rnd.get("calls", [])
-        if c.get("kind") == "pass2" and "input" in c
-    ]
-    for call in reversed(calls):
-        made = {str(m.get("content", "")) for m in parse_extraction(str(call.get("reply", "")))}
-        if made & contents:
-            return str(call["input"])
-    return str(calls[-1]["input"]) if calls else None
+def _same(text: object) -> str:
+    return " ".join(str(text).split())
+
+
+def extraction_evidence(
+    result: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]
+) -> tuple[str | None, str, int | None]:
+    """写出这几条的那一次第二次提炼看到的输入(闸门 11-16)→ (输入, 怎么找到的, 用户行号)。
+    ① ``exact``:最近一次产出里有同样正文(两边去掉多余空白再比)的第二次提炼,行号取那一条的
+    ``turn``;② ``fallback``:产出对不上(去重合并改写过)时,取这条正文**第一次**出现在有效记忆里
+    (``live_after``)的那一轮的第二次提炼;③ ``two-lines``:都没有(老记录不记输入)。"""
+    contents = {_same(m.get("content", "")) for m in rows}
+    rounds = list(result.get("rounds", []))
+
+    def pass2_input(rnd: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        calls = [c for c in rnd.get("calls", []) if c.get("kind") == "pass2" and "input" in c]
+        return calls[-1] if calls else None
+
+    for rnd in reversed(rounds):
+        call = pass2_input(rnd)
+        if call is None:
+            continue
+        for m in parse_extraction(str(call.get("reply", ""))):
+            if _same(m.get("content", "")) in contents:
+                turn = m.get("turn")
+                return str(call["input"]), "exact", turn if isinstance(turn, int) else None
+    for rnd in rounds:
+        call = pass2_input(rnd)
+        if call is not None and contents & {_same(x) for x in rnd.get("live_after") or []}:
+            return str(call["input"]), "fallback", None
+    return None, "two-lines", None
 
 
 def confirmed_check(
@@ -263,13 +319,15 @@ def confirmed_check(
         out[metric] = False
         return
     out[metric] = None
+    evidence, path, turn = extraction_evidence(result, rows)
     prompt = grounded_prompt(
         lines[0],
         lines[1],
         [str(m["content"]) for m in rows],
-        evidence=extraction_evidence(result, rows),
+        evidence=evidence,
+        user_line_no=turn,
     )
-    items.append(JudgeItem(f"{record['key']}|{metric}", metric, prompt))
+    items.append(JudgeItem(f"{record['key']}|{metric}", metric, prompt, evidence=path))
 
 
 def event_date_prompt(content: str, occurred_on: str) -> str:
