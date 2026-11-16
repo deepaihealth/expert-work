@@ -1606,13 +1606,16 @@ def _identical_neighbors(item: MemoryItem, neighbors: Sequence[MemoryItem]) -> l
     比写入去重严:SQL 唯一索引那一格是 (tenant, user, content_hash, agent_name),不含 kind)、来源
     层级不低于候选(重做 §6.3,:func:`origin_tier`)的有效邻居。不带更正的候选碰上这样的邻居 →
     确定性 NOOP,不问模型;层级更低的相同内容(用户说的候选对上用户确认 / 来自助手的)照旧交给模型
-    (应更新、升格)。"""
+    (应更新、升格)。两边事件日期不同的不算(不同的两次,§7.4;复审 11-16)。"""
     text = _normalized_text(item.content)
     tier = origin_tier(item)
     return [
         n
         for n in neighbors
-        if _same_cell(n, item) and origin_tier(n) >= tier and _normalized_text(n.content) == text
+        if _same_cell(n, item)
+        and origin_tier(n) >= tier
+        and _normalized_text(n.content) == text
+        and not _other_event_dates(item, n)
     ]
 
 

@@ -454,6 +454,27 @@ async def test_a_noop_across_different_event_dates_is_an_add(
     assert ("noop_other_event_date" in counted) is added
 
 
+@pytest.mark.parametrize(
+    ("target_day", "deterministic"),
+    [(2, False), (1, True), (None, True)],
+    ids=["other-day", "same-day", "target-undated"],
+)
+@pytest.mark.asyncio
+async def test_identical_text_on_another_event_date_is_not_a_deterministic_noop(
+    target_day: int | None, deterministic: bool
+) -> None:
+    """内容相同、事件日期不同 = 不同的两次:不走确定性「重复」,交给模型(判「重复」也改为新增)。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    target = c.mem("the meter read 310", occurred_on=_day(target_day))
+    await store.write([target])
+    cand = c.mem("the meter read 310", occurred_on=_day(1))
+    llm = _LLM([_ops((0, "NOOP", "e0"))])
+    result = await _reconcile(store, llm, _Candidate(cand))
+    assert (llm.calls == []) is deterministic
+    assert [m.id for m in result.direct] == ([] if deterministic else [cand.id])
+
+
 def test_an_unapplied_noop_across_different_event_dates_is_still_written() -> None:
     """收尾时(去重合并出错)还没落的「重复」:日期不同的按新增写,同一天的不写。"""
     c = _Ctx()
