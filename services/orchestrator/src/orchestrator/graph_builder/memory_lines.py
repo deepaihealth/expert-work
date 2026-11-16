@@ -10,8 +10,9 @@
 (那些轮次或已由之前的任务处理,或按切片规则有意不提炼),这一条丢弃、计数
 :data:`CONTEXT_LINE_DROPPED`(§8.2)。例外里的例外(用户 11-16「这种情况照旧保存」「按用户确认重新
 核对」):第二次提炼的用户回答 / 同意,``turn`` 指在上下文最后一行的助手提议上、紧接着的新段第一行
-是 ``[user]`` —— 改挂到那一行、照常核对,过了 → 用户确认(:data:`CONTEXT_LINE_REANCHORED`);
-其余落在上下文行的(含核对不过的)照旧丢弃。
+是 ``[user]`` —— 改挂到那一行、照常核对,过了 → 用户确认(:data:`TURN_REANCHORED_CONTEXT`);
+其余落在上下文行的(含核对不过的)照旧丢弃。同样的产出落在同一段里(助手行、下一行用户行都在新段)
+也同样改挂(用户 11-16「同一批里也改指」,:data:`TURN_REANCHORED_IN_SEGMENT`),结果与怎么切片无关。
 """
 
 from __future__ import annotations
@@ -36,10 +37,11 @@ ASSISTANT_TAG = "[assistant]"
 
 #: 产出的 ``turn`` 落在上下文行上 → 丢弃(两次提炼都是),按这个检查名计数。
 CONTEXT_LINE_DROPPED = "context_line_dropped"
-#: 第二次提炼里用户回答 / 同意的 ``turn`` 落在上下文最后一行 ``[assistant]`` 上、新段第一行是
-#: ``[user]``:改挂到那一行,照常核对过了 → 用户确认,按这个检查名计数(用户 11-16「按用户确认
-#: 重新核对」)。
-CONTEXT_LINE_REANCHORED = "context_line_reanchored"
+#: 第二次提炼里用户回答 / 同意的 ``turn`` 指在 ``[assistant]`` 行上、紧接着的新段的行是 ``[user]``:
+#: 改挂到那一行,照常核对过了 → 用户确认(用户 11-16「按用户确认重新核对」「同一批里也改指」)。
+#: 助手行是上下文最后一行 / 也在新段里,分两个检查名计数(前缀相同,可合起来看)。
+TURN_REANCHORED_CONTEXT = "turn_reanchored_context"
+TURN_REANCHORED_IN_SEGMENT = "turn_reanchored_in_segment"
 
 #: 第二次提炼里表示「用户对助手上一句的回答 / 同意」的 ``basis``(§5.2)。
 _USER_BASES = frozenset({"user_answer", "user_agreement"})
@@ -117,15 +119,19 @@ def _on_context_line(turn: object, lines: Sequence[ExtractionLine]) -> bool:
     return line is not None and line.context
 
 
-def _answered_across_the_mark(turn: object, lines: Sequence[ExtractionLine]) -> bool:
-    """``turn`` 是上下文的最后一行、是 ``[assistant]``,紧接着的新段第一行是 ``[user]``:用户的回答 /
-    同意被模型指到了它所回应的那一句上(用户 11-16)。"""
+def _answered_by_next_line(turn: object, lines: Sequence[ExtractionLine]) -> bool:
+    """``turn`` 是 ``[assistant]`` 行(上下文最后一行,或新段里的),紧接着的是新段里的 ``[user]`` 行,
+    且那一行照常核对挂得上:用户的回答 / 同意被模型指到了它所回应的那一句上(用户 11-16)。"""
     line = _line_of(turn, lines)
     position = cast(int, turn)  # 下一行的下标
     if line is None or line.tag != ASSISTANT_TAG or position >= len(lines):
         return False
     following = lines[position]
-    return not following.context and following.tag == USER_TAG
+    return (
+        not following.context
+        and following.tag == USER_TAG
+        and _downgrade_reason(position + 1, lines) is None
+    )
 
 
 def _event_date(claimed: object, line: ExtractionLine | None, today: date) -> date | None:
@@ -207,26 +213,22 @@ def settle_conversation(
 ) -> Settled | None:
     """第二次提炼:``basis`` 为用户回答 / 同意且挂得上 → ``user_confirmed``(≤ 0.8);其余一律
     ``assistant_derived``(≤ 0.6),挂不上的计一次降级与原因。``turn`` 落在上下文行 → ``None``
-    (丢弃)—— 只有用户回答 / 同意、指在上下文最后一行 ``[assistant]`` 上、新段第一行是 ``[user]``
-    的改挂到那一行重新核对,过了 → ``user_confirmed``,计数 :data:`CONTEXT_LINE_REANCHORED`。"""
-    if _on_context_line(turn, lines):
-        # 用户 11-16「按用户确认重新核对」:改挂到紧接着的用户行(时间、事件日期都按它,用户的回答
-        # 可能已是第二天,审查 LOW-2),照常核对;过不了的与其余上下文行一样丢弃。
-        answer = cast(int, turn) + 1
-        if (
-            basis in _USER_BASES
-            and _answered_across_the_mark(turn, lines)
-            and _downgrade_reason(answer, lines) is None
-        ):
-            return _settle(
-                "user_confirmed",
-                USER_CONFIRMED_MAX_CONFIDENCE,
-                answer,
-                claimed_event_date,
-                lines,
-                today,
-                (CONTEXT_LINE_REANCHORED,),
-            )
+    (丢弃)。例外:用户回答 / 同意指在 ``[assistant]`` 行上、紧接着的是新段里的 ``[user]`` 行 →
+    改挂到那一行(:func:`_answered_by_next_line`),不论助手行在上下文还是新段里。"""
+    on_context = _on_context_line(turn, lines)
+    if basis in _USER_BASES and _answered_by_next_line(turn, lines):
+        # 用户 11-16「按用户确认重新核对」「同一批里也改指」:时间、事件日期都按用户那一行(用户的
+        # 回答可能已是第二天,审查 LOW-2)。
+        return _settle(
+            "user_confirmed",
+            USER_CONFIRMED_MAX_CONFIDENCE,
+            cast(int, turn) + 1,
+            claimed_event_date,
+            lines,
+            today,
+            (TURN_REANCHORED_CONTEXT if on_context else TURN_REANCHORED_IN_SEGMENT,),
+        )
+    if on_context:
         return None
     downgraded: tuple[str, ...] = ()
     if basis in _USER_BASES:

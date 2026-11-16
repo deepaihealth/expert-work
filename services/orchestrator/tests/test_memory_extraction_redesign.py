@@ -531,7 +531,9 @@ async def test_an_agreement_is_user_confirmed_too() -> None:
 @pytest.mark.parametrize(
     ("turn", "check", "pointer"),
     [
-        (2, "downgraded_not_user_line", ("a1", 1)),  # 指向助手行
+        # 指向助手行、下面没有用户行(下面紧接着用户行的改挂到用户行,用户 11-16「同一批里也改指」,
+        # 见 test_memory_b300_acceptance_findings 第 6 节)
+        (4, "downgraded_not_user_line", ("a2", 3)),
         (1, "downgraded_previous_not_assistant", ("u1", 0)),  # 第一句,上面没有助手行
         (99, "downgraded_out_of_range", (None, None)),
         (0, "downgraded_out_of_range", (None, None)),

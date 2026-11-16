@@ -7,7 +7,7 @@
    指针留空(第一次仍是 ``user_stated``,第二次仍是 ``assistant_derived``)。唯一的例外(用户 11-16
    「这种情况照旧保存」「按用户确认重新核对」):用户在新段第一行回答 / 同意上下文最后一行的助手
    提议、``turn`` 被指在助手那一行 → 改挂到用户那一行照常核对,存成用户确认,计数
-   ``context_line_reanchored``(第 4 节)。
+   ``turn_reanchored_context``(第 4 节);同样的产出落在同一段里也同样改挂(第 6 节)。
 2. 同一条用户消息被存两遍(run ``7ee5144b``):第一次存成 ``user_stated``,第二次又把它标成用户
    回答 / 同意;去重合并判「更新」,却被「候选那一行早于目标的记录时间」改成新增 —— 目标几秒前才在
    本任务第一段写下。改:① 先后按目标的**证据消息**的发送时间比(这条消息在本对话里、知道时间时;
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -896,7 +896,7 @@ def test_an_answer_put_on_the_last_context_assistant_line_is_reanchored_to_the_u
     """M-3 → 审查 M-1(用户 11-16「按用户确认重新核对」):上一轮以「[assistant] 建议叫它蛋黄」结束,
     新段第一行是「[user] 好,就叫这个」,模型把 ``turn`` 指在助手那一行 → 程序改挂到那一行用户行、
     照常核对:过了 → 用户确认(≤ 0.8)、证据指针 = 用户那条消息、算新段,计数
-    ``context_line_reanchored``。时间与事件日期按用户那一行(00:10,第二天),不按助手那一行
+    ``turn_reanchored_context``。时间与事件日期按用户那一行(00:10,第二天),不按助手那一行
     (23:50):「今天」的事件日期不被当成「晚于那一行」清掉(审查 LOW-2)。"""
     settled = memory_lines.settle_conversation(
         basis, 2, _AFTER.date().isoformat(), _named_across_the_mark(), today=_TODAY
@@ -906,7 +906,7 @@ def test_an_answer_put_on_the_last_context_assistant_line_is_reanchored_to_the_u
     assert (settled.evidence_message_id, settled.evidence_message_index) == ("u2", 2)
     assert (settled.in_new_segment, settled.line_at) == (True, _AFTER)
     assert settled.event_date == _AFTER.date()
-    assert settled.checks == ("context_line_reanchored",)
+    assert settled.checks == ("turn_reanchored_context",)
 
 
 def test_near_misses_of_the_answer_shape_are_still_dropped() -> None:
@@ -986,7 +986,7 @@ async def test_the_reanchored_answer_is_kept_alongside_what_the_user_said_before
     assert named.confidence <= 0.8
     assert outcome.written == 1
     assert _count("blocked_update_added_confirmed") == added + 1
-    assert checks == [("conversation", "context_line_reanchored")]
+    assert checks == [("conversation", "turn_reanchored_context")]
 
 
 # ─── 5. 第二轮审查(11-16):同层级置信度更低的用户确认也与旧的并存;逐字重述 ──────────────
@@ -1014,3 +1014,81 @@ async def test_identical_content_from_the_same_message_counts_as_same_evidence()
     assert (_count("noop_same_evidence"), _count("noop_refreshed")) == (same + 1, refreshed)
     [row] = _live(store)
     assert row.confirmed_at is None
+
+
+# ─── 6. 第三轮审查(11-16):改挂与切片无关(用户「同一批里也改指」)──────────────────────
+
+
+def _named_in_one_segment(next_line: ExtractionLine | None = None) -> list[ExtractionLine]:
+    """同样四行,都在新段里(积压 / 重试一次覆盖了几轮)。"""
+    return [replace(line, context=False) for line in _named_across_the_mark(next_line)]
+
+
+@pytest.mark.parametrize("basis", ["user_answer", "user_agreement"])
+def test_an_answer_put_on_the_assistant_line_inside_the_segment_is_reanchored(basis: str) -> None:
+    """审查 M-1:助手提议与用户回答都在新段里,模型把 ``turn`` 指在助手那一行、下一行是用户行 ——
+    与跨分界时一样改挂到用户行:用户确认、证据指针取用户行、时间与事件日期按用户行,计数
+    ``turn_reanchored_in_segment``。以前降为来自助手,被层级拦下就丢了。"""
+    settled = memory_lines.settle_conversation(
+        basis, 2, _AFTER.date().isoformat(), _named_in_one_segment(), today=_TODAY
+    )
+    assert settled is not None
+    assert (settled.origin, settled.max_confidence) == ("user_confirmed", 0.8)
+    assert (settled.evidence_message_id, settled.evidence_message_index) == ("u2", 2)
+    assert (settled.in_new_segment, settled.line_at) == (True, _AFTER)
+    assert settled.event_date == _AFTER.date()
+    assert settled.checks == ("turn_reanchored_in_segment",)
+
+
+def test_in_segment_near_misses_keep_todays_downgrade() -> None:
+    """同一段里别的形状照旧:助手行的下一行不是用户行、助手行是最后一行、``basis`` 不是回答 / 同意
+    → 来自助手,指针取助手那一行。"""
+    task_next = _named_in_one_segment(
+        ExtractionLine(text="定时提醒", tag="[task]", message_id="t1", message_index=2),
+    )
+    cases = [
+        ("user_agreement", 2, task_next, ("downgraded_not_user_line",)),
+        ("user_agreement", 4, _named_in_one_segment(), ("downgraded_not_user_line",)),
+        ("assistant", 2, _named_in_one_segment(), ()),
+    ]
+    for basis, turn, lines, checks in cases:
+        settled = memory_lines.settle_conversation(basis, turn, None, lines, today=_TODAY)
+        assert settled is not None
+        assert (settled.origin, settled.evidence_message_id) == (
+            "assistant_derived",
+            lines[turn - 1].message_id,
+        )
+        assert settled.checks == checks
+
+
+@pytest.mark.asyncio
+async def test_the_same_output_settles_the_same_however_the_write_back_is_sliced(
+    checks: list[tuple[str, str]],
+) -> None:
+    """用户 11-16「同一批里也改指」:同一段对话、同一份模型产出(``turn`` 指在助手提议那一行),
+    一次按「上一轮是上下文」切,一次整段都是新段 —— 存下的来源、置信度、证据指针完全一样。"""
+    messages = [
+        _user("帮我想个猫名", _LATE - timedelta(minutes=1), "u1"),
+        _assistant("建议叫它蛋黄", _LATE, "a1"),
+        _user("好,就叫这个", _AFTER, "u2"),
+        _assistant("好的,就叫蛋黄。", _AFTER + timedelta(seconds=5), "a2"),
+    ]
+    reply = _reply(
+        {"kind": "fact", "content": "用户的猫叫蛋黄", "basis": "user_agreement", "turn": 2,
+         "confidence": 0.9},
+    )  # fmt: skip
+    stored = []
+    for segment in (SegmentStart(message_index=2), None):
+        c = _Ctx()
+        store = InMemoryMemoryStore()
+        llm = _RoutingLLM(conversation_reply=reply)
+        await _flush(c, store, messages, llm, {"用户的猫叫蛋黄": _E}, segment)
+        [row] = _live(store)
+        stored.append(
+            (row.origin, row.confidence, row.evidence_message_id, row.evidence_message_index)
+        )
+    assert stored[0] == stored[1] == ("user_confirmed", 0.8, "u2", 2)
+    assert checks == [
+        ("conversation", "turn_reanchored_context"),
+        ("conversation", "turn_reanchored_in_segment"),
+    ]

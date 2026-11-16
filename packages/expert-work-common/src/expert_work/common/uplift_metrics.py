@@ -143,13 +143,13 @@ _memory_extraction_total = expert_work_counter(
 # ``turn`` / ``event_date``: ``downgraded_<reason>`` (a user answer / agreement that does
 # not anchor on a user line, so it is stored as from the assistant), ``pointer_missing``
 # (no evidence pointer because ``turn`` is missing or out of range; a ``turn`` on a context
-# line is never counted here — it is ``context_line_*``), ``event_date_dropped``,
-# ``context_line_dropped`` (``turn`` is a context line above ``=== new ===``: not stored —
-# B-300 test acceptance 11-16), and the one exception, user 11-16: a user answer / agreement
-# whose ``turn`` is the last context line, an assistant line directly followed by the first
-# new-segment line, a user line, is re-anchored to that user line and checked again —
-# ``context_line_reanchored`` (passed: stored as user-confirmed, pointer on that line;
-# otherwise it is dropped like any other context-line item).
+# line is never counted here), ``event_date_dropped``, ``context_line_dropped`` (``turn`` is a
+# context line above ``=== new ===``: not stored — B-300 test acceptance 11-16), and, user
+# 11-16: a user answer / agreement whose ``turn`` is an assistant line directly followed by a
+# new-segment user line is re-anchored to that user line and checked again —
+# ``turn_reanchored_context`` (the assistant line was the last context line) /
+# ``turn_reanchored_in_segment`` (it was in the new segment too); passed: stored as
+# user-confirmed, pointer on that line. Sum them with ``check=~"turn_reanchored_.*"``.
 _memory_extraction_check_total = expert_work_counter(
     "expert_work_memory_extraction_check_total",
     "Extraction results the program changed after checking them, by pass and check (B-300).",
@@ -587,13 +587,15 @@ def record_memory_extraction_check(*, pass_name: str, check: str) -> None:
     ``event_date_dropped``,
     ``context_line_dropped`` (the memory's ``turn`` is a context line: dropped, both passes;
     replaces ``downgraded_context_line``, B-300 test acceptance 11-16). Second pass only,
-    user 11-16 「这种情况照旧保存」「按用户确认重新核对」: a ``user_answer`` /
-    ``user_agreement`` whose ``turn`` is the last context line, an ``[assistant]`` line
-    directly followed by the first new-segment line, a ``[user]`` line, is re-anchored to that
-    user line and checked like any user answer — ``context_line_reanchored`` (stored as
-    ``user_confirmed`` with that line's evidence pointer, in the new segment; time and
-    event-date checks from that line). Failing the check, it is dropped
-    (``context_line_dropped``) like every other context-line item."""
+    user 11-16 「这种情况照旧保存」「按用户确认重新核对」「同一批里也改指」: a
+    ``user_answer`` / ``user_agreement`` whose ``turn`` is an ``[assistant]`` line directly
+    followed by a new-segment ``[user]`` line that passes the usual check is re-anchored to
+    that user line — stored as ``user_confirmed`` with that line's evidence pointer, in the
+    new segment, time and event-date checks from that line; counted as
+    ``turn_reanchored_context`` when the assistant line was the last context line, otherwise
+    ``turn_reanchored_in_segment`` (the same output gives the same row however the write-back
+    is sliced). Any other context-line item is dropped (``context_line_dropped``); any other
+    in-segment assistant-line answer keeps ``downgraded_not_user_line``."""
     _memory_extraction_check_total.labels(extraction_pass=pass_name, check=check).inc()
 
 
