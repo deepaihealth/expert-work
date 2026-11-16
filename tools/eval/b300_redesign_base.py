@@ -200,8 +200,8 @@ GROUNDED_WORDING = (
     "understood. Content must be supported by the user line and the assistant line right above "
     "it. Send dates and other user lines may supply time and references. A fact that appears "
     "only in other assistant lines, activity lines or tool results counts as added. "
-    "Statements about the exchange itself (that the assistant asked, proposed or recorded it) "
-    "are not added facts."
+    "Saying that the assistant asked, proposed or recorded the value is not an added fact; "
+    "what was asked, proposed, recorded or agreed must still be supported by the two lines."
 )
 #: 证据的上限(审查 LOW):单行至多这么多字,整段至多这么多字;超了截短 / 丢最早的上下文行,写明丢了什么。
 EVIDENCE_LINE_CAP = 1_000

@@ -304,9 +304,12 @@ def test_copied_detail_from_another_assistant_line_is_outside_the_anchor_pair() 
 def test_grounded_wording_does_not_count_statements_about_the_exchange() -> None:
     """用户在 gate-01 / gate-05 上答「是」:「助手记下了」这类说这次往来本身的话不算多加的事实。"""
     assert (
-        "Statements about the exchange itself (that the assistant asked, proposed or recorded "
-        "it) are not added facts." in base.GROUNDED_WORDING
+        "Saying that the assistant asked, proposed or recorded the value is not an added fact; "
+        "what was asked, proposed, recorded or agreed must still be supported by the two lines."
+        in base.GROUNDED_WORDING
     )
+    # 收窄(终审 LOW):不再泛泛地说「说这次往来本身的话」
+    assert "Statements about the exchange itself" not in base.GROUNDED_WORDING
 
 
 def test_cap_keeps_the_line_right_above_the_named_user_line() -> None:
