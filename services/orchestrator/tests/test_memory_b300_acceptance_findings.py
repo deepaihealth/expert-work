@@ -1020,7 +1020,7 @@ async def test_identical_content_from_the_same_message_counts_as_same_evidence()
 
 
 def _named_in_one_segment(next_line: ExtractionLine | None = None) -> list[ExtractionLine]:
-    """同样四行,都在新段里(积压 / 重试一次覆盖了几轮)。"""
+    """同样四行,都在新段里(一个写回任务覆盖了几轮,例如对话的第一个任务按 30 天窗起算)。"""
     return [replace(line, context=False) for line in _named_across_the_mark(next_line)]
 
 
