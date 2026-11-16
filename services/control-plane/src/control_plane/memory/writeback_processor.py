@@ -150,10 +150,33 @@ def config_error(exc: BaseException) -> BaseException | None:
     return None
 
 
-def _config_error_outcome(error: BaseException | str) -> WritebackOutcome:
+def _error_chain(exc: BaseException) -> str:
+    """整条错误链(外层包装 → ``last_exc`` → ``__cause__`` …),每层「类名: 消息」,给日志用。"""
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(f"{type(current).__name__}: {str(current)[:200]}")
+        if isinstance(current, AllProvidersExhaustedError):
+            current = current.last_exc
+        else:
+            current = current.__cause__
+    return " -> ".join(parts)
+
+
+def _config_error_outcome(
+    error: BaseException | str, chain: BaseException | None = None
+) -> WritebackOutcome:
     record_memory_writeback_segment(event="config_error")
     reason = error if isinstance(error, str) else type(error).__name__
-    logger.warning("memory.writeback_processor.config_error reason=%s — no retry", reason)
+    # 审查 LOW-3:判定只看 ``AllProvidersExhaustedError.last_exc`` 那一层;日志写下整条链,误判时
+    # 看得出是哪一家、哪一层报的。
+    logger.warning(
+        "memory.writeback_processor.config_error reason=%s chain=%s — no retry",
+        reason,
+        _error_chain(chain) if chain is not None else reason,
+    )
     return WritebackOutcome(written_count=0, failed=True, note=f"config error: {reason}")
 
 
@@ -276,7 +299,7 @@ class MemoryWritebackProcessor:
             found = config_error(exc)
             if found is None:
                 raise
-            return _config_error_outcome(found)
+            return _config_error_outcome(found, exc)
 
     async def _segment_start(self, job: MemoryWritebackJob, read: int) -> SegmentStart | None:
         """§8.1 —— 本段从哪里起;``None`` = 同一 ``message_count`` 已有别的任务做完,本段为空。"""

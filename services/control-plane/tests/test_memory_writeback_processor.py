@@ -778,6 +778,29 @@ async def test_a_config_class_error_finishes_without_a_retry(exc: Exception) -> 
 
 
 @pytest.mark.asyncio
+async def test_a_config_class_decision_logs_the_whole_error_chain(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """审查 LOW-3:判成配置类时只看 ``last_exc``;日志里写下整条错误链(外层包装、``last_exc``、
+    原因),出了误判能从日志里看出是哪一家、哪一层。"""
+    h = _Harness()
+    await h.add_agent(_spec())
+    await h.checkpoint(_TURN_1)
+    cause = LLMAuthError("refresh did not help for glm-key-2")
+    cause.__cause__ = LLMUnauthorizedError("401 from glm")
+    h.caller = _RaisingCaller(AllProvidersExhaustedError(cause))  # type: ignore[assignment]
+
+    with caplog.at_level("WARNING", logger="expert_work.control_plane.memory.writeback_processor"):
+        outcome = await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_held=_yes)
+
+    assert outcome.failed is True
+    [record] = [r for r in caplog.records if "config_error" in r.getMessage()]
+    message = record.getMessage()
+    for part in ("AllProvidersExhaustedError", "LLMAuthError", "glm-key-2", "LLMUnauthorizedError"):
+        assert part in message, part
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("exc", _RETRYABLE, ids=lambda e: type(e).__name__)
 async def test_any_other_error_goes_to_the_task_retry(exc: Exception) -> None:
     h = _Harness()
