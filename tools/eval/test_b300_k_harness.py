@@ -151,14 +151,14 @@ def _line(cls: str, metric: str) -> rep.PassLine:
 def test_k_lines_match_the_design() -> None:
     """§11.3 第 9 版各线、§11.1 第 2 步闸门多看的三样:(比法, 线, 逐领域, 应有单元数)。"""
     expect = {
-        ("G-K-a", "retired_to_new"): ("min", 8, None, 10),
+        ("G-K-a", "retired_to_new"): ("min", 6, None, 8),
         ("G-K-b", "x_still_valid"): ("min", 9, None, 10),
         ("G-K-n2", "x_retired"): ("max", 0, None, 10),
         ("G-K-cp", "x_retired"): ("max", 0, None, 10),
         ("G-ALL", "write_guarantee_broken"): ("max", 0, None, 1),
         ("G-ALL", "reconcile_reply_error"): ("max", 0, None, 40),
-        ("K-a", "retired_to_new"): ("min", 24, 4, 30),
-        ("K-a", "missed"): ("max", 3, None, 30),
+        ("K-a", "retired_to_new"): ("min", 19, None, 24),  # 用户 11-16:带日期的 6 个单元剔出
+        ("K-a", "missed"): ("max", 2, None, 24),
         ("K-ap", "new_valid"): ("min", 24, None, 30),
         ("K-b", "x_still_valid"): ("min", 27, None, 30),
         ("K-b", "hedge_kept"): ("min", 24, None, 30),
@@ -205,6 +205,29 @@ def test_k_lines_match_the_design() -> None:
         assert (line.op, line.total, line.per_domain, line.expected_n) == (op, total, per_domain, n)
         assert line.status == krep.APPROVED_V9, (cls, metric)
     assert _line("S7", "conclusion_confirmed").expected_n == 30  # 审查 M-1:15 次加到 30 次
+
+
+def test_k_a_line_counts_only_the_undated_units() -> None:
+    """K-a 的线是 24 个单元(10 个场景里 2 个带事件日期的不进线);闸门里是 8 个。逐领域按比例:
+    6 个单元的领域要 4 个、3 个单元的要 2 个。"""
+    plain = [s for s in K if s.cls == "K-a" and s.variant != "dated"]
+    line = _line("K-a", "retired_to_new")
+    assert line.expected_n == len(plain) * plan.REPEATS == 24
+    assert _line("G-K-a", "retired_to_new").expected_n == len(plain) == 8
+    assert line.per_domain is None and line.per_domain_share == pytest.approx(2 / 3)
+    sizes = {"office": 6, "aftercare": 6, "club": 6, "study": 3, "household": 3}
+
+    def verdict(bad: dict[str, int]) -> str:
+        rows = [(d, i < bad.get(d, 0)) for d, n in sizes.items() for i in range(n)]
+        return str(rep.judge_line(line, rows)["verdict"])
+
+    assert verdict({}) == "pass"
+    assert verdict({"office": 2, "study": 1, "household": 1, "club": 1}) == "pass"  # 19 / 24
+    assert verdict({"study": 2}) == "fail"  # 3 个单元的领域只做到 1 个
+    assert verdict({"office": 3}) == "fail"  # 6 个单元的领域只做到 3 个
+    assert verdict({"office": 2, "aftercare": 2, "club": 2}) == "fail"  # 18 / 24
+    other = _line("K-b", "x_still_valid")
+    assert other.per_domain_share is None
 
 
 def test_good_metrics_are_the_min_lines() -> None:
@@ -630,3 +653,117 @@ def test_on_v9_code_a_denied_summary_is_marked_then_rewritten_in_place() -> None
     assert [i.check for i in items] == ["b_still_in_summary", "ac_lost"]
     assert f"- {rewritten}" in items[0].prompt
     assert out["neighbour_retired"] is False and out["write_guarantee_broken"] is False
+
+
+# --------------------------------------------------------------------------- 用户 11-16 定的四件
+
+
+def test_dated_k_a_units_are_reported_but_not_judged_on_the_line(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    dated = next(s for s in K if s.cls == "K-a" and s.variant == "dated")
+    plain = _k("K-a")
+    y = ks.item_of(dated).y.memory
+    _write(out, "k", [_record(dated, "d1", [_mem("n1", y)]), _record(plain, "p1", [])])
+    body = cli.report(out, None)
+    assert body["lines"]["K-a.retired_to_new"]["glm"]["n"] == 1
+    assert body["lines"]["K-a.missed"]["glm"]["n"] == 1
+    counts = body["counts"]["k"]
+    assert (counts["K-a.dated_units"], counts["K-a.dated_coexists"]) == (1, 1)
+    assert body["lines"]["ALL-K.neighbour_retired"]["glm"]["n"] == 2
+
+
+def test_report_splits_k_s_failures_by_where_the_unit_stopped(tmp_path: Path) -> None:
+    """K-s 否认那一半不达标的次数按原因分开:被程序挡下(没进同格前 2 名等)与重写本身错。"""
+    out = tmp_path / "out"
+    s = next(x for x in K if x.cls == "K-s" and x.variant == "deny")
+    trio = ks.item_of(s).trio
+
+    def unit(key: str, *, flagged: bool, outcomes: list[str]) -> dict[str, Any]:
+        rec = _record(s, key, [_mem(f"{key}-n", "denial")])
+        for row in rec["result"]["memories"]:
+            if row["id"] == f"{key}-summary":
+                row.update(origin=None, consolidated_from=[f"{key}-a", f"{key}-b", f"{key}-c"])
+        material = {
+            "candidates": [
+                {
+                    "index": 0,
+                    "content": "denial",
+                    "source": "stated in user messages",
+                    "existing": [{"id": "e0", "content": trio.summary}],
+                }
+            ]
+        }
+        reply = {"ops": [{"index": 0, "op": "ADD", "replaces": ["e0"]}]}
+        call = {"kind": "reconcile", "input": json.dumps(material), "reply": json.dumps(reply)}
+        before = {"summary_live": True, "summary_flagged": flagged}
+        rec["result"]["rounds"] = [
+            {"calls": [call], "rewrite": {"ran": True, "outcomes": outcomes, "before": before}}
+        ]
+        return rec
+
+    digest = rep.a_judge_wording_digest()
+    verdicts = [
+        {"key": f"{k}|b_still_in_summary", "verdict": True, "wording_digest": digest}
+        for k in ("s1", "s2", "s3")
+    ]
+    records = [
+        unit("s1", flagged=False, outcomes=[]),
+        unit("s2", flagged=False, outcomes=[]),
+        unit("s3", flagged=True, outcomes=["rewritten"]),
+    ]
+    _write(out, "k", records, verdicts)
+    body = cli.report(out, None)
+    counts = body["counts"]["k"]
+    assert body["lines"]["K-s.b_still_in_summary"]["glm"]["bad"] == 3  # 线的判定照旧
+    assert counts["K-s.b_still_in_summary_bad_listed_blocked"] == 2
+    assert counts["K-s.b_still_in_summary_bad_rewritten"] == 1
+    assert (counts["K-s.deny_listed_blocked"], counts["K-s.deny_rewritten"]) == (2, 1)
+    text = "\n".join(body["disclosures"])
+    assert "deny_listed_blocked" in text and "名次" in text
+
+
+def test_labels_todo_turns_finished_records_into_a_list_to_label(tmp_path: Path) -> None:
+    """校准要的人工标注:不调模型,把跑出来的记录变成待标清单(题型、领域、题目、空着的标注)。"""
+    out = tmp_path / "out"
+    records = []
+    for n, s in enumerate(x for x in K if x.cls in {"K-b", "K-p"}):
+        memory = ks.item_of(s).hedge_memory if s.cls == "K-b" else ks.item_of(s).compound.deny_b
+        retire: dict[str, str | None] | None = {"x": f"k{n}-n"} if s.cls == "K-p" else None
+        records.append(_record(s, f"k{n}", [_mem(f"k{n}-n", memory)], retire=retire))
+    _write(out, "k", records)
+    todo = tmp_path / "todo.jsonl"
+    lines: list[str] = []
+    assert (
+        cli.main(
+            ["labels-todo", "--out", str(out), "--phase", "k", "--write", str(todo)],
+            emit=lines.append,
+        )
+        == 0
+    )
+    summary = json.loads(lines[0])
+    assert summary["items"] == 20 and summary["by_check"] == {"half": 10, "hedge": 10}
+    assert summary["suggested"] == 20 and set(summary["suggested_by_domain"].values()) == {4}
+    assert {"fuller", "summary", "grounded"} <= set(summary["checks_without_items"])
+    assert summary["wording_digest"] == rep.a_judge_wording_digest()
+    rows = [json.loads(x) for x in todo.read_text(encoding="utf-8").splitlines()]
+    assert all(r["label"] is None and rep.wording_in_prompt(r["prompt"]) for r in rows)
+    assert {r["check"] for r in rows} == {"hedge", "half"}
+    labelled = [{**r, "label": i % 2 == 0} for i, r in enumerate(rows) if r["suggested"]]
+    phases.check_labels(labelled)  # 标完的那 20 条直接过校准的入口检查
+
+
+def test_labels_todo_suggests_at_most_four_per_domain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    b = [s for s in K if s.cls == "K-b" and s.domain == "office"]
+    records = [
+        _record(s, f"k{n}-{r}", [_mem(f"k{n}-{r}-n", ks.item_of(s).hedge_memory)])
+        for n, s in enumerate(b)
+        for r in range(3)
+    ]
+    _write(out, "k", records)
+    summary = cli.labels_todo(out, ["k"], tmp_path / "todo.jsonl", 20)
+    assert summary["items"] == 6 and summary["suggested_by_domain"] == {"office": 4}
+    monkeypatch.setattr(rep, "label_check", lambda _prompt: None)  # 认不出题型的题不进清单
+    assert cli.labels_todo(out, ["k"], tmp_path / "todo.jsonl", 20)["items"] == 0

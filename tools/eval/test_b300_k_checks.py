@@ -113,12 +113,19 @@ def test_k_a_needs_the_old_row_retired_and_linked_to_the_new_valid_row() -> None
     assert _check(s, [], retire={"x": "seed-near1"})["retired_to_new"] is False  # 连到近邻不算
 
 
-def test_k_a_dated_scenarios_are_counted_apart() -> None:
+def test_k_a_dated_scenarios_stay_out_of_the_line_and_are_only_counted() -> None:
+    """用户 11-16:带事件日期的 2 个场景不进 K-a 的线,单独报数、不设线。"""
     s = _s("K-a", "dated")
-    counts = _check(s, [_row("n1", _y(s))])["counts"]
-    assert counts["dated_coexists"] == 1 and counts["dated_retired"] == 0
-    assert _check(s, [_row("n1", _y(s))], retire={"x": "n1"})["counts"]["dated_retired"] == 1
-    assert "dated_retired" not in _check(_s("K-a", ""), [_row("n1", _y(s))])["counts"]
+    coexist = _check(s, [_row("n1", _y(s))])
+    assert "retired_to_new" not in coexist and "missed" not in coexist
+    counts = coexist["counts"]
+    assert (counts["dated_units"], counts["dated_coexists"], counts["dated_retired"]) == (1, 1, 0)
+    done = _check(s, [_row("n1", _y(s))], retire={"x": "n1"})["counts"]
+    assert (done["dated_retired"], done["dated_retired_to_new"]) == (1, 1)
+    assert _check(s, [])["counts"]["dated_missed"] == 1
+    plain = _check(_s("K-a", ""), [_row("n1", _y(s))])
+    assert "dated_units" not in plain["counts"] and plain["retired_to_new"] is False
+    assert "neighbour_retired" in coexist  # 近邻照样量
 
 
 def test_k_a_prime_only_lines_the_new_value_and_counts_the_rest() -> None:
@@ -535,7 +542,42 @@ def test_every_class_yields_only_known_metrics(cls: str) -> None:
     lined = {(c, m) for c, m, *_rest in krep.K_LINES}
     for s in (x for x in K if x.cls == cls):
         out = _check(s, [_row("n1", "anything")], rewrite=_before())
-        metrics = {k for k in out if k not in {"missing", "counts"}} | set(out["missing"])
+        metrics = {k for k in out if k not in kchk.INFO_KEYS} | set(out["missing"])
         for metric in metrics:
             target = kchk.AGGREGATE.get(metric, cls)
             assert (target, metric) in lined, (cls, metric)
+
+
+# --------------------------------------------------------------------------- K-s:卡在哪一步
+
+
+def _summary_call(s: sc.Scenario, listed: bool) -> dict[str, Any]:
+    existing = [x.content for x in s.seeds]
+    at = next(n for n, x in enumerate(s.seeds) if x.key == "summary")
+    return _reconcile(
+        0, "denial", existing, {"op": "ADD", "replaces": [f"e{at}"] if listed else []}
+    )
+
+
+def test_k_s_denial_tells_where_each_unit_stopped() -> None:
+    """用户 11-16:K-s 的不达标要分得出「被名次等规则挡下」与「重写本身错」。"""
+    s = _s("K-s", "deny")
+    said = _row("n1", "denial")
+
+    def cause(listed: bool, flagged: bool, outcomes: list[str]) -> str:
+        rewrite = {**_before(flagged=flagged), "outcomes": outcomes}
+        out = _check(s, [said], calls=[_summary_call(s, listed)], rewrite=rewrite)
+        assert out["counts"][f"deny_{out['info']['cause']}"] == 1
+        return str(out["info"]["cause"])
+
+    assert cause(False, False, []) == "not_listed"
+    assert cause(True, False, []) == "listed_blocked"  # 模型列了、程序没让打标(名次等)
+    assert cause(True, True, []) == "marked_not_rewritten"
+    assert cause(True, True, ["failed"]) == "marked_not_rewritten"
+    assert cause(True, True, ["unchanged"]) == "marked_not_rewritten"
+    assert cause(True, True, ["rewritten"]) == "rewritten"
+    assert cause(True, True, ["emptied"]) == "rewritten"
+    assert {cause(True, True, ["rewritten"]), "not_listed", "listed_blocked"} <= set(
+        kchk.SUMMARY_CAUSES
+    )
+    assert "info" not in _check(_s("K-s", "restate"), [], rewrite=_before())

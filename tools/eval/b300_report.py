@@ -547,6 +547,8 @@ class PassLine:
     status: str
     expected_n: int
     vendors: str = "each"  # "each" | "consolidation"
+    #: ``min`` 线:每个领域做到的比例不低于它(各领域单元数不一样时用,代替 ``per_domain``)。
+    per_domain_share: float | None = None
 
 
 _A_N, _B_N, _C_N = 30, 30, 15
@@ -613,7 +615,16 @@ LINES: tuple[PassLine, ...] = (
     PassLine("C5", "violation", "max", 1, None, PENDING, _C_N),
     *REDESIGN_LINES,
     *(
-        PassLine(cls, metric, op, total, per_domain, krep.APPROVED_V9, n)
+        PassLine(
+            cls,
+            metric,
+            op,
+            total,
+            per_domain,
+            krep.APPROVED_V9,
+            n,
+            per_domain_share=krep.PER_DOMAIN_SHARE.get((cls, metric)),
+        )
         for cls, metric, op, total, n, per_domain in krep.K_LINES
     ),
 )
@@ -635,6 +646,12 @@ def judge_line(
         ok = good >= line.total and all(
             (n_domain[d] - by_domain[d]) >= (line.per_domain or 0) for d in n_domain
         )
+        if line.per_domain_share is not None:  # 各领域单元数不一样时按比例(K-a)
+            ok = ok and all(
+                (n_domain[d] - by_domain[d])
+                >= math.ceil(line.per_domain_share * n_domain[d] - 1e-9)
+                for d in n_domain
+            )
         shown = {"good": good}
     elif line.op == "rate_max":
         ok = bad <= math.floor(line.total * n + 1e-9) and all(

@@ -361,6 +361,28 @@ def _late(
     out["counts"]["earlier_not_stored"] += int(not earlier)
 
 
+#: K-s 否认的那一半,每个单元走到了哪一步(``b300_outcomes`` 按它把不达标的次数分开报)。
+SUMMARY_CAUSES = ("not_listed", "listed_blocked", "marked_not_rewritten", "rewritten")
+_REWRITTEN = frozenset({"rewritten", "emptied", "collided"})
+
+
+def _summary_cause(
+    result: Mapping[str, Any], summary: str, marked: bool, rewrites: Sequence[Mapping[str, Any]]
+) -> str:
+    """``rewritten``:打了标、重写落了库(之后还不达标 = 重写本身错);``marked_not_rewritten``:打了
+    标、重写没落库(没调、失败、原样返回);``listed_blocked``:模型把汇总行列进了清单、程序没让
+    打标(没进同格前 2 名等,§7.1 第 6、18 行);``not_listed``:模型根本没列它。"""
+    if marked:
+        done = any(o in _REWRITTEN for r in rewrites for o in r.get("outcomes", []))
+        return "rewritten" if done else "marked_not_rewritten"
+    listed = any(
+        _norm(c) == _norm(summary)
+        for d in _reconciled(result)
+        for c in (*d["replaces"], *d["restates"])
+    )
+    return "listed_blocked" if listed else "not_listed"
+
+
 def _summary(
     out: dict[str, Any], items: list[JudgeItem], rec: Mapping[str, Any], s: Scenario, rows: Rows
 ) -> None:
@@ -378,6 +400,8 @@ def _summary(
         out["synonym_added"] = bool(rows.new_live)
         return
     out["new_stored"] = _user_statement_stored(rows)
+    out["info"] = {"cause": _summary_cause(result, trio.summary, marked, rewrites)}
+    counts[f"deny_{out['info']['cause']}"] += 1
     # 直接作废(没经重写):写回落完库、重写还没开始时,汇总行已经不是有效行
     out["summary_retired_directly"] = before.get("summary_live") is False
     if not capability(result, "summary_rewrite"):
@@ -405,11 +429,17 @@ def checks(record: Mapping[str, Any], scenario: Scenario) -> tuple[dict[str, Any
     it: ki.KItem = ks.item_of(s)
     rows, counts = Rows(result), out["counts"]
     if cls == "K-a":
-        out["retired_to_new"] = _retired_to_new(rows, "x") and bool(rows.new_with(it.y.key))
-        out["missed"] = not any(has_key(str(m.get("content", "")), it.y.key) for m in rows.new)
-        if s.variant == "dated":  # 带日期的碰上不带日期的:只报数
+        retired = _retired_to_new(rows, "x") and bool(rows.new_with(it.y.key))
+        missed = not any(has_key(str(m.get("content", "")), it.y.key) for m in rows.new)
+        if s.variant == "dated":
+            # 带日期的碰上不带日期的(用户 11-16):不进 K-a 的线,单独报数、不设线
+            counts["dated_units"] += 1
+            counts["dated_retired_to_new"] += int(retired)
             counts["dated_retired"] += int(not rows.seed_live("x"))
             counts["dated_coexists"] += int(rows.seed_live("x") and bool(rows.new_with(it.y.key)))
+            counts["dated_missed"] += int(missed)
+        else:
+            out["retired_to_new"], out["missed"] = retired, missed
     elif cls == "K-ap":
         new = rows.new_with(it.y.key)
         out["new_valid"] = bool(new)
@@ -469,3 +499,7 @@ def gate_checks(
     """回归闸门的 K 段(§11.1 第 2 步 ①):只看读库的那几条线,不送判官(等判官的指标去掉)。"""
     out, _items = checks(record, scenario)
     return {k: v for k, v in out.items() if v is not None}, []
+
+
+#: 检查里不是指标的键(``b300_outcomes`` 不把它们当线)。
+INFO_KEYS = frozenset({"missing", "counts", "info"})

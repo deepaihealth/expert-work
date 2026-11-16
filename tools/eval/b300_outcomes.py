@@ -315,6 +315,7 @@ _INFO_KEYS = frozenset(
     {
         "two_pass",
         "missing",
+        "info",
         "counts",
         "is_correction",
         "user_version",
@@ -329,6 +330,10 @@ _INFO_KEYS = frozenset(
 _ITEM_CHECK = {"pass1_statement": "statement"}
 #: 跨类合计的指标 → 报告里的类名(§11.3「误伤」;第 9 版的近邻、写的保证)。闸门里的带 ``G-`` 前缀。
 _AGGREGATE = {"collateral": "ALL", **kchk.AGGREGATE}
+
+
+#: K-s 否认那一半里按原因分开报的线(原因见 ``b300_k_checks.SUMMARY_CAUSES``)。
+_CAUSE_METRICS = frozenset({"b_still_in_summary", "ac_lost", "new_stored"})
 
 
 def _line_class(cls: str, metric: str) -> str:
@@ -368,6 +373,10 @@ def _a_outcomes(
         else:
             bad = not value if metric in good_metrics else bool(value)
         outcomes[(_line_class(cls, metric), metric, vendor)].append((domain, bad))
+        cause = (checks.get("info") or {}).get("cause")
+        if bad and cause and metric in _CAUSE_METRICS:
+            # K-s:不达标的那几次各是卡在哪一步(用户 11-16:让名次规则的真实影响看得见)
+            counts[f"{cls}.{metric}_bad_{cause}"] += 1
     for metric, field in (checks.get("missing") or {}).items():
         missing[(_line_class(cls, metric), metric, vendor)][field] += 1
     for name, n in (checks.get("counts") or {}).items():

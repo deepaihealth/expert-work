@@ -14,15 +14,16 @@ APPROVED_V9 = "已拍板(用户 11-16,重做设计第 9 版 §11.1 / §11.3)"
 #: 不超过。``G-`` = 回归闸门(各 10 个单元);``ALL-K`` = K 组全部;``ALL`` = 全部提炼段。
 K_LINES: tuple[tuple[str, str, str, float, int, float | None], ...] = (
     # §11.1 第 2 步(第 9 版):闸门多看的三样
-    ("G-K-a", "retired_to_new", "min", 8, 10, None),
+    ("G-K-a", "retired_to_new", "min", 6, 8, None),
     ("G-K-b", "x_still_valid", "min", 9, 10, None),
     ("G-K-n2", "x_retired", "max", 0, 10, None),
     ("G-K-cp", "x_retired", "max", 0, 10, None),
     ("G-ALL", "write_guarantee_broken", "max", 0, 1, None),
     ("G-ALL", "reconcile_reply_error", "max", 0, 40, None),
     # §11.3 K 组
-    ("K-a", "retired_to_new", "min", 24, 30, 4),
-    ("K-a", "missed", "max", 3, 30, None),
+    # 用户 11-16:带事件日期的 2 个场景(6 个单元)剔出 K-a 的线、单独报数;线按原 24 / 30 同比例
+    ("K-a", "retired_to_new", "min", 19, 24, None),
+    ("K-a", "missed", "max", 2, 24, None),
     ("K-ap", "new_valid", "min", 24, 30, None),
     ("K-b", "x_still_valid", "min", 27, 30, None),
     ("K-b", "hedge_kept", "min", 24, 30, None),
@@ -65,6 +66,10 @@ K_LINES: tuple[tuple[str, str, str, float, int, float | None], ...] = (
     ("B4c", "violation", "max", 0, 30, None),
     ("B4d", "violation", "max", 0, 30, None),
 )
+
+#: 各领域单元数不一样的 ``min`` 线:每个领域做到的比例不低于它。K-a 原来是「逐领域 ≥ 4 / 6」;
+#: 剔出带事件日期的场景之后有两个领域只剩 3 个单元,按同一个比例(6 个里 4 个、3 个里 2 个)。
+PER_DOMAIN_SHARE: dict[tuple[str, str], float] = {("K-a", "retired_to_new"): 2 / 3}
 
 #: §11.3「第 9 版各条线的统计力」:线的形状 → 过线时真实比例最高可以到(单侧 95%, 双侧 95% 的
 #: 上限),与用在哪。精确二项区间,数取自设计的表。
@@ -125,8 +130,17 @@ _NOTES: tuple[str, ...] = (
     "近邻:除 K-late(设计写明不种)外每个单元两条,共 17 x 30 x 2 = 1,020 条;设计 §11.3 写的"
     "「900 条」是加 K-n2、K-late、K-s 之前的数。「模型列了、被程序挡下」按「回复里列了、那一行"
     "写回后仍有效」数(counts 的 listed_blocked / listed_blocked_on_neighbour),不读进程级计数。",
-    "K-a 里内容形态是数字的 2 个场景给旧值带了事件日期(「带日期的碰上不带日期的」,§11.2a 末);"
-    "这 6 个单元照样进 K-a 的线,另在 counts 里单报(dated_retired / dated_coexists)。",
+    "K-a 里内容形态是数字的 2 个场景给旧值带了事件日期(「带日期的碰上不带日期的」,§11.2a 末)。"
+    "用户 11-16 定:这 6 个单元不进 K-a 的线,只在 counts 里报数(dated_units / "
+    "dated_retired_to_new / dated_retired / dated_coexists / dated_missed),不设线;K-a 的线按原 "
+    "24 / 30 同比例改成 19 / 24(漏记 ≤ 2 / 24),逐领域按做到的不少于三分之二(6 个单元的领域 ≥ 4、"
+    "3 个单元的 ≥ 2)。闸门里同理:8 个单元、≥ 6。",
+    "K-s 否认的那一半,场景不改、照实量(用户 11-16)。汇总行与两条近邻争「同格前 2 名」,排不进去"
+    "时模型列了它也不打标、不重写,「B 仍在汇总句里」就会不达标 —— 原因是名次规则,不是重写。所以"
+    "每个单元走到哪一步在 counts 里分开报:deny_not_listed(模型没列汇总行)、deny_listed_blocked"
+    "(列了、程序没让打标)、deny_marked_not_rewritten(打了标、重写没落库)、deny_rewritten;不达标的"
+    "次数再按这四种分:<指标>_bad_<原因>(如 b_still_in_summary_bad_listed_blocked = 被名次等规则"
+    "挡下,b_still_in_summary_bad_rewritten = 重写本身错)。线的判定照旧。",
     "K-e2 / K-w「逐字相同必须全中」的前提是提炼写出的正文与种下的那条一字不差,这由模型决定;"
     "counts 的 verbatim_extracted 报这个前提成立了几次,不成立的那几次这条线量的是模型而不是程序。",
     "写的保证只查进了去重合并模型调用的用户一方候选(材料里看得到的那些);写入扫描拦下的在本机"

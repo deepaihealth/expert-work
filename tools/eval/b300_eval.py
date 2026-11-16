@@ -53,7 +53,7 @@ import b300_scenarios as sc  # noqa: E402
 import b300_spend as spend  # noqa: E402
 import b300_steps as steps  # noqa: E402
 from b300_approve import approved, make_quote, spending, vendors_of  # noqa: E402
-from b300_outcomes import judge_items, report  # noqa: E402
+from b300_outcomes import judge_items, latest_records, report  # noqa: E402
 from b300_phases import (  # noqa: E402
     GATE_PHASES,
     INPOD_SOURCE,
@@ -219,6 +219,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--set", dest="which", choices=("a", "b"), default="b")
     _quote_args(p, stop_required=True)
     p.add_argument("--approved-quote", required=True)
+    p = sub.add_parser("labels-todo")  # 不花钱:把已经跑出来的记录变成待人工标注的清单
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--phase", action="append", required=True, choices=sorted(PHASES))
+    p.add_argument("--write", type=Path, required=True)
+    p.add_argument("--pick", type=int, default=plan.CALIBRATION_ITEMS)
     p = sub.add_parser("progress")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--write", type=Path, required=True)
@@ -482,6 +487,56 @@ def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     )
 
 
+# --------------------------------------------------------------------------- 待标清单
+
+
+def labels_todo(out: Path, names: Sequence[str], write: Path, pick: int) -> dict[str, Any]:
+    """校准要的人工标注从哪来(不调模型、不花钱):把 ``out`` 里这几段**已经跑出来**的记录变成判官
+    题,写成待标清单 —— 每行 ``key`` / ``check``(题型)/ ``domain`` / ``prompt`` / ``label``(空着,
+    人填 true / false)/ ``suggested``(建议先标的那 ``pick`` 条:题型轮着取、每个领域至多 4 条)。
+    人标完,把选定的 20 条(是 / 否各半、至少 5 个领域、每个至多 4 条、每种题型都有)另存一份交给
+    ``calibrate --set a --labels``。"""
+    rows: list[dict[str, Any]] = []
+    for name in names:
+        items, _facts = judge_items(out, PHASES[name])
+        domains = {key: r["domain"] for key, r in latest_records(out, name).items()}
+        for item in items:
+            domain = next((d for k, d in domains.items() if item.key.startswith(f"{k}|")), None)
+            kind = rep.label_check(item.prompt)
+            if domain is None or kind is None:
+                continue
+            row = {"key": item.key, "check": kind, "domain": domain, "prompt": item.prompt}
+            rows.append({**row, "label": None, "suggested": False})
+    per_domain: dict[str, int] = {}
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_kind.setdefault(row["check"], []).append(row)
+    picked = 0
+    while picked < pick and any(by_kind.values()):
+        for kind in sorted(by_kind):
+            queue = by_kind[kind]
+            while queue and per_domain.get(queue[0]["domain"], 0) >= 4:
+                queue.pop(0)
+            if queue and picked < pick:
+                row = queue.pop(0)
+                row["suggested"] = True
+                per_domain[row["domain"]] = per_domain.get(row["domain"], 0) + 1
+                picked += 1
+    write.write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8"
+    )
+    kinds = {k: sum(r["check"] == k for r in rows) for k in sorted({r["check"] for r in rows})}
+    needed = sorted(set().union(*CALIBRATION_CHECKS.values()) - set(kinds))
+    return {
+        "items": len(rows),
+        "by_check": kinds,
+        "suggested": picked,
+        "suggested_by_domain": dict(sorted(per_domain.items())),
+        "checks_without_items": needed,
+        "wording_digest": rep.a_judge_wording_digest(),
+    }
+
+
 # --------------------------------------------------------------------------- 入口
 
 
@@ -513,6 +568,9 @@ def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = pri
         if args.cmd == "manifests":
             for path in write_manifests(args.out, vendors_of(args.vendor)):
                 emit(str(path))
+            return 0
+        if args.cmd == "labels-todo":
+            emit(json.dumps(labels_todo(args.out, args.phase, args.write, args.pick)))
             return 0
         if args.cmd == "progress":
             body = progress(args.out)
