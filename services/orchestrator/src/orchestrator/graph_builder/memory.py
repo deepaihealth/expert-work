@@ -2526,6 +2526,8 @@ async def flush_messages_with_outcome(
                     # 去重);最后一次尝试 / 本轮内写回时,失败队列只收这一批还没写的与后面几段的。
                     record_memory_reconcile(op="reconcile_failed")
                     retry_pairs = [(str(item.kind), item.content) for item in exc.unwritten] + later
+                    # 审查 LOW-1 —— 出错前被写入扫描拦下的(「更新」的新内容)照样计数、发审计。
+                    blocked.extend(exc.blocked)
                     raise
                 to_write, written = done.direct, written + done.superseded
                 blocked.extend(done.blocked)
@@ -2543,6 +2545,11 @@ async def flush_messages_with_outcome(
     except RunCancelledError:
         raise
     except Exception as exc:
+        # 审查 LOW-1 —— 出错之前已被写入扫描拦下的,无论接下来是抛给重试还是进失败队列,都先计数、
+        # 发审计(内容是确定的,重试时同样会被拦下,那一次再记一次)。
+        await _report_blocked(
+            blocked, audit_logger, log_label, tenant_id=tenant_id, user_id=user_id, run_id=run_id
+        )
         # 重做 §7.6 —— 后台任务:出错抛给任务重试;只有最后一次尝试(给了 ``dlq``)、提炼已经
         # 成功(``extracted`` 非空 —— 提炼本身出错时它还是空的)才往下走、进失败队列。
         if raise_on_failure and (dlq is None or not extracted):
@@ -2576,19 +2583,35 @@ async def flush_messages_with_outcome(
         else:
             logger.warning("%s_failed — run unaffected", log_label, exc_info=True)
         return FlushOutcome(written=0, failed=True)
-    if blocked:
-        # LLM extracted something the strict scanner caught. The content is
-        # deterministic, so retrying fails identically: dropped, not queued.
-        logger.warning(
-            "%s_blocked count=%d — content rejected by strict scanner", log_label, len(blocked)
-        )
-        for entry in blocked:
-            record_memory_blocked(source=entry.source)
-        await _emit_blocked_audits(
-            audit_logger, blocked, tenant_id=tenant_id, user_id=user_id, run_id=run_id
-        )
+    await _report_blocked(
+        blocked, audit_logger, log_label, tenant_id=tenant_id, user_id=user_id, run_id=run_id
+    )
     logger.info("%s count=%d", log_label, written)
     return FlushOutcome(written=written, failed=bool(blocked) or extract_failed)
+
+
+async def _report_blocked(
+    blocked: Sequence[_BlockedWrite],
+    audit_logger: AuditLogger | None,
+    log_label: str,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    run_id: str | None,
+) -> None:
+    """被写入扫描拦下的:逐条计数、发审计。成功收尾与出错收尾都走这里。"""
+    if not blocked:
+        return
+    # LLM extracted something the strict scanner caught. The content is
+    # deterministic, so retrying fails identically: dropped, not queued.
+    logger.warning(
+        "%s_blocked count=%d — content rejected by strict scanner", log_label, len(blocked)
+    )
+    for entry in blocked:
+        record_memory_blocked(source=entry.source)
+    await _emit_blocked_audits(
+        audit_logger, blocked, tenant_id=tenant_id, user_id=user_id, run_id=run_id
+    )
 
 
 async def _emit_blocked_audits(
