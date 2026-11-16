@@ -2175,15 +2175,19 @@ class ExtractionReplyError(RuntimeError):
     上限截断):抛给任务重试(第 2 次起按整轮对半分块),不当成「没什么可记」。"""
 
 
-def _record_plan(plan: SlicePlan) -> None:
+def _record_plan(plan: SlicePlan, attempt: int) -> None:
+    """审查 LOW-7 —— 同一个任务每次尝试切出来的是同一段:段的计数只在第 1 次尝试记,对半分块只在
+    第一次分块的那次(第 2 次)记,重试不把计数翻倍。"""
+    if attempt == 2 and plan.halved:
+        record_memory_writeback_segment(event="halved")
+    if attempt != 1:
+        return
     if plan.straddling:
         record_memory_writeback_segment(event="straddling_turn_skipped", count=plan.straddling)
     if plan.dropped_over_cap:
         record_memory_writeback_segment(event="turns_over_cap_dropped", count=plan.dropped_over_cap)
     if plan.older:
         record_memory_writeback_segment(event="turns_older_than_window", count=plan.older)
-    if plan.halved:
-        record_memory_writeback_segment(event="halved")
     if not plan.chunks:
         record_memory_writeback_segment(event="empty")
 
@@ -2241,20 +2245,20 @@ async def _extract_two_passes(
     token: CancellationToken,
     log_label: str,
     segment: SegmentStart | None = None,
-    halves: bool = False,
+    attempt: int = 1,
     raise_on_failure: bool = False,
 ) -> tuple[list[ExtractedMemory], bool]:
     """B-300 ① —— 两次提炼(并发),产出合在一起:第一次的在前,同内容只留一条。
 
     PR S —— 只提炼 ``segment`` 之后的整轮(:func:`plan_slice`;``None`` = 整段),新段之前几行作上下文;
-    ``halves``(第 2 次起的尝试)按整轮对半切成至多两块、依次提炼。语言按整段对话里用户的文字判。
+    第 2 次起的尝试(``attempt``)按整轮对半切成至多两块、依次提炼。语言按整段对话里用户的文字判。
 
     返回 ``(产出, 是否有一次调用失败)``。``raise_on_failure``(后台任务)为假时,一次的普通失败只丢
     那一次;为真时调用失败原样抛出、回复用不了或被截断抛 :class:`ExtractionReplyError`,交给任务重试。
     取消一律原样抛出。"""
     turns = _extraction_inputs(messages, user_text_messages)
-    plan = plan_slice(turns, segment, cap=_EXTRACT_INPUT_CHAR_CAP, halves=halves)
-    _record_plan(plan)
+    plan = plan_slice(turns, segment, cap=_EXTRACT_INPUT_CHAR_CAP, halves=attempt >= 2)
+    _record_plan(plan, attempt)
     # 语言只按用户输入的文字判(附件、外部内容、助手的话都不算,B-300 ④);切片后看整段对话,
     # 否则新段只有一句「18 号」时判不出(§8.3)。
     language = detect_user_language([line.text for turn in turns for line in turn.user])
@@ -2356,7 +2360,7 @@ async def flush_messages_with_outcome(
     audit_logger: AuditLogger | None = None,
     user_text_messages: Sequence[BaseMessage] | None = None,
     segment: SegmentStart | None = None,
-    halves: bool = False,
+    attempt: int = 1,
     raise_on_failure: bool = False,
 ) -> FlushOutcome:
     """Extract durable memories from ``messages``, embed, and persist them.
@@ -2416,7 +2420,8 @@ async def flush_messages_with_outcome(
     与事件日期。
 
     B-300 重做 PR S(B-176 M2-1,§8)—— ``segment``:只提炼这个起点之后的整轮,之前的几行作上下文
-    (``None`` = 整段,内联写回模式的逃生口);``halves``:第 2 次起的尝试,按整轮对半切成至多两块。
+    (``None`` = 整段,内联写回模式的逃生口);``attempt``:这是任务的第几次尝试 —— 第 2 次起按整轮
+    对半切成至多两块;段的计数每个任务只记一次。
     ``raise_on_failure``(后台任务,§7.6):模型调用出错、回复用不了、被截断、向量化 / 去重合并 /
     写库失败一律抛给任务重试;只有同时给了 ``dlq``(最后一次尝试)、且提炼已经成功时,坏在之后的才
     交给失败队列、回 ``failed``(用户 11-15「留一半」)。为假时(本轮内写回 —— 它每次都等于最后一次
@@ -2440,7 +2445,7 @@ async def flush_messages_with_outcome(
             token=token,
             log_label=log_label,
             segment=segment,
-            halves=halves,
+            attempt=attempt,
             raise_on_failure=raise_on_failure,
         )
         # Stream Memory-Enhance (M-2) — write-filter: drop low-value memories

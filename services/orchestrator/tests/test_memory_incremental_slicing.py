@@ -421,7 +421,7 @@ async def test_a_retry_splits_the_segment_into_two_halves_of_whole_turns(
     events: list[tuple[str, int]],
 ) -> None:
     llm = _LLM()
-    await _flush(_turns(4), llm, segment=SegmentStart(message_index=0), halves=True)
+    await _flush(_turns(4), llm, segment=SegmentStart(message_index=0), attempt=2)
     first, second = llm.inputs("conversation")
     assert first.splitlines()[0] == "=== new ==="
     assert "U0" in first and "U1" in first and "U2" not in first
@@ -433,8 +433,36 @@ async def test_a_retry_splits_the_segment_into_two_halves_of_whole_turns(
 
 async def test_a_single_turn_is_retried_as_it_is() -> None:
     llm = _LLM()
-    await _flush(_turns(2), llm, segment=SegmentStart(message_index=2), halves=True)
+    await _flush(_turns(2), llm, segment=SegmentStart(message_index=2), attempt=2)
     assert len(llm.inputs("conversation")) == 1
+
+
+@pytest.mark.parametrize(
+    ("attempt", "expected"),
+    [
+        (1, [("straddling_turn_skipped", 1), ("turns_over_cap_dropped", 1)]),
+        (2, [("halved", 1)]),
+        (3, []),
+    ],
+)
+async def test_slice_counters_are_recorded_once_per_job(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[tuple[str, int]],
+    attempt: int,
+    expected: list[tuple[str, int]],
+) -> None:
+    """审查 LOW-7:同一个任务的每次尝试切出来的是同一段 —— 跨在起点上的、超长丢掉的只在第 1 次记,
+    对半分块只在第一次分块(第 2 次)记;否则重试会把计数翻几倍。"""
+    # 3 轮新段里放得下最近 2 轮(丢 1 轮),第 2 次尝试仍能对半分。
+    monkeypatch.setattr(memory_module, "_EXTRACT_INPUT_CHAR_CAP", 270)
+    messages = [
+        _user("U0"),
+        AIMessage(content="", tool_calls=[{"name": "t", "args": {}, "id": "c"}]),
+        _assistant("A0"),
+        *_turns(3, start=1),
+    ]
+    await _flush(messages, _LLM(), segment=SegmentStart(message_index=2), attempt=attempt)
+    assert events == expected
 
 
 async def test_language_comes_from_the_whole_conversation() -> None:

@@ -104,8 +104,10 @@ CallerFactory = Callable[[AgentSpec, ModelSpec, UUID], Awaitable[LLMCaller]]
 #: 展开 ``extends``(fork 的模板继承)—— 与构建时同一取法;``None`` = 原样用存的配置。
 SpecResolver = Callable[[AgentSpec], Awaitable[AgentSpec]]
 
-#: B-300 重做 §8.1 —— 没有更早的任务时,开轮时间在这么多天内的轮次是本段(任务行做完满 30 天才
-#: 删,``0162``;更早的轮次都早已收尾)。
+#: B-300 重做 §8.1 —— 没有更早的任务时,开轮时间在这么多天内的轮次是本段。这个 30 天跟着任务行的
+#: 保留期走:retention-cleanup-job 的 ``memory_writeback_job_retention_days``(默认 30,``0162``)只删
+#: 收尾满这么多天的任务行,所以「找不到更早的任务」只会发生在这之前的轮次都早已收尾的对话上。改了
+#: 那个保留期,这里要一起改(审查 LOW-7)。
 RECENT_TURNS_WINDOW = timedelta(days=30)
 
 #: §7.6 —— 配置类错误:不重试。``LLMAuthError`` 是 ``LLMServerError`` 的子类(router 把它当可重试、
@@ -362,7 +364,7 @@ class MemoryWritebackProcessor:
                     dlq=self._env.dlq if job.attempts >= self._max_attempts else None,
                     raise_on_failure=True,
                     segment=segment,
-                    halves=job.attempts >= 2,
+                    attempt=job.attempts,
                     log_label="memory.writeback_background",
                     reconcile=long_term.reconcile_writes,
                     agent_name=spec.metadata.name,
