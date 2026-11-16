@@ -287,7 +287,10 @@ class MemoryWritebackProcessor:
         if previous.message_count is not None:
             start = SegmentStart(message_index=previous.message_count)
         else:
-            start = SegmentStart(opened_since=self._clock() - RECENT_TURNS_WINDOW)
+            # 审查 LOW-4 —— 任务自己那一轮(含它最后一条消息)无论开了多久都在新段里。
+            start = SegmentStart(
+                opened_since=self._clock() - RECENT_TURNS_WINDOW, own_index=end - 1
+            )
         logger.info(
             "memory.writeback_processor.segment job_id=%s attempt=%d start=%s",
             job.id,

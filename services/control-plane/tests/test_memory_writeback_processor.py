@@ -637,6 +637,23 @@ async def test_without_an_earlier_job_only_the_last_30_days_are_extracted() -> N
 
 
 @pytest.mark.asyncio
+async def test_a_first_turn_that_ends_long_after_it_opened_is_still_extracted() -> None:
+    """审查 LOW-4:对话第一轮开在 40 天前(比如审批挂了很久才续跑完),没有更早的任务 —— 这个任务
+    自己的那一轮(含 ``message_count - 1`` 那条消息)一定是新段。"""
+    h = _Harness()
+    await h.add_agent(_spec())
+    opened = datetime.now(UTC) - timedelta(days=40)
+    await h.checkpoint([_stamped(HumanMessage("I like green tea"), opened), AIMessage("noted")])
+
+    outcome = await h.processor(
+        h.job(checkpoint_id=h.checkpoint_ids[0], message_count=2), still_held=_yes
+    )
+
+    assert outcome.written_count == 1
+    assert "green tea" in _split(h.caller.prompts[0])[1]
+
+
+@pytest.mark.asyncio
 async def test_a_message_count_already_done_by_another_job_calls_no_model() -> None:
     h = _Harness()
     await h.add_agent(_spec())

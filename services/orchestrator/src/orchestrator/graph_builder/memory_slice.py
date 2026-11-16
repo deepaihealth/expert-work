@@ -28,12 +28,15 @@ class SegmentStart:
       ``message_count``;本轮内写回取本轮的开轮消息。一轮从它之前开始、在它之后结束(起点落在一轮
       中间)→ 那一轮不进新段、计数(它属于前一个任务)。
     * ``opened_since``:没有更早的任务 —— 开轮消息的写入时间(``expert_work_created_at``)不早于它的
-      轮是新段;没有这个时间戳的算更早的。
+      轮是新段;没有这个时间戳的算更早的(不进新段、计数)。``own_index``(任务自己的最后一条消息,
+      即 ``message_count - 1``)所在的那一轮无论何时开的都是新段:第一轮可能开在很久以前(审批挂了
+      很久才续跑完),它是这个任务自己负责的那一轮(审查 LOW-4)。
 
     两样都没有 = 整段都是新段(内联写回模式,逃生口,§8.1 末)。"""
 
     message_index: int | None = None
     opened_since: datetime | None = None
+    own_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -76,12 +79,17 @@ class SlicePlan:
     straddling: int = 0
     dropped_over_cap: int = 0
     halved: bool = False
+    #: 30 天规则下开得更早、或开轮消息没有时间戳而不进新段的轮次数。
+    older: int = 0
 
 
 def _is_new(turn: Turn, start: SegmentStart) -> bool:
     if start.message_index is not None:
         return turn.first_index >= start.message_index
     if start.opened_since is not None:
+        own = start.own_index
+        if own is not None and turn.first_index <= own <= turn.last_index:
+            return True
         return turn.opened_at is not None and turn.opened_at >= start.opened_since
     return True
 
@@ -140,10 +148,11 @@ def plan_slice(
     start = start or SegmentStart()
     new = [turn for turn in turns if _is_new(turn, start)]
     straddling = sum(1 for turn in turns if _straddles(turn, start))
+    older = len(turns) - len(new) if start.opened_since is not None else 0
     kept = _cap(turns, new, cap)
     dropped = len(new) - len(kept)
     if not kept:
-        return SlicePlan(chunks=(), straddling=straddling)
+        return SlicePlan(chunks=(), straddling=straddling, older=older)
     split = halves and len(kept) > 1
     middle = (len(kept) + 1) // 2
     parts = [kept[:middle], kept[middle:]] if split else [kept]
@@ -152,6 +161,7 @@ def plan_slice(
         straddling=straddling,
         dropped_over_cap=dropped,
         halved=split,
+        older=older,
     )
 
 

@@ -302,12 +302,43 @@ async def test_without_an_earlier_job_only_recent_turns_are_new() -> None:
     assert "NOSTAMP" in above
 
 
+async def test_the_jobs_own_turn_is_new_even_if_it_opened_long_ago(
+    events: list[tuple[str, int]],
+) -> None:
+    """审查 LOW-4:第一轮开得早(审批挂了 40 天才续跑完)、对话里没有更早的任务 —— 30 天规则不能把
+    任务自己那一轮(含最后一条消息的那一轮)当成更早的丢掉;别的更早 / 没戳的轮次照旧不进、计数。"""
+    long_ago = _NOW - timedelta(days=40)
+    messages: list[BaseMessage] = [
+        _user("ANCIENT", _NOW - timedelta(days=60)),
+        _assistant("old"),
+        _user("NOSTAMP", None),
+        _assistant("x"),
+        _user("SLOWTURN", long_ago),
+        AIMessage(content="", tool_calls=[{"name": "approve", "args": {}, "id": "c"}]),
+        _assistant("done after approval"),
+    ]
+    since = _NOW - timedelta(days=30)
+    llm = _LLM()
+    await _flush(
+        messages, llm, segment=SegmentStart(opened_since=since, own_index=len(messages) - 1)
+    )
+    [rendered] = llm.inputs("user")
+    above, below = rendered.split("=== new ===")
+    assert "SLOWTURN" in below and "ANCIENT" in above and "NOSTAMP" in above
+    assert ("turns_older_than_window", 2) in events
+    # 不给 ``own_index``(老的调用方):照旧按开轮时间,这一轮也不进。
+    other = _LLM()
+    await _flush(messages, other, segment=SegmentStart(opened_since=since))
+    assert other.calls == []
+
+
 async def test_an_empty_segment_calls_no_model(events: list[tuple[str, int]]) -> None:
     llm = _LLM()
     outcome = await _flush(_turns(2), llm, segment=SegmentStart(message_index=4))
     assert llm.calls == []
     assert (outcome.written, outcome.failed) == (0, False)
-    assert ("empty", 1) in events
+    # 起点之前的轮次属于前一个任务,不算「30 天规则下更早的」。
+    assert events == [("empty", 1)]
 
 
 async def test_a_draft_turn_in_the_segment_is_skipped() -> None:

@@ -2180,6 +2180,8 @@ def _record_plan(plan: SlicePlan) -> None:
         record_memory_writeback_segment(event="straddling_turn_skipped", count=plan.straddling)
     if plan.dropped_over_cap:
         record_memory_writeback_segment(event="turns_over_cap_dropped", count=plan.dropped_over_cap)
+    if plan.older:
+        record_memory_writeback_segment(event="turns_older_than_window", count=plan.older)
     if plan.halved:
         record_memory_writeback_segment(event="halved")
     if not plan.chunks:

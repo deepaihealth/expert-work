@@ -568,7 +568,9 @@ def record_memory_writeback_segment(*, event: str, count: int = 1) -> None:
     """Add ``count`` to ``expert_work_memory_writeback_segment_total{event}`` (B-300 redesign
     PR S): ``empty`` (nothing new since the previous job — no model call),
     ``straddling_turn_skipped`` (a turn began before the start and ended after it; it belongs to
-    the previous job), ``turns_over_cap_dropped`` (older whole turns dropped to keep the segment
+    the previous job), ``turns_older_than_window`` (with no earlier job, turns opened more than
+    30 days ago or with no timestamp — left out), ``turns_over_cap_dropped`` (older whole turns
+    dropped to keep the segment
     within the extraction cap; replaces the line-level ``input_capped`` counter), ``halved`` (a
     retry split the segment into two halves), ``precompaction_flush_skipped`` (the pre-compaction
     flush no longer extracts), ``already_done`` (another job at the same message count is done),
