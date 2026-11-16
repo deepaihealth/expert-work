@@ -403,6 +403,8 @@ def test_inpod_seeds_b4d_summary_members_and_the_linked_later_statement() -> Non
     assert str(rows[ids["y"]].supersedes) == ids["summary"] and summary.invalid_at is None
     # 汇总行还没重写:走真实的那条路打了重写标记(§7.12 第 1 步),用户的新说法是有效行
     assert summary.review_flagged_at is not None and rows[ids["y"]].invalid_at is None
+    # 8b2fc1f48:汇总行自己的 supersedes 记的是打标的依据(用户的新说法),不是「它替掉了谁」
+    assert str(summary.supersedes) == ids["y"]
     listed = asyncio.run(
         store.list_flagged_summaries(tenant_id=TENANT, user_id=summary.user_id, limit=5)
     )

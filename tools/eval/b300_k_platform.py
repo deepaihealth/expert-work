@@ -31,15 +31,19 @@ ASSUMPTIONS: tuple[str, ...] = (
     "A3 记忆行的字段不变(§7.8「不需要迁移」):superseded_by / supersedes / invalid_at / "
     "consolidated_from / consolidated_into / status / review_flagged_at / occurred_on / "
     "confidence / origin。读库断言全靠这几列。",
-    "A4 supersedes 的两种含义(§7.8):被指的行仍有效 = 只是连着(并存、汇总行待重写);被指的行"
-    "已作废 = 替掉了它。历史行 = 落库时已作废(invalid_at 有值)、superseded_by 指向一条有效行。",
+    "A4 supersedes 的含义(§7.8;8b2fc1f48 核实):普通行上,被指的行仍有效 = 只是连着(并存、"
+    "汇总行待重写),被指的行已作废 = 替掉了它;**汇总行自己的 supersedes = 打标的依据那一行**"
+    "(用户的说法),不表示汇总行替掉了谁,重写出的新汇总行这一列为空。评测只读新写的普通行上的"
+    "这一列,从不把汇总行的 supersedes 当成「它替掉了谁」。历史行 = 落库时已作废(invalid_at 有值)、"
+    "superseded_by 指向一条有效行。",
     "A5 控制台更正过的 = confidence >= 1.0(effective_origin;§6.3 没改)。种子直接写 1.0。",
     "A6 汇总行与成员用 write_consolidated(tenant_id, user_id, content, embedding, source_ids, "
     "source_hashes) 种(第 9 版没改它);汇总行 status='consolidated'、带 consolidated_from,成员带 "
     "consolidated_into。",
     "A7 重写标记 = 汇总行的 review_flagged_at;由 supersede(flag_summary_ids=...) 打(只有用户一方的"
-    "新行打得上)。重写之后旧汇总行作废、superseded_by 指向新汇总行(或用户最晚的那条新说法 / 撞上"
-    "的那条),新汇总行的 consolidated_from 与旧行相同。",
+    "新行打得上;清单里每条符合条件的汇总行都打,flagged 可以有多条)。重写之后旧汇总行作废、"
+    "superseded_by 指向新汇总行(或用户最晚的那条新说法 / 撞上的那条),新汇总行的 "
+    "consolidated_from 与旧行相同、成员的 consolidated_into 改指新汇总行。",
     "A8 当场重写的入口(§7.12 第 2 步):control_plane.memory_consolidator.SummaryRewriter("
     "memory_store, aux_model, embedder, audit_logger, default_aux_model_name).rewrite_for_user("
     "tenant_id, user_id) -> list[str](各条的结果:rewritten / emptied / unchanged / collided / "

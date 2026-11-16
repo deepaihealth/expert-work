@@ -652,6 +652,12 @@ def test_on_v9_code_a_denied_summary_is_marked_then_rewritten_in_place() -> None
     fresh = rows[old["superseded_by"]]
     assert not old["live"] and fresh["live"] and fresh["content"] == rewritten
     assert fresh["consolidated_from"] == old["consolidated_from"]
+    # 8b2fc1f48:旧汇总行留着打标的依据(用户的新说法),重写出的新汇总行这一列为空
+    statement = next(m for m in result["memories"] if m["content"] == said)
+    assert old["supersedes"] == statement["id"] and fresh["supersedes"] is None
+    assert statement["supersedes"] == old["id"] and statement["live"]
+    members = [rows[i] for i in fresh["consolidated_from"]]
+    assert all(m["consolidated_into"] == fresh["id"] for m in members)
     out, items = kchk.checks({"key": "u", "result": result}, s)
     assert out["summary_retired_directly"] is False and out["new_stored"] is True
     assert out["missing"] == {} and out["counts"]["rewrite_rewritten"] == 1
