@@ -261,6 +261,8 @@ def test_evidence_is_capped_and_says_what_was_dropped() -> None:
     assert len(capped) <= base.EVIDENCE_CAP + 200
     assert "=== new ===\n[400] [user] [2026-11-16] 6.8" in capped
     assert "earlier context lines dropped" in capped
+    # 丢的是最早的上下文:离新段最近的那几行留着
+    assert "[399] [user] [2026-11-15] c399" in capped and "] c2\n" not in capped
     short = (
         "[1] [assistant] " + "y" * (base.EVIDENCE_LINE_CAP + 50) + "\n=== new ===\n[2] [user] 6.8"
     )
