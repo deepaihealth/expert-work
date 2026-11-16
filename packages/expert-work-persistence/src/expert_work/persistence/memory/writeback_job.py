@@ -71,6 +71,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
+from expert_work.common.uplift_metrics import record_memory_writeback_segment
 from expert_work.persistence.bulk_delete import count_where, delete_where
 from expert_work.persistence.models import MemoryWritebackJobRow
 
@@ -156,6 +157,12 @@ def _require_pointer(checkpoint_id: str | None, message_count: int | None) -> No
 
 def _lease_expired_error(attempts: int) -> str:
     return f"lease expired after {attempts} attempt(s)"
+
+
+def _record_reaped(count: int) -> None:
+    """B-300 重做 PR S 审查 LOW-2 —— 最后一次尝试死在半路(没走 ``fail_attempt``)、被领取时收成
+    ``failed`` 的任务:那一段就此放弃,与 worker 的 ``failed`` 结果同样要看得见。"""
+    record_memory_writeback_segment(event="lease_expired_failed", count=count)
 
 
 class MemoryWritebackJobStore(abc.ABC):
@@ -384,6 +391,7 @@ class InMemoryMemoryWritebackJobStore(MemoryWritebackJobStore):
     async def claim_next(
         self, *, now: datetime, lease_s: float, max_attempts: int
     ) -> MemoryWritebackJob | None:
+        reaped = 0
         for job in list(self._rows.values()):
             if (
                 job.status == RUNNING
@@ -391,6 +399,7 @@ class InMemoryMemoryWritebackJobStore(MemoryWritebackJobStore):
                 and job.lease_until <= now
                 and job.attempts >= max_attempts
             ):
+                reaped += 1
                 self._rows[job.id] = replace(
                     job,
                     status=FAILED,
@@ -398,6 +407,7 @@ class InMemoryMemoryWritebackJobStore(MemoryWritebackJobStore):
                     finished_at=now,
                     last_error=_lease_expired_error(job.attempts),
                 )
+        _record_reaped(reaped)
         candidates = sorted(
             (
                 j
@@ -688,7 +698,7 @@ class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
         async with self._sf() as session:
             # 到上限的过期租约先收成 failed —— 否则它永远挡着同一用户后面的任务。单独一个
             # 事务:不把这些行锁带进下面等 advisory lock 的那段。
-            await session.execute(
+            reaped = await session.execute(
                 update(_Job)
                 .where(
                     _Job.status == RUNNING,
@@ -701,7 +711,9 @@ class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
                     finished_at=now,
                     last_error=func.concat("lease expired after ", _Job.attempts, " attempt(s)"),
                 )
+                .returning(_Job.id)
             )
+            _record_reaped(len(reaped.all()))
             await session.commit()
         async with self._sf() as session:
             # ``FOR UPDATE SKIP LOCKED``:并发的领取者跳过别人已锁住的候选。

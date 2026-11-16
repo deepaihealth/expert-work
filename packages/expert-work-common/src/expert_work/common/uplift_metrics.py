@@ -572,7 +572,9 @@ def record_memory_writeback_segment(*, event: str, count: int = 1) -> None:
     within the extraction cap; replaces the line-level ``input_capped`` counter), ``halved`` (a
     retry split the segment into two halves), ``precompaction_flush_skipped`` (the pre-compaction
     flush no longer extracts), ``already_done`` (another job at the same message count is done),
-    ``config_error`` (a configuration-class error: finished without a retry)."""
+    ``config_error`` (a configuration-class error: finished without a retry),
+    ``lease_expired_failed`` (a job whose last attempt died mid-way and whose lease ran out was
+    settled ``failed`` by the next claim — its segment is abandoned)."""
     if count:
         _memory_writeback_segment_total.labels(event=event).inc(count)
 

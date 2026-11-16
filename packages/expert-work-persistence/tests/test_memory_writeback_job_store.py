@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from prometheus_client import REGISTRY
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -72,6 +73,13 @@ async def _enqueue(
         message_count=message_count,
         now=at,
     )
+
+
+def _reaped() -> float:
+    value = REGISTRY.get_sample_value(
+        "expert_work_memory_writeback_segment_total", {"event": "lease_expired_failed"}
+    )
+    return value or 0.0
 
 
 async def _claim(store: MemoryWritebackJobStore, at: datetime) -> MemoryWritebackJob | None:
@@ -242,7 +250,8 @@ async def an_expired_lease_is_reclaimed_and_fences_the_old_owner(
 async def exhausted_expired_lease_becomes_failed_and_unblocks_the_user(
     store: MemoryWritebackJobStore,
 ) -> None:
-    """(b) —— 租约过期且已到上限的任务收成 ``failed``,同一用户后面的任务接着跑。"""
+    """(b) —— 租约过期且已到上限的任务收成 ``failed``,同一用户后面的任务接着跑。审查 LOW-2:
+    这样收掉的任务(最后一次尝试死在半路、没走 ``fail_attempt``)也要计数,否则这一段丢了没人知道。"""
     tenant, user, run = uuid4(), uuid4(), uuid4()
     a1 = await _enqueue(store, tenant_id=tenant, user_id=user, at=_T0, run_id=run)
     a2 = await _enqueue(store, tenant_id=tenant, user_id=user, at=_T0 + timedelta(seconds=1))
@@ -252,7 +261,11 @@ async def exhausted_expired_lease_becomes_failed_and_unblocks_the_user(
         assert job is not None and job.id == a1 and job.attempts == attempt
         at = at + timedelta(seconds=_LEASE_S)  # crash: the lease simply runs out
 
+    before = _reaped()
     nxt = await _claim(store, at)
+    assert _reaped() == before + 1
+    await _claim(store, at)  # a second sweep reaps nothing new
+    assert _reaped() == before + 1
     assert nxt is not None and nxt.id == a2
     dead = await store.get_by_run(tenant_id=tenant, run_id=run)
     assert dead is not None
