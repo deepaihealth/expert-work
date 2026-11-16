@@ -5,8 +5,9 @@
    内容相同的两行。改:两次提炼里 ``turn`` 落在上下文行的一律丢弃、计数 ``context_line_dropped``
    (设计 §4、§5.4、§8.2:上下文行只帮助理解,由之前的任务提炼过)。``turn`` 缺失 / 越界的照旧写、
    指针留空(第一次仍是 ``user_stated``,第二次仍是 ``assistant_derived``)。唯一的例外(用户 11-16
-   「这种情况照旧保存」):用户在新段第一行回答 / 同意上下文最后一行的助手提议、``turn`` 被指在
-   助手那一行 → 照旧存成来自助手,计数 ``context_line_downgraded``。
+   「这种情况照旧保存」「按用户确认重新核对」):用户在新段第一行回答 / 同意上下文最后一行的助手
+   提议、``turn`` 被指在助手那一行 → 改挂到用户那一行照常核对,存成用户确认,计数
+   ``context_line_reanchored``(第 4 节)。
 2. 同一条用户消息被存两遍(run ``7ee5144b``):第一次存成 ``user_stated``,第二次又把它标成用户
    回答 / 同意;去重合并判「更新」,却被「候选那一行早于目标的记录时间」改成新增 —— 目标几秒前才在
    本任务第一段写下。改:① 先后按目标的**证据消息**的发送时间比(这条消息在本对话里、知道时间时;
@@ -908,24 +909,6 @@ def test_an_answer_put_on_the_last_context_assistant_line_is_reanchored_to_the_u
     assert settled.checks == ("context_line_reanchored",)
 
 
-def test_a_reanchored_answer_that_fails_the_check_is_downgraded() -> None:
-    """改挂之后核对不过(新段第一行不是用户输入,例如另一条助手消息)→ 照旧降为来自助手
-    (≤ 0.6)、指针留空、不算新段,计数 ``context_line_downgraded``;时间仍按改挂的那一行。"""
-    lines = _named_across_the_mark(
-        ExtractionLine(text="提醒:该喂猫了", tag="[assistant]", message_id="a1b", message_index=2,
-                       sent_at=_AFTER, sent_day=_AFTER.date()),
-    )  # fmt: skip
-    settled = memory_lines.settle_conversation(
-        "user_agreement", 2, _AFTER.date().isoformat(), lines, today=_TODAY
-    )
-    assert settled is not None
-    assert (settled.origin, settled.max_confidence) == ("assistant_derived", 0.6)
-    assert (settled.evidence_message_id, settled.evidence_message_index) == (None, None)
-    assert (settled.in_new_segment, settled.line_at) == (False, _AFTER)
-    assert settled.event_date == _AFTER.date()
-    assert settled.checks == ("context_line_downgraded",)
-
-
 def test_near_misses_of_the_answer_shape_are_still_dropped() -> None:
     lines = _named_across_the_mark()
     # 不是用户回答 / 同意
@@ -942,6 +925,15 @@ def test_near_misses_of_the_answer_shape_are_still_dropped() -> None:
     user_last = [lines[1], lines[0], *lines[2:]]
     assert (
         memory_lines.settle_conversation("user_agreement", 2, None, user_last, today=_TODAY) is None
+    )
+    # 新段第一行不是用户(另一条助手消息):不改挂,丢弃
+    assistant_next = _named_across_the_mark(
+        ExtractionLine(text="提醒:该喂猫了", tag="[assistant]", message_id="a1b", message_index=2,
+                       sent_at=_AFTER, sent_day=_AFTER.date()),
+    )  # fmt: skip
+    assert (
+        memory_lines.settle_conversation("user_agreement", 2, None, assistant_next, today=_TODAY)
+        is None
     )
     # 新段里没有行
     assert (
