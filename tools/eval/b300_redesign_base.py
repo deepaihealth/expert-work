@@ -31,6 +31,8 @@ class JudgeItem:
     key: str
     check: str
     prompt: str
+    #: 有据程度题的证据从哪来(审查 LOW):``exact`` / ``fallback`` / ``two-lines``;别的题为空。
+    evidence: str = ""
 
 
 #: 用户一方的来源(设计 §6.2:用户更正、用户说的、用户确认)。``user_corrected`` 不是列值(更正靠
@@ -184,14 +186,26 @@ def numbered_lines(text: str) -> dict[int, tuple[str, str]]:
 # --------------------------------------------------------------------------- 判官
 
 #: 内容「有据程度」(2602.01450 的五档;§11.4:≥ 4 算对)。只判内容 —— 来源由程序读字段。
+#: 闸门 11-16:判官看的是**提炼那一次看到的同一段**(带编号、发送日期,分隔行之上是上下文,
+#: §8.2);只给两行、不给日期与上文时,判官把正当的日期和上文里的细节当成「多加的」。
 GROUNDED_WORDING = (
-    "Rate how well a memory is supported by the two conversation lines on five levels: "
+    "Rate how well a memory is supported by the conversation lines on five levels: "
     "5 = everything it says is stated in the lines or follows directly from reading them "
     "together; 4 = supported, with only harmless rewording or obvious context added; 3 = partly "
     "supported, something is added, dropped or changed that matters; 2 = mostly not supported; "
     "1 = contradicts the lines or invents content. Keep any doubt the lines express: a memory "
-    "that states as certain what the lines leave uncertain is at most level 3."
+    "that states as certain what the lines leave uncertain is at most level 3. Each line starts "
+    "with its number and tag; a date in brackets after the tag is the day that line was sent, "
+    'and lines above "=== new ===" are earlier context shown so the lines below can be '
+    "understood. Content must be supported by the user line and the assistant line right above "
+    "it. Send dates and other user lines may supply time and references. A fact that appears "
+    "only in other assistant lines, activity lines or tool results counts as added. "
+    "Saying that the assistant asked, proposed or recorded the value is not an added fact; "
+    "what was asked, proposed, recorded or agreed must still be supported by the two lines."
 )
+#: 证据的上限(审查 LOW):单行至多这么多字,整段至多这么多字;超了截短 / 丢最早的上下文行,写明丢了什么。
+EVIDENCE_LINE_CAP = 1_000
+EVIDENCE_CAP = 8_000
 #: §11.3「不是事件却被标了事件日期」:判官判这条带事件日期的记忆是不是一次性的事。
 EVENT_DATE_WORDING = (
     "A one-time event is a value that happened or was observed on one day, such as a reading, "
@@ -204,13 +218,122 @@ def _bullets(rows: Sequence[str]) -> str:
     return "\n".join(f"- {r}" for r in rows) or "- (none)"
 
 
-def grounded_prompt(assistant_line: str, user_line: str, memories: Sequence[str]) -> str:
+_PREFIX = re.compile(r"^(\[\d+\] \[[a-z][a-z ]*\] (?:\[\d{4}-\d{2}-\d{2}\] )?)")
+
+
+def _cut(line: str) -> str:
+    """单行截短只算正文,不算行首的「[n] [tag] [date] 」(审查 LOW:与平台每行 1,000 字同口径)。"""
+    match = _PREFIX.match(line)
+    prefix = match.group(1) if match else ""
+    body = line[len(prefix) :]
+    if len(body) <= EVIDENCE_LINE_CAP:
+        return line
+    cut = len(body) - EVIDENCE_LINE_CAP
+    return f"{prefix}{body[:EVIDENCE_LINE_CAP]} [... {cut} characters cut]"
+
+
+def _line_no(line: str) -> int | None:
+    match = _LINE.match(line.strip())
+    return int(match.group(1)) if match else None
+
+
+def cap_evidence(text: str, *, keep: Sequence[int] = ()) -> str:
+    """证据截到上限:每行先截短;还超就从最早的上下文行(分隔行之上)丢起,写明丢了几行;分隔行以下的
+    行全留(那是这一次提炼的新段),``keep`` 里的行号(点名的用户行正上方那一行)也始终留着。"""
+    above, marker, below = text.partition(NEW_MARKER)
+    if not marker:
+        above, below = "", text
+    context = [_cut(x) for x in above.splitlines() if x.strip()]
+    new = [_cut(x) for x in below.splitlines() if x.strip()]
+    kept = set(keep)
+    dropped = 0
+    while len("\n".join([*context, NEW_MARKER, *new])) > EVIDENCE_CAP:
+        index = next((i for i, x in enumerate(context) if _line_no(x) not in kept), None)
+        if index is None:
+            break
+        context.pop(index)
+        dropped += 1
+    note = [f"(... {dropped} earlier context lines dropped)"] if dropped else []
+    lines = [*note, *context, NEW_MARKER, *new] if marker else new
+    return "\n".join(lines) if (dropped or lines != text.splitlines()) else text
+
+
+def grounded_prompt(
+    assistant_line: str,
+    user_line: str,
+    memories: Sequence[str],
+    *,
+    evidence: str | None = None,
+    user_line_no: int | None = None,
+) -> str:
+    """``evidence`` = 提炼那一次的输入原样(带编号、发送日期与上下文,截到上限);没有(老记录)就把助手
+    问、用户答这两行编上号给出,不带日期。``user_line_no`` = 这条记忆所依的用户行(第二次产出里的
+    ``turn``);两行时就是第 2 行。"""
+    if evidence:
+        anchor = user_line_no
+        lines = cap_evidence(evidence, keep=(anchor - 1,) if anchor else ())
+    else:
+        lines = f"{NEW_MARKER}\n[1] [assistant] {assistant_line}\n[2] [user] {user_line}"
+        anchor = 2
+    named = f"The user line is line [{anchor}].\n" if anchor else "The user line is not named.\n"
     return (
-        f"Conversation lines:\n[assistant] {assistant_line}\n[user] {user_line}\n\n"
+        f"Conversation lines:\n{lines}\n{named}\n"
         f"{GROUNDED_WORDING} Question: does any memory below reach level 4 or 5? yes = it does. "
         "Give the level you chose in the reason.\n"
         f"Memories:\n{_bullets(memories)}"
     )
+
+
+def _same(text: object) -> str:
+    return " ".join(str(text).split())
+
+
+def _turn(value: object) -> int | None:
+    """``turn`` 是整数或整数样的字符串(「3」)都认(审查 LOW);其它 = 没点名。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _last_user_line(text: str) -> int | None:
+    """这段输入里最后一条 ``[user]`` 行的行号(退路时点名用,审查 LOW);没有 = ``None``。"""
+    numbers = [n for n, (tag, _rest) in numbered_lines(text).items() if tag == "user"]
+    return max(numbers) if numbers else None
+
+
+def extraction_evidence(
+    result: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]
+) -> tuple[str | None, str, int | None]:
+    """写出这几条的那一次第二次提炼看到的输入(闸门 11-16)→ (输入, 怎么找到的, 用户行号)。
+    ① ``exact``:最近一次产出里有同样正文(两边去掉多余空白再比)的第二次提炼,行号取那一条的
+    ``turn``;② ``fallback``:产出对不上(去重合并改写过)时,取这条正文**第一次**出现在有效记忆里
+    (``live_after``)的那一轮的第二次提炼,点名那段输入里最后一条用户行;③ ``two-lines``:都没有(老
+    记录不记输入)。行号点不出来时判官题写「没有点名」。"""
+    contents = {_same(m.get("content", "")) for m in rows}
+    rounds = list(result.get("rounds", []))
+
+    def pass2_input(rnd: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        calls = [c for c in rnd.get("calls", []) if c.get("kind") == "pass2" and "input" in c]
+        return calls[-1] if calls else None
+
+    for rnd in reversed(rounds):
+        call = pass2_input(rnd)
+        if call is None:
+            continue
+        for m in parse_extraction(str(call.get("reply", ""))):
+            if _same(m.get("content", "")) in contents:
+                text = str(call["input"])
+                return text, "exact", _turn(m.get("turn")) or _last_user_line(text)
+    for rnd in rounds:
+        call = pass2_input(rnd)
+        if call is not None and contents & {_same(x) for x in rnd.get("live_after") or []}:
+            text = str(call["input"])
+            return text, "fallback", _last_user_line(text)
+    return None, "two-lines", None
 
 
 def confirmed_check(
@@ -235,8 +358,15 @@ def confirmed_check(
         out[metric] = False
         return
     out[metric] = None
-    prompt = grounded_prompt(lines[0], lines[1], [str(m["content"]) for m in rows])
-    items.append(JudgeItem(f"{record['key']}|{metric}", metric, prompt))
+    evidence, path, turn = extraction_evidence(result, rows)
+    prompt = grounded_prompt(
+        lines[0],
+        lines[1],
+        [str(m["content"]) for m in rows],
+        evidence=evidence,
+        user_line_no=turn,
+    )
+    items.append(JudgeItem(f"{record['key']}|{metric}", metric, prompt, evidence=path))
 
 
 def event_date_prompt(content: str, occurred_on: str) -> str:

@@ -278,6 +278,8 @@ async def run_judge(
                     "votes": votes_only,
                     "verdict": live.majority(votes_only),
                     "usage": [u for _v, u in got],
+                    # 有据程度题的证据从哪来(exact / fallback / two-lines,审查 LOW)
+                    **({"evidence": item.evidence} if getattr(item, "evidence", "") else {}),
                     **stamp,
                 },
             )
