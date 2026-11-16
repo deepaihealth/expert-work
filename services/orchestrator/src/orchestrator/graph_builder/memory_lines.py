@@ -6,8 +6,11 @@
 (交给去重合并的 ``in_new_segment``)。
 
 程序从不因为指针不对而丢掉一条记忆,只会让标签变弱或指针留空(§4 末)—— 唯一的例外:``turn``
-落在上下文行上的(B-300 测试验收 11-16):上下文行只帮助理解、由之前的任务提炼过,这一条丢弃、计数
-:data:`CONTEXT_LINE_DROPPED`(§8.2)。
+落在上下文行上的(B-300 测试验收 11-16):上下文行只帮助理解,它们属于更早的轮次、不归本次写回负责
+(那些轮次或已由之前的任务处理,或按切片规则有意不提炼),这一条丢弃、计数
+:data:`CONTEXT_LINE_DROPPED`(§8.2)。例外里的例外(用户 11-16「这种情况照旧保存」):用户在新段
+第一行回答 / 同意上下文最后一行的助手提议,模型却把 ``turn`` 指在助手那一行 → 照旧降为来自助手、
+指针留空,计数 :data:`CONTEXT_LINE_DOWNGRADED`。
 """
 
 from __future__ import annotations
@@ -32,6 +35,9 @@ ASSISTANT_TAG = "[assistant]"
 
 #: 产出的 ``turn`` 落在上下文行上 → 丢弃(两次提炼都是),按这个检查名计数。
 CONTEXT_LINE_DROPPED = "context_line_dropped"
+#: 第二次提炼里用户回答 / 同意的 ``turn`` 落在紧挨着新段第一行 ``[user]`` 的上下文最后一行
+#: ``[assistant]`` 上 → 照旧存成来自助手(不丢),按这个检查名计数(用户 11-16)。
+CONTEXT_LINE_DOWNGRADED = "context_line_downgraded"
 
 #: 第二次提炼里表示「用户对助手上一句的回答 / 同意」的 ``basis``(§5.2)。
 _USER_BASES = frozenset({"user_answer", "user_agreement"})
@@ -109,6 +115,17 @@ def _on_context_line(turn: object, lines: Sequence[ExtractionLine]) -> bool:
     return line is not None and line.context
 
 
+def _answered_across_the_mark(turn: object, lines: Sequence[ExtractionLine]) -> bool:
+    """``turn`` 是上下文的最后一行、是 ``[assistant]``,紧接着的新段第一行是 ``[user]``:用户的回答 /
+    同意被模型指到了它所回应的那一句上(用户 11-16「这种情况照旧保存」)。"""
+    line = _line_of(turn, lines)
+    position = cast(int, turn)  # 下一行的下标
+    if line is None or line.tag != ASSISTANT_TAG or position >= len(lines):
+        return False
+    following = lines[position]
+    return not following.context and following.tag == USER_TAG
+
+
 def _event_date(claimed: object, line: ExtractionLine | None, today: date) -> date | None:
     """能解析成 ``YYYY-MM-DD``、不晚于那一行的发送日期(那一行没有日期时不查这一条),且不晚于
     智能体时区的「今天」(``turn`` 挂不上、那一行没日期时也查;审查 L3)。"""
@@ -127,7 +144,7 @@ def _event_date(claimed: object, line: ExtractionLine | None, today: date) -> da
 
 def _downgrade_reason(turn: object, lines: Sequence[ExtractionLine]) -> str | None:
     """用户回答 / 同意挂不挂得上(§5.4):新段里的 ``[user]`` 行,上一行是 ``[assistant]``
-    (上一行可以是上下文行)。挂不上 → 原因。``turn`` 落在上下文行的在这之前已被丢弃。"""
+    (上一行可以是上下文行)。挂不上 → 原因。``turn`` 落在上下文行的在这之前已另行处理。"""
     line = _line_of(turn, lines)
     if line is None:
         return "out_of_range"
@@ -148,8 +165,10 @@ def _settle(
     today: date,
     downgraded: tuple[str, ...] = (),
 ) -> Settled:
-    line = _line_of(turn, lines)  # 不会是上下文行(调用方已丢弃)
-    pointer = evidence_pointer(line)
+    line = _line_of(turn, lines)
+    # 上下文行(只有 :data:`CONTEXT_LINE_DOWNGRADED` 那一种走到这里)不给证据指针、不算新段。
+    new_line = line if line is not None and not line.context else None
+    pointer = evidence_pointer(new_line)
     event_date = _event_date(claimed_event_date, line, today)
     checks = (
         *downgraded,
@@ -163,7 +182,7 @@ def _settle(
         evidence_message_index=pointer[1],
         event_date=event_date,
         line_at=line.sent_at if line is not None else None,
-        in_new_segment=line is not None,
+        in_new_segment=new_line is not None,
         checks=checks,
     )
 
@@ -188,8 +207,19 @@ def settle_conversation(
 ) -> Settled | None:
     """第二次提炼:``basis`` 为用户回答 / 同意且挂得上 → ``user_confirmed``(≤ 0.8);其余一律
     ``assistant_derived``(≤ 0.6),挂不上的计一次降级与原因。``turn`` 落在上下文行 → ``None``
-    (丢弃,不论 ``basis``)。"""
+    (丢弃)—— 只有用户回答 / 同意、指在紧挨新段第一行 ``[user]`` 的上下文最后一行 ``[assistant]``
+    上的照旧存成 ``assistant_derived``、指针留空,计数 :data:`CONTEXT_LINE_DOWNGRADED`。"""
     if _on_context_line(turn, lines):
+        if basis in _USER_BASES and _answered_across_the_mark(turn, lines):
+            return _settle(
+                "assistant_derived",
+                ASSISTANT_DERIVED_MAX_CONFIDENCE,
+                turn,
+                claimed_event_date,
+                lines,
+                today,
+                (CONTEXT_LINE_DOWNGRADED,),
+            )
         return None
     downgraded: tuple[str, ...] = ()
     if basis in _USER_BASES:

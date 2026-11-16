@@ -143,7 +143,10 @@ _memory_extraction_total = expert_work_counter(
 # ``turn`` / ``event_date``: ``downgraded_<reason>`` (a user answer / agreement that does
 # not anchor on a user line, so it is stored as from the assistant), ``pointer_missing``
 # (no evidence pointer), ``event_date_dropped``, ``context_line_dropped`` (``turn`` is a
-# context line above ``=== new ===``: not stored — B-300 test acceptance 11-16).
+# context line above ``=== new ===``: not stored — B-300 test acceptance 11-16),
+# ``context_line_downgraded`` (the one exception: a user answer / agreement whose ``turn`` is
+# the last context line, an assistant line right before a new-segment user line — stored as
+# from the assistant, no evidence pointer; user 11-16).
 _memory_extraction_check_total = expert_work_counter(
     "expert_work_memory_extraction_check_total",
     "Extraction results the program changed after checking them, by pass and check (B-300).",
@@ -523,11 +526,12 @@ def record_memory_reconcile(*, op: str) -> None:
     one, or a DELETE of a dated target by an undated non-correction); ``noop_other_event_date``
     = a NOOP between two memories with different event dates, written as an ADD (different
     occasions). B-300 test acceptance (11-16):
-    ``noop_same_evidence`` = a user-confirmed candidate judged a duplicate / update of a
-    user-side memory taken from the same message (a restatement: nothing written, no
-    refresh); ``blocked_update_added_confirmed`` = a user-confirmed candidate (not a
-    correction) whose UPDATE the tier rule blocked, stored next to the old memory (user
-    11-16 「被拦时与旧的并存」). ``degraded`` now only
+    ``noop_same_evidence`` = a user-confirmed candidate the model judged a duplicate (NOOP)
+    of a user-side memory taken from the same message, same event date or none (a
+    restatement: nothing written, no refresh; an UPDATE with the same evidence takes the
+    normal path, user 11-16 「只拦真重复」); ``blocked_update_added_confirmed`` = a
+    user-confirmed candidate (not a correction) whose UPDATE the tier rule blocked, stored
+    next to the old memory (user 11-16 「被拦时与旧的并存」). ``degraded`` now only
     means the model gave no usable decision for that candidate (or the UPDATE / DELETE target
     was already gone). ``reconcile_failed`` = one reconcile call failed inside (lookup, model,
     unusable reply, store error): nothing of that batch is written directly; the
@@ -573,7 +577,11 @@ def record_memory_extraction_check(*, pass_name: str, check: str) -> None:
     redesign §5.4): ``downgraded_out_of_range`` / ``downgraded_not_user_line`` /
     ``downgraded_previous_not_assistant``, ``pointer_missing``, ``event_date_dropped``,
     ``context_line_dropped`` (the memory's ``turn`` is a context line: dropped, both passes;
-    replaces ``downgraded_context_line``, B-300 test acceptance 11-16)."""
+    replaces ``downgraded_context_line``, B-300 test acceptance 11-16),
+    ``context_line_downgraded`` (second pass only, user 11-16 「这种情况照旧保存」: a
+    ``user_answer`` / ``user_agreement`` whose ``turn`` is the last context line, an
+    ``[assistant]`` line directly followed by the first new-segment line, a ``[user]`` line —
+    stored as ``assistant_derived`` with no evidence pointer instead of dropped)."""
     _memory_extraction_check_total.labels(extraction_pass=pass_name, check=check).inc()
 
 

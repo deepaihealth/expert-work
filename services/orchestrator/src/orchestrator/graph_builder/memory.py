@@ -648,14 +648,31 @@ def _extraction_inputs(
 def _message_times(
     messages: Sequence[BaseMessage], explicit_user_text: Sequence[BaseMessage]
 ) -> dict[str, datetime]:
-    """本对话里每条带日期的行(``[user]`` / ``[assistant]``)那条消息的发送时间,消息 id → UTC;与
-    提炼行的 ``line_at`` 同一个取法。去重合并比「更新」的先后时用(测试验收 run 7ee5144b)。"""
-    return {
-        line.message_id: line.sent_at
-        for turn in _extraction_inputs(messages, explicit_user_text)
-        for line in (*turn.user, *turn.conversation)
-        if line.message_id is not None and line.sent_at is not None
-    }
+    """本对话里会成为带日期的行(``[user]`` / ``[assistant]``)的消息的发送时间,消息 id → UTC;与
+    提炼行的 ``line_at`` 同一个取法。去重合并比「更新」的先后时用(测试验收 run 7ee5144b)。
+
+    审查 L-2:取**全部**消息,含被重新生成 / 编辑重发取代的(``_segments`` 会跳过它们)—— 已有
+    记忆的证据可能正指着被取代的那条。"""
+    explicit = {id(m) for m in explicit_user_text}
+    times: dict[str, datetime] = {}
+    for message in messages:
+        if not isinstance(message.id, str) or not message.id:
+            continue
+        sent = _dated_line_at(message, explicit)
+        if sent is not None:
+            times[message.id] = sent
+    return times
+
+
+def _dated_line_at(message: BaseMessage, explicit: set[int]) -> datetime | None:
+    """这条消息若成为带日期的行,那一行的发送时间(同 :func:`_turn`):用户输入看白名单,助手看
+    不带工具调用的最终回答;其余 ``None``。"""
+    if isinstance(message, HumanMessage):
+        typed = _typed_input(message, explicit)
+        return _user_sent_at(typed, message) if typed is not None else None
+    if isinstance(message, AIMessage) and not message.tool_calls and _reply_text(message).strip():
+        return _parse_stamp(message.additional_kwargs.get(STAMP_CREATED_AT))
+    return None
 
 
 def _extract_json_object(text: str) -> str | None:
@@ -1686,8 +1703,12 @@ def _evidence_at(
     target: MemoryItem, item: MemoryItem, message_times: Mapping[str, datetime]
 ) -> datetime | None:
     """目标的证据消息的发送时间(UTC):证据消息在本对话里(同一个 ``source_thread_id``)、且本次
-    写回的行里知道它的时间才有;否则 ``None``。"""
-    if target.evidence_message_id is None or target.source_thread_id != item.source_thread_id:
+    写回的行里知道它的时间才有;否则 ``None``。两边都不知道对话(``None``)不算同一对话(审查 L-4)。"""
+    if (
+        target.evidence_message_id is None
+        or item.source_thread_id is None
+        or target.source_thread_id != item.source_thread_id
+    ):
         return None
     sent = message_times.get(target.evidence_message_id)
     return as_utc(sent) if sent is not None else None
@@ -1732,16 +1753,22 @@ def _refusal(
 
 
 def _restates_same_message(item: MemoryItem, target: MemoryItem) -> bool:
-    """测试验收 run 7ee5144b —— 第二次的用户确认候选,被判成「重复 / 更新」一条有效的用户一方记忆,
+    """测试验收 run 7ee5144b —— 第二次的用户确认候选,被模型判成「重复」一条有效的用户一方记忆,
     而两者的证据是同一条消息(同一对话):是第一次已经记下的那句话的重述,不是用户又说了一次 ——
-    NOOP,不刷新确认日期。目标要在候选的召回范围内。模型判新增的(同一条消息里的另一件事)不受影响。"""
+    NOOP,不刷新确认日期。目标要在候选的召回范围内。
+
+    只管模型判「重复」的(用户 11-16「只拦真重复」):判「更新」的照常走拦截与层级(被层级拦下的
+    用户确认与旧的并存),代价是偶尔多一条换了说法的。两边事件日期不同的不算(一句话里说了两天的
+    读数,审查 M-1);两边都不知道对话的不算同一对话(审查 L-4)。"""
     return (
         effective_origin(item) == "user_confirmed"
         and item.evidence_message_id is not None
         and item.evidence_message_id == target.evidence_message_id
+        and item.source_thread_id is not None
         and item.source_thread_id == target.source_thread_id
         and effective_origin(target) in USER_SIDE_ORIGINS
         and _in_recall_scope(item, target)
+        and not _other_event_dates(item, target)
     )
 
 
@@ -1778,8 +1805,11 @@ def _agent_day_text(ts: datetime | None) -> str | None:
     return day.isoformat() if day is not None else None
 
 
-def _reconcile_material(pending: Sequence[_Pending], ids: Mapping[UUID, str]) -> dict[str, Any]:
-    """附录 B 的材料:候选与它的邻居都带类型、来源、日期、事件日期;邻居用短编号。"""
+def _reconcile_material(
+    pending: Sequence[_Pending], ids: Mapping[UUID, str], message_times: Mapping[str, datetime]
+) -> dict[str, Any]:
+    """附录 B 的材料:候选与它的邻居都带类型、来源、日期、事件日期;邻居用短编号。邻居的日期与
+    程序比「更新」先后的是同一个时间(:func:`_said_at`,审查 L-3)。"""
     return {
         "candidates": [
             {
@@ -1796,7 +1826,7 @@ def _reconcile_material(pending: Sequence[_Pending], ids: Mapping[UUID, str]) ->
                         "kind": n.kind,
                         "content": n.content,
                         "source": origin_label(n),
-                        "date": _agent_day_text(restated_at(n)),
+                        "date": _agent_day_text(_said_at(n, entry.candidate.item, message_times)),
                         "event_date": _day(n.occurred_on),
                     }
                     for n in entry.neighbors
@@ -1878,7 +1908,7 @@ async def _decide(
 ) -> tuple[dict[int, tuple[str, str | None]], dict[str, UUID]]:
     """一次模型调用;返回各候选的决定与短编号 → id。调用失败、回复用不了、被截断都抛(§7.6)。"""
     ids = _short_ids(pending)
-    material = _reconcile_material(pending, ids)
+    material = _reconcile_material(pending, ids, deps.message_times)
     with expert_work_span(ExpertWorkComponent.MEMORY, "reconcile"):
         reply = await deps.token.run_cancellable(
             llm_caller(
@@ -1979,8 +2009,9 @@ class _Progress:
 def _would_write(
     entry: _Pending, op: str, short: str | None, by_short_id: Mapping[str, UUID]
 ) -> bool:
-    """还没落完的一条候选,收尾时要不要写:与已有记忆相同的更正永远不写;判成召回范围内的重复
-    不写;其余(新增、没给决定、还没执行的更新 / 删除)按新增写。"""
+    """还没落完的一条候选,收尾时要不要写:与已有记忆相同的更正永远不写;判成召回范围内、事件日期
+    不冲突的重复不写(同一条消息的重述 :func:`_restates_same_message` 是其中一种,审查 L-1);其余
+    (新增、没给决定、还没执行的更新 / 删除)按新增写。"""
     if entry.identical:
         return False
     op, target = _resolve_target(entry, op, short, by_short_id)
@@ -2062,10 +2093,6 @@ async def _apply_decision(
         record_memory_reconcile(op="add" if op == "ADD" else "degraded")
         return _Reconciled(keep, [])
     _record_target(op, entry, target)
-    if op in ("NOOP", "UPDATE") and _restates_same_message(item, target):
-        logger.debug("%s_reconcile_same_evidence_noop", deps.log_label)
-        record_memory_reconcile(op="noop_same_evidence")
-        return _Reconciled([], [])
     if op == "NOOP":
         if not _in_recall_scope(item, target):
             record_memory_reconcile(op="noop_out_of_scope")
@@ -2074,6 +2101,10 @@ async def _apply_decision(
             # 复审 11-16(「方案三」在「重复」这条路上):事件日期不同 = 不同的两次 → 新增。
             record_memory_reconcile(op="noop_other_event_date")
             return _Reconciled(keep, [])
+        if _restates_same_message(item, target):
+            logger.debug("%s_reconcile_same_evidence_noop", deps.log_label)
+            record_memory_reconcile(op="noop_same_evidence")
+            return _Reconciled([], [])
         await _noop(candidate, target, deps)
         return _Reconciled([], [])
     refusal = _refusal(op, entry, target, deps.message_times)
