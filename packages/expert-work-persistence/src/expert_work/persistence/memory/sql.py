@@ -365,6 +365,8 @@ async def _flag_summaries(
     """B-300 redesign §7.12 step 1 — mark each (locked) summary "to rewrite"; one already
     rewritten is followed one step along ``superseded_by`` to the summary that replaced it."""
     flagged: list[UUID] = []
+    if candidate not in USER_SIDE_ORIGINS:
+        return flagged  # only the user's own later statement triggers a rewrite
     for summary_id in dict.fromkeys(ids):
         row = locked.get(summary_id)
         if row is not None and summary_id not in current:

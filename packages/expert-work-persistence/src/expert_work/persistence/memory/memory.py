@@ -488,6 +488,8 @@ class InMemoryMemoryStore(MemoryStore):
         rewritten is followed one step to the summary that replaced it."""
         load = self._member_loader(tenant_id, user_id)
         flagged: list[UUID] = []
+        if candidate not in USER_SIDE_ORIGINS:
+            return flagged  # only the user's own later statement triggers a rewrite
         for summary_id in dict.fromkeys(ids):
             row = self._current(tenant_id, user_id, summary_id)
             if row is None:

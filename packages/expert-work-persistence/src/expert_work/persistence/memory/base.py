@@ -503,7 +503,8 @@ class MemoryStore(abc.ABC):
         (``collision_replaced``) and the new row is inserted.
 
         ``flag_summary_ids`` (§7.12 step 1; the caller passes summaries the model itself
-        listed as no longer true, for a user-side candidate): each still-current summary
+        listed as no longer true, for a user-side candidate — a new row that is not on
+        the user's side flags nothing): each still-current summary
         whose members hold no console correction gets ``review_flagged_at=now``; one that
         was rewritten meanwhile is followed one step along ``superseded_by`` to the
         current summary. Only when the new row is inserted.

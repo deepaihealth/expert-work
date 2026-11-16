@@ -368,10 +368,16 @@ async def test_the_link_to_a_flagged_summary_wins_over_a_retired_row(store: Memo
 
 @pytest.mark.parametrize(
     ("candidate", "member"),
-    [("assistant_derived", "user_stated"), ("user_stated", "corrected")],
+    [
+        ("assistant_derived", "user_stated"),
+        ("user_stated", "corrected"),
+        # 只有用户一方的新说法触发重写:助手一方的候选对成员全是助手的汇总行也不打标。
+        ("assistant_derived", "assistant_derived"),
+        (None, None),
+    ],
 )
 async def test_a_summary_is_not_flagged_when_its_members_forbid_it(
-    store: MemoryStore, candidate: str, member: str
+    store: MemoryStore, candidate: str | None, member: str | None
 ) -> None:
     t, u = uuid4(), uuid4()
     summary = await _summary(

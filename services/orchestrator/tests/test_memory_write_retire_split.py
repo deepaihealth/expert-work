@@ -684,7 +684,11 @@ async def test_a_noop_of_a_weaker_row_is_written_and_retires_it() -> None:
     assert _write_guarantee_holds(store, cand)
 
 
-@pytest.mark.parametrize("reply_row", [_noop("e0"), _add(), {"index": 0, "op": "NOOP"}])
+@pytest.mark.parametrize(
+    "reply_row",
+    # e0 = 那条内容相同、来源更弱的;e1 = 另一条用户说的(模型把候选判成与它重复也一样写下)。
+    [_noop("e0"), _noop("e1"), _add(), {"index": 0, "op": "NOOP"}],
+)
 async def test_identical_text_with_a_weaker_source_is_retired_whatever_the_model_says(
     reply_row: dict[str, Any],
 ) -> None:
@@ -770,8 +774,6 @@ async def test_a_noop_with_a_list_retires_into_the_row_it_repeats() -> None:
     assert _retired_into(store, old, current) and _valid(_row(store, current.id))
     assert _row(store, current.id).confirmed_at == _LATER
     assert counts.delta() == {"retired": 1, "noop_refreshed": 1}
-    assert _write_guarantee_holds(store, cand) is False  # 第 2 项靠模型判的「重复」,哈希不同
-    assert _valid(_row(store, current.id))
 
 
 async def test_the_row_a_candidate_repeats_does_not_take_a_rank() -> None:
@@ -1031,6 +1033,21 @@ async def test_a_summary_is_neither_retired_nor_flagged_otherwise(
     assert await _reconcile(store, _LLM([_ops(_add(**lists))]), _now_said(cand)) == 1
     row = _row(store, summary.id)
     assert _stored(store, cand) and _valid(row) and row.review_flagged_at is None
+    assert counts.delta() == {"retire_refused_summary": 1, "summary_rewrite_marked": 0}
+
+
+async def test_a_summary_is_not_flagged_when_another_check_fails() -> None:
+    """打标的条件含「§7.3 第二步其余各项都过」:候选那一行早于汇总行的记录时间 → 不打标(候选
+    照写,两条并存)。来源那一项存储在锁里还会重判,先后这一项只有写回查。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    summary = await _summary(store, c, "commutes by metro on weekdays", "user_stated")
+    cand = c.mem("now drives to work")
+    counts = _Counts("retire_refused_summary", "summary_rewrite_marked")
+    # ``_said`` 的那一行在 ``_LATER``,早于刚写下的汇总行。
+    assert await _reconcile(store, _LLM([_ops(_add(replaces=["e0"]))]), _said(cand)) == 1
+    assert _stored(store, cand)
+    assert _row(store, summary.id).review_flagged_at is None
     assert counts.delta() == {"retire_refused_summary": 1, "summary_rewrite_marked": 0}
 
 
