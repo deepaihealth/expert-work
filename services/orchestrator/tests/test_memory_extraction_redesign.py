@@ -329,7 +329,13 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
         "except passwords, one-time codes, bank card or bank account numbers and other secrets, "
         "which are never recorded." in system
     )
-    assert "- A question, a guess, a hypothetical, or a repeat of what someone else said" in system
+    # 第 9 版(附录 C):猜测别人的事照旧跳过;关于用户自己的事、带着犹豫说的,记下并把犹豫写进内容。
+    assert (
+        "- A question, a hypothetical, a guess about something that is not the user's own, or a "
+        "repeat of what someone else said is not a statement by the user: skip it. "
+        "- When the user states something about themselves or their own things with doubt "
+        '("I think", "maybe", "not sure"), record it and keep the doubt in the content.' in system
+    )
 
 
 @pytest.mark.parametrize("which", ["user", "conversation"])

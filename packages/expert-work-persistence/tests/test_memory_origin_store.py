@@ -33,9 +33,6 @@ from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.memory.base import (
     ConsolidationSourcesChangedError,
     MemoryStore,
-    OriginStanding,
-    UserSideHigherConfidenceError,
-    UserSideTargetError,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
@@ -45,12 +42,6 @@ ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 _MODEL = "vendor-a/embed-v2"
 _NEW_MODEL = "vendor-b/embed-v3"
 _T0 = datetime(2026, 11, 1, tzinfo=UTC)
-#: B-300 重做 §6.3 —— 来自助手的候选(层级 0);用户说的候选按 ``_stated(x)``(层级 2)。
-_ASSISTANT = OriginStanding(tier=0, confidence=0.6)
-
-
-def _stated(confidence: float) -> OriginStanding:
-    return OriginStanding(tier=2, confidence=confidence)
 
 
 def _vec(*head: float) -> tuple[float, ...]:
@@ -133,8 +124,8 @@ async def test_supersede_writes_the_new_rows_origin_and_model(store: MemoryStore
     new = _item(t, u, "new", origin="assistant_derived").model_copy(
         update={"embedding_model": _NEW_MODEL}
     )
-    written = await store.supersede(tenant_id=t, user_id=u, old_id=old.id, new_item=new)
-    assert written is not None
+    written = await store.supersede(tenant_id=t, user_id=u, old_ids=[old.id], new_item=new)
+    assert written.inserted
     got = await _row(store, t, u, new.id)
     assert (got.origin, got.embedding_model) == ("assistant_derived", _NEW_MODEL)
 
@@ -295,22 +286,19 @@ async def test_update_content_sets_origin_and_caps_confidence_on_request(
     assert got_other.confidence == pytest.approx(0.99)
 
 
-# ─── 审查 MEDIUM-1 / MEDIUM-3:取代 / 作废前在锁里重判目标的来源 ─────────────────
+# ─── 审查 MEDIUM-1 / MEDIUM-3、重做第 9 版 §7.8:退之前在锁里按来源重判 ─────────────
 
 
 async def _assert_untouched(store: MemoryStore, t: UUID, u: UUID, target: MemoryItem) -> None:
     rows = await store.list_for_user(tenant_id=t, user_id=u, limit=50)
     [row] = [r for r in rows if r.id == target.id]
     assert (row.invalid_at, row.expired_at, row.superseded_by) == (None, None, None)
-    assert not [r for r in rows if r.supersedes == target.id]
 
 
 @pytest.mark.asyncio
-async def test_guarded_supersede_refuses_a_target_corrected_after_it_was_read(
-    store: MemoryStore,
-) -> None:
-    """读邻居时是「来自助手、0.5」,判的那几秒里用户点了「更正」(原地改成 1.0):带保护的
-    取代与作废都在锁里重判、抛专门的错误、什么都不改。"""
+async def test_a_target_corrected_after_it_was_read_is_not_retired(store: MemoryStore) -> None:
+    """读邻居时是「来自助手、0.5」,判的那几秒里用户点了「更正」(原地改成 1.0):锁里重判,
+    旧行不退(原因 ``corrected``),新行照写。"""
     t, u = uuid4(), uuid4()
     target = _item(t, u, "read as derived", origin="assistant_derived", confidence=0.5)
     await store.write([target])
@@ -320,39 +308,33 @@ async def test_guarded_supersede_refuses_a_target_corrected_after_it_was_read(
         tenant_id=t, user_id=u, memory_id=target.id, content="corrected",
         embedding=_vec(1.0), confidence=1.0,
     )  # fmt: skip
-    with pytest.raises(UserSideTargetError):
-        await store.supersede(
-            tenant_id=t, user_id=u, old_id=target.id,
-            new_item=_item(t, u, "assistant rewrite", origin="assistant_derived"),
-            candidate_standing=_ASSISTANT,
-        )  # fmt: skip
-    with pytest.raises(UserSideTargetError):
-        await store.expire(
-            tenant_id=t, user_id=u, memory_id=target.id, candidate_standing=_ASSISTANT
-        )
+    new = _item(t, u, "assistant rewrite", origin="assistant_derived")
+    got = await store.supersede(tenant_id=t, user_id=u, old_ids=[target.id], new_item=new)
+    assert got.inserted and dict(got.refused) == {target.id: "corrected"}
     await _assert_untouched(store, t, u, target)
     assert (await _row(store, t, u, target.id)).content == "corrected"
 
 
 @pytest.mark.asyncio
-async def test_guard_lets_assistant_and_unrecorded_targets_through(store: MemoryStore) -> None:
+async def test_assistant_and_unrecorded_targets_are_retired(store: MemoryStore) -> None:
     t, u = uuid4(), uuid4()
     derived, unrecorded = _item(t, u, "d", origin="assistant_derived"), _item(t, u, "n")
     await store.write([derived, unrecorded])
     new = _item(t, u, "d2", origin="assistant_derived")
     written = await store.supersede(
-        tenant_id=t, user_id=u, old_id=derived.id, new_item=new, candidate_standing=_ASSISTANT
+        tenant_id=t, user_id=u, old_ids=[derived.id, unrecorded.id], new_item=new
     )
-    assert written is not None
-    assert await store.expire(
-        tenant_id=t, user_id=u, memory_id=unrecorded.id, candidate_standing=_ASSISTANT
-    )
-    # 不带保护(用户说的候选)照旧能取代用户那一条。
+    assert set(written.retired) == {derived.id, unrecorded.id}
+    # 用户说的候选照旧能退用户说的那一条。
     stated = _item(t, u, "s", origin="user_stated")
     await store.write([stated])
-    assert await store.supersede(
-        tenant_id=t, user_id=u, old_id=stated.id, new_item=_item(t, u, "s2", origin="user_stated")
+    again = await store.supersede(
+        tenant_id=t,
+        user_id=u,
+        old_ids=[stated.id],
+        new_item=_item(t, u, "s2", origin="user_stated"),
     )
+    assert again.retired == (stated.id,)
 
 
 async def _summary(store: MemoryStore, t: UUID, u: UUID, origins: list[str | None]) -> MemoryItem:
@@ -367,168 +349,45 @@ async def _summary(store: MemoryStore, t: UUID, u: UUID, origins: list[str | Non
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("origins", "protected"),
+    ("origins", "tier"),
     [
-        (["user_stated", None, None], True),
-        (["corrected", None, None], True),
-        (["assistant_derived", "assistant_derived", None], False),
-        ([None, None, None], False),
+        (["user_stated", None, None], 2),
+        (["corrected", None, None], 3),
+        (["assistant_derived", "assistant_derived", None], 0),
+        ([None, None, None], 0),
     ],
     ids=["stated-member", "corrected-member", "assistant-and-unrecorded", "unrecorded"],
 )
-async def test_summary_is_protected_by_its_user_side_members(
-    store: MemoryStore, origins: list[str | None], protected: bool
+async def test_a_summary_takes_its_tier_from_its_members_and_is_never_retired(
+    store: MemoryStore, origins: list[str | None], tier: int
 ) -> None:
-    """MEDIUM-3(用户 11-13 定「补上保护」)—— 汇总行本身来源为空,但成员里有用户说的 /
-    用户更正的,就和用户那一条一样受保护;成员已被汇总(不再当前有效)也照样查得到。"""
+    """MEDIUM-3 —— 汇总行本身来源为空,层级按成员算(成员已被汇总、不再当前有效也照样查得到);
+    重做第 9 版 —— 写回一律不直接退汇总行,不分来源(审查 H-3),新行照写。"""
     t, u = uuid4(), uuid4()
     summary = await _summary(store, t, u, origins)
     assert summary.origin is None
-    standing = await store.origin_standing(tenant_id=t, user_id=u, memory_id=summary.id)
-    assert standing is not None
-    assert (standing.tier > 0) is protected
-    if protected:
-        with pytest.raises(UserSideTargetError):
-            await store.expire(
-                tenant_id=t, user_id=u, memory_id=summary.id, candidate_standing=_ASSISTANT
-            )
-        await _assert_untouched(store, t, u, summary)
-    else:
-        assert await store.expire(
-            tenant_id=t, user_id=u, memory_id=summary.id, candidate_standing=_ASSISTANT
-        )
+    assert await store.origin_standing(tenant_id=t, user_id=u, memory_id=summary.id) == tier
+    for origin in ("assistant_derived", "user_stated"):
+        new = _item(t, u, f"rewrite {uuid4()}", origin=origin)
+        got = await store.supersede(tenant_id=t, user_id=u, old_ids=[summary.id], new_item=new)
+        assert got.inserted and dict(got.refused) == {summary.id: "summary"}
+    await _assert_untouched(store, t, u, summary)
 
 
 @pytest.mark.asyncio
-async def test_nested_summary_inherits_protection(store: MemoryStore) -> None:
+async def test_nested_summary_inherits_its_members_tier(store: MemoryStore) -> None:
     t, u = uuid4(), uuid4()
     inner = await _summary(store, t, u, ["user_stated", None, None])
     outer = await _consolidate(
         store, [inner, _item(t, u, "o1", created_at=_T0), _item(t, u, "o2", created_at=_T0)]
     )
     assert inner.id in outer.consolidated_from
-    standing = await store.origin_standing(tenant_id=t, user_id=u, memory_id=outer.id)
-    assert standing is not None
-    assert standing.tier == 2
-    with pytest.raises(UserSideTargetError):
-        await store.supersede(
-            tenant_id=t, user_id=u, old_id=outer.id,
-            new_item=_item(t, u, "rewrite", origin="assistant_derived"),
-            candidate_standing=_ASSISTANT,
-        )  # fmt: skip
-    await _assert_untouched(store, t, u, outer)
+    assert await store.origin_standing(tenant_id=t, user_id=u, memory_id=outer.id) == 2
     plain = await _summary(store, t, u, [None, None, None])
     outer2 = await _consolidate(
         store, [plain, _item(t, u, "p1", created_at=_T0), _item(t, u, "p2", created_at=_T0)]
     )
-    standing2 = await store.origin_standing(tenant_id=t, user_id=u, memory_id=outer2.id)
-    assert standing2 is not None
-    assert standing2.tier == 0
-
-
-# ─── 用户 11-14:置信度更低的「用户消息里说的」候选不得改用户一方的记忆(锁里重判)──────
-
-
-async def _refuse_both(
-    store: MemoryStore,
-    t: UUID,
-    u: UUID,
-    target: MemoryItem,
-    above: float,
-    error: type[UserSideTargetError] = UserSideHigherConfidenceError,
-) -> None:
-    """``error``:同层更确定 → :class:`UserSideHigherConfidenceError`;重做 §6.3 起,目标层级
-    更高(用户更正)→ :class:`UserSideTargetError` 本身(不是置信度那个子类)。"""
-    with pytest.raises(error) as raised:
-        _ = await store.supersede(
-            tenant_id=t, user_id=u, old_id=target.id,
-            new_item=_item(t, u, f"rewrite {uuid4()}", origin="user_stated", confidence=above),
-            candidate_standing=_stated(above),
-        )  # fmt: skip
-    assert type(raised.value) is error
-    with pytest.raises(error) as raised:
-        _ = await store.expire(
-            tenant_id=t, user_id=u, memory_id=target.id, candidate_standing=_stated(above)
-        )
-    assert type(raised.value) is error
-    await _assert_untouched(store, t, u, target)
-
-
-@pytest.mark.asyncio
-async def test_lower_confidence_guard_refuses_a_more_certain_user_side_target(
-    store: MemoryStore,
-) -> None:
-    t, u = uuid4(), uuid4()
-    stated = _item(t, u, "stated", origin="user_stated", confidence=0.9)
-    _ = await store.write([stated])
-    await _refuse_both(store, t, u, stated, above=0.5)
-
-
-@pytest.mark.asyncio
-async def test_lower_confidence_guard_judges_the_targets_current_confidence(
-    store: MemoryStore,
-) -> None:
-    """存储按目标**此刻**的置信度判(这里写入时 0.5、调用前已被更正成 1.0),不按调用方早先
-    读到的值;「判的那几秒里被更正」的竞争由 orchestrator 的
-    ``test_target_made_more_certain_while_deciding_is_rechecked_under_the_lock`` 覆盖。"""
-    t, u = uuid4(), uuid4()
-    target = _item(t, u, "stated", origin="user_stated", confidence=0.5)
-    _ = await store.write([target])
-    _ = await store.update_content(
-        tenant_id=t, user_id=u, memory_id=target.id, content="corrected",
-        embedding=_vec(1.0), confidence=1.0,
-    )  # fmt: skip
-    await _refuse_both(store, t, u, target, above=0.6, error=UserSideTargetError)
-
-
-@pytest.mark.asyncio
-async def test_lower_confidence_guard_lets_equal_and_non_user_targets_through(
-    store: MemoryStore,
-) -> None:
-    t, u = uuid4(), uuid4()
-    equal = _item(t, u, "equal", origin="user_stated", confidence=0.5)
-    derived = _item(t, u, "derived", origin="assistant_derived", confidence=0.6)
-    unrecorded = _item(t, u, "unrecorded", confidence=0.9)
-    _ = await store.write([equal, derived, unrecorded])
-    for target in (equal, derived):
-        assert await store.supersede(
-            tenant_id=t, user_id=u, old_id=target.id,
-            new_item=_item(t, u, f"new {target.content}", origin="user_stated"),
-            candidate_standing=_stated(0.5),
-        )  # fmt: skip
-    assert await store.expire(
-        tenant_id=t, user_id=u, memory_id=unrecorded.id, candidate_standing=_stated(0.5)
-    )
-
-
-@pytest.mark.asyncio
-async def test_lower_confidence_guard_on_a_summary_uses_its_user_side_members(
-    store: MemoryStore,
-) -> None:
-    """成员里有用户说的汇总行算用户一方;比的是成员里最高的用户一方置信度(这里 0.5)。"""
-    t, u = uuid4(), uuid4()
-    summary = await _summary(store, t, u, ["user_stated", None, None])
-    assert summary.confidence == 0.5
-    await _refuse_both(store, t, u, summary, above=0.4)
-    assert await store.expire(
-        tenant_id=t, user_id=u, memory_id=summary.id, candidate_standing=_stated(0.5)
-    )
-
-
-@pytest.mark.asyncio
-async def test_lower_confidence_guard_keeps_a_correction_folded_into_a_summary(
-    store: MemoryStore,
-) -> None:
-    """审查(11-14)—— {用户更正 1.0, 未记录 0.5, 未记录 0.5} 汇成的汇总行自己是 0.5;按成员里最高的
-    用户一方置信度(1.0)比,0.6 乃至 0.99 的用户候选都改不动它,更正不会被抹掉。"""
-    t, u = uuid4(), uuid4()
-    summary = await _summary(store, t, u, ["corrected", None, None])
-    assert summary.confidence == 0.5
-    # 写回预判用的同一个口径(存储方法,读邻居之后、改库之前):成员里的更正 → 层级 3。
-    got = await store.origin_standing(tenant_id=t, user_id=u, memory_id=summary.id)
-    assert got == OriginStanding(3, 1.0)
-    await _refuse_both(store, t, u, summary, above=0.6, error=UserSideTargetError)
-    await _refuse_both(store, t, u, summary, above=0.99, error=UserSideTargetError)
+    assert await store.origin_standing(tenant_id=t, user_id=u, memory_id=outer2.id) == 0
 
 
 @pytest.mark.asyncio

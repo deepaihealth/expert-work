@@ -3,10 +3,10 @@
 * 来源只由「是哪一次提炼出来的」决定:第一次 → ``user_stated``,第二次 → ``assistant_derived``,
   无论模型回什么;压缩前抢存同样两次、不走去重合并;
 * 每条写下的记忆带这次实际用的向量模型名(嵌入器报得出来时);
-* 唯一的一条拦截规则:来自助手的候选不得「更新」或「删除」有效来源是用户消息里说的 /
-  用户更正的记忆 —— 被拦的删除什么都不做;被拦的更新带 ``is_correction`` 按新增存下,
-  不带就丢弃;其余照旧;
-* 去重合并的材料带双方的来源,指令里有「用户说全了的候选对上来自助手的旧记忆是更新」那一句。
+* 来源管的一条(重做第 9 版 §6.3):来自助手的候选**退不掉**有效来源是用户一方的记忆 —— 旧行
+  不动,候选自己照写(标「来自助手」),带不带 ``is_correction`` 都一样;控制台更正过的谁也退不掉;
+  写回不直接退汇总行;其余按先后退;
+* 去重合并的材料带双方的来源,指令里有「同样的内容、已有的来源更弱 → 写下并列进 restates」那一句。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -22,6 +23,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from prometheus_client import REGISTRY
 
+from expert_work.common.message_stamp import STAMP_CREATED_AT
 from expert_work.common.user_input import user_input_kwargs
 from expert_work.persistence import InMemoryMemoryStore
 from expert_work.protocol import MemoryItem
@@ -38,6 +40,9 @@ _USER = UUID("00000000-0000-4000-8000-0000000000b2")
 _EAST = (1.0, 0.0, 0.0, 0.0)
 _NEAR_EAST = (0.9, 0.43589, 0.0, 0.0)  # cosine vs _EAST = 0.9 ≥ 0.80
 _NORTH = (0.0, 1.0, 0.0, 0.0)
+#: 这一轮两条消息的发送时间:晚于用例里种下的记忆(它们的记录时间是「此刻」)。不知道那一行的
+#: 时间的候选退不掉任何旧记忆(重做 §7.1 第 11 行)。
+_SENT = datetime.now(UTC) + timedelta(hours=1)
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +73,11 @@ def _ops(op: str, target: UUID | None = None) -> str:
     if target is not None:
         row["target_id"] = str(target)
     return json.dumps({"ops": [row]})
+
+
+def _replaces(*targets: UUID) -> str:
+    """写下候选(``ADD``),并说这几条已有记忆不再成立。"""
+    return json.dumps({"ops": [{"index": 0, "op": "ADD", "replaces": [str(t) for t in targets]}]})
 
 
 @dataclass
@@ -130,12 +140,15 @@ class _PlainEmbedder:
 def _user(text: str) -> HumanMessage:
     return HumanMessage(
         content=text,
-        additional_kwargs=user_input_kwargs(text=text, images=0, files=0, external_blocks=0),
+        additional_kwargs=user_input_kwargs(
+            text=text, images=0, files=0, external_blocks=0, sent_at=_SENT.isoformat()
+        ),
     )
 
 
 def _turn(text: str = "my words", answer: str = "the answer") -> list[BaseMessage]:
-    return [_user(text), AIMessage(content=answer)]
+    reply = AIMessage(content=answer, additional_kwargs={STAMP_CREATED_AT: _SENT.isoformat()})
+    return [_user(text), reply]
 
 
 async def _flush(
@@ -237,12 +250,18 @@ async def test_pre_compaction_flush_no_longer_extracts() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 唯一的拦截规则
+# 来源管的那一条:助手一方的候选退不掉用户一方的记忆,它自己照写
 # ---------------------------------------------------------------------------
 
 
 def _assistant_candidate(content: str = "cand", *, is_correction: bool = False) -> str:
-    return _reply({"kind": "fact", "content": content, "is_correction": is_correction})
+    """第二次提炼的一条候选,出自助手那一行(第 2 行)。"""
+    return _reply({"kind": "fact", "content": content, "is_correction": is_correction, "turn": 2})
+
+
+def _user_candidate(content: str) -> str:
+    """第一次提炼的一条候选,出自用户那一行(第 1 行)。"""
+    return _reply({"kind": "fact", "content": content, "confidence": 0.8, "turn": 1})
 
 
 def _reconcile_count(op: str) -> float:
@@ -250,121 +269,96 @@ def _reconcile_count(op: str) -> float:
     return value or 0.0
 
 
+@pytest.mark.parametrize("is_correction", [False, True], ids=["plain", "correction"])
 @pytest.mark.parametrize(
-    ("origin", "confidence"),
-    [("user_stated", 0.9), (None, 1.0)],
+    ("origin", "confidence", "label"),
+    [("user_stated", 0.9, "retire_refused_assistant"), (None, 1.0, "retire_refused_corrected")],
     ids=["user_stated", "user_corrected"],
 )
-async def test_assistant_update_without_correction_is_dropped(
-    origin: MemoryOrigin | None, confidence: float
+async def test_an_assistant_candidate_never_retires_a_user_memory_and_is_still_written(
+    origin: MemoryOrigin | None, confidence: float, label: str, is_correction: bool
 ) -> None:
-    store = InMemoryMemoryStore()
-    target = await _seed(store, "user said", origin=origin, confidence=confidence)
-    llm = _LLM(conversation_reply=_assistant_candidate(), ops_reply=_ops("UPDATE", target.id))
-    before = _reconcile_count("blocked_update_dropped")
-    written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
-    assert written == 0
-    assert set(await _live(store)) == {"user said"}
-    assert all(r.invalid_at is None for r in store._rows if r.id == target.id)
-    assert _reconcile_count("blocked_update_dropped") == before + 1
-
-
-@pytest.mark.parametrize(
-    ("origin", "confidence"),
-    [("user_stated", 0.9), (None, 1.0)],
-    ids=["user_stated", "user_corrected"],
-)
-async def test_assistant_update_marked_as_correction_is_added_alongside(
-    origin: MemoryOrigin | None, confidence: float
-) -> None:
-    store = InMemoryMemoryStore()
-    target = await _seed(store, "user said", origin=origin, confidence=confidence)
-    llm = _LLM(
-        conversation_reply=_assistant_candidate(is_correction=True),
-        ops_reply=_ops("UPDATE", target.id),
-    )
-    before = _reconcile_count("blocked_update_added")
-    written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
-    assert written == 1
-    assert _reconcile_count("blocked_update_added") == before + 1
-    rows = await _live(store)
-    assert set(rows) == {"user said", "cand"}
-    assert rows["cand"].origin == "assistant_derived"
-    assert rows["cand"].supersedes is None
-
-
-@pytest.mark.parametrize(
-    ("is_correction", "expected_live", "label"),
-    [
-        (False, {"user said"}, "blocked_delete"),
-        (True, {"user said", "cand"}, "blocked_delete_added"),
-    ],
-    ids=["no-correction-noop", "correction-added"],
-)
-@pytest.mark.parametrize(
-    ("origin", "confidence"),
-    [("user_stated", 0.9), (None, 1.0)],
-    ids=["user_stated", "user_corrected"],
-)
-async def test_assistant_delete_of_a_user_memory_never_removes_it(
-    origin: MemoryOrigin | None,
-    confidence: float,
-    is_correction: bool,
-    expected_live: set[str],
-    label: str,
-) -> None:
-    """被拦的删除不动用户那条;评测 A 组 P9(11-14):候选带更正时按新增存下(与被拦的更新同样
-    处理),否则新值就丢了。"""
     store = InMemoryMemoryStore()
     target = await _seed(store, "user said", origin=origin, confidence=confidence)
     llm = _LLM(
         conversation_reply=_assistant_candidate(is_correction=is_correction),
-        ops_reply=_ops("DELETE", target.id),
+        ops_reply=_replaces(target.id),
     )
     before = _reconcile_count(label)
     written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
-    assert written == len(expected_live) - 1
+    assert written == 1
     rows = await _live(store)
-    assert set(rows) == expected_live
-    assert all(r.expired_at is None for r in store._rows if r.id == target.id)
-    if "cand" in rows:
-        assert (rows["cand"].origin, rows["cand"].supersedes) == ("assistant_derived", None)
+    assert set(rows) == {"user said", "cand"}
+    assert (rows["cand"].origin, rows["cand"].supersedes) == ("assistant_derived", None)
+    assert all(
+        (r.invalid_at, r.expired_at) == (None, None) for r in store._rows if r.id == target.id
+    )
     assert _reconcile_count(label) == before + 1
 
 
+@pytest.mark.parametrize("op", ["UPDATE", "DELETE"])
+async def test_a_legacy_op_by_the_assistant_never_removes_a_user_memory(op: str) -> None:
+    """模型仍回旧的操作:照 ``ADD`` + 清单读,用户那条同样不动,候选照写。"""
+    store = InMemoryMemoryStore()
+    target = await _seed(store, "user said", origin="user_stated", confidence=0.9)
+    llm = _LLM(conversation_reply=_assistant_candidate(), ops_reply=_ops(op, target.id))
+    before = _reconcile_count("legacy_op")
+    written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
+    assert written == 1
+    assert set(await _live(store)) == {"user said", "cand"}
+    assert all(r.expired_at is None for r in store._rows if r.id == target.id)
+    assert _reconcile_count("legacy_op") == before + 1
+
+
 @pytest.mark.parametrize("origin", ["assistant_derived", None])
-async def test_assistant_update_of_other_memories_applies(origin: MemoryOrigin | None) -> None:
+async def test_an_assistant_candidate_retires_assistant_side_memories(
+    origin: MemoryOrigin | None,
+) -> None:
     store = InMemoryMemoryStore()
     target = await _seed(store, "old", origin=origin)
-    llm = _LLM(conversation_reply=_assistant_candidate(), ops_reply=_ops("UPDATE", target.id))
+    llm = _LLM(conversation_reply=_assistant_candidate(), ops_reply=_replaces(target.id))
     await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
     rows = await _live(store)
     assert set(rows) == {"cand"}
-    # 取代出来的新行带候选的来源和向量模型名。
+    # 新行带候选的来源和向量模型名,旧行连到它。
     assert (rows["cand"].origin, rows["cand"].embedding_model) == ("assistant_derived", _MODEL)
     assert rows["cand"].supersedes == target.id
 
 
-async def test_assistant_delete_of_an_assistant_memory_applies() -> None:
+async def test_a_denial_is_itself_stored_and_the_old_memory_links_to_it() -> None:
+    """以前的「删除」:旧行标过期、这句话本身不存。现在把这句话写下,旧行作废并连到它(§7.3)。"""
     store = InMemoryMemoryStore()
     target = await _seed(store, "old", origin="assistant_derived")
     llm = _LLM(conversation_reply=_assistant_candidate(), ops_reply=_ops("DELETE", target.id))
     await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
-    assert await _live(store) == {}
+    rows = await _live(store)
+    assert set(rows) == {"cand"}
+    [old] = [r for r in store._rows if r.id == target.id]
+    assert (old.expired_at, old.superseded_by) == (None, rows["cand"].id)
 
 
-async def test_user_stated_candidate_may_update_a_user_memory() -> None:
+async def test_user_stated_candidate_retires_a_user_memory() -> None:
+    store = InMemoryMemoryStore()
+    target = await _seed(store, "old words", origin="user_stated", confidence=0.95)
+    llm = _LLM(user_reply=_user_candidate("new words"), ops_reply=_replaces(target.id))
+    await _flush(llm, store, _ReportingEmbedder({"new words": _NEAR_EAST}), reconcile=True)
+    rows = await _live(store)
+    # 置信度(0.8 对 0.95)不参与:同是用户说的,按先后。
+    assert set(rows) == {"new words"}
+    assert rows["new words"].origin == "user_stated"
+
+
+async def test_a_candidate_whose_line_time_is_unknown_retires_nothing() -> None:
     store = InMemoryMemoryStore()
     target = await _seed(store, "old words", origin="user_stated")
     llm = _LLM(
-        # 用户 11-14 —— 置信度不低于目标(0.8)才可以;更低的见 test_memory_lower_confidence_guard。
-        user_reply=_reply({"kind": "fact", "content": "new words", "confidence": 0.8}),
-        ops_reply=_ops("UPDATE", target.id),
+        user_reply=_reply({"kind": "fact", "content": "new words"}),  # 没给 turn
+        ops_reply=_replaces(target.id),
     )
+    before = _reconcile_count("retire_refused_unknown_time")
     await _flush(llm, store, _ReportingEmbedder({"new words": _NEAR_EAST}), reconcile=True)
-    rows = await _live(store)
-    assert set(rows) == {"new words"}
-    assert rows["new words"].origin == "user_stated"
+    assert set(await _live(store)) == {"old words", "new words"}
+    assert _reconcile_count("retire_refused_unknown_time") == before + 1
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +373,10 @@ async def test_reconcile_material_carries_both_sides_sources_and_the_rule() -> N
     llm = _LLM(user_reply=_reply({"kind": "fact", "content": "said now"}), ops_reply=_ops("NOOP"))
     await _flush(llm, store, _ReportingEmbedder({"said now": _NEAR_EAST}), reconcile=True)
     [call] = llm.reconcile_calls()
-    # 重做附录 B:同样内容、已有的来源更弱 → 更新(用户后来自己说全了,取代来自助手的版本)。
+    # 重做附录 B:同样内容、已有的来源更弱 → 写下,并把那条列进 restates(用户后来自己说全了)。
     assert (
         "When the candidate says the same thing as an existing memory with a weaker source, it is\n"
-        "  an UPDATE of that memory." in str(call[0].content)
+        '  an ADD that lists that memory in "restates".' in str(call[0].content)
     )
     payload = json.loads(str(call[1].content))
     [candidate] = payload["candidates"]
@@ -415,51 +409,31 @@ def _correct_while_deciding(
     return correct
 
 
-@pytest.mark.parametrize(
-    ("op", "is_correction", "expected_live", "label"),
-    [
-        ("UPDATE", False, {"corrected by the user"}, "blocked_update_dropped"),
-        ("UPDATE", True, {"corrected by the user", "cand"}, "blocked_update_added"),
-        ("DELETE", False, {"corrected by the user"}, "blocked_delete"),
-        ("DELETE", True, {"corrected by the user", "cand"}, "blocked_delete_added"),
-    ],
-    ids=["update-dropped", "update-added", "delete-noop", "delete-correction-added"],
-)
-async def test_target_corrected_while_the_model_decides_is_still_protected(
-    op: str, is_correction: bool, expected_live: set[str], label: str
+@pytest.mark.parametrize("is_correction", [False, True], ids=["plain", "correction"])
+@pytest.mark.parametrize("op", ["ADD", "UPDATE", "DELETE"])
+async def test_target_corrected_while_the_model_decides_is_not_retired(
+    op: str, is_correction: bool
 ) -> None:
+    """预判时目标还是「来自助手」,判的那几秒里用户点了更正:存储在行锁里重判 → 不退,候选照写。"""
     store = InMemoryMemoryStore()
     target = await _seed(store, "derived", origin="assistant_derived", confidence=0.5)
     llm = _LLM(
         conversation_reply=_assistant_candidate(is_correction=is_correction),
-        ops_reply=_ops(op, target.id),
+        ops_reply=_replaces(target.id) if op == "ADD" else _ops(op, target.id),
         while_deciding=_correct_while_deciding(store, target),
     )
-    before = _reconcile_count(label)
+    before = _reconcile_count("retire_refused_corrected")
     await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
     rows = await _live(store)
-    assert set(rows) == expected_live
+    assert set(rows) == {"corrected by the user", "cand"}
     assert rows["corrected by the user"].supersedes is None
-    assert _reconcile_count(label) == before + 1
+    assert rows["cand"].supersedes is None
+    assert _reconcile_count("retire_refused_corrected") == before + 1
 
 
 # ---------------------------------------------------------------------------
-# 审查 MEDIUM-3:成员里有用户一方的汇总行同样受保护
+# 审查 MEDIUM-3 / 重做第 9 版审查 H-3:写回不直接退汇总行
 # ---------------------------------------------------------------------------
-
-
-class _CountingStore(InMemoryMemoryStore):
-    def __init__(self) -> None:
-        super().__init__()
-        self.writes_to_targets = 0
-
-    async def supersede(self, **kwargs: Any) -> MemoryItem | None:
-        self.writes_to_targets += 1
-        return await super().supersede(**kwargs)
-
-    async def expire(self, **kwargs: Any) -> bool:
-        self.writes_to_targets += 1
-        return await super().expire(**kwargs)
 
 
 async def _seed_summary(
@@ -489,25 +463,27 @@ async def _seed_summary(
     )
 
 
-@pytest.mark.parametrize("op", ["UPDATE", "DELETE"])
-async def test_summary_of_user_side_members_is_protected(op: str) -> None:
-    store = _CountingStore()
-    summary = await _seed_summary(store, ["user_stated", None, None])
-    assert summary.origin is None
-    llm = _LLM(conversation_reply=_assistant_candidate(), ops_reply=_ops(op, summary.id))
-    written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
-    assert written == 0
-    assert set(await _live(store)) == {"summary"}
-    # 预判就拦下了,没有走到改库那一步(锁里的那道是兜底)。
-    assert store.writes_to_targets == 0
-
-
-async def test_summary_of_unrecorded_members_is_not_protected() -> None:
+@pytest.mark.parametrize(
+    "members",
+    [["user_stated", None, None], [None, None, None]],
+    ids=["user-side-member", "unrecorded-members"],
+)
+async def test_an_assistant_candidate_neither_retires_nor_flags_a_summary(
+    members: list[MemoryOrigin | None],
+) -> None:
+    """汇总行是几条记忆合成的一句,候选通常只否认其中一件:写回一律不退(不分成员来源,第 9 版
+    §14 第 30 行);重写标记只有用户一方的候选打得上。候选照写。"""
     store = InMemoryMemoryStore()
-    summary = await _seed_summary(store, [None, None, None])
-    llm = _LLM(conversation_reply=_assistant_candidate(), ops_reply=_ops("UPDATE", summary.id))
-    await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
-    assert set(await _live(store)) == {"cand"}
+    summary = await _seed_summary(store, members)
+    assert summary.origin is None
+    llm = _LLM(conversation_reply=_assistant_candidate(), ops_reply=_replaces(summary.id))
+    before = _reconcile_count("retire_refused_summary")
+    written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
+    assert written == 1
+    rows = await _live(store)
+    assert set(rows) == {"summary", "cand"}
+    assert rows["summary"].review_flagged_at is None
+    assert _reconcile_count("retire_refused_summary") == before + 1
 
 
 # ---------------------------------------------------------------------------
@@ -529,23 +505,23 @@ class _RecordingDLQ:
         self.enqueued.append(list(extracted))
 
 
-async def test_dlq_gets_only_what_reconcile_meant_to_write() -> None:
+async def test_dlq_gets_only_what_was_not_written_yet() -> None:
     store = _FailingWriteStore()
     user_target = await _seed_in(store, "user said", origin="user_stated")
     derived_target = await _seed_in(store, "derived", origin="assistant_derived")
     llm = _LLM(
         conversation_reply=_reply(
-            {"kind": "fact", "content": "keep"},
-            {"kind": "fact", "content": "drop"},
-            {"kind": "fact", "content": "retract"},
+            {"kind": "fact", "content": "keep", "turn": 2},
+            {"kind": "fact", "content": "beside", "turn": 2},
+            {"kind": "fact", "content": "landed", "turn": 2},
         ),
         # 重做 §7.1 第 2 行:没有相似度门槛,三条都交给模型(「keep」的邻居再远也算)。
         ops_reply=json.dumps(
             {
                 "ops": [
                     {"index": 0, "op": "ADD"},
-                    {"index": 1, "op": "UPDATE", "target_id": str(user_target.id)},
-                    {"index": 2, "op": "DELETE", "target_id": str(derived_target.id)},
+                    {"index": 1, "op": "ADD", "replaces": [str(user_target.id)]},
+                    {"index": 2, "op": "ADD", "replaces": [str(derived_target.id)]},
                 ]
             }
         ),
@@ -554,7 +530,7 @@ async def test_dlq_gets_only_what_reconcile_meant_to_write() -> None:
     outcome = await flush_messages_with_outcome(
         _turn(),
         memory_store=store,
-        embedder=_ReportingEmbedder({"drop": _NEAR_EAST, "retract": _NEAR_EAST}),
+        embedder=_ReportingEmbedder({"beside": _NEAR_EAST, "landed": _NEAR_EAST}),
         llm_caller=llm,
         tenant_id=_TENANT,
         user_id=_USER,
@@ -564,8 +540,10 @@ async def test_dlq_gets_only_what_reconcile_meant_to_write() -> None:
         dlq=dlq,  # type: ignore[arg-type]
     )
     assert outcome.failed
-    # 被拦下丢弃的更新、删除事件都不该在重试时被重建成新记忆。
-    assert dlq.enqueued == [[("fact", "keep")]]
+    # 第三条连同它退掉的旧行已经在去重合并里落库(``supersede``),不该在重试时再被重建一遍;
+    # 前两条(什么都不退的、退不掉用户那条的)还在等批量写入,写入失败 → 进失败队列。
+    assert dlq.enqueued == [[("fact", "keep"), ("fact", "beside")]]
+    assert [r.content for r in store._rows if r.supersedes == derived_target.id] == ["landed"]
 
 
 async def _seed_in(store: InMemoryMemoryStore, content: str, *, origin: MemoryOrigin) -> MemoryItem:
@@ -584,33 +562,23 @@ async def _seed_in(store: InMemoryMemoryStore, content: str, *, origin: MemoryOr
 
 
 # ---------------------------------------------------------------------------
-# D12 —— 「写了几条」含去重合并里取代出来的新行(真栈验收 §117.9:库里多了 3 行、计数报 1)
+# D12 —— 「写了几条」含去重合并里自己落库的新行(真栈验收 §117.9:库里多了 3 行、计数报 1)
 # ---------------------------------------------------------------------------
-
-
-class _GoneTargetStore(InMemoryMemoryStore):
-    """``supersede`` 找不到目标(已被删 / 已被取代)时返回 ``None``、什么都不写。"""
-
-    async def supersede(self, **kwargs: Any) -> MemoryItem | None:
-        del kwargs
-        return None
 
 
 async def test_written_counts_reconciled_adds() -> None:
     store = InMemoryMemoryStore()
     _ = await _seed(store, "old", origin=None)
-    llm = _LLM(user_reply=_reply({"kind": "fact", "content": "cand"}), ops_reply=_ops("ADD"))
+    llm = _LLM(user_reply=_user_candidate("cand"), ops_reply=_ops("ADD"))
     written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
     assert written == 1
     assert set(await _live(store)) == {"old", "cand"}
 
 
-async def test_written_counts_the_row_a_supersede_wrote() -> None:
+async def test_written_counts_the_row_that_retired_another() -> None:
     store = InMemoryMemoryStore()
     target = await _seed(store, "old", origin=None)
-    llm = _LLM(
-        user_reply=_reply({"kind": "fact", "content": "cand"}), ops_reply=_ops("UPDATE", target.id)
-    )
+    llm = _LLM(user_reply=_user_candidate("cand"), ops_reply=_replaces(target.id))
     written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
     assert written == 1
     rows = await _live(store)
@@ -618,36 +586,43 @@ async def test_written_counts_the_row_a_supersede_wrote() -> None:
     assert rows["cand"].supersedes == target.id
 
 
-async def test_supersede_that_wrote_nothing_counts_only_the_fallback_write() -> None:
-    store = _GoneTargetStore()
+async def test_a_target_that_is_gone_does_not_stop_the_write() -> None:
+    """要退的那条在判的那几秒里被用户删了:跳过它,候选照写,只算那一行(以前是「取代没写成 →
+    退回直接写入」)。"""
+    store = InMemoryMemoryStore()
     target = await _seed(store, "old", origin=None)
+
+    async def forget() -> object:
+        return await store.soft_delete(tenant_id=_TENANT, user_id=_USER, memory_id=target.id)
+
     llm = _LLM(
-        user_reply=_reply({"kind": "fact", "content": "cand"}), ops_reply=_ops("UPDATE", target.id)
+        user_reply=_user_candidate("cand"), ops_reply=_replaces(target.id), while_deciding=forget
     )
+    before = _reconcile_count("retire_target_gone")
     written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
-    # 取代没写成 → 候选退回直接写入,只算那一行。
     assert written == 1
     assert len(store._rows) == 2
     rows = await _live(store)
-    assert set(rows) == {"old", "cand"}
+    assert set(rows) == {"cand"}
     assert rows["cand"].supersedes is None
+    assert _reconcile_count("retire_target_gone") == before + 1
 
 
-async def test_written_counts_superseded_and_added_rows_but_not_retractions() -> None:
+async def test_written_counts_every_row_that_landed() -> None:
     store = InMemoryMemoryStore()
     old1 = await _seed(store, "old1", origin=None)
     old2 = await _seed(store, "old2", origin=None)
     llm = _LLM(
         user_reply=_reply(
-            {"kind": "fact", "content": "replaces old1"},
-            {"kind": "fact", "content": "retracts old2"},
-            {"kind": "fact", "content": "unrelated"},
+            {"kind": "fact", "content": "replaces old1", "turn": 1},
+            {"kind": "fact", "content": "denies old2", "turn": 1},
+            {"kind": "fact", "content": "unrelated", "turn": 1},
         ),
         ops_reply=json.dumps(
             {
                 "ops": [
-                    {"index": 0, "op": "UPDATE", "target_id": str(old1.id)},
-                    {"index": 1, "op": "DELETE", "target_id": str(old2.id)},
+                    {"index": 0, "op": "ADD", "restates": [str(old1.id)]},
+                    {"index": 1, "op": "ADD", "replaces": [str(old2.id)]},
                 ]
             }
         ),
@@ -656,9 +631,9 @@ async def test_written_counts_superseded_and_added_rows_but_not_retractions() ->
     written, _ = await _flush(
         llm,
         store,
-        _ReportingEmbedder({"replaces old1": _NEAR_EAST, "retracts old2": _NEAR_EAST}),
+        _ReportingEmbedder({"replaces old1": _NEAR_EAST, "denies old2": _NEAR_EAST}),
         reconcile=True,
     )
-    assert set(await _live(store)) == {"replaces old1", "unrelated"}
-    # 新增的行 = 取代出来的一行 + 直接写入的一行;作废(DELETE)不新增行。
-    assert written == len(store._rows) - rows_before == 2
+    # 每条候选都写下(否认旧记忆的那句话本身也是一行);两条旧行各被退一次。
+    assert set(await _live(store)) == {"replaces old1", "denies old2", "unrelated"}
+    assert written == len(store._rows) - rows_before == 3

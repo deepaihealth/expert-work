@@ -1,18 +1,18 @@
-"""B-300 重做 PR R —— 去重合并(设计 §7、附录 B、§11.6 去重合并 / 失败语义 / 层级拦截)。
+"""B-300 重做 PR R —— 去重合并(设计 §7、附录 B、§11.6 去重合并 / 失败语义)。
+
+第 9 版「写和退分开」之后,「谁能退谁」、两张清单的解析、程序改判、事件日期的严规则、历史行、
+汇总行在 ``test_memory_write_retire_split.py``;这里留的是第 9 版没有改的那些:
 
 * 没有相似度门槛:相似度 0.3 的邻居也交给模型;每条候选按向量取召回范围内(带智能体名)最近 5 条;
 * 材料带类型、来源、日期、事件日期,已有记忆用本次调用内的短编号 ``e0, e1, …``,程序映射回去,
   不认识的编号按没给决定;
-* 更新 / 删除:跨格、不是同一格里按余弦(不是检索顺序)最近的前 2 条 → 新增;两边都有事件日期时,
-  相同且候选带更正才可以,相同不是更正、不同 → 新增;只有一边有 → 不按这条拒绝(「方案三:折中」,
-  用户 2026-11-16),只有不带日期、不是更正的候选删一条带日期的仍拒绝;放行的按 ``update`` /
-  ``delete`` 计 ``event_date_one_sided_*``;候选那一行早于目标的记录时间的「更新」→ 新增;
+* 要退的目标:跨格、不是同一格里按余弦(不是检索顺序)最近的前 2 条 → 不退,候选照写;候选那一行
+  早于目标的时间、或不知道那一行的时间 → 不退;
 * 「重复」要带目标、目标要在候选的召回范围内;只在用户一方对用户一方、候选那一行在新段里时把目标
   的确认日期刷新为那一行的发送时间,确定性「重复」同样;
-* 层级拦截:用户确认改不动用户说的;用户说的可以改用户确认的;
 * 两段合并:第二次提炼的候选能取到第一段刚写的行;
-* 去重合并内部出错抛 ``ReconcileFailedError``,只带「还没写的」;PR S 起写回不再直接写入,抛给
-  任务重试,只有最后一次尝试才把「还没写的」交给失败队列。
+* 去重合并内部出错抛 ``ReconcileFailedError``,只带「还没写的」;写回不直接写入,抛给任务重试,
+  只有最后一次尝试才把「还没写的」交给失败队列。
 """
 
 from __future__ import annotations
@@ -43,53 +43,6 @@ from orchestrator.graph_builder.memory import (
     _reconcile_and_apply,
     flush_messages_with_outcome,
 )
-
-_APPENDIX_B = """\
-You compare newly extracted memories ("candidates") with existing memories about the same
-user and decide what to store. Each candidate comes with up to five existing memories that
-are closest to it in meaning. Every existing memory has a short id (e0, e1, ...), its kind,
-its source, its date, and "event_date" when it is about something that happened on one day.
-Each candidate also has the date of the line it was taken from.
-For each candidate choose one operation:
-- "NOOP": an existing memory already says the same thing; the candidate only rephrases it
-  or says less. Set "target_id" to that memory.
-- "UPDATE": the candidate is about the same subject or the same occasion as one existing
-  memory and brings newer or fuller information. The candidate replaces that memory's text,
-  so choose UPDATE only when the candidate still says everything in it that remains true;
-  otherwise choose ADD. Set "target_id".
-- "DELETE": the candidate says that one existing memory is no longer true and gives
-  nothing to put in its place. Set "target_id".
-- "ADD": anything else. A memory that is only related — the same topic but another subject,
-  person, item or occasion — is not a target; the candidate is an ADD.
-UPDATE and DELETE apply only to an existing memory of the same kind.
-An "event_date" marks something that happened or was measured on one day, such as a
-reading or a count. Two such memories with different event dates are different occasions:
-ADD. When both have the same "event_date", the existing memory is changed only by a
-candidate with "is_correction": true; any other candidate about that day is a NOOP when it
-says the same thing and an ADD otherwise. A reading or count taken on a different date or
-time than an existing one is a new memory (ADD), not an UPDATE of the earlier one, whether
-or not either has an "event_date": the date written in its content counts too.
-For a state, a date written in the content, such as "(as of <date>)", does not make another
-occasion: a changed state of the same thing is an UPDATE, and the same state said again is
-a NOOP.
-When only one of the two has an "event_date", decide by what they say.
-A candidate with "is_correction": true changes something said earlier: when an existing
-memory still says the earlier value, the candidate is an UPDATE of that memory.
-A candidate's "is_correction" says what the candidate does, not where it comes from; its
-source is given in "source".
-Sources, from strongest to weakest: "corrected by the user", "stated in user messages",
-"confirmed by the user", then "from the assistant" and "source not recorded" (equal).
-- When an existing memory whose source is at least as strong as the candidate's says the
-  same thing, the candidate is a NOOP of that memory, even if a memory with a weaker source
-  also matches.
-- When the candidate says the same thing as an existing memory with a weaker source, it is
-  an UPDATE of that memory.
-- When a candidate with "is_correction": true says the same thing as an existing memory
-  whose source is at least as strong, and another existing memory still says the earlier
-  value, DELETE that other memory; otherwise the candidate is a NOOP.
-Respond with ONLY a JSON object, no prose and no code fences:
-{"ops": [{"index": <candidate index>, "op": "ADD" | "UPDATE" | "DELETE" | "NOOP",
-"target_id": "<short id of the existing memory; omit for ADD>"}]}"""
 
 _T0 = datetime(2026, 11, 1, 9, 0, tzinfo=UTC)
 _AGENT = "agent-a"
@@ -166,6 +119,19 @@ def _ops(*rows: tuple[int, str, str | None]) -> str:
     )
 
 
+def _retiring(*rows: tuple[int, str]) -> str:
+    """每条候选写下(``ADD``),并说一条已有记忆被它说全了(``restates``)。"""
+    return json.dumps({"ops": [{"index": i, "op": "ADD", "restates": [t]} for i, t in rows]})
+
+
+#: 晚于用例里种下的记忆的记录时间(``_T0``)。不知道那一行时间的候选退不掉任何旧记忆。
+_SAID_AT = _T0 + timedelta(days=30)
+
+
+def _said(item: MemoryItem) -> _Candidate:
+    return _Candidate(item, line_at=_SAID_AT, in_new_segment=True)
+
+
 async def _reconcile(
     store: InMemoryMemoryStore, llm: _LLM, *candidates: _Candidate, agent: str | None = _AGENT
 ) -> Any:
@@ -192,10 +158,6 @@ def _untouched(store: InMemoryMemoryStore, target: MemoryItem) -> bool:
 
 
 # ─── 指令 ──────────────────────────────────────────────────────────────
-
-
-def test_reconcile_prompt_is_appendix_b_verbatim() -> None:
-    assert _RECONCILE_SYSTEM == _APPENDIX_B
 
 
 _DOMAIN_WORDS = (
@@ -302,9 +264,9 @@ async def test_a_short_id_maps_back_to_its_memory() -> None:
     store = InMemoryMemoryStore()
     nearest, second = c.mem("likes tea", _at(0.95)), c.mem("likes green tea", _at(0.9))
     await store.write([nearest, second])
-    llm = _LLM([_ops((0, "UPDATE", "e1"))])
+    llm = _LLM([_retiring((0, "e1"))])
     cand = c.mem("likes green tea, no sugar")
-    result = await _reconcile(store, llm, _Candidate(cand))
+    result = await _reconcile(store, llm, _said(cand))
     assert result.superseded == 1
     assert _untouched(store, nearest)
     assert not _untouched(store, second)
@@ -326,12 +288,12 @@ async def test_an_unknown_or_missing_id_is_no_decision(target: str | None) -> No
     assert _untouched(store, old)
 
 
-# ─── 更新 / 删除的程序拒绝 ──────────────────────────────────────────────
+# ─── 要退的目标:程序的限制 ──────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("op", ["UPDATE", "DELETE"])
 @pytest.mark.asyncio
-async def test_update_or_delete_across_cells_becomes_add(op: str) -> None:
+async def test_a_target_in_another_cell_is_not_retired(op: str) -> None:
     c = _Ctx()
     store = InMemoryMemoryStore()
     event = c.mem("went hiking on saturday", _at(0.95), kind="episodic", agent=_AGENT)
@@ -352,78 +314,15 @@ async def test_targets_are_ranked_by_cosine_not_by_retrieval_order() -> None:
         c.mem(f"lives in district {i}", _at(s)) for i, s in enumerate((0.95, 0.9, 0.85))
     )
     await store.write([near, mid, far])
-    llm = _LLM([_ops((0, "UPDATE", "e2"), (1, "UPDATE", "e0"))])
+    llm = _LLM([_retiring((0, "e2"), (1, "e0"))])
     refused, allowed = c.mem("moved to district 9"), c.mem("moved to district 8")
-    result = await _reconcile(store, llm, _Candidate(refused), _Candidate(allowed))
+    result = await _reconcile(store, llm, _said(refused), _said(allowed))
     existing = [e["content"] for e in llm.payload()["candidates"][0]["existing"]]
     assert existing == [near.content, mid.content, far.content]
+    # 名次不够的不退,候选照写(助手一方、什么都不退 → 交回调用方直写)。
     assert [m.id for m in result.direct] == [refused.id]
     assert _untouched(store, far)
     assert not _untouched(store, near)
-
-
-@pytest.mark.parametrize(
-    ("cand_day", "target_day", "correction", "applied_by_op"),
-    [
-        (1, 1, True, {"UPDATE": True, "DELETE": True}),
-        (1, 1, False, {"UPDATE": False, "DELETE": False}),
-        (1, 2, True, {"UPDATE": False, "DELETE": False}),
-        (1, 2, False, {"UPDATE": False, "DELETE": False}),
-        # 「方案三:折中」(用户 2026-11-16):只有一边有事件日期 → 不按这条拒绝,由模型照常判;
-        # 例外:不带日期、不是更正的候选删不掉一条带日期的(过去的读数不会变得不成立)。
-        (1, None, True, {"UPDATE": True, "DELETE": True}),
-        (1, None, False, {"UPDATE": True, "DELETE": True}),
-        (None, 1, True, {"UPDATE": True, "DELETE": True}),
-        (None, 1, False, {"UPDATE": True, "DELETE": False}),
-        (None, None, False, {"UPDATE": True, "DELETE": True}),
-    ],
-    ids=[
-        "same-day-correction",
-        "same-day-again",
-        "other-day-correction",
-        "other-day",
-        "candidate-only-correction",
-        "candidate-only",
-        "target-only-correction",
-        "target-only",
-        "no-event-date",
-    ],
-)
-@pytest.mark.parametrize("op", ["UPDATE", "DELETE"])
-@pytest.mark.asyncio
-async def test_event_dates_gate_update_and_delete(
-    monkeypatch: pytest.MonkeyPatch,
-    op: str,
-    cand_day: int | None,
-    target_day: int | None,
-    correction: bool,
-    applied_by_op: dict[str, bool],
-) -> None:
-    applied = applied_by_op[op]
-    c = _Ctx()
-    store = InMemoryMemoryStore()
-    counted: list[str] = []
-    monkeypatch.setattr(memory_module, "record_memory_reconcile", lambda *, op: counted.append(op))
-
-    def day(n: int | None) -> date | None:
-        return None if n is None else date(2026, 11, n)
-
-    target = c.mem("the meter read 310", _at(0.95), occurred_on=day(target_day))
-    await store.write([target])
-    cand = c.mem("the meter read 301", occurred_on=day(cand_day))
-    result = await _reconcile(
-        store, _LLM([_ops((0, op, "e0"))]), _Candidate(cand, is_correction=correction)
-    )
-    assert _untouched(store, target) is not applied
-    assert ("refused_event_date" in counted) is not applied
-    one_sided = (cand_day is None) != (target_day is None)
-    assert (f"event_date_one_sided_{op.lower()}" in counted) is (applied and one_sided)
-    written = [m.id for m in result.direct]
-    if applied:
-        # 更新落成新行;带更正的删除照旧把候选存下,不带的不存。
-        assert written == ([cand.id] if op == "DELETE" and correction else [])
-    else:
-        assert written == [cand.id]
 
 
 def _day(n: int | None) -> date | None:
@@ -476,28 +375,28 @@ async def test_identical_text_on_another_event_date_is_not_a_deterministic_noop(
 
 
 def test_an_unapplied_noop_across_different_event_dates_is_still_written() -> None:
-    """收尾时(去重合并出错)还没落的「重复」:日期不同的按新增写,同一天的不写。"""
+    """收尾时(去重合并出错)还没落的「重复」:日期不同的写下,同一天的不写。"""
     c = _Ctx()
     target = c.mem("the meter read 310", occurred_on=_day(2))
     by_short_id = {"e0": target.id}
+    tiers = {target.id: 0}
     other = memory_module._Pending(
-        _Candidate(c.mem("read 310", occurred_on=_day(1))), (target,), frozenset()
+        _Candidate(c.mem("read 310", occurred_on=_day(1))), (target,), tiers
     )
     same = memory_module._Pending(
-        _Candidate(c.mem("read 310", occurred_on=_day(2))), (target,), frozenset()
+        _Candidate(c.mem("read 310", occurred_on=_day(2))), (target,), tiers
     )
-    assert memory_module._would_write(other, "NOOP", "e0", by_short_id) is True
-    assert memory_module._would_write(same, "NOOP", "e0", by_short_id) is False
+    noop = memory_module._Decision("NOOP", "e0")
+    assert memory_module._would_write(other, noop, by_short_id) is True
+    assert memory_module._would_write(same, noop, by_short_id) is False
 
 
-@pytest.mark.parametrize(
-    ("op", "cand_day", "target_day"), [("UPDATE", None, 1), ("DELETE", 1, None)]
-)
+@pytest.mark.parametrize(("cand_day", "target_day"), [(1, None)])
 @pytest.mark.asyncio
-async def test_the_one_sided_count_needs_the_write_to_happen(
-    monkeypatch: pytest.MonkeyPatch, op: str, cand_day: int | None, target_day: int | None
+async def test_the_one_sided_count_needs_the_retirement_to_happen(
+    monkeypatch: pytest.MonkeyPatch, cand_day: int | None, target_day: int | None
 ) -> None:
-    """复审 LOW(11-16):只有一边有事件日期的计数只在更新 / 删除真的落了之后才记;被层级拦下的不记。"""
+    """复审 LOW(11-16):只有候选一边有事件日期的计数只在旧行真的被退了之后才记;因来源没退的不记。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     counted: list[str] = []
@@ -510,46 +409,20 @@ async def test_the_one_sided_count_needs_the_write_to_happen(
     cand = c.mem(
         "the meter read 301", origin="assistant_derived", confidence=0.5, occurred_on=_day(cand_day)
     )
-    await _reconcile(store, _LLM([_ops((0, op, "e0"))]), _Candidate(cand))
+    await _reconcile(store, _LLM([_retiring((0, "e0"))]), _said(cand))
     assert _untouched(store, target)
-    assert [o for o in counted if o.startswith("blocked_")]
+    assert [o for o in counted if o.startswith("retire_refused_")] == ["retire_refused_assistant"]
     assert [o for o in counted if o.startswith("event_date_one_sided")] == []
 
 
 @pytest.mark.parametrize(
-    ("op", "cand_day", "target_day"), [("UPDATE", None, 1), ("DELETE", 1, None)]
-)
-@pytest.mark.asyncio
-async def test_the_one_sided_count_skips_a_write_that_did_not_land(
-    monkeypatch: pytest.MonkeyPatch, op: str, cand_day: int | None, target_day: int | None
-) -> None:
-    """取代 / 作废没成(目标已不在,存储返回「没写」)→ 只记 ``degraded``,不记一边有日期。"""
-    c = _Ctx()
-    store = InMemoryMemoryStore()
-    counted: list[str] = []
-    monkeypatch.setattr(memory_module, "record_memory_reconcile", lambda *, op: counted.append(op))
-
-    async def not_written(*_args: Any, **_kwargs: Any) -> bool:
-        return False
-
-    monkeypatch.setattr(memory_module, "_apply_update", not_written)
-    monkeypatch.setattr(memory_module, "_apply_delete", not_written)
-    target = c.mem("the meter read 310", _at(0.95), occurred_on=_day(target_day))
-    await store.write([target])
-    cand = c.mem("the meter read 301", occurred_on=_day(cand_day))
-    await _reconcile(store, _LLM([_ops((0, op, "e0"))]), _Candidate(cand))
-    assert "degraded" in counted
-    assert [o for o in counted if o.startswith("event_date_one_sided")] == []
-
-
-@pytest.mark.parametrize(
-    ("line_offset", "applied"),
-    [(timedelta(days=-1), False), (timedelta(days=1), True), (None, True)],
+    ("line_offset", "retired"),
+    [(timedelta(days=-1), False), (timedelta(days=1), True), (None, False)],
     ids=["older-line", "newer-line", "unknown-line"],
 )
 @pytest.mark.asyncio
-async def test_an_update_from_a_line_older_than_the_target_becomes_add(
-    line_offset: timedelta | None, applied: bool
+async def test_a_candidate_from_an_older_or_unknown_line_does_not_retire_the_target(
+    line_offset: timedelta | None, retired: bool
 ) -> None:
     c = _Ctx()
     store = InMemoryMemoryStore()
@@ -560,16 +433,18 @@ async def test_an_update_from_a_line_older_than_the_target_becomes_add(
     cand = c.mem("lives in the south", origin="user_stated", confidence=0.9)
     result = await _reconcile(
         store,
-        _LLM([_ops((0, "UPDATE", "e0"))]),
+        _LLM([_retiring((0, "e0"))]),
         _Candidate(cand, line_at=line_at, in_new_segment=True),
     )
-    assert _untouched(store, target) is not applied
-    assert [m.id for m in result.direct] == ([] if applied else [cand.id])
+    assert _untouched(store, target) is not retired
+    # 退不退都不影响写:候选一定落库。
+    assert (result.superseded, result.direct) == (1, [])
+    assert cand.id in {r.id for r in _live(store)}
 
 
 @pytest.mark.asyncio
 async def test_a_later_restatement_counts_as_the_targets_record_time() -> None:
-    """目标是三天前记下、昨天用户又说了一遍:前天那一行的「更新」也算更旧,改为新增。"""
+    """目标是三天前记下、昨天用户又说了一遍:前天那一行的候选也算更旧,目标不退。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     target = c.mem(
@@ -578,12 +453,12 @@ async def test_a_later_restatement_counts_as_the_targets_record_time() -> None:
     )  # fmt: skip
     await store.write([target])
     cand = c.mem("lives in the south", origin="user_stated", confidence=0.9)
-    result = await _reconcile(
-        store, _LLM([_ops((0, "UPDATE", "e0"))]),
+    await _reconcile(
+        store, _LLM([_retiring((0, "e0"))]),
         _Candidate(cand, line_at=_T0 + timedelta(days=1), in_new_segment=True),
     )  # fmt: skip
     assert _untouched(store, target)
-    assert [m.id for m in result.direct] == [cand.id]
+    assert cand.id in {r.id for r in _live(store)}
 
 
 # ─── 「重复」:召回范围与刷新确认日期 ────────────────────────────────────
@@ -617,7 +492,7 @@ _LINE = _T0 + timedelta(days=4, hours=3)
 @pytest.mark.parametrize(
     ("cand_origin", "target_origin", "in_new_segment", "line_at", "refreshed"),
     [
-        ("user_stated", "user_confirmed", True, _LINE, True),
+        ("user_stated", "user_stated", True, _LINE, True),
         ("user_confirmed", "user_stated", True, _LINE, True),
         ("assistant_derived", "user_stated", True, _LINE, False),
         ("user_stated", "assistant_derived", True, _LINE, False),
@@ -626,7 +501,7 @@ _LINE = _T0 + timedelta(days=4, hours=3)
         ("user_stated", "user_stated", True, None, False),
     ],
     ids=[
-        "stated-on-confirmed",
+        "stated-on-stated",
         "confirmed-on-stated",
         "assistant-candidate",
         "assistant-target",
@@ -688,43 +563,13 @@ async def test_an_identical_restatement_refreshes_without_asking_the_model(
     assert got.confirmed_at == (_LINE if refreshed else None)
 
 
-# ─── 层级拦截 ───────────────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize(("correction", "kept"), [(False, True), (True, True)])
-@pytest.mark.asyncio
-async def test_user_confirmed_cannot_update_a_less_certain_user_stated(
-    correction: bool, kept: bool
-) -> None:
-    """审查 H2:0.8 的用户确认改不动 0.5 的用户说的;被拦后按新增并存 —— 带更正的一向如此,不带的
-    自用户 2026-11-16「被拦时与旧的并存」起也是(以前丢弃)。"""
-    c = _Ctx()
-    store = InMemoryMemoryStore()
-    target = c.mem("the car is a hatchback", _at(0.95), origin="user_stated", confidence=0.5)
-    await store.write([target])
-    cand = c.mem("the car is a sedan", origin="user_confirmed", confidence=0.8)
-    result = await _reconcile(
-        store, _LLM([_ops((0, "UPDATE", "e0"))]), _Candidate(cand, is_correction=correction)
-    )
-    assert _untouched(store, target)
-    assert [m.id for m in result.direct] == ([cand.id] if kept else [])
-
-
-@pytest.mark.asyncio
-async def test_user_stated_updates_a_more_certain_user_confirmed() -> None:
-    c = _Ctx()
-    store = InMemoryMemoryStore()
-    target = c.mem("the car is a hatchback", _at(0.95), origin="user_confirmed", confidence=0.8)
-    await store.write([target])
-    cand = c.mem("the car is a red hatchback", origin="user_stated", confidence=0.3)
-    result = await _reconcile(store, _LLM([_ops((0, "UPDATE", "e0"))]), _Candidate(cand))
-    assert result.superseded == 1
-    assert not _untouched(store, target)
+# ─── 确定性「重复」看来源强弱 ────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_identical_text_noop_follows_the_tiers() -> None:
-    """确定性「重复」:用户确认候选碰到相同的用户说的 → 不问模型;反过来交给模型(应升级)。"""
+    """确定性「重复」:用户确认候选碰到相同的用户说的 → 不问模型;反过来(已有的那条来源更弱)
+    候选写下、那条被退,由程序定(``test_memory_write_retire_split``),模型调用照常发生。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     await store.write([c.mem("works nights", origin="user_stated")])
@@ -742,15 +587,14 @@ async def test_identical_text_noop_follows_the_tiers() -> None:
 
 # ─── 失败语义:去重合并内部出错 → 抛 ReconcileFailedError,带着「还没写的」──────────
 #
-# 协调人 11-15(审查 MEDIUM-1/2):S 合入之前,写回接住它、把 ``.unwritten`` 原样(带全部字段)
-# 直接写入;已落库的、已判重复的、被层级拦下丢弃的都不在里面。S 再改成抛给任务重试。
+# ``.unwritten`` 里是要写但还没写的;已落库的、已判重复的不在里面(第 9 版起没有「被拦下丢弃」)。
 
 
 class _FailingStore(InMemoryMemoryStore):
     def __init__(self, *fails: str, fail_on: UUID | None = None) -> None:
         super().__init__()
         self.fails = set(fails)
-        #: 取代 / 作废只在改这一条时出错(``None`` = 每次都出错)。
+        #: ``supersede`` 只在要退这一条时出错(``None`` = 每次都出错)。
         self.fail_on = fail_on
 
     def _boom(self, what: str, target: UUID | None = None) -> None:
@@ -761,13 +605,18 @@ class _FailingStore(InMemoryMemoryStore):
         self._boom("retrieve")
         return await super().retrieve(**kwargs)
 
-    async def supersede(self, **kwargs: Any) -> MemoryItem | None:
-        self._boom("supersede", kwargs["old_id"])
+    async def supersede(self, **kwargs: Any) -> Any:
+        targets = kwargs.get("old_ids") or [None]
+        self._boom("supersede", self.fail_on if self.fail_on in targets else targets[0])
         return await super().supersede(**kwargs)
 
-    async def expire(self, **kwargs: Any) -> bool:
-        self._boom("expire", kwargs["memory_id"])
-        return await super().expire(**kwargs)
+    async def retire(self, **kwargs: Any) -> Any:
+        self._boom("retire")
+        return await super().retire(**kwargs)
+
+    async def get_live(self, **kwargs: Any) -> MemoryItem | None:
+        self._boom("get_live")
+        return await super().get_live(**kwargs)
 
     async def origin_standing(self, **kwargs: Any) -> Any:
         self._boom("origin_standing")
@@ -789,30 +638,35 @@ async def _failed(store: InMemoryMemoryStore, llm: Any, *candidates: _Candidate)
 
 
 @pytest.mark.parametrize(
-    ("fail", "op", "kept"),
+    ("fail", "reply", "kept"),
     [
-        ("retrieve", "ADD", True),
-        ("supersede", "UPDATE", True),
-        ("expire", "DELETE", True),
-        # 判成重复、只是刷新确认日期失败:候选本来就不写。
-        ("refresh", "NOOP", False),
+        ("retrieve", _ops((0, "ADD", None)), True),
+        ("supersede", _retiring((0, "e0")), True),
+        ("supersede", _ops((0, "ADD", None)), True),
+        # 判成重复的候选本来就不写:核对那条还在不在、刷新确认日期、只退不写时出错都一样。
+        ("get_live", _ops((0, "NOOP", "e0")), False),
+        ("refresh", _ops((0, "NOOP", "e0")), False),
+        ("retire", json.dumps({"ops": [{"index": 0, "op": "NOOP", "target_id": "e0",
+                                        "replaces": ["e1"]}]}), False),
     ],
-)
+    ids=["retrieve", "supersede", "plain-write", "still-current", "refresh", "retire"],
+)  # fmt: skip
 @pytest.mark.asyncio
 async def test_store_errors_inside_reconcile_raise_with_what_is_unwritten(
-    fail: str, op: str, kept: bool
+    fail: str, reply: str, kept: bool
 ) -> None:
     c = _Ctx()
     store = _FailingStore(fail)
     target = c.mem("speaks French", _at(0.95), origin="user_stated")
-    await store.write([target])
+    other = c.mem("speaks German", _at(0.9), origin="user_stated")
+    await store.write([target, other])
     cand = c.mem("speaks French well", origin="user_stated", confidence=0.9)
     error = await _failed(
-        store, _LLM([_ops((0, op, "e0"))]), _Candidate(cand, line_at=_LINE, in_new_segment=True)
+        store, _LLM([reply]), _Candidate(cand, line_at=_LINE, in_new_segment=True)
     )
     assert isinstance(error.__cause__, ConnectionError)
     assert [m.id for m in error.unwritten] == ([cand.id] if kept else [])
-    assert len(store._rows) == 1
+    assert len(store._rows) == 2
 
 
 @pytest.mark.asyncio
@@ -861,10 +715,11 @@ def _deg(deg: float) -> tuple[float, ...]:
 
 @pytest.mark.asyncio
 async def test_a_mid_batch_failure_hands_back_only_the_unwritten() -> None:
-    """审查 MEDIUM-2:a1 已取代成功、b 被层级拦下丢弃、a2 取代时库出错、a3 判重复(还没轮到)、
-    d 判新增(还没轮到)—— 交回的只有 a2 与 d。已落库的、重复的、被拦下的都不在里面。"""
+    """审查 MEDIUM-2:a1 已写下并退掉 r0、b(来自助手)退不掉用户说的那条但照写(还在等批量写入)、
+    a2 写下时库出错、a3 判重复(还没轮到)、d 判写下(还没轮到)—— 交回的是 b、a2 与 d。已落库的、
+    重复的不在里面。"""
     c = _Ctx()
-    r0, r1 = c.mem("lives north", _deg(0)), c.mem("lives east", _deg(40))
+    r0, r1 = c.mem("lives north", _deg(0), origin="user_stated"), c.mem("lives east", _deg(40))
     user_row = c.mem("works nights", _deg(80), origin="user_stated", confidence=0.9)
     store = _FailingStore("supersede", fail_on=r1.id)
     await store.write([r0, r1, user_row])
@@ -877,16 +732,17 @@ async def test_a_mid_batch_failure_hands_back_only_the_unwritten() -> None:
         (0, "UPDATE", "e0"), (1, "UPDATE", "e2"), (2, "UPDATE", "e1"), (3, "NOOP", "e0"),
         (4, "ADD", None),
     )  # fmt: skip
-    error = await _failed(store, _LLM([ops]), *(_Candidate(m) for m in (a1, b, a2, a3, d)))
-    assert [m.id for m in error.unwritten] == [a2.id, d.id]
+    error = await _failed(store, _LLM([ops]), *(_said(m) for m in (a1, b, a2, a3, d)))
+    assert [m.id for m in error.unwritten] == [b.id, a2.id, d.id]
     assert error.superseded == 1
     assert not _untouched(store, r0)
     assert _untouched(store, r1) and _untouched(store, user_row)
 
-    # PR S(§7.6)—— 写回不再直接写下 a2:没有任务重试的这一次(本轮内写回)等于最后一次尝试,
-    # 失败队列只收 a2(已取代落库的 a1、重复的 a3 不重建);出错走失败分支,条数是 0、failed 为真。
+    # PR S(§7.6)—— 写回不直接写下 a2:没有任务重试的这一次(本轮内写回)等于最后一次尝试,
+    # 失败队列只收 a2(已落库的 a1、重复的 a3 不重建);出错走失败分支,条数是 0、failed 为真。
     c2 = _Ctx()
-    s0, s1 = c2.mem("lives north", _deg(0)), c2.mem("lives east", _deg(40))
+    s0 = c2.mem("lives north", _deg(0), origin="user_stated")
+    s1 = c2.mem("lives east", _deg(40))
     store2 = _FailingStore("supersede", fail_on=s1.id)
     await store2.write([s0, s1])
     llm = _RoutingLLM(
@@ -929,14 +785,12 @@ async def test_a_naive_line_time_is_read_as_utc() -> None:
     await store.write([target])
     cand = c.mem("lives south", origin="user_stated", confidence=0.9)
     naive_older = (recorded - timedelta(hours=1)).replace(tzinfo=None)
-    result = await _reconcile(
-        store, _LLM([_ops((0, "UPDATE", "e0"))]), _Candidate(cand, line_at=naive_older)
-    )
-    assert [m.id for m in result.direct] == [cand.id]
+    await _reconcile(store, _LLM([_retiring((0, "e0"))]), _Candidate(cand, line_at=naive_older))
     assert _untouched(store, target)
+    assert cand.id in {r.id for r in _live(store)}
 
 
-# ─── 写回整体:两段合并、出错时只直接写还没写的 ───────────────────────────────────
+# ─── 写回整体:两段合并、出错时失败队列只收还没写的 ─────────────────────────────────
 
 PASS1_MARK = "The other side of the conversation is not shown."
 PASS2_MARK = "Each line starts with its number in brackets and a tag:"
@@ -978,7 +832,9 @@ def _memories(content: str) -> str:
 def _user_message(text: str) -> HumanMessage:
     return HumanMessage(
         content=text,
-        additional_kwargs=user_input_kwargs(text=text, images=0, files=0, external_blocks=0),
+        additional_kwargs=user_input_kwargs(
+            text=text, images=0, files=0, external_blocks=0, sent_at=_SAID_AT.isoformat()
+        ),
     )
 
 
@@ -1051,7 +907,11 @@ async def _flush_with_dlq(
 
 def _user_memories(*rows: tuple[str, float]) -> str:
     return json.dumps(
-        {"memories": [{"kind": "fact", "content": t, "confidence": conf} for t, conf in rows]}
+        {
+            "memories": [
+                {"kind": "fact", "content": t, "confidence": conf, "turn": 1} for t, conf in rows
+            ]
+        }
     )
 
 
@@ -1099,10 +959,10 @@ async def test_a_reconcile_failure_raises_to_the_retry_and_dlqs_only_on_the_last
 
 @pytest.mark.asyncio
 async def test_after_a_reconcile_failure_the_dlq_gets_only_the_unwritten() -> None:
-    """审查 MEDIUM-2,失败队列接上:a1 已取代、a2 取代出错、a3 判重复;之后直接写入也失败 ——
+    """审查 MEDIUM-2,失败队列接上:a1 已写下并退掉旧行、a2 写下时出错、a3 判重复 ——
     失败队列只收到 a2(已落库的 a1、重复的 a3 不会被重建成新行)。"""
     c = _Ctx()
-    r0, r1 = c.mem("lives north", _deg(0)), c.mem("lives east", _deg(40))
+    r0, r1 = c.mem("lives north", _deg(0), origin="user_stated"), c.mem("lives east", _deg(40))
     store = _FailingStore(fail_on=r1.id)
     await store.write([r0, r1])
     store.fails = {"supersede", "write"}

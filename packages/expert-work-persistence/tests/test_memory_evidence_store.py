@@ -38,8 +38,6 @@ from expert_work.persistence.memory.base import (
     USER_SIDE_ORIGINS,
     ConsolidationSourcesChangedError,
     MemoryStore,
-    OriginStanding,
-    UserSideTargetError,
     is_mixed_origin,
 )
 from expert_work.persistence.memory.hash import hash_content
@@ -175,31 +173,25 @@ async def test_supersede_writes_the_candidates_pointer_and_event_date(store: Mem
     old = _item(t, u, "old", origin="user_stated", **_evidence(1))
     await store.write([old])
     new = _item(t, u, "new", origin="user_confirmed", **_evidence(9))
-    written = await store.supersede(tenant_id=t, user_id=u, old_id=old.id, new_item=new)
-    assert written is not None
+    new_stated = new.model_copy(update={"origin": "user_stated"})
+    written = await store.supersede(tenant_id=t, user_id=u, old_ids=[old.id], new_item=new_stated)
+    assert written.retired == (old.id,)
     got = await _row(store, t, u, new.id)
-    assert got.origin == "user_confirmed"
+    assert got.origin == "user_stated"
     assert _fields(got) == _expected(9)
 
 
 @pytest.mark.asyncio
-async def test_guarded_supersede_and_expire_refuse_a_user_confirmed_target(
+async def test_an_assistant_candidate_does_not_retire_a_user_confirmed_target(
     store: MemoryStore,
 ) -> None:
-    """来自助手的候选(带保护)改不动用户确认的那一条(设计 §6.3 第一行)。"""
+    """来自助手的候选退不掉用户确认的那一条,它自己照写(设计 §6.3 第一行)。"""
     t, u = uuid4(), uuid4()
     target = _item(t, u, "confirmed", origin="user_confirmed", confidence=0.8)
     await store.write([target])
-    with pytest.raises(UserSideTargetError):
-        await store.supersede(
-            tenant_id=t, user_id=u, old_id=target.id,
-            new_item=_item(t, u, "assistant rewrite", origin="assistant_derived"),
-            candidate_standing=OriginStanding(0, 0.6),
-        )  # fmt: skip
-    with pytest.raises(UserSideTargetError):
-        await store.expire(
-            tenant_id=t, user_id=u, memory_id=target.id, candidate_standing=OriginStanding(0, 0.6)
-        )
+    new = _item(t, u, "assistant rewrite", origin="assistant_derived")
+    result = await store.supersede(tenant_id=t, user_id=u, old_ids=[target.id], new_item=new)
+    assert result.inserted and dict(result.refused) == {target.id: "assistant"}
     got = await _row(store, t, u, target.id)
     assert (got.invalid_at, got.expired_at, got.superseded_by) == (None, None, None)
 
