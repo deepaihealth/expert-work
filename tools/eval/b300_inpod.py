@@ -157,13 +157,14 @@ async def _supersede_seed(
 ) -> str:
     """种「已被取代」的种子。**接口假设**(与 ``b300_k_platform`` 的 A1 / A2 是同一条;这个文件要
     整份喂进 pod,不能 import 那边,所以在这里再写一遍):第 9 版的 ``supersede`` 收 ``old_ids``
-    (零到多个),返回 (新行或它撞上的那条, 退了哪些, 没退的各自原因);之前的收 ``old_id``,返回
-    新行或 ``None``。按签名认是哪一种。返回新行的 id(没写成 = 空串)。"""
+    (零到多个),返回 ``SupersedeResult``(``item`` = 新行或它撞上的那条);之前的收 ``old_id``,返回
+    新行或 ``None``。按签名认是哪一种。返回新行的 id(没写成 = 空串)。旧行没被退(来源组合不许
+    退,``refused``)时新行照写 —— 种子里「已被取代」的那一对要用许退的组合。"""
     if "old_ids" in inspect.signature(store.supersede).parameters:
         result = await store.supersede(
             tenant_id=tenant_id, user_id=user_id, old_ids=[old_id], new_item=new_item
         )
-        row = result[0] if isinstance(result, tuple) else result
+        row = result.item
     else:
         row = await store.supersede(
             tenant_id=tenant_id, user_id=user_id, old_id=old_id, new_item=new_item
@@ -201,11 +202,26 @@ async def _write_seeds(
             source_hashes={m.id: hash_content(m.content) for m in members},
         )
         ids[s["key"]] = str(row.id)
+    summary_keys = {s["key"] for s in seeds if s.get("summary_of")}
+    new_interface = "old_ids" in inspect.signature(store.supersede).parameters
     for s in seeds:
-        if s.get("linked_to"):
-            row = items[s["key"]].model_copy(update={"supersedes": UUID(ids[s["linked_to"]])})
-            await store.write([row])
-            ids[s["key"]] = str(row.id)
+        target = s.get("linked_to")
+        if not target:
+            continue
+        if new_interface and target in summary_keys:
+            # 连着一条汇总行 = 用户的新说法否认了其中一件、汇总行还没重写:用真实的那条路打标
+            # (§7.12 第 1 步;新行的 supersedes 指向汇总行,汇总行写上 review_flagged_at)。
+            result = await store.supersede(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                new_item=items[s["key"]],
+                flag_summary_ids=[UUID(ids[target])],
+            )
+            ids[s["key"]] = str(result.item.id)
+            continue
+        row = items[s["key"]].model_copy(update={"supersedes": UUID(ids[target])})
+        await store.write([row])
+        ids[s["key"]] = str(row.id)
     for s in seeds:
         target = s.get("superseded_by")
         if target:

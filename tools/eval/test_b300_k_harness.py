@@ -543,3 +543,90 @@ def test_reconcile_material_and_swallowed_errors_are_recorded() -> None:
     assert material["candidates"][0]["content"] == "The user changed it."
     assert kp.RECONCILE_REPLY_ERROR in result["rounds"][0]["errors"]
     assert result["rounds"][0]["failed"] is True
+
+
+# --------------------------------------------------------------------------- 第 9 版代码(假模型)
+
+
+def _user_line(body: Any) -> int:
+    """第一次提炼的输入里最后一行的行号(第一次只看用户的文字,每行 ``[n] [日期] 文字``)。"""
+    text = "\n".join(str(m["content"]) for m in body["messages"] if m["role"] != "system")
+    numbers = [x[1 : x.index("]")] for x in text.splitlines() if x.startswith("[") and "]" in x]
+    return int([n for n in numbers if n.isdigit()][-1])
+
+
+def _scripted(content: str, listed: str, rewritten: str = "") -> Any:
+    """假模型:第一次提炼把 ``content`` 记成用户说的(带 ``turn``);去重合并 ``ADD`` 并把正文是
+    ``listed`` 的那条已有记忆列进 ``replaces``;重写回 ``rewritten``。"""
+
+    def reply(kind: str, body: Any) -> str:
+        if kind == "pass1":
+            turn = _user_line(body)
+            memory = {"kind": "fact", "content": content, "importance": 0.8, "turn": turn}
+            return json.dumps({"memories": [memory]}, ensure_ascii=False)
+        if kind == "reconcile":
+            material = json.loads(body["messages"][-1]["content"])
+            ops = []
+            for cand in material["candidates"]:
+                ids = [e["id"] for e in cand["existing"] if e["content"] == listed]
+                ops.append({"index": cand["index"], "op": "ADD", "replaces": ids, "restates": []})
+            return json.dumps({"ops": ops})
+        if kind == "other":
+            return json.dumps({"summary": rewritten}, ensure_ascii=False)
+        return '{"memories": []}'
+
+    return reply
+
+
+def test_on_v9_code_a_full_sentence_change_retires_the_old_row_and_keeps_the_guarantee() -> None:
+    """代码侧第 9 版合进来之后:能力探测为真,K-a 的线与「写的保证」算得出来(不再 incomplete)。"""
+    s = _k("K-a")
+    it = ks.item_of(s)
+    result = _run(s, _scripted(it.y.memory, it.x.memory))
+    assert result["capabilities"]["retire_split"] is True
+    assert result["capabilities"]["summary_rewrite"] is True
+    out, _items = kchk.checks({"key": "u", "result": result}, s)
+    assert out["retired_to_new"] is True and out["missed"] is False
+    assert out["write_guarantee_broken"] is False and out["missing"] == {}
+    assert out["counts"]["guarantee_candidates"] == 1 and out["counts"]["listed"] == 1
+    assert out["counts"].get("listed_blocked", 0) == 0 and out["neighbour_retired"] is False
+    rows = {m["id"]: m for m in result["memories"]}
+    old = rows[result["seeded"]["x"]]
+    assert not old["live"] and rows[old["superseded_by"]]["origin"] == "user_stated"
+
+
+def test_on_v9_code_a_listed_neighbour_that_the_program_keeps_is_counted() -> None:
+    """控制台更正过的行模型列了也退不掉(K-t):新说法照写、旧行仍有效,数进「被程序挡下」。"""
+    s = _k("K-t")
+    it = ks.item_of(s)
+    result = _run(s, _scripted(it.y.memory, it.x.memory))
+    out, _items = kchk.checks({"key": "u", "result": result}, s)
+    assert out["x_retired"] is False and out["stored_new"] is True
+    assert out["counts"]["listed_blocked"] == 1 and out["write_guarantee_broken"] is False
+
+
+def test_on_v9_code_a_denied_summary_is_marked_then_rewritten_in_place() -> None:
+    """K-s 否认的那一半:写回不直接退汇总行、只打标;当场重写之后旧汇总行连到新汇总行,
+    重写后的两条线送判官(不再 incomplete)。"""
+    s = next(x for x in K if x.cls == "K-s" and x.variant == "deny")
+    trio = ks.item_of(s).trio
+    rewritten = f"{trio.a.memory} {trio.c.memory}"
+    # 假嵌入按字面相近排名次:让假模型写出的那句贴着汇总句,汇总行才进同格前 2 名(§7.1 第 6 行);
+    # 真跑时名次由真嵌入定,排不进前 2 名就只是不退、不打标(counts 的 listed_blocked 看得到)。
+    said = f"{trio.summary} {trio.deny_b}"
+    result = _run(s, _scripted(said, trio.summary, rewritten))
+    rewrite = result["rounds"][0]["rewrite"]
+    assert rewrite["before"] == {"summary_live": True, "summary_flagged": True}
+    assert rewrite["ran"] is True and rewrite["outcomes"] == ["rewritten"]
+    assert [c["kind"] for c in rewrite["calls"]] == ["rewrite"]
+    rows = {m["id"]: m for m in result["memories"]}
+    old = rows[result["seeded"]["summary"]]
+    fresh = rows[old["superseded_by"]]
+    assert not old["live"] and fresh["live"] and fresh["content"] == rewritten
+    assert fresh["consolidated_from"] == old["consolidated_from"]
+    out, items = kchk.checks({"key": "u", "result": result}, s)
+    assert out["summary_retired_directly"] is False and out["new_stored"] is True
+    assert out["missing"] == {} and out["counts"]["rewrite_rewritten"] == 1
+    assert [i.check for i in items] == ["b_still_in_summary", "ac_lost"]
+    assert f"- {rewritten}" in items[0].prompt
+    assert out["neighbour_retired"] is False and out["write_guarantee_broken"] is False

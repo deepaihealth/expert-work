@@ -398,7 +398,7 @@ _PROBES: dict[str, Callable[[], bool]] = {
     "slicing": _takes_slice_start,
     # 第 9 版(``b300_k_platform`` 的 A1 / A8):存储的 ``supersede`` 收清单;整理器有当场重写的入口
     "retire_split": lambda: "old_ids" in inspect.signature(_store_supersede()).parameters,
-    "summary_rewrite": lambda: hasattr(_consolidator(), "rewrite_flagged_summaries"),
+    "summary_rewrite": lambda: hasattr(_rewriter(), "rewrite_for_user"),
 }
 
 
@@ -408,10 +408,10 @@ def _store_supersede() -> Any:
     return InMemoryMemoryStore.supersede
 
 
-def _consolidator() -> Any:
-    from control_plane.memory_consolidator import MemoryConsolidator
+def _rewriter() -> Any:
+    from control_plane import memory_consolidator
 
-    return MemoryConsolidator
+    return getattr(memory_consolidator, "SummaryRewriter", None)
 
 
 @pytest.mark.parametrize("name", base.CAPABILITIES)

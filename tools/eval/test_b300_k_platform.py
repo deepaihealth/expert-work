@@ -124,9 +124,9 @@ class _NewStore:
 
     async def supersede(
         self, *, tenant_id: UUID, user_id: UUID, old_ids: Any, new_item: Any
-    ) -> tuple[Any, list[UUID], dict[UUID, str]]:
+    ) -> Any:
         self.calls.append({"old_ids": list(old_ids), "new": new_item})
-        return new_item, list(old_ids), {}
+        return SimpleNamespace(item=new_item, retired=tuple(old_ids), refused={})
 
 
 def test_retire_split_is_read_off_the_supersede_signature() -> None:
@@ -200,9 +200,9 @@ def test_before_state_sees_a_flag_and_a_retired_summary() -> None:
 
 
 def test_with_the_entry_the_rewrite_runs_for_this_user(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A8:整理器上的 ``rewrite_flagged_summaries(tenant_id=, user_id=)``;结果认字符串和带
+    """A8:``SummaryRewriter.rewrite_for_user(tenant_id=, user_id=)``;结果认字符串和带
     ``.outcome`` 的对象。"""
-    from control_plane.memory_consolidator import MemoryConsolidator
+    from control_plane.memory_consolidator import SummaryRewriter
 
     seen: list[tuple[UUID, UUID]] = []
 
@@ -210,7 +210,8 @@ def test_with_the_entry_the_rewrite_runs_for_this_user(monkeypatch: pytest.Monke
         seen.append((tenant_id, user_id))
         return ["rewritten", SimpleNamespace(outcome="unchanged")]
 
-    monkeypatch.setattr(MemoryConsolidator, kp.REWRITE_ENTRY[2], rewrite, raising=False)
+    assert kp.REWRITE_ENTRY[1:] == ("SummaryRewriter", "rewrite_for_user")
+    monkeypatch.setattr(SummaryRewriter, kp.REWRITE_ENTRY[2], rewrite)
     assert kp.capabilities(InMemoryMemoryStore)["summary_rewrite"] is True
     store, user, ids = asyncio.run(_summary_store())
     out = _run_rewrite(store, user, ids["summary"])
@@ -400,6 +401,13 @@ def test_inpod_seeds_b4d_summary_members_and_the_linked_later_statement() -> Non
     assert [str(i) for i in summary.consolidated_from] == [ids["a"], ids["x"], ids["c"]]
     assert all(str(rows[ids[k]].consolidated_into) == ids["summary"] for k in ("a", "x", "c"))
     assert str(rows[ids["y"]].supersedes) == ids["summary"] and summary.invalid_at is None
+    # 汇总行还没重写:走真实的那条路打了重写标记(§7.12 第 1 步),用户的新说法是有效行
+    assert summary.review_flagged_at is not None and rows[ids["y"]].invalid_at is None
+    listed = asyncio.run(
+        store.list_flagged_summaries(tenant_id=TENANT, user_id=summary.user_id, limit=5)
+    )
+    assert [str(e.summary.id) for e in listed] == [ids["summary"]]
+    assert [str(m.id) for m in listed[0].statements] == [ids["y"]]
     assert set(ids) == {"a", "x", "c", "summary", "y"}
 
 
@@ -430,3 +438,12 @@ def test_inpod_c5_seed_still_supersedes_x_with_y() -> None:
     rows = {str(r.id): r for r in store._rows}
     x = next(r for r in store._rows if r.superseded_by is not None)
     assert str(x.superseded_by) == ids["y"] and rows[ids["y"]].invalid_at is None
+
+
+def test_inpod_links_a_seed_to_an_ordinary_row_that_stays_valid() -> None:
+    """连着一条普通行(不是汇总行)的种子:``supersedes`` 指过去、对方仍有效、不打任何标。"""
+    store = InMemoryMemoryStore()
+    ids = _inpod_seed(store, _s("K-e2"))["memory_ids"]
+    rows = {str(r.id): r for r in store._rows}
+    assert str(rows[ids["y"]].supersedes) == ids["x"]
+    assert rows[ids["x"]].invalid_at is None and rows[ids["x"]].review_flagged_at is None

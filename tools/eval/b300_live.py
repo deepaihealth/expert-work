@@ -488,6 +488,8 @@ async def run_extraction(
                 summary_id=seeded.get("summary"),
             )
             rewrite["calls"] = aux.calls
+            if transport.guard.blocked:  # 重写器把模型调用的错吞成 failed:止损了照样停
+                raise SpendStopError(transport.guard.blocked)
         now = await store.list_for_user(tenant_id=A_TENANT, user_id=user_id, limit=500)
         rounds.append(
             {

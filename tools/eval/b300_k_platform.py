@@ -21,50 +21,53 @@ from typing import Any
 from uuid import UUID, uuid4
 
 ASSUMPTIONS: tuple[str, ...] = (
-    "A1 存储 supersede:新签名收 old_ids(零到多个),不再收 old_id(§7.8)。评测只用它判断被测"
-    "代码是不是第 9 版(capabilities['retire_split']),和在 pod 里种「已被取代」的种子。",
-    "A2 supersede 的返回:(新行或它撞上的那条, 退了哪些, 没退的各自原因) 三元组,第一项有 .id"
-    "(§7.8);pod 里种种子时取第一项的 id。老签名返回单个行或 None,也认。",
+    "A1 存储 supersede(*, tenant_id, user_id, new_item, old_ids=(), identical_ids=(), "
+    "flag_summary_ids=(), link_id=None)(§7.8;已对着代码核实)。评测用「签名里有 old_ids」判断被测"
+    "代码是不是第 9 版(capabilities['retire_split']);pod 里种「已被取代」的种子、给汇总行打标"
+    "也走它。",
+    "A2 supersede 返回 SupersedeResult(item / inserted / retired / refused / flagged / "
+    "collision_replaced),不再返回 None;种子取 result.item.id。老签名(old_id、返回单行或 None)"
+    "只为在第 9 版之前的提交上跑基线保留。",
     "A3 记忆行的字段不变(§7.8「不需要迁移」):superseded_by / supersedes / invalid_at / "
     "consolidated_from / consolidated_into / status / review_flagged_at / occurred_on / "
     "confidence / origin。读库断言全靠这几列。",
     "A4 supersedes 的两种含义(§7.8):被指的行仍有效 = 只是连着(并存、汇总行待重写);被指的行"
     "已作废 = 替掉了它。历史行 = 落库时已作废(invalid_at 有值)、superseded_by 指向一条有效行。",
-    "A5 控制台更正过的 = confidence >= 1.0(现有的 effective_origin;§6.3 没改)。种子直接写 1.0。",
-    "A6 汇总行与成员用现有的 write_consolidated(tenant_id, user_id, content, embedding, "
-    "source_ids, source_hashes) 种(§7.12 没改它);汇总行 status='consolidated'、带 "
-    "consolidated_from,成员带 consolidated_into。",
-    "A7 重写标记 = 汇总行的 review_flagged_at(§7.12「标记用现有的列」);重写之后旧汇总行作废、"
-    "superseded_by 指向新汇总行(或用户最晚的那条新说法 / 撞上的那条),新汇总行的 "
-    "consolidated_from 与旧行相同。",
-    "A8 当场重写的入口(§7.12 第 2 步):control_plane.memory_consolidator.MemoryConsolidator 上的"
-    "异步方法 rewrite_flagged_summaries(*, tenant_id, user_id),返回每条打了标的汇总行的结果"
-    "(字符串或带 .outcome 的对象;取值 §7.12「计数」那 9 个)。方法名与签名是本脚本猜的,设计没写;"
-    "对不上时 capabilities['summary_rewrite'] 为假,K-s 里要重写才量得到的线报 incomplete。",
-    "A9 去重合并的材料仍是一条 JSON(candidates[].index / content / source / existing[].id / "
-    "content,短编号 e0、e1……,§7.1 第 3 行);回复里每条候选的决定带 op、target_id、replaces、"
-    "restates(§7.1 第 13 行)。评测只从回复里读这两张清单与 op / target_id,按候选的 index "
-    "对回材料。",
-    "A10 去重合并指令的开头仍能被 b300_live.classify_call 认成 reconcile(现在认 "
-    "'You compare newly extracted memories' 与旧的 'You reconcile newly extracted memories');"
-    "附录 B 的新开头若不同,要在 b300_live 的 *_RECONCILE_MARK 里加一条。",
-    "A11 来源的显示文字仍由 orchestrator.context.memory_render.ORIGIN_LABELS(有效来源 → 文字)给;"
+    "A5 控制台更正过的 = confidence >= 1.0(effective_origin;§6.3 没改)。种子直接写 1.0。",
+    "A6 汇总行与成员用 write_consolidated(tenant_id, user_id, content, embedding, source_ids, "
+    "source_hashes) 种(第 9 版没改它);汇总行 status='consolidated'、带 consolidated_from,成员带 "
+    "consolidated_into。",
+    "A7 重写标记 = 汇总行的 review_flagged_at;由 supersede(flag_summary_ids=...) 打(只有用户一方的"
+    "新行打得上)。重写之后旧汇总行作废、superseded_by 指向新汇总行(或用户最晚的那条新说法 / 撞上"
+    "的那条),新汇总行的 consolidated_from 与旧行相同。",
+    "A8 当场重写的入口(§7.12 第 2 步):control_plane.memory_consolidator.SummaryRewriter("
+    "memory_store, aux_model, embedder, audit_logger, default_aux_model_name).rewrite_for_user("
+    "tenant_id, user_id) -> list[str](各条的结果:rewritten / emptied / unchanged / collided / "
+    "stale / corrected_member / blocked / abandoned / failed)。它从不向外抛:模型调用出错记成 "
+    "failed。评测给它的审计是空桩(只有新句子被写入扫描拦下时才用到)。",
+    "A9 去重合并的材料是一条 JSON(candidates[].index / content / source / existing[].id / "
+    'content,短编号 e0、e1……);回复是 {"ops": [{index, op, target_id, replaces, restates}]}'
+    "(已核实)。评测只读这两张清单与 op / target_id,按候选的 index 对回材料。",
+    "A10 去重合并指令的开头是 'You compare newly extracted memories'(已核实),"
+    "b300_live.classify_call 认得出;旧的 'You reconcile newly extracted memories' 也还认。",
+    "A11 来源的显示文字由 orchestrator.context.memory_render.ORIGIN_LABELS(有效来源 → 文字)给;"
     "评测用它把材料里候选的 source 倒回来源。",
-    "A12 写回入口不变:orchestrator.graph_builder.memory.flush_messages_with_outcome(..., "
+    "A12 写回入口:orchestrator.graph_builder.memory.flush_messages_with_outcome(..., "
     "segment=SegmentStart(message_index=...));K-late 靠「起点 0、只在最后写回一次」让一个写回"
-    "覆盖两轮。",
-    "A13 不退的原因只从库里的结果和去重合并的回复推(模型列了、那一行却仍有效);12 个 "
+    "覆盖两轮。候选要有 line_at 才退得掉旧行:消息的发送时间由 _build_human_message 盖,turn 由"
+    "提炼模型给 —— 模型没给 turn 时什么都退不掉(retire_refused_unknown_time)。",
+    "A13 不退的原因只从库里的结果和去重合并的回复推(模型列了、那一行却仍有效);"
     "retire_refused_* 计数是进程级的 Prometheus 计数,评测并发跑单元时分不到每个单元,不读。",
-    "A14 写回入口把内部的错吞掉、只回 failed(现在就是这样),错由 logging 记在 "
+    "A14 写回入口把内部的错吞掉、只回 failed,错由 logging 记在 "
     "'orchestrator.graph_builder.memory' 这个 logger 上、带 exc_info;去重合并回复解析失败的异常名"
-    "仍是 ReconcileReplyError(§11.1 第 2 步 ③)。评测挂一个只记异常名的 handler 来数它。",
+    "是 ReconcileReplyError(已核实)。评测挂一个只记异常名的 handler 来数它。",
 )
 
 #: A8:当场重写的入口(模块, 类, 方法)。
 REWRITE_ENTRY = (
     "control_plane.memory_consolidator",
-    "MemoryConsolidator",
-    "rewrite_flagged_summaries",
+    "SummaryRewriter",
+    "rewrite_for_user",
 )
 #: A1:新 ``supersede`` 的清单参数名。
 SUPERSEDE_LIST_PARAM = "old_ids"
@@ -223,7 +226,7 @@ def dump_row(m: Any) -> dict[str, Any]:
 
 
 class _Stub:
-    """重写用不到、但构造整理器时要给的那几样(租户配置、审计):任何方法都是空的异步函数。"""
+    """构造重写器时要给的审计(只有新句子被写入扫描拦下时才用到):任何方法都是空的异步函数。"""
 
     def __getattr__(self, _name: str) -> Any:
         async def nothing(*_args: Any, **_kwargs: Any) -> None:
@@ -270,17 +273,16 @@ async def rewrite_flagged(
     before = await summary_state(store, tenant_id=tenant_id, user_id=user_id, summary_id=summary_id)
     if _rewrite_method() is None:
         return {"ran": False, "outcomes": [], "before": before}
-    from control_plane.memory_consolidator import MemoryConsolidator, make_consolidator_embedder
+    from control_plane.memory_consolidator import SummaryRewriter, make_consolidator_embedder
 
-    consolidator = MemoryConsolidator(
+    rewriter = SummaryRewriter(
         memory_store=store,
-        tenant_config_service=_Stub(),  # type: ignore[arg-type]
-        audit_logger=_Stub(),  # type: ignore[arg-type]
         aux_model=aux_model,
         embedder=make_consolidator_embedder(embedder),
+        audit_logger=_Stub(),  # type: ignore[arg-type]
         default_aux_model_name=model,
     )
-    method = getattr(consolidator, REWRITE_ENTRY[2])
+    method = getattr(rewriter, REWRITE_ENTRY[2])
     result = await method(tenant_id=tenant_id, user_id=user_id)
     rows = result if isinstance(result, list | tuple) else ([] if result is None else [result])
     return {"ran": True, "outcomes": [_outcome(r) for r in rows], "before": before}
