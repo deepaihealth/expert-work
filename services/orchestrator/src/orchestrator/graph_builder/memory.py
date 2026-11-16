@@ -119,6 +119,7 @@ from orchestrator.graph_builder._config import (
 )
 from orchestrator.graph_builder.memory_lines import (
     ASSISTANT_TAG,
+    CONTEXT_LINE_DROPPED,
     USER_TAG,
     ExtractionLine,
     render_lines,
@@ -642,6 +643,36 @@ def _extraction_inputs(
     explicit = {id(m) for m in explicit_user_text}
     positions = {id(m): idx for idx, m in enumerate(messages)}
     return [_turn(segment, explicit, positions) for segment in _segments(messages)]
+
+
+def _message_times(
+    messages: Sequence[BaseMessage], explicit_user_text: Sequence[BaseMessage]
+) -> dict[str, datetime]:
+    """本对话里会成为带日期的行(``[user]`` / ``[assistant]``)的消息的发送时间,消息 id → UTC;与
+    提炼行的 ``line_at`` 同一个取法。去重合并比「更新」的先后时用(测试验收 run 7ee5144b)。
+
+    审查 L-2:取**全部**消息,含被重新生成 / 编辑重发取代的(``_segments`` 会跳过它们)—— 已有
+    记忆的证据可能正指着被取代的那条。"""
+    explicit = {id(m) for m in explicit_user_text}
+    times: dict[str, datetime] = {}
+    for message in messages:
+        if not isinstance(message.id, str) or not message.id:
+            continue
+        sent = _dated_line_at(message, explicit)
+        if sent is not None:
+            times[message.id] = sent
+    return times
+
+
+def _dated_line_at(message: BaseMessage, explicit: set[int]) -> datetime | None:
+    """这条消息若成为带日期的行,那一行的发送时间(同 :func:`_turn`):用户输入看白名单,助手看
+    不带工具调用的最终回答;其余 ``None``。"""
+    if isinstance(message, HumanMessage):
+        typed = _typed_input(message, explicit)
+        return _user_sent_at(typed, message) if typed is not None else None
+    if isinstance(message, AIMessage) and not message.tool_calls and _reply_text(message).strip():
+        return _parse_stamp(message.additional_kwargs.get(STAMP_CREATED_AT))
+    return None
 
 
 def _extract_json_object(text: str) -> str | None:
@@ -1437,7 +1468,11 @@ class ReconcileFailedError(RuntimeError):
     拦下丢弃的都不在里面),以及出错前已经取代的条数与被写入扫描拦下的那几条,调用方据此收尾。
 
     协调人 11-15(审查 MEDIUM-1/2):PR S 之前,写回接住它、把 ``unwritten`` 原样(来源、置信度、
-    智能体名都在)直接写入 —— 只新增、不碰已有行,拦截规则不会被绕过;S 再改成抛给任务重试。"""
+    智能体名都在)直接写入 —— 只新增、不碰已有行,拦截规则不会被绕过;S 再改成抛给任务重试。
+
+    已知局限(早于本分支,第三轮审查 LOW-2 记下):判了「更新 / 删除」、还没执行的候选在收尾时
+    一律算「要写」(:func:`_would_write`),不再预判层级拦截 —— 真正落库时会被拦下丢弃的(例如来自
+    助手的候选「更新」用户说的),最后一次重试失败时也会进失败队列。"""
 
     def __init__(
         self,
@@ -1485,11 +1520,20 @@ def _blocked_by_user_side(
     ``_delete``。
 
     ``lower_confidence`` = 拦下的是同一层级、置信度更低的用户一方候选(用户 11-14),处理相同,
-    计数用 ``lower_confidence_*`` 标签;层级更低的(重做 §6.3)用 ``blocked_*``。"""
+    计数用 ``lower_confidence_*`` 标签;层级更低的(重做 §6.3)用 ``blocked_*``。
+
+    用户 2026-11-16「被拦时与旧的并存」(测试验收 run 8e5a1f0d):被层级拦下的「更新」、候选是用户
+    确认的(不是更正)→ 也按新增存下,计数 ``blocked_update_added_confirmed`` —— 用户同意过的事不丢,
+    代价是偶尔多一条换了说法的重复。同层级、置信度更低被拦下的用户确认同样并存(用户 11-16「也和
+    旧的并存」),计数 ``lower_confidence_update_added_confirmed``;预判与锁里重判走这同一个函数。
+    来自助手的候选、用户说的候选照旧丢弃。"""
     prefix = "lower_confidence" if lower_confidence else "blocked"
     verb = "update" if op == "UPDATE" else "delete"
     if is_correction:
         record_memory_reconcile(op=f"{prefix}_{verb}_added")
+        return item
+    if op == "UPDATE" and effective_origin(item) == "user_confirmed":
+        record_memory_reconcile(op=f"{prefix}_update_added_confirmed")
         return item
     record_memory_reconcile(op=f"{prefix}_update_dropped" if op == "UPDATE" else f"{prefix}_delete")
     return None
@@ -1661,7 +1705,37 @@ def _event_dates_allow(op: str, candidate: _Candidate, target: MemoryItem) -> bo
     return True
 
 
-def _refusal(op: str, pending: _Pending, target: MemoryItem) -> str | None:
+def _evidence_at(
+    target: MemoryItem, item: MemoryItem, message_times: Mapping[str, datetime]
+) -> datetime | None:
+    """目标的证据消息的发送时间(UTC):证据消息在本对话里(同一个 ``source_thread_id``)、且本次
+    写回的行里知道它的时间才有;否则 ``None``。两边都不知道对话(``None``)不算同一对话(审查 L-4)。"""
+    if (
+        target.evidence_message_id is None
+        or item.source_thread_id is None
+        or target.source_thread_id != item.source_thread_id
+    ):
+        return None
+    sent = message_times.get(target.evidence_message_id)
+    return as_utc(sent) if sent is not None else None
+
+
+def _said_at(
+    target: MemoryItem, item: MemoryItem, message_times: Mapping[str, datetime]
+) -> datetime | None:
+    """「更新」比先后用的目标时间(测试验收 run 7ee5144b):知道证据消息的发送时间就用它代替记录时间
+    (记录时间晚只是写回排队、或同一任务第一段几秒前才写),用户一方的确认日期仍算;否则按
+    :func:`restated_at`。同一条消息、更晚的消息都不会「更旧」。"""
+    evidence = _evidence_at(target, item, message_times)
+    if evidence is None:
+        return restated_at(target)
+    restated = target.confirmed_at if effective_origin(target) in USER_SIDE_ORIGINS else None
+    return max(evidence, as_utc(restated)) if restated is not None else evidence
+
+
+def _refusal(
+    op: str, pending: _Pending, target: MemoryItem, message_times: Mapping[str, datetime]
+) -> str | None:
     """更新 / 删除在层级拦截之前的程序拒绝(重做 §7.1 第 6、7、11 行);``None`` = 放行。"""
     candidate = pending.candidate
     item = candidate.item
@@ -1672,8 +1746,8 @@ def _refusal(op: str, pending: _Pending, target: MemoryItem) -> str | None:
         return "rank"
     if not _event_dates_allow(op, candidate, target):
         return "event_date"
-    # 目标的记录时间与材料里给的日期同一个口径;没有时区的按 UTC 读。
-    recorded = restated_at(target)
+    # 目标的证据消息时间(不知道就用记录时间,与材料里给的日期同一个口径);没有时区的按 UTC 读。
+    recorded = _said_at(target, item, message_times)
     if (
         op == "UPDATE"
         and candidate.line_at is not None
@@ -1682,6 +1756,26 @@ def _refusal(op: str, pending: _Pending, target: MemoryItem) -> str | None:
     ):
         return "older_line"
     return None
+
+
+def _restates_same_message(item: MemoryItem, target: MemoryItem) -> bool:
+    """测试验收 run 7ee5144b —— 第二次的用户确认候选,被模型判成「重复」一条有效的用户一方记忆,
+    而两者的证据是同一条消息(同一对话):是第一次已经记下的那句话的重述,不是用户又说了一次 ——
+    NOOP,不刷新确认日期。目标要在候选的召回范围内。
+
+    只管模型判「重复」的(用户 11-16「只拦真重复」):判「更新」的照常走拦截与层级(被层级拦下的
+    用户确认与旧的并存),代价是偶尔多一条换了说法的。两边事件日期不同的不算(一句话里说了两天的
+    读数,审查 M-1);两边都不知道对话的不算同一对话(审查 L-4)。"""
+    return (
+        effective_origin(item) == "user_confirmed"
+        and item.evidence_message_id is not None
+        and item.evidence_message_id == target.evidence_message_id
+        and item.source_thread_id is not None
+        and item.source_thread_id == target.source_thread_id
+        and effective_origin(target) in USER_SIDE_ORIGINS
+        and _in_recall_scope(item, target)
+        and not _other_event_dates(item, target)
+    )
 
 
 def _record_target(op: str, pending: _Pending, target: MemoryItem) -> None:
@@ -1717,8 +1811,11 @@ def _agent_day_text(ts: datetime | None) -> str | None:
     return day.isoformat() if day is not None else None
 
 
-def _reconcile_material(pending: Sequence[_Pending], ids: Mapping[UUID, str]) -> dict[str, Any]:
-    """附录 B 的材料:候选与它的邻居都带类型、来源、日期、事件日期;邻居用短编号。"""
+def _reconcile_material(
+    pending: Sequence[_Pending], ids: Mapping[UUID, str], message_times: Mapping[str, datetime]
+) -> dict[str, Any]:
+    """附录 B 的材料:候选与它的邻居都带类型、来源、日期、事件日期;邻居用短编号。邻居的日期与
+    程序比「更新」先后的是同一个时间(:func:`_said_at`,审查 L-3)。"""
     return {
         "candidates": [
             {
@@ -1735,7 +1832,7 @@ def _reconcile_material(pending: Sequence[_Pending], ids: Mapping[UUID, str]) ->
                         "kind": n.kind,
                         "content": n.content,
                         "source": origin_label(n),
-                        "date": _agent_day_text(restated_at(n)),
+                        "date": _agent_day_text(_said_at(n, entry.candidate.item, message_times)),
                         "event_date": _day(n.occurred_on),
                     }
                     for n in entry.neighbors
@@ -1759,6 +1856,8 @@ class _ReconcileDeps:
     token: CancellationToken
     log_label: str
     before_store: BeforeStore | None
+    #: 本对话里各消息的发送时间(消息 id → UTC),「更新」比先后用(:func:`_said_at`)。
+    message_times: Mapping[str, datetime] = field(default_factory=dict)
 
 
 async def _refresh_if_restated(
@@ -1815,7 +1914,7 @@ async def _decide(
 ) -> tuple[dict[int, tuple[str, str | None]], dict[str, UUID]]:
     """一次模型调用;返回各候选的决定与短编号 → id。调用失败、回复用不了、被截断都抛(§7.6)。"""
     ids = _short_ids(pending)
-    material = _reconcile_material(pending, ids)
+    material = _reconcile_material(pending, ids, deps.message_times)
     with expert_work_span(ExpertWorkComponent.MEMORY, "reconcile"):
         reply = await deps.token.run_cancellable(
             llm_caller(
@@ -1844,6 +1943,7 @@ async def _reconcile_and_apply(
     token: CancellationToken,
     log_label: str,
     before_store: BeforeStore | None = None,
+    message_times: Mapping[str, datetime] | None = None,
 ) -> _Reconciled:
     """Stream CM-7 Mem0-style extract→update, B-300 redesign §7.
 
@@ -1863,7 +1963,7 @@ async def _reconcile_and_apply(
     模型没给决定、判新增 / NOOP、改那条相同的记忆,都按 NOOP;只有删掉(或「更新」成删掉)别的冲突
     记忆会执行(``_redundant_correction_op``)。
     """
-    deps = _ReconcileDeps(memory_store, token, log_label, before_store)
+    deps = _ReconcileDeps(memory_store, token, log_label, before_store, message_times or {})
     progress = _Progress()
     try:
         await _reconcile_into(progress, candidates, agent_name, positions, llm_caller, deps)
@@ -1915,8 +2015,10 @@ class _Progress:
 def _would_write(
     entry: _Pending, op: str, short: str | None, by_short_id: Mapping[str, UUID]
 ) -> bool:
-    """还没落完的一条候选,收尾时要不要写:与已有记忆相同的更正永远不写;判成召回范围内的重复
-    不写;其余(新增、没给决定、还没执行的更新 / 删除)按新增写。"""
+    """还没落完的一条候选,收尾时要不要写:与已有记忆相同的更正永远不写;判成召回范围内、事件日期
+    不冲突的重复不写(同一条消息的重述 :func:`_restates_same_message` 是其中一种,审查 L-1);其余
+    (新增、没给决定、还没执行的更新 / 删除)按新增写。还没执行的更新 / 删除**不预判**层级拦截(§7.1
+    的程序拒绝本来就改为新增,与此一致;早于本分支的局限,见 :class:`ReconcileFailedError`)。"""
     if entry.identical:
         return False
     op, target = _resolve_target(entry, op, short, by_short_id)
@@ -1945,7 +2047,14 @@ async def _reconcile_into(
             # 11-14 重跑 118.5 —— 内容相同(归一后)、层级不低的已有记忆:不问模型,直接 NOOP。
             # 带更正的候选照旧问模型(审查 MEDIUM):它可能要删掉旁边一条与之冲突的记忆。
             logger.debug("%s_reconcile_identical_noop", deps.log_label)
-            await _noop(candidate, identical[0], deps)
+            restated = next(
+                (n for n in identical if _restates_same_message(candidate.item, n)), None
+            )
+            if restated is not None:
+                # 审查 LOW-4 —— 同一条消息逐字又给了一遍:重述,不刷新确认日期(§7.1 第 12 行)。
+                record_memory_reconcile(op="noop_same_evidence")
+            else:
+                await _noop(candidate, identical[0], deps)
         elif neighbors:
             ids = frozenset(n.id for n in identical)
             progress.pending.append(_Pending(candidate, tuple(neighbors), ids))
@@ -2006,9 +2115,13 @@ async def _apply_decision(
             # 复审 11-16(「方案三」在「重复」这条路上):事件日期不同 = 不同的两次 → 新增。
             record_memory_reconcile(op="noop_other_event_date")
             return _Reconciled(keep, [])
+        if _restates_same_message(item, target):
+            logger.debug("%s_reconcile_same_evidence_noop", deps.log_label)
+            record_memory_reconcile(op="noop_same_evidence")
+            return _Reconciled([], [])
         await _noop(candidate, target, deps)
         return _Reconciled([], [])
-    refusal = _refusal(op, entry, target)
+    refusal = _refusal(op, entry, target, deps.message_times)
     if refusal is not None:
         logger.info("%s_reconcile_refused op=%s reason=%s", deps.log_label, op, refusal)
         record_memory_reconcile(op=f"refused_{refusal}")
@@ -2177,15 +2290,19 @@ async def _apply_delete(
 
 def _settled(
     pass_name: str, memory: ExtractedMemory, lines: Sequence[ExtractionLine], today: date
-) -> ExtractedMemory:
+) -> ExtractedMemory | None:
     """B-300 重做 §4 / §5.4 —— 程序按 ``turn`` 那一行定来源、置信度上限、证据指针、事件日期、
-    那一行的发送时间与在不在新段;降级、指针留空、事件日期置空各计一次。"""
+    那一行的发送时间与在不在新段;降级、指针留空、事件日期置空各计一次。``turn`` 落在上下文行的
+    丢弃(``None``),计一次 ``context_line_dropped``(B-300 测试验收 11-16)。"""
     if pass_name == _CONVERSATION_EXTRACTION:
         settled = settle_conversation(
             memory.basis, memory.turn, memory.claimed_event_date, lines, today=today
         )
     else:
         settled = settle_user_text(memory.turn, memory.claimed_event_date, lines, today=today)
+    if settled is None:
+        record_memory_extraction_check(pass_name=pass_name, check=CONTEXT_LINE_DROPPED)
+        return None
     for check in settled.checks:
         record_memory_extraction_check(pass_name=pass_name, check=check)
     confidence = memory.confidence
@@ -2234,7 +2351,8 @@ async def _extract_pass(
     # 按 basis + turn 定「用户确认」(≤ 0.8)或「来自助手」(≤ 0.6),无论模型给多少。
     # 事件日期不能晚于智能体时区的「今天」(审查 L3)。
     today = datetime.now(UTC).astimezone(resolve_agent_timezone()).date()
-    return [_settled(pass_name, m, lines, today) for m in parsed or []]
+    settled = (_settled(pass_name, m, lines, today) for m in parsed or [])
+    return [m for m in settled if m is not None]
 
 
 class ExtractionReplyError(RuntimeError):
@@ -2579,6 +2697,7 @@ async def flush_messages_with_outcome(
             if reconcile
             else [candidates]
         )
+        message_times = _message_times(messages, user_text_messages or ()) if reconcile else {}
         for number, stage in enumerate(stages):
             later = [(str(c.item.kind), c.item.content) for s in stages[number + 1 :] for c in s]
             retry_pairs = [(str(c.item.kind), c.item.content) for c in stage] + later
@@ -2594,6 +2713,7 @@ async def flush_messages_with_outcome(
                         token=token,
                         log_label=log_label,
                         before_store=before_store,
+                        message_times=message_times,
                     )
                 except ReconcileFailedError as exc:
                     # 重做 §7.6(PR S)—— 不再直接写入:抛给任务重试(重试会完整地再做一遍拦截与

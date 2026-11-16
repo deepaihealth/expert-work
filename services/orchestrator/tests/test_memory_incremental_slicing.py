@@ -220,7 +220,8 @@ async def test_the_context_reaches_back_to_an_assistant_line() -> None:
 
 
 async def test_evidence_index_is_the_position_in_the_whole_conversation() -> None:
-    """先整段编序号、再按起点过滤:证据指针的序号是整段对话里的;上下文行不进新段。"""
+    """先整段编序号、再按起点过滤:证据指针的序号是整段对话里的;落在上下文行的不写(测试验收
+    11-16)。"""
     llm = _LLM(
         user_reply=_reply({"kind": "fact", "content": "说过 U2", "turn": 3}),
         conversation_reply=_reply(
@@ -241,11 +242,12 @@ async def test_evidence_index_is_the_position_in_the_whole_conversation() -> Non
         5,
     )
     assert rows["答过 U2"].origin == "user_confirmed"
-    assert rows["上下文里的"].evidence_message_id is None
+    assert "上下文里的" not in rows
 
 
 async def test_lines_in_the_new_segment_count_as_new() -> None:
-    """``in_new_segment`` = 不是上下文行(切片之后新段里的每一行都是第一次被提炼)。"""
+    """``in_new_segment`` = 不是上下文行(切片之后新段里的每一行都是第一次被提炼);落在上下文行的
+    不交出去(测试验收 11-16)。"""
     llm = _LLM(
         user_reply=_reply(
             {"kind": "fact", "content": "上下文", "turn": 1},
@@ -260,8 +262,7 @@ async def test_lines_in_the_new_segment_count_as_new() -> None:
         log_label="t",
         segment=SegmentStart(message_index=4),
     )
-    by = {m.content: m for m in out}
-    assert (by["上下文"].in_new_segment, by["新段"].in_new_segment) == (False, True)
+    assert [(m.content, m.in_new_segment) for m in out] == [("新段", True)]
 
 
 async def test_a_turn_straddling_the_start_is_left_out_and_counted(
