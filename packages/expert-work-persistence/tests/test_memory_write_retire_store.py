@@ -994,3 +994,63 @@ async def test_the_walk_along_replaced_statements_is_bounded(store: MemoryStore)
         last = nxt
     [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
     assert flagged.statements == ()  # 超过上限:不再追,按「没有可用的说法」
+
+
+async def test_a_statement_folded_into_another_summary_still_drives_the_rewrite(
+    store: MemoryStore,
+) -> None:
+    """复审 L-1:S 被 A「现在开车上班」打了标,A 随后被整理巡检并进另一条汇总 T。A 只是不再单独
+    召回,它说的事仍成立 —— 仍是 S 的说法,S 仍被重写(不是 ``statement_gone``)。"""
+    t, u = uuid4(), uuid4()
+    summary, _members, said = await _flagged_summary(store, t, u)
+    other = _item(t, u, "parks at the office garage", origin="user_stated")
+    await store.write([other])
+    folded_into = await store.write_consolidated(
+        tenant_id=t,
+        user_id=u,
+        content="drives to work and parks at the office garage",
+        embedding=_vec(1.0),
+        source_ids=[said.id, other.id],
+        source_hashes={said.id: hash_content(said.content), other.id: hash_content(other.content)},
+    )
+    assert (await _row(store, t, u, said.id)).consolidated_into == folded_into.id
+    [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
+    assert flagged.summary.id == summary.id
+    assert [s.id for s in flagged.statements] == [said.id]
+    assert summary.review_flagged_at is not None
+    outcome = await store.rewrite_summary(
+        tenant_id=t,
+        user_id=u,
+        summary_id=summary.id,
+        flagged_at=summary.review_flagged_at,
+        content=None,
+    )
+    assert outcome == "emptied"
+    assert (await _row(store, t, u, summary.id)).superseded_by == said.id
+
+
+async def test_the_statements_are_ordered_by_when_they_were_said(store: MemoryStore) -> None:
+    """复审 L-4:依据(汇总行自己的 ``supersedes``)比某条连着它的行说得更早 —— 合并后按「说的
+    时间」(记录时间与最后再说的时间里晚的)排:重写指令里按时间排,「什么都不剩」时旧汇总连到
+    最新那句。"""
+    t, u = uuid4(), uuid4()
+    earlier = _item(t, u, "drove to work last winter", origin="user_stated", created_at=_T0)
+    await store.write([earlier])
+    summary = await _summary(
+        store, t, u, "commutes by metro; lives downtown", _item(t, u, "m", origin="user_stated")
+    )
+    assert await store.flag_summary(
+        tenant_id=t, user_id=u, summary_id=summary.id, statement_id=earlier.id
+    )
+    later = _item(t, u, "now drives to work every day", origin="user_stated")
+    await store.supersede(tenant_id=t, user_id=u, new_item=later, link_id=summary.id)
+    assert (await _row(store, t, u, later.id)).supersedes == summary.id
+    [flagged] = await store.list_flagged_summaries(tenant_id=t, user_id=u, limit=10)
+    assert [s.id for s in flagged.statements] == [earlier.id, later.id]
+    flagged_at = flagged.summary.review_flagged_at
+    assert flagged_at is not None
+    outcome = await store.rewrite_summary(
+        tenant_id=t, user_id=u, summary_id=summary.id, flagged_at=flagged_at, content=None
+    )
+    assert outcome == "emptied"
+    assert (await _row(store, t, u, summary.id)).superseded_by == later.id

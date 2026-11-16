@@ -118,6 +118,22 @@ def _currently_valid(row: MemoryItem, *, now: datetime) -> bool:
     )
 
 
+def _still_holds(row: MemoryItem, *, now: datetime) -> bool:
+    """Mirrors the SQL store: not superseded, expired or archived (deleted rows are
+    filtered by the caller). A row folded into a summary still counts (复审 L-1)."""
+    return (
+        row.status != "archived"
+        and row.invalid_at is None
+        and (row.expired_at is None or row.expired_at > now)
+    )
+
+
+def _said_order(item: MemoryItem) -> tuple[datetime, UUID]:
+    """When a statement was said: the later of its record time and its last restatement."""
+    stamps = [ts for ts in (item.created_at, item.confirmed_at) if ts is not None]
+    return (max(stamps) if stamps else datetime.min.replace(tzinfo=UTC), item.id)
+
+
 class InMemoryMemoryStore(MemoryStore):
     def __init__(self) -> None:
         self._rows: list[MemoryItem] = []
@@ -1016,8 +1032,9 @@ class InMemoryMemoryStore(MemoryStore):
         """Mirrors the SQL store: user-side rows linked to the summary and recorded or last
         restated after it, plus the row the summary's own ``supersedes`` names (the basis
         recorded when it was flagged); one that was replaced is followed along
-        ``superseded_by`` to its currently valid user-side successor, at most
-        :data:`MAX_STATEMENT_HOPS` steps."""
+        ``superseded_by`` to a user-side successor that still holds (a row folded into a
+        summary does), at most :data:`MAX_STATEMENT_HOPS` steps; ordered by when they
+        were said."""
         floor = datetime.min.replace(tzinfo=UTC)
         owned = {
             r.id: r
@@ -1045,12 +1062,12 @@ class InMemoryMemoryStore(MemoryStore):
         for start in starts:
             row = owned.get(start)
             for _hop in range(MAX_STATEMENT_HOPS):
-                if row is None or (user_side(row) and _currently_valid(row, now=now)):
+                if row is None or (user_side(row) and _still_holds(row, now=now)):
                     break
                 row = owned.get(row.superseded_by) if row.superseded_by is not None else None
-            if row is not None and user_side(row) and _currently_valid(row, now=now):
+            if row is not None and user_side(row) and _still_holds(row, now=now):
                 found.setdefault(row.id, row)
-        return list(found.values())
+        return sorted(found.values(), key=_said_order)
 
     async def rewrite_summary(
         self,

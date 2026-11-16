@@ -187,7 +187,10 @@ class MemoryItem(BaseModel):
         "arrived late, a summary waiting to be rewritten). On a **summary** row "
         "(``consolidated_from`` set) it means something else: the row holding the "
         "user's statement the summary was flagged by — the basis of its rewrite; "
-        "written when the flag is set, never inherited by the rewritten summary.",
+        "written when the flag is set, never inherited by the rewritten summary. "
+        "The links can form a two-node cycle (a new row pointing at the summary it "
+        "flagged, the summary pointing back at that row): never follow this column "
+        "as a chain without a step limit and de-duplication by id.",
     )
     superseded_by: UUID | None = Field(
         default=None,

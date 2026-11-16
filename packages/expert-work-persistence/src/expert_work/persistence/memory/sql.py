@@ -368,13 +368,38 @@ _USER_SIDE_ROW = or_(
 )
 
 
+async def _still_holds(session: AsyncSession, tenant_id: UUID, user_id: UUID, row_id: UUID) -> bool:
+    """The row still says something true: not deleted, superseded, expired or archived.
+    Unlike the recall predicate, a row folded into a summary still counts — it is only no
+    longer recalled on its own (复审 L-1: the statement a summary was flagged by may be
+    folded by the consolidation sweep before the rewrite runs)."""
+    found = await session.execute(
+        select(MemoryItemRow.id).where(
+            MemoryItemRow.id == row_id,
+            *_owned(tenant_id, user_id),
+            MemoryItemRow.deleted_at.is_(None),
+            MemoryItemRow.status != "archived",
+            MemoryItemRow.invalid_at.is_(None),
+            or_(MemoryItemRow.expired_at.is_(None), MemoryItemRow.expired_at > func.now()),
+        )
+    )
+    return found.scalar() is not None
+
+
+def _said_order(item: MemoryItem) -> tuple[datetime, UUID]:
+    """When a statement was said: the later of its record time and its last restatement."""
+    stamps = [ts for ts in (item.created_at, item.confirmed_at) if ts is not None]
+    return (max(stamps) if stamps else datetime.min.replace(tzinfo=UTC), item.id)
+
+
 async def _valid_statement(
     session: AsyncSession, tenant_id: UUID, user_id: UUID, start: UUID
 ) -> MemoryItemRow | None:
     """``start``, or — when it was replaced — the row at the end of its ``superseded_by``
-    chain, as long as that row is currently valid and on the user's side; at most
-    :data:`MAX_STATEMENT_HOPS` steps (also the guard against a loop). A deleted row, or a
-    chain that does not get there, gives ``None``."""
+    chain, as long as that row still holds (:func:`_still_holds`; a row folded into a
+    summary does) and is on the user's side; at most :data:`MAX_STATEMENT_HOPS` steps
+    (also the guard against a loop). A deleted row, or a chain that does not get there,
+    gives ``None``."""
     wanted: UUID | None = start
     for _hop in range(MAX_STATEMENT_HOPS + 1):
         if wanted is None:
@@ -391,7 +416,7 @@ async def _valid_statement(
         if row is None:
             return None
         user_side = effective_origin(_row_to_item(row)) in USER_SIDE_ORIGINS
-        if user_side and await _current_ids(session, tenant_id, user_id, [row.id]):
+        if user_side and await _still_holds(session, tenant_id, user_id, row.id):
             return row
         wanted = row.superseded_by
     return None
@@ -399,12 +424,14 @@ async def _valid_statement(
 
 async def _later_statements(session: AsyncSession, summary: MemoryItemRow) -> list[MemoryItem]:
     """B-300 redesign §7.12 — what the user said that a summary is to be rewritten by,
-    oldest first: user-side rows whose ``supersedes`` is the summary and that were
-    recorded or last restated after it, plus the row the summary's own ``supersedes``
-    names (the basis recorded when it was flagged — it reaches a summary a statement
-    could not link to itself: the second summary one sentence denied, or one flagged by
-    a candidate that was not written). A statement that later ones replaced is followed
-    along ``superseded_by`` to its currently valid user-side successor
+    in the order it was said (record time or last restatement, whichever is later — so the
+    prompt reads in time order and "nothing left" links to the latest): user-side rows
+    whose ``supersedes`` is the summary and that were recorded or last restated after it,
+    plus the row the summary's own ``supersedes`` names (the basis recorded when it was
+    flagged — it reaches a summary a statement could not link to itself: the second
+    summary one sentence denied, or one flagged by a candidate that was not written). A
+    statement that later ones replaced is followed along ``superseded_by`` to a
+    user-side successor that still holds — a row folded into a summary does
     (:func:`_valid_statement`); a deleted one, or one without such a successor,
     contributes nothing."""
     tenant_id, user_id = summary.tenant_id, summary.user_id
@@ -432,7 +459,7 @@ async def _later_statements(session: AsyncSession, summary: MemoryItemRow) -> li
         row = await _valid_statement(session, tenant_id, user_id, start)
         if row is not None:
             found.setdefault(row.id, _row_to_item(row))
-    return list(found.values())
+    return sorted(found.values(), key=_said_order)
 
 
 async def _flag_summaries(
