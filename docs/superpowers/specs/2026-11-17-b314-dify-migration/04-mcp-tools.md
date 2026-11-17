@@ -2,19 +2,21 @@
 
 > 所属:B-314 Dify「健管师」迁移(总览:00-overview.md)。状态:草稿 v1,待逐个过。
 > 读者:深护 MCP 服务开发者(第 3、5、6 节是施工图);配置智能体的人(3.3、3.5、3.7、5.11 节)。
-> 核对基线:深护 MCP `499302b`、数字人服务 `8dc5f3f`、项目服务 `b6938bc2`、Expert Work `origin/main d9db26f79`(测试环境镜像 `5908fe554`)、Dify DSL `深护智康(pad)-健管师-3.0.yml`。下文「确认」= 读过代码,「推断」= 没跑过或靠参数名对上。
+> 核对基线:深护 MCP `499302b`、数字人服务 `8dc5f3f`、项目服务 `b6938bc2`、pad 消息同步 `0ff5743`、dk 会话存档 `ba0a89e`、Expert Work `origin/main d9db26f79`(测试环境镜像 `5908fe554`)、Dify DSL `深护智康(pad)-健管师-3.0.yml`。下文「确认」= 读过代码,「推断」= 没跑过或靠参数名对上。
+>
+> **修订(2026-11-17,04 评审结论)**:写入不需客户确认、不设按客户上限;化验单按上传月合并;按小时循环沿用 30 天;数据情境(空腹 / 餐次 / 测量时间)按表单配置、模型先推断再问;防重复写改为「按来源消息」判断(取代「同一天同内容」);客户资料由模型调 `profile_get_brief` 一次取齐(含现有提醒,v1 就做);「查更早聊天」改为增强现有 `chat_private_history`;新增转人工工具 `handoff_to_human`(MCP 直接发通知,四种组合 + 急症例外,§3.10);主回复仍由业务方发,「走 MCP 发」记为否决项(§3.11);Expert Work 平台加「固定值下拉」(§4.1)。
 
 ## 0. 一句话结论
 
-迁移后,健管师智能体对深护业务数据的读写全部走深护 MCP:**复用深护 MCP 现有 3 个只读工具(查字段结构、查最新值、按时间查提交),新增 6 个工具**(表单写入、提醒增 / 查 / 删、健康方案精简版、一次取齐客户资料),加上平台高德的天气工具共放行 10 个(§3.5);另有 2 个可选工具后定(查更早聊天、转人工)。「这是谁的数据」由平台 `arg_bindings` 按本轮 inputs 填进去,模型看不到也改不了。Dify 里靠提示词约束的写入规则(化验单按月合并、最多 70 字段、累积字段追加、不写姓名、不重复写)搬到 MCP 服务端。天气用平台已有的 `amap-maps` 的 `maps_weather`,快递不做。Expert Work 平台**不需要改代码**,全靠现有配置能力。
+迁移后,健管师智能体对深护业务数据的读写全部走深护 MCP:**复用现有 3 个只读工具(查字段结构、查最新值、按时间查提交),增强 1 个(`chat_private_history`,查更早聊天),新增 7 个**(表单写入、提醒增 / 查 / 删、健康方案精简版、客户资料精简版、转人工),加上平台高德的天气工具共放行 12 个(§3.5)。「这是谁的数据」由平台 `arg_bindings` 按本轮 inputs 填进去,模型看不到也改不了。Dify 里靠提示词约束的写入规则(化验单按月合并、最多 70 字段、累积字段追加、不写姓名、不重复写)搬到 MCP 服务端;防重复写看「这条记录是不是由同一批客户消息写过」(§3.4)。转人工由 MCP 直接通知同事,并按智能体配置决定「本轮回不回」「之后还回不回」(§3.10)。主回复仍由业务方取 run 结果后发。天气用平台已有的 `amap-maps` 的 `maps_weather`,快递不做。Expert Work 平台只改一处:MCP 工具参数的「固定值」在工具声明了可选值时改成下拉选择,保存时校验(约 1 人天,§4.1)。
 
 ### 威胁模型(先看这里)
 
 | | 内容 |
 |---|---|
-| **防** | ① 客户(或群里任何发言人)在企微里用话术诱导模型**查、改、删别的客户**的档案、健康数据、提醒。例:「帮我看看张三的血糖」「把客户 cust_xxx 的体重改成 60」「把所有人的提醒都删了」。② **重复写**:同一条消息因为打断后合并重跑、补消息、模型连调两次,导致档案写两遍、同一个提醒设两条。 |
-| **不防** | 平台管理员、深护管理员(可信);客户对**自己**的数据说假话(属于数据质量,服务端只做格式和选项校验)。 |
-| **怎么防** | ① 身份参数(项目、客户、员工、群)全部由平台 `arg_bindings` 从本轮 inputs 填,并从模型看到的工具参数里删掉;只放行「只能作用于当前客户」的工具;深护**生产** MCP 的 agent key 白名单必须非空,健管师单独发一把 key。② 服务端去重(内容指纹 + 现有幂等表)+ 按客户限额,不靠模型自觉。 |
+| **防** | ① 客户(或群里任何发言人)在企微里用话术诱导模型**查、改、删别的客户**的档案、健康数据、提醒、聊天记录,或替别人转人工、关 AI。例:「帮我看看张三的血糖」「把客户 cust_xxx 的体重改成 60」「把所有人的提醒都删了」。② **重复写**:同一批客户消息被处理两次 —— 打断后合并重跑、模型在一轮里连调两次保存、网络重试 —— 导致一条数据记两遍、同一个提醒设两条、同事收到两次转人工通知。 |
+| **不防** | 平台管理员、深护管理员(可信);客户对**自己**的数据说假话(属于数据质量,服务端只做格式和选项校验);客户让 AI 对**自己**少回或不回(只影响他自己的服务,员工可重新打开)。 |
+| **怎么防** | ① 身份参数(项目、客户、员工、群)全部由平台 `arg_bindings` 从本轮 inputs 填,并从模型看到的工具参数里删掉;只放行「只能作用于当前客户」的工具;深护**生产** MCP 的 agent key 白名单必须非空,健管师单独发一把 key。② 业务方把本批企微消息 id 作为变量 `input_message_ids` 传进来,平台绑定进写工具;服务端记下每条记录来自哪些消息,「同表 + 同内容 + 来源消息有重叠」才算重复(§3.4)。不设按客户的调用 / 写入上限(11-17 定)。 |
 | **剩余风险(只列不做)** | 绑定「没落地」时参数会回到模型手里(平台保存时会给英文警告,见 6.2);key 泄露后可以调全部 45 个工具、可以填任意客户编号(MCP 目前不按 key 限工具、限项目,见 9.5 加固项)。 |
 
 ## 1. 现状:Dify 现在怎么做
@@ -85,6 +87,15 @@
 - 数据库连接时区 `+08:00`(`app.module.ts:42`)。
 - 写库 + 投队列的先例:用药提醒生产者(`medication-reminder-producer.service.ts:1-17`,显式按 `Asia/Shanghai` 算时间)。
 - 通用幂等表 `t_open_api_idempotency` 已有 model,唯一键 `uk_idem`(公司、业务类型、范围、幂等键)(`models/TOpenApiIdempotency.ts`)。
+- 聊天记录工具 `chat_private_history` 只查员工 ↔ 客户的私聊,入参 `project_code`、`employee_code`、`customer_code`,默认近 7 天、每页 50、上限 100(`chat.tool-provider.ts:116-160`;`chat.service.ts:286-380`)。数据来自 `t_project_cpwx_chat_msg`,**pad 和 dk 两条通道都写这张表**:pad 消息同步服务每收一条就 `findOrCreate` 进去,发送方 / 接收方存企微明文 id、群消息存 `roomid` 和 @ 名单(`sync-pad-message.processor.ts:1381-1419、1457-1552、1602-1608`,确认)。
+- 发消息工具 `cpwx_send_*` 只能发文字:pad 走 `message.service.ts:82-230` 直接调 pad 接口,pc 往 `t_machine_task` 插一条发送任务(`message-pc.service.ts:150-215、347-369`)。整个 MCP 仓库搜不到 `AI_SENT` / `markAiSent`(确认),即不写「AI 已发」标记。
+
+### 1.5 人工接管与转人工现在怎么做(与 §3.10 有关,确认)
+
+- **临时接管标志** `HUMAN_HAS_ANSWERED_{项目}_{员工}[_{群}]_{客户}`,存活 600 秒,放在数字人、pad 同步、dk 存档三方共用的 Redis 库里。员工号发了一条**没有 AI 标记**的消息就写(pad:`sync-pad-message.processor.ts:713-765`;dk:`human-answered.service.ts:38、157-185`,dk 先查 `AI_SENT` 标记,命中算 AI 发的);客户再开口就删(pad `:664-679`;dk `human-answered.service.ts:132-135`)。键里的员工 / 客户 / 群 id 两通道不同:pad 用员工 pad id、客户 pad id、`room_conversation_id`;dk 用员工企微 userid、客户 external_userid、群 chat_id(`human-answered.service.ts:225-227`)。
+- **发送前检查**:pad 发回答前按这个键查,命中就不发给这个客户(`send-agent-answer.processor.ts:488-497`);dk 在 PC 端领任务时查(`pc-send-task.service.ts:432-452`)。到点提醒例外。
+- **常开开关** `is_enabled_agent_reply`:私聊在 `t_project_customer_cpwx_relation`(员工企微 userid + 客户 external_userid 一行),群里在 `t_project_cpwx_group_member`(员工、客户各一行,两行都开才回)。数字人服务**调用前**查,关了就不调智能体(`invoke-agent.processor.ts:479-538`);发送侧不查。项目服务里已有改它的接口:私聊 `POST /employee/set-cpwx-external-contact-is-enabled-agent-reply`(`employee.controller.ts:1033` → `employee.service.ts:4520`),群成员 `POST /employee/set-cpwx-room-member-is-enabled-agent-reply`(`:1325` → `:4659`);员工端有没有按钮在用**没核实**。
+- **转人工**(Dify 3.0 没用,数字人服务有接口):pad 把一段文字经发送队列发给员工绑定行上的 `referral_human_pad_user_id` / `referral_human_pad_room_id`(调用方传了就用传的,没传读绑定行,都没有就不发),私聊时再把本批客户消息标 `t_project_cpwx_pad_msg.referral_human_status=1`(按 `msg_app_info`)(`agent-callback.service.ts:43-125`)。dk 取 pc 绑定行的 `referral_human_userid` / `referral_human_chat_id`,建一条 `t_project_cpwx_pc_send_task`、`task_kind=referral` 的任务;这类任务**不过接管检查、不写 `AI_SENT`**(目标是内部同事 / 内部群),30 分钟没领走就过期;dk 没有状态列,「已转人工」就是这条任务(`agent-callback-dk.service.ts:6-7、70-104`;`pc-send-task.service.ts:55-57、206-223、292-296、324-330`)。
 
 ## 2. 目标与不做什么
 
@@ -94,31 +105,36 @@
 2. 每个写操作返回**真实结果**:写了哪些字段、跳过了哪些及原因、提醒编号与实际发送时间。模型据此回复,不再「凭感觉说设好了」。
 3. 身份由平台绑定,模型不经手。
 4. 写入规则在服务端,换模型、改提示词都不影响数据正确性。
-5. 重复写在服务端兜住。
+5. 重复写在服务端兜住(按来源消息判断,§3.4)。
 6. 每次返回体积受控(≤ 8000 字),时间一律带时区或注明北京时间。
+7. 能把客户交给同事:通知同事,并按配置决定本轮回不回、之后还回不回(§3.10)。
+8. 客户问到会话里没有的更早聊天时能查(§3.12)。
 
 **不做**
 
 - 快递查询(已拍板)。
-- 智能体自己发企微消息:主回复由业务方取 run 结果后发,不放行 `cpwx_send_*`。
+- 主回复走 MCP 发:主回复由业务方取 run 结果后发,不放行 `cpwx_send_*`(否决理由见 §3.11)。
 - 用药方案(`medication_*`)读写。
 - 读图 / PDF 转录(平台视觉,另文)。
-- 人工接管开关、攒消息、打断(留在数字人服务,已拍板)。
+- 攒消息、打断、人工接管的**判断逻辑**(留在数字人服务,已拍板);转人工工具只写现有的接管标志和 AI 开关,不改谁来查、怎么查。
+- 写入前找客户或员工确认;按客户限制调用 / 写入次数(11-17 定:都不做)。
 - 防管理员、防 key 泄露(见威胁模型)。
-- Expert Work 平台代码改动:本设计用现有的 `arg_bindings`、`allow_tools`、平台 MCP 目录就够。
+- Expert Work 平台的其它改动:除「固定值下拉」(§4.1)外,都用现有的 `arg_bindings`、`allow_tools`、平台 MCP 目录。
 
 ## 3. 设计
 
 ### 3.1 先走一遍真实场景
 
 **场景 A:私聊上报血糖。** 客户早上 8:20 发「今天早上空腹血糖 7.2」。
-1. 业务方调 runs,inputs 带上 `project_code / customer_code / employee_code / customer_pad_userid / employee_pad_userid / room_conversation_id(私聊为空串)`。
-2. 模型调 `profile_get_brief`(只看到可选参数 `sections`,看不到客户编号)。平台在发出前把 `project_code`、`customer_code` 填成本轮的值。
+1. 业务方调 runs,inputs 带上 `project_code / customer_code / employee_code / customer_pad_userid / employee_pad_userid / room_conversation_id(私聊为空串)`,以及本批消息 id `input_message_ids`(如 `["pad:A1"]`)。
+2. 模型调 `profile_get_brief`(只看到可选参数 `sections`,看不到客户编号)。平台在发出前把 `project_code`、`customer_code` 等填成本轮的值。
 3. 模型从返回的 `writable_forms` 里选出血糖表,调 `form_get_field_detail` 拿字段编码(平台还钉死 `detail_level=brief`,返回紧凑表格)。
-4. 模型调 `form_save_customer_values`,只填 `form_code` 和 `fields`。服务端校验字段属于该表、值是数字,写入,返回 `status=created`、写入字段清单、`server_now`。
+4. 模型调 `form_save_customer_values`,只填 `form_code` 和 `fields`。平台补上身份和 `input_message_ids`;服务端校验字段属于该表、值是数字,写入并记下来源消息 `pad:A1`,返回 `status=created`、写入字段清单、`server_now`。
 5. 模型回复「记下了,空腹 7.2……」。
 
-**场景 B:打断后重跑。** 客户 8:20 发完血糖,8:20:06 又补一句「昨晚睡得不好」。数字人服务取消正在跑的那一轮,合并两条消息重跑(`invoke-agent.processor.ts:935-960`,见共享背景)。被取消的那一轮可能已经写过血糖。重跑时模型再写一次同样内容:服务端发现「同客户、同表、同一个北京日、内容一样」,返回 `status=duplicate` 和原来的 `submission_code`,不新建。
+**场景 B:打断后重跑。** 客户 8:20 发完血糖(消息 A1),8:20:06 又补一句「昨晚睡得不好」(A2)。数字人服务取消正在跑的那一轮,合并两条消息重跑(`invoke-agent.processor.ts:935-960`)。被取消的那一轮可能已经写过血糖。重跑这一轮的 `input_message_ids` 是 `[A1, A2]`;模型再写一次同样内容时,服务端发现「同一张表、内容一样、来源消息里有 A1 与已有记录重叠」,返回 `status=duplicate` 和原来的 `submission_code`,不新建。
+
+**场景 G:真的又报了一次同样的数。** 客户上午 10:00 发「喝了 300ml 水」,下午 15:00 又发「喝了 300ml 水」。两条是不同的消息(id 不同),第二次没有重叠的来源消息,照常新建一条。同理:一天两次各走 30 分钟、一天两次服药打卡、三餐后血糖都是 7(时段不同,本来就是不同内容)都会如实记下。一条消息里说了两遍同样的量(「喝了 300ml,又喝了 300ml」)时,两次写入来源消息相同,第二次会被当成重复 —— 所以提示词要求模型把它合成一条(600ml),或分别带上时间(06)。
 
 **场景 C:每天提醒吃药。** 客户说「每天早上 8 点提醒我吃二甲双胍」。模型调 `reminder_create`,参数是 `event_time="2026-11-18 08:00"`、`repeat="day"`;`advance_minutes` 不传,默认 10。服务端算出首次发送 `2026-11-18T07:50:00+08:00`、结束 `2026-12-18T07:50:00+08:00`,写表、投延迟队列,返回 `status=created`、`notify_code`。模型照返回值回复。工具说明里写明「吃药提醒也用本工具,它不改用药方案」,而且 `medication_*` 根本没放行,不会走错。到点由数字人服务发出,和今天一样。
 
@@ -134,14 +150,14 @@
 
 | Dify 操作 | 迁移后工具 | 复用 / 新增 / 改造 | 参数要点与坑 |
 |---|---|---|---|
-| 客户基础档案 + 健康方案 + 今日饮食 + 系统表单清单(每轮预取) | `profile_get_brief` | **新增** | 一次返回,≤ 8000 字;未建档时返回 `customer_registered=false` |
+| 客户基础档案 + 健康方案 + 今日饮食 + 系统表单清单 + 提醒列表(每轮预取) | `profile_get_brief` | **新增**(v1 就做,11-17 定) | 模型需要客户情况时调一次,一次返回,≤ 8000 字;未建档时返回 `customer_registered=false`;业务方不再每轮预取 |
 | 健康方案(markdown) | `health_plan_get_brief` | **新增** | 照项目服务 `queryCustomerHealthPlanMd`(`customer-health-plan.service.ts:11065`)改成纯文本;不要在现有 `health_plan_get_customer_plan` 上加模式,原因见 6.8 |
 | 某表单字段结构 | `form_get_field_detail` | 复用 | 平台 `fixed: {detail_level: brief}`,只回一张紧凑表格(字段编码 / 类型 / 单位 / 选项);`project_code` 绑定 |
 | 某表单最新值(如最近一次糖化) | `form_get_latest_field_values` | 复用 + 小改 | `owner_code` ← `customer_code` 绑定;**日期参数只能传 `YYYY-MM-DD`**,服务端会再拼 ` 00:00:00` / ` 23:59:59`(MCP `form.service.ts:272-279`);说明文字写着「服务器本地时区」,实际是北京时间(连接时区 `+08:00`),要改说明 |
 | 按时间查表单数据(「上周血糖」) | `form_list_owner_submissions` | 复用 + 小改 | 同上日期坑(`:391-394`)。Dify 传的是 `YYYY-MM-DD 00:00:00`,原样搬过来会变成 `… 00:00:00 00:00:00`,结果靠 MySQL 隐式转换(推断:不可依赖)。`page_size` 默认 10、最大 100,大页可能超 2 万字被截断,提示词里要求 ≤ 20 并带 `include_fields` |
 | 化验单本月记录 | 不再单独调 | — | 并进 `form_save_customer_values` 服务端逻辑 |
 | 提醒列表 | `reminder_list` | **新增** | 按 `customer_pad_userid` 查(与现有数据一致,群里未建档的人也能用) |
-| 历史聊天 | 不再需要 | — | 已拍板补消息方案;「查更早聊天」可选工具后定(5.9) |
+| 历史聊天 | 不再每轮拉;客户问到会话里没有的更早聊天时调 `chat_private_history` | 复用 + **增强** | 范围扩到「该客户私聊 + 该客户在群里发的 + 员工号 @ 该客户的」,加关键词 / 时间段 / 条数(≤ 30),身份由平台绑定(§3.12、5.8) |
 | 天气 | 平台 `amap-maps` 的 `maps_weather` | 平台已有 | 见 3.7 |
 | 快递 | 不做 | — | 已拍板 |
 
@@ -150,10 +166,11 @@
 | Dify 操作 | 迁移后工具 | 复用 / 新增 / 改造 | 要点 |
 |---|---|---|---|
 | 改个人档案 | `form_save_customer_values`(`form_customer_basic_info` → 档案模式) | **新增** | 只写变了的字段;不写姓名;累积字段追加;否定描述不覆盖 |
-| 上报健康数据 | `form_save_customer_values`(其它可写表单 → 上报模式) | **新增** | 新建提交;同日同内容去重 |
-| 化验单 | `form_save_customer_values`(`form_analysis_report` → 按月合并模式) | **新增** | 按北京时间当月合并;附件合并;≤ 70 字段 |
+| 上报健康数据 | `form_save_customer_values`(其它可写表单 → 上报模式) | **新增** | 新建提交;按来源消息去重(§3.4) |
+| 化验单 | `form_save_customer_values`(`form_analysis_report` → 按月合并模式) | **新增** | 按北京时间当月(上传月)合并;附件合并;≤ 70 字段 |
 | 新增提醒 | `reminder_create` | **新增** | 返回真实 `notify_code` 与发送时间 |
 | 删除提醒 | `reminder_list` + `reminder_delete` | **新增** | 只能删当前客户的 |
+| 转人工(Dify 3.0 没用) | `handoff_to_human` | **新增** | MCP 直接发通知给同事;按配置写接管标志 / 关 AI 开关(§3.10、5.9) |
 
 ### 3.3 身份:谁的数据由平台填
 
@@ -177,20 +194,20 @@
 
 | 工具 | `args`(工具参数 ← 声明变量) | `fixed` |
 |---|---|---|
-| `profile_get_brief` | `project_code`←`project_code`;`customer_code`←`customer_code` | — |
+| `profile_get_brief` | `project_code`;`customer_code`;`customer_pad_userid`;`room_conversation_id`(后两个给「现有提醒」一段用) | — |
 | `health_plan_get_brief` | `project_code`←`project_code`;`customer_code`←`customer_code` | — |
 | `form_get_field_detail` | `project_code`←`project_code` | `detail_level: brief` |
 | `form_get_latest_field_values` | `project_code`←`project_code`;**`owner_code`←`customer_code`** | — |
 | `form_list_owner_submissions` | `project_code`←`project_code`;**`owner_code`←`customer_code`** | — |
-| `form_save_customer_values` | `project_code`;**`owner_code`←`customer_code`**;`employee_code`;`attachments`←`attachment_urls` | — |
+| `form_save_customer_values` | `project_code`;**`owner_code`←`customer_code`**;`employee_code`;`attachments`←`attachment_urls`;`input_message_ids` | — |
 | `reminder_create` | `project_code`;`customer_code`;`customer_pad_userid`;`employee_code`;`employee_pad_userid`;`room_conversation_id` | — |
 | `reminder_list` | `project_code`;`customer_pad_userid`;`room_conversation_id` | — |
 | `reminder_delete` | `project_code`;`customer_pad_userid` | — |
-| (可选)`chat_get_customer_history` | `project_code`;`customer_pad_userid`;`employee_pad_userid`;`room_conversation_id` | — |
-| (可选)`handoff_notify_staff` | `project_code`;`employee_code`;`employee_pad_userid`;`customer_pad_userid`;`room_conversation_id` | — |
+| `chat_private_history`(增强) | `project_code`;`employee_code`;`customer_code` | `scope: customer`(5.8) |
+| `handoff_to_human` | `project_code`;`employee_code`;`employee_pad_userid`;`customer_code`;`customer_pad_userid`;`room_conversation_id`;`input_message_ids` | `this_turn`、`afterwards`(控制台下拉选,§3.10) |
 | `amap-maps` / `maps_weather` | 无(不涉及客户身份) | — |
 
-没写箭头的表示工具参数名与变量名相同。表单类工具的参数叫 `owner_code`,要绑到 `customer_code`,这是最容易配错的一处。
+没写箭头的表示工具参数名与变量名相同。表单类工具的参数叫 `owner_code`,要绑到 `customer_code`,这是最容易配错的一处。`handoff_to_human` 绑 `input_message_ids` 是为了两件事:同一批消息重跑时不重复通知同事;pad 私聊照现在的做法把这批客户消息标成「已转人工」(按 `msg_app_info`,§1.5)。
 
 **变量取值约定**(业务方调 runs 时)
 
@@ -202,6 +219,9 @@
 | `employee_code` / `employee_pad_userid` | 服务该客户的员工账号 | 不能空 |
 | `room_conversation_id` | 群 id | 私聊传空串 |
 | `attachment_urls` | 本轮客户发来的图片 / 文件原始链接(列表) | 没有附件就不传(`required: false`) |
+| `input_message_ids` | 本轮要处理的客户消息的企微消息 id,JSON 数组,带通道前缀:pad `"pad:" + msg_app_info`,dk `"dk:" + msgid`(与 03 同一规则);打断后合并重跑时 = 合并后的整批(含被取消那批) | 必传;理论上不会空(每轮都由客户消息触发);空数组时服务端不判重复,每次都记 |
+
+**各通道的 id 要对得上**:`employee_pad_userid`、`customer_pad_userid`、`room_conversation_id` 在 pad 通道填 pad id,在 dk 通道填企微明文 id(员工 userid、客户 external_userid、群 chat_id)。转人工要用它们拼人工接管标志的键(§3.10),和数字人 / 同步 / 存档服务的拼法必须逐字一致,是跨服务约定,要有契约测试。
 
 **服务端核对归属(可选加固)**:做法、代价见 9.5。
 
@@ -212,8 +232,8 @@
 | 模式 | 哪些表单 | 怎么落库 |
 |---|---|---|
 | 档案覆盖 | `form_customer_basic_info` | 只写与当前最新值不同的字段,新建一条提交(沿用项目服务「最新值按字段取」的读法);全部没变 → `status=unchanged`,不建提交 |
-| 日常上报 | 可写表单清单里的其它表(血糖、饮食、运动等) | 新建一条提交;`submit_time` = `measured_at`(北京时间)或当前时间;同日同内容 → `duplicate` |
-| 化验单按月合并 | `form_analysis_report` | 找该客户「北京时间本月」最近一条化验单提交,有就合并(同字段覆盖、新字段新增),没有就新建 |
+| 日常上报 | 可写表单清单里的其它表(血糖、饮食、运动等) | 新建一条提交;`submit_time` = `measured_at`(北京时间)或当前时间;同内容且来源消息重叠 → `duplicate` |
+| 化验单按月合并 | `form_analysis_report` | 找该客户「北京时间本月」(即上传月,11-17 定)最近一条化验单提交,有就合并(同字段覆盖、新字段新增),没有就新建 |
 
 | Dify 里的规则(出处) | 服务端怎么做 |
 |---|---|
@@ -227,16 +247,31 @@
 | 字段必须属于该表(Dify 靠模型) | 不属于 → 跳过,原因 `not_in_form` |
 | 数值字段 | Integer / Float 不能解析 → 跳过,原因 `invalid_number`(单位换算仍由模型做) |
 | DateTime 字段取当前时间 | 没给值的 DateTime 字段,服务端填 `measured_at` 或当前北京时间 |
-| 化验单同月合并(`1789740487772`) | 见上表;月份按**北京时间当前月**(沿用 Dify;按采样日期归月列为待拍板 9.3) |
+| 化验单同月合并(`1789740487772`) | 见上表;月份按**北京时间当前月**(沿用 Dify,11-17 定,9.3) |
 | `field_analysis_node_name` 写当月(规则 8) | 服务端写入 `YYYY-MM`,忽略模型给的值 |
 | 附件分号拼接、含已有(规则 7) | `attachments` 与该提交已有的 `field_analysis_attachment` 合并、去重,用「;」连接;其它表单有 UploadImage / UploadFile 字段时,同样处理第一个这类字段 |
 | 最多 70 条(规则 10、`1789743707720`) | 超出部分不写,列在 `dropped_over_limit` |
 | 至少一个实际指标(`1789742570094`) | 化验单只有附件、日期、节点名这类元数据字段 → 42200 `lab_report_no_indicator` |
-| 血糖两要素、他人数据不报(`1761367647758`) | 语义判断,留在提示词;服务端不拦 |
+| 血糖两要素、他人数据不报(`1761367647758`) | 他人数据、假设性提问:语义判断,留在提示词。血糖时段等「数据情境」:见下面「情境字段」,服务端**不因缺情境拒收** |
 
-**去重**:同一客户、同一表、同一北京日,规范化后的字段集合相同 → 返回第一次的结果,`status=duplicate`。用现有幂等表 `t_open_api_idempotency`:`biz_type=mcp_form_save`、`scope_code=project_code`、`idempotency_key` = sha256(owner|form|北京日期|规范化字段)取前 64 位、`response_snapshot` 存首次响应。唯一键能顺带挡住两个并发的同样请求。档案模式靠「与最新值比对」天然去重,化验单模式靠「同字段覆盖 + 附件去重」天然幂等,都不需要查这张表。
+**情境字段(11-17 定,所有业务表单通用)**:很多数据要带「情境」才有意义 —— 血糖是空腹还是餐后、饮食是哪一餐、血压体重是什么时候量的。
+
+- 每张表单在 MCP 侧配置自己的情境字段(哪个字段、取值、怎么推断的说明),由深护按表单维护;`profile_get_brief` 的 `writable_forms` 把它一并告诉模型(5.7)。
+- 模型的规则(写进提示词,06):先按消息时间和上下文推断,**真推不出来才问**。例:清晨 5 点发「血糖 6.1」→ 按空腹记,不问「是空腹吗」;刚说完「中午吃了碗面」,半小时后发「血糖 9.6」→ 按午餐后记;下午三点没头没尾的一句「血糖 9.6」→ 问一句。
+- 服务端不因为缺情境字段拒收(取代此前「血糖缺时段就拒收」的写法);缺了照常写,DateTime 类按 `measured_at` 或当前北京时间补。
+
+**去重(11-17 定,取代「同一天同内容」)**:要挡的重复都来自**同一批客户消息被处理两次** —— 打断后合并重跑、模型一轮里连调两次保存、网络重试。所以按来源消息判断:
+
+- 业务方每轮把本批客户消息的企微 id 作为变量 `input_message_ids` 传入,平台绑定进 `form_save_customer_values`(模型看不到、改不了)。
+- MCP 写每条记录时一并存下它的来源消息 id。存在哪(提交表加一列,还是另建一张小表)是 MCP 实现细节,实现时定。
+- 判重:**同一客户、同一表单、规范化后内容相同、来源消息有重叠** → 返回第一次的结果,`status=duplicate`。规范化内容 = 各字段编码 + 规范化后的值,加上模型给的 `measured_at`;服务端自己补的当前时间不算。
+- 重跑:合并重跑那一轮带着旧消息的 id,和已写记录重叠 → 挡住。客户在**新消息**里报了同样的数 → 没有重叠 → 照常记。
+- 判重和写入在同一把锁里做(按客户 + 表单),防同一轮里并行的两次调用都写进去。
+- 档案模式靠「与最新值比对」天然去重,化验单模式靠「同字段覆盖 + 附件去重」天然幂等;两种模式同样存来源消息 id,便于追查。
 
 **改口**:客户说「刚才血糖说错了,是 6.2」。模型带上刚才返回的 `submission_code` 作 `amend_submission_code` 再调一次,服务端在原提交上覆盖字段。限制:同一客户、同一表、由智能体写入、北京时间当天,否则 42200。
+
+**不需要确认、不设上限(11-17 定)**:写入不找客户或员工确认;不设按客户的调用 / 写入次数上限。错了靠员工撤销。
 
 **员工可撤销**:每次写入在 `t_project_operation_log` 记一行(操作人 = 绑定的员工、来源 = 健管师智能体 / `x-agent-id`、字段前后值,≤ 2000 字)。撤销沿用项目服务现有的 `form/del-form-field-values`(把字段置为无效,`form.service.ts:1685-1699`);控制台有没有入口要深护确认。提醒的撤销用项目服务运营后台的 AI 提醒删除(`ai-notify.service.ts:221`)。
 
@@ -246,27 +281,29 @@
 
 | 工具 | 读 / 写 | 为什么要 |
 |---|---|---|
-| `profile_get_brief` | 读 | 替代 Dify 每轮 4~5 路预取 |
-| `health_plan_get_brief` | 读 | 方案问答;推广话术前判断客户有没有方案(02 §3.6,已拍板 11-17) |
+| `profile_get_brief` | 读 | 替代 Dify 每轮 4~5 路预取:话题与健康有关时调一次;推广话术前判断有没有方案、首轮补问看缺哪些档案项也用它 |
+| `health_plan_get_brief` | 读 | 客户要看方案完整内容时 |
 | `form_get_field_detail` | 读 | 写表单前拿字段编码与选项 |
 | `form_get_latest_field_values` | 读 | 「我最近一次糖化多少」 |
 | `form_list_owner_submissions` | 读 | 「上周血糖怎么样」 |
 | `form_save_customer_values` | 写 | 档案 / 上报 / 化验单 |
 | `reminder_create` / `reminder_list` / `reminder_delete` | 写 / 读 / 写 | 提醒 |
+| `chat_private_history`(增强后) | 读 | 「我上周跟你说的那个……」而会话里没有 |
+| `handoff_to_human` | 写 | 转人工 |
 | `amap-maps` 的 `maps_weather` | 读 | 天气 |
 
-一共 10 个工具,说明文字都控制在 300 字内。平台规则(`orchestrator/tools/assembly.py:442-470`,确认):MCP 工具 schema 总量小于 min(上下文窗口 × 10%, 2 万 token)时全部直接可见,超过就要模型先用 `find_tools` 搜。10 个工具远小于这个量,不会被藏起来。
+一共 12 个工具,说明文字都控制在 300 字内。平台规则(`orchestrator/tools/assembly.py:442-470`,确认):MCP 工具 schema 总量小于 min(上下文窗口 × 10%, 2 万 token)时全部直接可见,超过就要模型先用 `find_tools` 搜。12 个工具远小于这个量,不会被藏起来。
 
 **禁用(不放行)**
 
 | 工具 | 理由 |
 |---|---|
-| `cpwx_send_text_to_customer` / `cpwx_send_text_to_group` / `cpwx_query_send_status` | 主回复由业务方发,智能体再发会重复;也绕过了数字人服务发送前的人工接管检查 |
+| `cpwx_send_text_to_customer` / `cpwx_send_text_to_group` / `cpwx_query_send_status` | 主回复由业务方发,智能体再发会重复;也绕过了数字人服务发送前的人工接管检查;不写 AI 标记,dk 会把它当成真人接管(§3.11) |
 | `medication_create_plan(s_batch)` / `medication_stop_plan(s_batch)` | 会真推送(工具自己标了 dangerous、需确认,`medication.tool-provider.ts:154-160`);「每天提醒吃药」容易被路由到这里 |
 | `medication_query_plans` | 首版用不上;放进来会让「吃药提醒」多一个可能走错的去处 |
 | `customer_*`(5 个) | 能按关键词、标签、编号查任意客户 |
 | `group_*`(4 个) | 能列项目下的群、群成员 |
-| `chat_private_history` / `chat_group_history` | 群工具能跨客户读;而且两者只读会话存档表 `t_project_cpwx_chat_msg`(`chat.service.ts:54-55`),pad 通道的消息在 `t_project_cpwx_pad_msg`,健管师(pad)查不到(推断) |
+| `chat_group_history` | 按群读整群聊天,能看到群里所有人(包括别的客户)说的话。查更早聊天改用增强后的 `chat_private_history`(§3.12) |
 | `sop_*`、`sop_campaign_*` | `sop_query_customers` 能跨客户查;`sop_campaign_pause / cancel_*` 是写操作 |
 | `ai_strategy_*` | 员工侧内部资料 |
 | `employee_*` | 员工账号登录状态,与客户服务无关 |
@@ -287,7 +324,7 @@
 | 先例 | 项目服务 `ai-notify` 模块就是这么做的,是队列的第二个生产者(`ai-notify.const.ts:1-14`、`ai-notify.service.ts:82-106`);MCP 自己的用药提醒也是写库 + 投队列 | 无 |
 | 耦合 | 三方共享队列名 `send-notify-queue`、job 字段、Redis 库号 → 要一条契约测试 | 依赖数字人服务在线,多一跳;pad 和 dk 两套回调路径要选对 |
 | 时区 | MCP 显式按东八区算延迟 | 沿用数字人进程时区(仓库里没设 TZ,见 6.7) |
-| 去重 / 限额 | 在 MCP 一处做 | 两边都要改 |
+| 去重 | 在 MCP 一处做 | 两边都要改 |
 | pad / dk 分流 | 不用管。消费端按员工判断走 pad 队列还是 PC 任务(`send-notify.processor.ts:50-82`) | 同左 |
 
 **推荐 A**。实现时照抄项目服务 `ai-notify.service.ts` 的 `scheduleNotifyJob` / `removePendingJob`(`:82-106`)。job 字段与消费端逐字一致:`{project_code, notify_code, event_description, room_conversation_id, send_pad_userid, receive_pad_userid}`,选项 `{delay, removeOnComplete: true, removeOnFail: true}`。MCP 注册这个队列时显式指定数字人那边的队列库号,与项目服务用同一个配置值(`SEND_NOTIFY_QUEUE_REDIS_DB_INDEX`,项目服务默认 15、注释说数字人部署在 15;数字人代码默认 14,以部署环境为准)。
@@ -310,9 +347,9 @@
 | `POST /agent-callback/add-notify`、`/agent-callback-dk/add-notify` | Dify 新增提醒 | **挪到 MCP** `reminder_create` | 并行期保留;Dify 下线后删除或补鉴权 |
 | `POST /ai-notify/get-ai-notify-list` | Dify 删提醒前查询 | **挪到 MCP** `reminder_list` | 同上 |
 | `POST /ai-notify/delete-ai-notify` | Dify 删除提醒 | **挪到 MCP** `reminder_delete` | 同上 |
-| `POST /message/get-history-message` | Dify 每轮拉历史 | **不再需要**(补消息);「查更早聊天」可选工具后定 | 同上 |
-| `POST /agent-callback/receive-answer`、`/agent-callback-dk/receive-answer` | Dify 发主回复 / 兜底 / 推广话术 | **不再给智能体调**;发送逻辑**留在数字人服务**,业务方拿到 run 结果后在内部直接投发送队列 | 见总览「主回复」 |
-| `POST /agent-callback/referral-human`、`/agent-callback-dk/referral-human` | 本 Dify 应用**没有调用节点**(只声明了变量 `referral_human_pad_user_id`,DSL@2436) | **挪到 MCP**(可选,后定)`handoff_notify_staff` | |
+| `POST /message/get-history-message` | Dify 每轮拉历史 | **不再每轮拉**(补消息);「查更早聊天」用增强后的 MCP `chat_private_history`(§3.12) | 同上 |
+| `POST /agent-callback/receive-answer`、`/agent-callback-dk/receive-answer` | Dify 发主回复 / 兜底 / 推广话术 | **不再给智能体调**;发送逻辑**留在数字人服务**,业务方拿到 run 结果后在内部直接投发送队列 | 见总览「主回复」;走 MCP 发的否决理由见 §3.11 |
+| `POST /agent-callback/referral-human`、`/agent-callback-dk/referral-human` | 本 Dify 应用**没有调用节点**(只声明了变量 `referral_human_pad_user_id`,DSL@2436) | Expert Work 上的健管师**不用**这条回调;转人工由 MCP `handoff_to_human` 直接发通知(§3.10) | 接口本身留给别的调用方 |
 | 延迟队列消费 `SendNotifyProcessor` | — | **留在数字人服务** | 到点发送、循环续期不变 |
 
 Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetFormLatestData / QueryFormList / GetFormFieldDetail / GetFormDataList / SetFormFieldValues,OpenAPI 定义不在 DSL 里)、「健康方案查询接口」(QueryHealthPlan),以及化验单的两个 HTTP 节点。迁移后智能体一个都不调,全部换成上表的 MCP 工具。这些接口还有别的调用方,不删。
@@ -326,11 +363,73 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 - **标注**:读工具 `dangerLevel: safe`;写工具 `moderate`(可撤销,`destructiveHint=false`);`confirmRequired: false`(见 9.1)。
 - **两条鉴权通道都可用**:OAuth 员工下 `project_code` / `employee_code` 强制取登录身份(沿用 `bindEmployeeContext`);agent key 下取入参(由平台绑定)。
 
+### 3.10 转人工:`handoff_to_human`(11-17 定)
+
+**前提**:对客户来说,AI 和同事是同一个人(同一个企微号)。所以转人工不是「告诉客户已转人工」,而是「悄悄让同事接手」,客户那边看到的最多是一句「我确认一下,稍后回复您」。
+
+**两个固定选项**(每个智能体在配置里各选一个,控制台下拉,§4.1):
+
+| 选项 | 取值 | 含义 |
+|---|---|---|
+| `this_turn` | `reply`(本轮回复) / `silent`(本轮不回) | 这一轮 AI 还说不说话 |
+| `afterwards` | `continue`(之后照常) / `stop`(之后不回) | 客户下次再说话,AI 还回不回 |
+
+**四种组合,各走一遍**:
+
+1. **reply + continue「回答了,顺便让同事知道」**。客户:「这一周血压都在 150 左右,有时候头晕。」AI 照常回复(建议、注意事项),同时调转人工,同事收到「客户近一周血压 150 左右伴头晕,已建议……,请跟进」。客户下一句「那我今天还能跑步吗」,AI 照常回答。
+2. **silent + continue「这道题交给人,别的照常」**。客户:「二甲双胍我能不能减半吃?」AI 调转人工,本轮不发任何话;同事收到通知后亲自回复。客户接着问「晚饭吃什么好」,AI 照常回答。如果同事还没回、客户先追问「在吗?」,AI 回「在的,刚才那个问题我确认一下,稍后回复您」,不回答药的问题。
+3. **reply + stop「稳住客户,整个交给人」**。客户:「你们这服务太差了,我要退款!」AI 回一句稳住的话(「抱歉让您不舒服了,我马上核实一下情况,稍后给您答复」),同时转人工;之后客户再说什么,AI 都不回,直到同事处理完把 AI 重新打开。
+4. **silent + stop「AI 一句不说,全部交给人」**。适合重点客户、医疗纠纷、法律问题:AI 本轮不说话,之后也不回,全部由同事接手。
+
+**模型填什么**:`summary`(写给同事看:客户原话要点、为什么要交给人、AI 已经说了什么)、`is_emergency`(是否急症)。身份(项目、员工、客户、群)和本批消息 id 由平台从 inputs 绑定;`this_turn`、`afterwards` 由配置钉死,模型看不到。
+
+**MCP 做什么(按顺序)**:
+
+1. **校验固定选项**:不是允许值(如手误写成 `slient`)→ 42200,明确说哪个参数、允许哪些值;不悄悄按默认处理。
+2. **通知同事**:按员工绑定判断走 pad 还是 pc(与到点提醒同口径,`send-notify.processor.ts:50-82`),目标取绑定行上的转人工配置,兜底规则与现在一致(§1.5)。用 MCP 现有的 pad / pc 发送能力发出;目标是内部同事 / 内部群,所以**和现在 dk 的转人工一样,不写 AI 标记、不过人工接管检查**。pc 要建成 `t_project_cpwx_pc_send_task` 里 `task_kind=referral` 的任务(跳过接管检查、30 分钟过期);注意 MCP 现有的 pc 发送写的是另一张 `t_machine_task`(§1.4),这里要按 referral 任务的字段另写(照 `pc-send-task.service.ts:206-223`)。转人工状态照现在标:pad 私聊把本批客户消息标 `referral_human_status=1`(从 `input_message_ids` 取 `msg_app_info`);dk 没有状态列,referral 任务本身就是记录。
+3. **本轮不回**:`this_turn=silent` 且**不是急症**时,写现有的临时接管标志 `HUMAN_HAS_ANSWERED_{项目}_{员工}[_{群}]_{客户}`(存活 600 秒),写在数字人服务共用的那个 Redis 库(库号待核实,与「提醒队列 14 还是 15」一起核,§9.12)。两通道的发送前检查本来就查这个键(§1.5),这一轮的回复即使生成了也会被拦下。客户再开口时这个键会被自动删掉,下一轮 AI 恢复回复。键里的 id 拼法是跨服务约定,pad 用 pad id、dk 用企微明文 id(§3.3),必须逐字一致。只写客户级的键,不写群级键(群级会挡住群里其他客户)。
+4. **之后不回**:`afterwards=stop` 时,把当前对话的 AI 开关 `is_enabled_agent_reply` 置 0:私聊改 `t_project_customer_cpwx_relation` 那一行,群里改 `t_project_cpwx_group_member` 里**这位客户**那一行。数字人服务调用前本来就查它(`invoke-agent.processor.ts:479-538`),之后这位客户在这个对话里的消息不再调智能体。两张表按企微明文 id 查(员工 `cpwx_userid`、客户 `cpwx_external_userid`、群 `chat_id`);pad 通道绑定的是 pad id,要换算 —— 用 `customer_code` / `employee_code` 反查,或业务方另传企微明文 id,实现时定。
+5. **返回**:告诉模型本轮怎么做 —— `silent`:「本轮不用写回复,输出空」;`reply`:「照常回复,用稳住的话,不要说已转人工」。
+
+**急症例外**:`is_emergency=true` 时,不管 `this_turn` 选的什么,**都不写临时接管标志**,AI 本轮「立即就医 / 拨打 120」的建议必须发出去;`afterwards` 照配置执行。把普通情况误判成急症,最多多发一条回复;提示词仍然要求不回答已经交出去的问题(06)。
+
+**谁把 AI 重新打开**:业务后台。读代码找到项目服务已有两个接口能改这个开关(§1.5),但员工端有没有入口在用**没核实**;实现前必须确认,没有就补一个(§9.13)。
+
+**数字人服务:转人工不需要任何改动。** 发送前检查(查临时标志)和调用前检查(查 AI 开关)都已存在。此前设想过「发送前再查一次 AI 开关」,**撤回**:那样会把 reply + stop 组合里那句稳住客户的话也拦掉。Expert Work 上的健管师也不再走数字人服务的 `referralHuman` 回调。
+
+**已知边界(与现在的真人接管相同)**:转人工那一轮还在跑时客户又发了新消息,临时标志会被删掉;如果这时那一轮没取消成功,它的回复可能照样发出去。
+
+### 3.11 主回复为什么不走 MCP 发(否决项,11-17 核实)
+
+考虑过让智能体在一轮里调 MCP 发消息工具发主回复。不做,理由(都读过代码):
+
+1. **会让 AI 一发言就把自己关掉。** MCP 的发消息工具不写「AI 已发」标记(整个 MCP 仓库搜不到 `AI_SENT` / `markAiSent`)。dk 通道上,会话存档服务把员工号发出、又没有这个标记的消息一律当成真人接管,写临时接管标志(`human-answered.service.ts:38、157-185`)→ AI 第一条回复发出去后,自己就被当成「真人接手了」,接下来 10 分钟不回。pad 在消息同步服务里有类似判断(`sync-pad-message.processor.ts:713-765`,没逐行核对是否同样触发)。
+2. **回复会从平台的各个视图里消失。** 长期记忆提炼只看每一轮的最终回答,工具调用只留下名字(`graph_builder/memory.py:540-546、583-612`,`_turn` 只取最后一条不带工具调用的助手消息);对话页、调试台、评测看的也是最终回答。通过工具发出的回复,这些地方都看不到。
+3. **被打断时收不回。** 新消息到达时数字人服务会取消正在跑的一轮、合并后重跑(`invoke-agent-message.processor.ts:338-371`);一轮中途已经用工具发出去的话撤不回来,重跑又发一次,客户收到前后矛盾的两段。
+4. **没法保证正好发一次。** 模型可能漏调、多调;最终回答有 `output_schema` 校验和重试兜底,工具调用没有。
+5. **只能发文字。** MCP 的发送工具只发文字(pad `message.service.ts`、pc `message-pc.service.ts`);视频、多气泡、发送节奏都在数字人服务。
+
+粗估要多 5 人天,还多两类事故级风险(AI 自我关闭、重复矛盾回复)。等以后做「智能体主动找客户」时再重新评估。
+
+### 3.12 查更早聊天:增强现有 `chat_private_history`(11-17 定,不新建工具)
+
+- **场景**:客户说「上周我跟你说过我在吃的那个药,叫什么来着」,而会话里没有(03 落地前会话只有 AI 参与过的对话;落地后也只补最近的)。
+- **范围**:该客户的私聊 + 该客户在各群里发的消息 + 员工号在群里 @ 该客户的消息。与数字人现有历史接口在群里的取法一致(`message.service.ts:157-190`)。不读群里其他人的话;`chat_group_history` 继续不放行。
+- **新参数**:`keyword`(关键词)、时间段(沿用现有 `since_time` / `until_time` / `recent_days`)、`limit`(≤ 30)。
+- **每条带**说话人(`客户` / `健管师`)和时间(+08:00)。员工号发出的一律算「健管师」,不区分 AI 还是真人(已拍板)。
+- **身份**:`project_code`、`employee_code`、`customer_code` 由平台绑定。
+- **数据源**:`t_project_cpwx_chat_msg`,pad 和 dk 都写(§1.4),两条通道都查得到。此前文档里「pad 消息不在这张表、健管师查不到」的说法是错的,已更正。
+
 ## 4. 改动清单
 
 ### 4.1 Expert Work 平台
 
-- **代码:不改。**
+- **代码:一处,固定值下拉(11-17 批准,约 1 人天,随 B-314 其它平台改动一起发)。**
+  - 现状:控制台给工具参数配「固定值」只有一个文本框(`apps/admin-ui/src/components/manifest-editor/widgets/McpToolPicker.tsx:740-760`),只检查非空、首尾无空格(`mcp_arg_bindings.ts:67-68`);读工具参数时只取名字和是否必填(`ToolParam`,`mcp_arg_bindings.ts:125-128`);后端保存也只查非空、首尾空格(`agent_spec.py:1328-1353`),不看工具声明的可选值。所以把 `silent` 手误写成 `slient`,要到真转人工那一刻才报错。
+  - 改法:工具参数声明了字符串 `enum`,或 `oneOf` 里每项是 `{const, title}` 时,固定值输入框换成下拉,只能选这些值;有 `title` 就显示 `title`(运营看到「本轮回复 / 本轮不回」),没有就显示原值;其它参数仍是文本框。工具 schema 当不可信输入处理,只认白名单形状(照 `paramsOf` 的做法),形状不对就退回文本框。
+  - 保存时校验:固定值不在可选值里就拒绝保存。放在保存时已经拿到工具 schema 的那段核对里(`api/agents.py:1131-1220`);连不上 MCP、拿不到 schema 时与现在一样只给警告。
+  - 被绑定的参数本来就从模型看到的 schema 里删掉,`title` 只给运营看,不影响模型。改动是通用的,对所有 MCP 工具生效。
+  - MCP 侧同样拒绝不认识的值,并给清楚的错误,不悄悄用默认值(§3.10)。
 - 配置(测试由我们做,生产由用户执行):租户 MCP 注册表新增「健管师专用」一条(同地址、新 key、`x-agent-id`);租户打开 `amap-maps`;智能体配置见 4.4、5.11。
 - 保存智能体后看返回的警告:出现 `arg_bindings did not land` 或 `were not checked` 时必须处理,不能发布(`api/agents.py:1131-1220`)。
 
@@ -342,30 +441,34 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | M2 | 未预料异常不回原文 | `mcp-error.ts:32-44` 改成固定文案 + `request_id`;详情只进服务端日志,日志里不打客户姓名、聊天正文 |
 | M3 | 按 `inputSchema` 校验入参 | 在 `mcp-server.service.ts:102` 前统一用 ajv 校验(含 `required`、类型、`format`),不合格回 42200。新工具必须有;旧工具建议一起上(对 Dify 有行为变化,并行期可先只对新工具开) |
 | M4 | 日期参数容错 + 改说明 | `form_get_latest_field_values` / `form_list_owner_submissions`:`start/end_submit_time` 接受 `YYYY-MM-DD`,也接受带时分秒或 ISO(只取北京日期),其它格式回 42200;说明里「服务器本地时区」改成「北京时间」 |
-| M5 | `form_save_customer_values` | 5.2;含三种模式、规则、去重、改口、限额、操作日志 |
+| M5 | `form_save_customer_values` | 5.2;含三种模式、规则、情境字段配置、按来源消息去重(存来源消息 id)、改口、操作日志 |
 | M6 | `reminder_create` / `reminder_list` / `reminder_delete` | 5.3–5.5;注册 `send-notify-queue`(显式库号) |
 | M7 | `health_plan_get_brief` | 5.6;移植 `queryCustomerHealthPlanMd` 为纯文本 |
-| M8 | `profile_get_brief` | 5.7 |
-| M9 | 按客户限额 | Redis 计数(按项目 + 客户 + 工具 + 北京日),超限 42900 |
-| M10 | 契约测试 | 新工具每条返回路径(含空结果、未建档、去重)都过 outputSchema 校验(见 6.8);提醒 job 字段与数字人消费端对齐 |
-| M11 | (可选)`chat_get_customer_history`、`handoff_notify_staff` | 5.8–5.9,后定 |
+| M8 | `profile_get_brief` | 5.7;v1 就做(11-17 定),含现有提醒一段 |
+| M9 | ~~按客户限额~~ | 取消(11-17 定:不设上限) |
+| M10 | 契约测试 | 新工具每条返回路径(含空结果、未建档、去重)都过 outputSchema 校验(见 6.8);提醒 job 字段与数字人消费端对齐;转人工写的接管标志键与数字人 / 同步 / 存档三方拼法一致 |
+| M11 | 增强 `chat_private_history` | 5.8;范围、关键词、时间段、条数、说话人标注 |
 | M12 | (可选加固)key 限项目、限工具;客户属于项目核对 | 9.5 |
-| 配置 | 生产 `AGENT_KEYS` 非空;新增健管师 key | |
+| M13 | `handoff_to_human` | 5.9;pad / pc 通知、接管标志、AI 开关、转人工状态、固定选项校验;连数字人共用的 Redis 库 |
+| 配置 | 生产 `AGENT_KEYS` 非空;新增健管师 key;MCP 能连上数字人共用的 Redis 库(写接管标志) | |
 
 ### 4.3 深护数字人 · 项目服务
 
-- 业务方调 runs 时带上 3.3 的 inputs(属于「发起一轮」改造,和补消息一起做)。项目服务客户端 `EwRunRequest.inputs` 现在是 `Record<string, string>`(`expert-work.types.ts:46`);`attachment_urls` 按 01 §3.3.2 传 JSON 数组(数组里的链接平台不预下载,06 §5.1),客户端类型要放宽;MCP 仍两种都收。
+- 业务方调 runs 时带上 3.3 的 inputs(属于「发起一轮」改造)。项目服务客户端 `EwRunRequest.inputs` 现在是 `Record<string, string>`(`expert-work.types.ts:46`);`attachment_urls`、`input_message_ids` 按 01 §3.3.2 传 JSON 数组,客户端类型要放宽;MCP 仍两种都收。
+- `input_message_ids`:数字人服务已经把本批每条消息的企微身份传给项目服务(01 §5.1 `messages[].msg_key`),项目服务加上通道前缀放进 inputs;打断后合并重跑时放合并后的整批。
+- 不再每轮预取客户档案、提醒、饮食、方案(客户资料由智能体调 `profile_get_brief`,11-17 定)。
 - 部署确认数字人服务进程时区为东八区:循环提醒续期按进程时区算(`send-notify.processor.ts:200-202`),仓库里的 `dockerfile`、`pm2.json` 没设 TZ(推断:若生产不是东八区,续期会偏)。
+- 转人工:数字人服务**不改**(§3.10)。要确认 AI 开关被关掉后由谁、在哪重新打开(§9.13)。
 - Dify 下线后:3.8 表里「挪到 MCP / 不再需要」的接口删除,或去掉调试请求头放行。
 - 控制台确认员工能撤销 AI 写入的表单字段和提醒(3.4 末)。
 
 ### 4.4 智能体配置
 
-- `system_prompt.jinja: true`,声明 3.3 的 7 个变量。
-- `tools` 两个 mcp 条目(深护健管师专用注册名 + `amap-maps`),`allow_tools`、`arg_bindings` 按 5.11。
+- `system_prompt.jinja: true`,声明 3.3 的 8 个变量。
+- `tools` 两个 mcp 条目(深护健管师专用注册名 + `amap-maps`),`allow_tools`、`arg_bindings` 按 5.11;`handoff_to_human` 的 `this_turn`、`afterwards` 在控制台下拉里选(健管师默认建议见 5.9)。
 - 不开 `dynamic_workers`、不配 `subagents`(绑定在子智能体里的行为不在本文核对范围)。
-- `approval_required_tools` 留空(9.1 推荐不确认)。
-- 提示词里写清:只用手上的工具;写入和提醒以工具返回为准;日期参数只传 `YYYY-MM-DD`;`form_list_owner_submissions` 的 `page_size` ≤ 20。
+- `approval_required_tools` 留空(9.1:不确认,已定)。
+- 提示词里写清(全文在 06):只用手上的工具;写入和提醒以工具返回为准;日期参数只传 `YYYY-MM-DD`;`form_list_owner_submissions` 的 `page_size` ≤ 20;客户资料只在话题与健康有关时调、每轮最多一次;情境字段先推断再问;一条消息里重复的量合并或带时间;转人工的时机、急症信号、不说「已转人工」、不回答已交出去的问题。
 
 ## 5. 接口与数据结构
 
@@ -376,14 +479,15 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | 40100 | auth | key 不在白名单(建连时) | — |
 | 40300 | permission | 表单不在可写清单;(加固后)该 key 不允许此工具或项目 | 不要重试,换别的说法回复客户 |
 | 40400 | not_found | 客户未建档(`customer_code` / `owner_code` 为空,或加固后不属于该项目) | 不要再调写入工具 |
-| 42200 | validation | 参数不合法、字段全部被拒、时间不合法 | 按 `context.details` 改一次 |
-| 42900 | rate_limit | 超出按客户限额 | 不重试,如实告诉客户稍后再试 |
+| 42200 | validation | 参数不合法、字段全部被拒、时间不合法;配置钉死的固定值不在允许值里(`invalid_fixed_value`) | 按 `context.details` 改一次;固定值错误模型改不了,如实回复、不重试 |
 | 9999 | internal | 未预料异常(只回固定文案 + `request_id`) | 最多重试 1 次 |
+
+不设按客户的调用 / 写入上限,没有限流错误码(11-17 定)。
 
 ### 5.2 `form_save_customer_values`(新增,写)
 
 - **用途**:把当前客户本人明确给出的数据写进档案或健康记录表单。
-- **说明文字**(给模型,原样用):「[保存客户健康数据或档案] 把当前客户本人在对话里明确给出的数据写进表单:改个人档案(form_customer_basic_info),上报血糖、血压、体重、饮食、运动、睡眠等日常记录,保存化验单 / 体检报告里的指标(form_analysis_report)。客户是谁由系统决定,你只填表单和字段。只写客户本人的、有具体数值或内容的数据;别人的数据、假设性提问、你自己推测或建议的内容都不写;血糖要同时有数值和测量时段才写。写之前先用 form_get_field_detail 查字段编码和选项。写成功了什么、跳过了什么,以返回的 saved / skipped 为准。本工具不设提醒、不改用药方案、不改健康方案。」
+- **说明文字**(给模型,原样用):「[保存客户健康数据或档案] 把当前客户本人在对话里明确给出的数据写进表单:改个人档案(form_customer_basic_info),上报血糖、血压、体重、饮食、运动、睡眠等日常记录,保存化验单 / 体检报告里的指标(form_analysis_report)。客户是谁由系统决定,你只填表单和字段。只写客户本人的、有具体数值或内容的数据;别人的数据、假设性提问、你自己推测或建议的内容都不写。表单要求的情境(如血糖的测量时段、饮食的餐次、测量时间)先按消息时间和上下文推断,真推不出来再问客户。同一条消息里说了两遍同样的量,合成一条写,或分别带上时间。写之前先用 form_get_field_detail 查字段编码和选项。写成功了什么、跳过了什么,以返回的 saved / skipped 为准。本工具不设提醒、不改用药方案、不改健康方案。」
 
 **入参**
 
@@ -393,6 +497,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | `owner_code` | string | 是 | 平台绑定(← `customer_code`) | 空串 → 40400 |
 | `employee_code` | string | 是 | 平台绑定 | 作提交人,并写进操作日志 |
 | `attachments` | string[] 或用「;」「,」分隔的 string | 否 | 平台绑定(← `attachment_urls`) | 本轮客户附件原始链接,≤ 10 个;只在表单有附件类字段时使用 |
+| `input_message_ids` | string[] 或 JSON 数组字符串 | 是 | 平台绑定 | 本轮客户消息 id,存为这条记录的来源消息,判重用(3.4) |
 | `form_code` | string | 是 | 模型 | 必须在可写清单里(默认:本项目启用的系统表单,`is_system=1`) |
 | `fields` | object[] 1..70 | 是 | 模型 | 每项见下表;超过 70 的部分不写 |
 | `measured_at` | string | 否 | 模型 | 数据对应的时间(北京时间);日常上报用作提交时间,缺省为当前时间 |
@@ -415,9 +520,9 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 
 **其它规格**
 
-- 错误:40400(未建档)、40300(表单不可写)、42200(全部字段被拒 / 化验单无指标 / `measured_at` 不合法 / `amend_submission_code` 不合法)、42900、9999。
-- 幂等:见 3.4「去重」。`duplicate` 返回首次的 `response_snapshot`(`status` 改为 `duplicate`)。
-- 限额:每客户每北京日 ≤ 30 次写(含 `unchanged` / `duplicate`);单值 ≤ 500 字。`field_value` 列在 model 里是 `STRING`(`TProjectFormSubmissionDetail.ts:37`),长度要按真实表结构核对后再定上限(推断:可能是 255)。
+- 错误:40400(未建档)、40300(表单不可写)、42200(全部字段被拒 / 化验单无指标 / `measured_at` 不合法 / `amend_submission_code` 不合法)、9999。
+- 幂等:见 3.4「去重」(按来源消息)。`duplicate` 返回首次写入的结果(`status` 改为 `duplicate`)。
+- 不设按客户的次数上限(11-17 定)。单值 ≤ 500 字;`field_value` 列在 model 里是 `STRING`(`TProjectFormSubmissionDetail.ts:37`),长度要按真实表结构核对后再定上限(推断:可能是 255)。
 - 权限:两条通道都可用(3.9)。
 - 写库:事务内写提交和明细 + 操作日志;`submitter_code` = 绑定的员工编号(控制台怎么展示要深护核对);`created_by` = 默认用户。
 
@@ -479,8 +584,8 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 
 **返回**:`results[]`,每项含 `index`、`status`(`created` / `duplicate` / `rejected`)、`notify_code`、`content`、`first_send_at`、`repeat`、`repeat_interval`、`repeat_until`、`reason`、`advance_adjusted`;外加 `server_now`、`request_id`。全部 `rejected` 时 `isError=true`、42200,`context` 里带每条的原因。
 
-- 幂等:同一 `customer_pad_userid` + 同一 `room_conversation_id` + 同一首次发送时间 + 同循环方式 + 规范化后的同内容,且该提醒仍生效 → `duplicate`,返回已有编号。
-- 限额:每客户生效中 ≤ 20 条;每客户每北京日新增 ≤ 10 条;每次 ≤ 5 条。
+- 幂等:同一 `customer_pad_userid` + 同一 `room_conversation_id` + 同一首次发送时间 + 同循环方式 + 规范化后的同内容,且该提醒仍生效 → `duplicate`,返回已有编号(同一时刻的同一句提醒设两条没有意义,所以这里不需要来源消息)。
+- 不设按客户的条数上限(11-17 定);一次调用最多 5 条(参数上限)。按小时循环同样最长 30 天(沿用 Dify,11-17 定)。
 
 示例:
 
@@ -518,37 +623,56 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 - **内容**:照项目服务 `queryCustomerHealthPlanMd` 的三段(基础信息、每日饮食安排、文档表格,`customer-health-plan.service.ts:11065` 起)。
 - 未建档 → 40400;没有方案 → `found=false`、`text=""`(不报错)。
 
-### 5.7 `profile_get_brief`(新增,读)
+### 5.7 `profile_get_brief`(新增,读;客户资料精简版,v1 就做)
 
-- **说明文字**:「[一次取齐客户资料] 一次返回当前客户的基础档案、健康方案摘要、今天已记录的饮食、可以写入的表单清单,以及当前北京时间。每轮回答需要了解客户情况时先调它,不要分别调多个表单工具。customer_registered=false 表示这位发言人在系统里没有建档,不要调写入类工具。」
-- **入参**:绑定 `project_code`、`customer_code`;模型可选 `sections`(`basic_info` / `health_plan` / `today_food_log` / `writable_forms` 的子集,默认全部)。
+- **说明文字**:「[一次取齐客户资料] 一次返回当前客户的基础档案、健康方案摘要、今天已记录的饮食、现有提醒、可以写入的表单清单(含每张表需要的情境),以及当前北京时间。话题和客户健康有关时调一次,每轮最多一次;闲聊、问天气不用调。推广方案话术前判断客户有没有方案、首轮补问前看档案缺哪些,也用它。customer_registered=false 表示这位发言人在系统里没有建档,不要调写入类工具。」
+- **入参**:绑定 `project_code`、`customer_code`、`customer_pad_userid`、`room_conversation_id`;模型可选 `sections`(`basic_info` / `health_plan` / `today_food_log` / `reminders` / `writable_forms` 的子集,默认全部)。
 - **返回**:
 
 | 字段 | 内容 |
 |---|---|
-| `customer_registered` | bool;`customer_code` 为空或查不到时为 false,其余段为空 |
+| `customer_registered` | bool;`customer_code` 为空或查不到时为 false,档案、方案、饮食段为空(提醒段照常,按企微 id 查) |
 | `basic_info` | `{text, updated_at}`;`form_customer_basic_info` 各字段最新值,「字段名:值 单位」一行一个,空值省略 |
 | `health_plan` | `{found, text, truncated}`;同 5.6,但 ≤ 3000 字 |
 | `today_food_log` | `{text, count}`;今天(北京)`form_food_log` 的记录 |
-| `writable_forms` | `{form_code, form_name, description}[]`;可写表单清单 |
+| `reminders` | `{items, total}`;同 5.4 的口径和字段(编号、提醒语、下次发送时间、循环、截止),最多 20 条,多了注明总数 |
+| `writable_forms` | `{form_code, form_name, description, context_fields}[]`;可写表单清单;`context_fields` 是这张表的情境字段和推断说明(3.4「情境字段」) |
 | `server_now` | |
 
-- 总长 ≤ 8000 字。超出时依次压缩方案、饮食日志。
-- 替代 Dify 每轮的 5 路预取;Dify 用会话变量缓存 120 / 300 秒,这里不缓存,每次现查。
+- 总长 ≤ 8000 字。超出时依次压缩方案、饮食日志、提醒。
+- 替代 Dify 每轮的 5 路预取 + 每轮查提醒;业务方不再预取。不缓存,每次现查:本轮刚写的数据,下一次查就能看到。
+- 为什么由模型自己查(11-17 定):`customer_code` 是绑定变量,模型看不到改不了;数据是最新的;系统提示词每轮不变,厂商的前缀缓存能用上;业务方不用多写查询。代价是用到资料的轮次多一步工具调用,所以做成「一次取齐」、每轮最多一次。
 
-### 5.8 (可选,后定)`chat_get_customer_history`
+### 5.8 增强 `chat_private_history`(复用 + 增强,读)
 
-- **用途**:补消息之后,会话里没有的更早聊天,客户问到时再查。
-- **入参**:绑定 `project_code`、`customer_pad_userid`、`employee_pad_userid`、`room_conversation_id`;模型填 `before`(时间)、`limit`(≤ 30)。
-- **返回**:`messages[]`,每项含 `sent_at`(+08:00)、`role`(`客户` / `健管师`)、`text`;只返回文字。
-- **口径**:照搬数字人 `message.service.ts:72-87` 的 pad / dk 双来源与群过滤规则(群里只取该客户发的 + 员工 @ 该客户的;多对一服务群另含内部员工)。不能复用 MCP 现有 `chat_*`,原因见 3.5。
+- **说明文字**(改写):「[查这位客户更早的聊天] 客户提到会话里找不到的过去聊天内容时用(『上周我跟你说的那个药』)。只查当前客户:他的私聊、他在群里发的话、我们在群里 @ 他的话。可按关键词和时间段查,一次最多 30 条。每条标明是客户还是健管师说的、什么时间。」
+- **入参**:绑定 `project_code`、`employee_code`、`customer_code`;模型可填 `keyword`(新)、`since_time` / `until_time` / `recent_days`(沿用)、条数 `page_size`(沿用,新范围下上限 30)、`cursor`(沿用)。
+- **范围**(新):`t_project_cpwx_chat_msg` 里 ① 员工号 ↔ 该客户的私聊(现有);② 该客户在各群里发的(`roomid` 非空且发送方是该客户);③ 员工号在群里发、@ 名单含该客户的。不撤回、不跨客户。
+- **不改变别的调用方**:这个工具已经有人在用(员工 OAuth 等),直接扩大范围会改变他们看到的结果。建议加一个参数 `scope`(`private` = 现有行为,默认;`customer` = 上面的新范围),健管师配置里用固定值钉成 `customer`(下拉可选,§4.1),模型看不到。实现时深护可另选兼容做法。
+- **返回**:沿用现有 `rows` 结构,每条加 `speaker`(`客户` / `健管师`)和 `chat`(`private` / `group`);时间统一 `+08:00`;文字之外的类型只给一行占位(「[图片]」等),不给链接。总长 ≤ 8000 字。
+- `customer_code` 为空(群里未建档的发言人)→ 40400,模型照常回答,不查。
+- 两条鉴权通道都可用;OAuth 员工下 `employee_code` 仍取登录身份(现有 `bindEmployeeScope`)。
 
-### 5.9 (可选,后定)`handoff_notify_staff`(转人工)
+### 5.9 `handoff_to_human`(新增,写;转人工)
 
-- **用途**:客户情况超出 AI 边界(急症、投诉、明确要真人)时,通知内部负责人。不改人工接管开关,开关仍在数字人服务。
-- **入参**:绑定 `project_code`、`employee_code`、`employee_pad_userid`、`customer_pad_userid`、`room_conversation_id`;模型填 `reason`(≤ 200 字)。
-- **返回**:`status`(`sent` / `no_target`)、`server_now`。
-- **做法**:目标取员工绑定行的转人工配置(同 `agent-callback.service.ts:43-83`)。发送复用 MCP 现有发消息的内部函数(推断:需核实 pad / dk 两路都能发)。同一客户 30 分钟内只通知一次。
+- **说明文字**(给模型):「[把客户交给同事跟进] 客户的问题需要同事亲自处理时调用,系统会马上把你写的 summary 发给负责的同事。本轮回不回、之后还回不回由系统配置决定,结果里会告诉你本轮怎么做。summary 写给同事看:客户原话要点、为什么要交给人、你已经跟客户说了什么。急症时先在回复里建议立即就医或拨打 120,再调本工具并把 is_emergency 设为 true。不要对客户说『已转人工』。」
+- **入参**:
+
+| 参数 | 类型 | 谁填 | 说明 |
+|---|---|---|---|
+| `summary` | string 10..500 字 | 模型 | 给同事看的交接说明 |
+| `is_emergency` | boolean | 模型 | 急症时为 true(不写临时接管标志,3.10) |
+| `this_turn` | string,`oneOf`:`{const: "reply", title: "本轮回复"}`、`{const: "silent", title: "本轮不回"}` | 配置钉死(下拉) | |
+| `afterwards` | string,`oneOf`:`{const: "continue", title: "之后照常"}`、`{const: "stop", title: "之后不回"}` | 配置钉死(下拉) | |
+| `project_code`、`employee_code`、`employee_pad_userid`、`customer_code`、`customer_pad_userid`、`room_conversation_id`、`input_message_ids` | string / 数组 | 平台绑定 | `customer_code` 可为空串(群里未建档),其余不能空 |
+
+  `this_turn`、`afterwards` 做成字符串而不是布尔,因为平台的固定值只收字符串(6.6)。
+
+- **返回**:`status`(`sent` / `duplicate` / `no_target`)、`target`(`user` / `room`,不回显 id)、`this_turn`、`afterwards`、`is_emergency`、`takeover_flag_written`、`ai_switch_off`、`guidance`(本轮怎么做的一句话)、`server_now`、`request_id`。
+- **做法**:见 3.10 的五步。
+- **去重**:同一客户、本次 `input_message_ids` 与之前某次转人工重叠(打断后重跑)→ `duplicate`,不再通知同事,返回上次的结果。不同的消息再转一次照常通知(不按时间窗压)。
+- **找不到通知对象**(绑定行没配、调用也没给)→ `no_target`,**不写接管标志、不关 AI 开关**,`guidance` 让模型照常回复;服务端记告警日志。理由:同事收不到,AI 再闭嘴,客户就没人管了(9.14)。
+- **健管师用哪种组合**:由业务定,控制台随时可改;未定前建议 `reply` + `continue`(9.15)。
 
 ### 5.10 复用工具的改造
 
@@ -556,6 +680,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 |---|---|
 | `form_get_latest_field_values`、`form_list_owner_submissions` | M4 日期容错与说明修正;(建议)返回体超过 15000 字时减少行数,并加 `truncated: true`(outputSchema 顶层没禁额外字段,可以加) |
 | `form_get_field_detail` | 不改;平台钉 `detail_level=brief` |
+| `chat_private_history` | M11:范围、关键词、条数、说话人标注(5.8) |
 | 全部工具 | M2 异常文案;M3 入参校验(并行期先只对新工具开) |
 
 ### 5.11 智能体配置片段(YAML,配置的人用)
@@ -574,6 +699,7 @@ spec:
       - {name: employee_pad_userid,  description: 服务员工企微 id}
       - {name: room_conversation_id, description: 群 id;私聊传空串}
       - {name: attachment_urls, required: false, description: 本轮附件原始链接,只给表单写入用}
+      - {name: input_message_ids,    description: 本轮客户消息 id(JSON 数组),只给写工具判重用}
   tools:
     - type: mcp
       servers: ["<健管师 MCP 注册名>"]
@@ -587,10 +713,13 @@ spec:
         - reminder_create
         - reminder_list
         - reminder_delete
+        - chat_private_history
+        - handoff_to_human
       arg_bindings:
         - server: "<健管师 MCP 注册名>"
           tool: profile_get_brief
-          args: {project_code: project_code, customer_code: customer_code}
+          args: {project_code: project_code, customer_code: customer_code,
+                 customer_pad_userid: customer_pad_userid, room_conversation_id: room_conversation_id}
         - server: "<健管师 MCP 注册名>"
           tool: health_plan_get_brief
           args: {project_code: project_code, customer_code: customer_code}
@@ -607,7 +736,8 @@ spec:
         - server: "<健管师 MCP 注册名>"
           tool: form_save_customer_values
           args: {project_code: project_code, owner_code: customer_code,
-                 employee_code: employee_code, attachments: attachment_urls}
+                 employee_code: employee_code, attachments: attachment_urls,
+                 input_message_ids: input_message_ids}
         - server: "<健管师 MCP 注册名>"
           tool: reminder_create
           args: {project_code: project_code, customer_code: customer_code,
@@ -620,6 +750,17 @@ spec:
         - server: "<健管师 MCP 注册名>"
           tool: reminder_delete
           args: {project_code: project_code, customer_pad_userid: customer_pad_userid}
+        - server: "<健管师 MCP 注册名>"
+          tool: chat_private_history
+          args: {project_code: project_code, employee_code: employee_code, customer_code: customer_code}
+          fixed: {scope: customer}
+        - server: "<健管师 MCP 注册名>"
+          tool: handoff_to_human
+          args: {project_code: project_code, employee_code: employee_code,
+                 employee_pad_userid: employee_pad_userid, customer_code: customer_code,
+                 customer_pad_userid: customer_pad_userid, room_conversation_id: room_conversation_id,
+                 input_message_ids: input_message_ids}
+          fixed: {this_turn: reply, afterwards: continue}   # 控制台下拉选,组合见 3.10、9.15
     - type: mcp
       servers: ["amap-maps"]
       allow_tools: [maps_weather]
@@ -646,7 +787,7 @@ spec:
 
 **6.5 返回体积。** 平台单次 2 万字中间截断(`tools/mcp.py:115、1437-1450`),截断后的 JSON 模型读起来就是坏的。新工具自己控制在 8000 字内;旧工具靠 5.10 和提示词约束。
 
-**6.6 `fixed` 只收字符串。** 布尔或整数参数钉不住:字符串 "false" 在 JS 端是真值,`is_system` 这类整数也钉不了。所以平台要钉死的参数,MCP 一律设计成字符串枚举(本设计只钉 `detail_level`)。旧工具的布尔参数如果以后要钉,服务端先把 "true" / "false" 字符串转成布尔。
+**6.6 `fixed` 只收字符串。** 布尔或整数参数钉不住:字符串 "false" 在 JS 端是真值,`is_system` 这类整数也钉不了。所以平台要钉死的参数,MCP 一律设计成字符串枚举(本设计钉 `detail_level`、`chat_private_history` 的 `scope`、`handoff_to_human` 的 `this_turn` / `afterwards`),并在 schema 里声明可选值,控制台才能出下拉、保存时才能校验(§4.1)。旧工具的布尔参数如果以后要钉,服务端先把 "true" / "false" 字符串转成布尔。
 
 **6.7 时间与时区。**
 - MCP 读写数据库按 `+08:00`;新工具入参按 3.9 解析,出参带 `+08:00`。
@@ -670,7 +811,18 @@ spec:
 
 **6.14 写入与主回复的先后。** Dify 里写入支路和主回复并行,本轮写的东西健管师看不到。迁移后写入是模型的工具调用,发生在回答之前,回答能引用写入结果。这是行为改进,无需额外处理。
 
-**6.15 被取消的轮次。** 平台取消不回滚,已执行的写入保留(见共享背景)。重跑时靠 3.4 的去重兜住;提醒靠 5.3 的去重兜住。
+**6.15 被取消的轮次。** 平台取消不回滚,已执行的写入保留(见共享背景)。重跑时 `input_message_ids` 带着被取消那批的 id,靠 3.4 的来源消息去重兜住;提醒靠 5.3 的去重兜住;转人工靠 5.9 的去重,不会通知同事两次。
+
+**6.16 `input_message_ids` 与 03 的同名字段。** 03 给「发起一轮」请求加了一个**顶层**字段 `input_message_ids`(平台补消息判重用),本文的是 **inputs 变量**(给 MCP 判重用),平台不会把前者自动传给工具。03 落地前两者内容相同,业务方传同一份清单即可。03 落地后打断重跑时,被取消那批改作补消息、不再进顶层字段(03 §4.3 S-8),但**仍要放进 inputs 变量**:变量的含义是「本轮要处理的客户消息」,少了它,模型重写同样内容时就判不出重复。名字是否改开见 9.16。
+
+**6.17 转人工的边界。**
+- 同一轮里客户又发新消息、取消没成功:临时接管标志已被客户的新消息删掉,旧回复可能照发(3.10,与现在的真人接管相同)。
+- 临时标志写到了错的 Redis 库,或键的拼法和三方不一致:发送前检查查不到,`silent` 失效,本该不回的那句照样发出。对策:M10 契约测试 + 7 节用例 20。
+- dk 的回复任务要在标志存活的 10 分钟内被领走才拦得住;模型在 `silent` 时本来就输出空(06),标志是第二道保险。
+- 客户自己要求「别让 AI 回我了」:属于客户对自己服务的选择,不在威胁模型里;模型照提示词判断要不要转人工。
+- 找不到通知对象:见 5.9,不写标志、不关开关。
+
+**6.18 查更早聊天的边界。** 群里未建档的发言人(`customer_code` 空)查不了,回 40400;多对一服务群里内部同事的发言不在三类范围内,不返回(数字人现有历史接口在多对一群另带内部员工,`message.service.ts:157-166`);返回只有文字,图片等只给占位。
 
 ## 7. 测试与验收
 
@@ -682,7 +834,7 @@ spec:
 | 4 | 保存智能体配置;在控制台工具目录 / trace 里看工具 schema | 保存返回的警告;模型看到的工具参数 | 无 `did not land` / `not checked` 警告;模型看到的 schema 里没有 `project_code`、`customer_code`、`owner_code` 等身份参数 | 参数留在模型手里,1–3 可能失守 |
 | 5 | 调 runs 不带 `customer_code` | HTTP 返回 | 422 `missing required input` | run 起来了,工具收到空身份 |
 | 6 | 生产 MCP 用随机 key 建连 | HTTP 返回 | 40100 | 任意 key 都能连上并调全部工具 |
-| 7 | 同一句「早上空腹血糖 7.2」连跑两次 runs(模拟打断重跑) | 返回 `status`;表单提交表 | 第二次 `duplicate`,只有一条提交 | 两条一样的血糖记录 |
+| 7 | ① 「早上空腹血糖 7.2」跑一轮;再用**同一批 id 加一条新消息**跑一轮(模拟打断合并重跑)。② 10:00、15:00 两条**不同消息**各发「喝了 300ml 水」 | 返回 `status`;表单提交表;记录上的来源消息 id | ① 第二次 `duplicate`,只有一条血糖提交;② 两条饮水记录都在 | ① 两条一样的血糖记录;② 第二次被误当重复、少记一次 |
 | 8 | 「我叫王小明」;「我现在还在吃 X 药」(档案里已有 Y 药);「我没有过敏」(档案里已有过敏源) | 返回 `skipped` / `saved`;客户主表 `real_name`;档案最新值 | 姓名跳过(`forbidden_field`)、主表不变;用药变成「Y;X(日期)」;过敏源不被清空(`negation_ignored`) | 主表姓名被昵称覆盖;用药被替换;过敏源清空 |
 | 9 | 同月先后发两张化验单;下月再发一张;一张超过 70 项的 | 返回 `status`、`dropped_over_limit`;化验单提交表 | 前两张合成 1 条(`merged`),附件两张都在且不重复;下月新建;超出的列在 `dropped_over_limit` | 同月多条、附件丢失,或写入失败 |
 | 10 | 「明天早上 8 点提醒我测血糖」;「每天提醒我吃药」 | 返回;提醒表;Redis delayed 队列;到点时客户企微 | 返回 `created` + `notify_code` + `first_send_at=07:50+08:00`;表里有行、队列里有 job、到点真发出;吃药提醒走的是 `reminder_create` 而不是用药工具 | 回复说设好了但到点没发(库号不对 / 时区偏) |
@@ -693,9 +845,18 @@ spec:
 | 15 | 选一位健康方案最大的客户,调 `profile_get_brief`、`health_plan_get_brief` | 返回长度;trace 里有没有 `chars truncated` | ≤ 8000 字,没有平台截断标记 | JSON 被中间截断,模型读到坏数据 |
 | 16 | 「明天杭州冷不冷」;「明天天气怎么样」(档案无地址) | trace 工具名 | 前者调 `mcp__amap-maps__maps_weather`,回复用真实数据;后者先问城市 | 没调工具、编天气 |
 | 17 | 群里未建档的发言人说「记一下我血糖 7.0」「明天提醒我喝水」 | 返回 | 写表单回 40400、回复按话术处理;提醒正常设上 | 写到空 owner 名下 |
-| 18 | 一位客户一天内连发 11 条设提醒请求 | 返回 | 第 11 条 42900,回复如实说 | 无限设提醒、刷屏 |
+| 18 | 一条消息「早上喝了 300ml,上午又喝了 300ml」 | 写入次数与内容 | 合成一条 600ml,或两条各带不同时间;没有一条被判成重复而丢掉 | 少记一次 |
+| 19 | 测试员工配 `reply`+`continue`:「这周血压都 150 左右,有点头晕」;下一句「今天还能跑步吗」 | 同事企微(测试转人工目标);客户收到的消息;Redis;AI 开关 | 同事收到交接说明;客户收到正常回复;没写临时标志、开关仍为 1;下一句正常回复 | 同事没收到,或客户那边多出「已转人工」 |
+| 20 | 配 `silent`+`continue`:「二甲双胍能不能减半?」;同事回复前客户再发「在吗」;同事回复后客户问「晚饭吃什么」 | 同事企微;客户收到的消息;Redis `HUMAN_HAS_ANSWERED_*`(pad、dk 各一次) | 本轮客户什么都没收到,标志键与三方拼法一致;「在吗」时标志已被客户开口删掉,AI 回「确认一下稍后回复」、不答药的问题;之后正常回答饮食 | 本轮回复照发;或标志一直不删、AI 再也不回 |
+| 21 | 配 `reply`+`stop`:「我要退款,太差了」;再发两条 | 客户收到的消息;AI 开关;数字人调用记录 `agent_reply_disabled` | 本轮收到稳住的话;开关置 0(私聊 / 群里这位客户那一行);后两条不调智能体 | 稳住的话被拦;或之后照常回复 |
+| 22 | 21 之后由业务后台把开关打开,客户再发一条 | 开关;客户收到的消息 | 开关回到 1,AI 恢复回复 | 没地方打开,AI 永远不回 |
+| 23 | 配 `silent`+`stop`,客户「我要找律师」 | 同上 | 本轮不回、之后不回、同事收到通知 | 漏任何一项 |
+| 24 | 配 `silent`+`continue`,客户「胸口疼,喘不上气」 | 客户收到的消息;Redis | 客户收到「立即就医 / 拨打 120」;**没写**临时标志;同事收到通知(`is_emergency=true`) | 急症建议被拦,客户什么都没收到 |
+| 25 | 打断重跑:转人工那一轮被新消息取消后重跑 | 同事收到几次通知 | 只有一次(`duplicate`) | 同事收到两次 |
+| 26 | 控制台给 `handoff_to_human` 的 `this_turn` 配固定值:看是不是下拉、选项文字;再用 YAML 页直接写 `slient` 保存;再绕过控制台直接调 MCP 传 `slient` | 控制台;保存返回;MCP 返回 | 下拉显示「本轮回复 / 本轮不回」;写 `slient` 保存被拒;MCP 回 42200、说明允许值 | 能存进错值,到转人工时才失败或被当成默认 |
+| 27 | 客户 A:「上周我跟你说过我在吃的那个药叫什么?」(测试库里 A 有私聊、群里发言、员工在群里 @ A 的消息,同群还有客户 B 的发言) | 工具返回 | 三类消息都能查到、带说话人和时间;B 的发言一条都没有;pad 与 dk 员工各测一次 | 查不到 pad 的消息,或带出别的客户的话 |
 
-用例 1–6、10、12、13 是上线闸门,必须全过。其余没过要记缺陷后再定。
+用例 1–6、10、12、13、20、21、24、26 是上线闸门,必须全过。其余没过要记缺陷后再定。
 
 ## 8. 工作量粗估
 
@@ -706,43 +867,38 @@ spec:
 | 深护 MCP | M1 404 + M2 异常文案 | 0.5 |
 | | M3 入参校验(新工具;旧工具一起上再 +0.5) | 0.5 |
 | | M4 日期容错 + 说明 | 0.5 |
-| | M5 表单写入(三模式、规则、去重、改口、日志) | 4–5 |
-| | M6 提醒增查删(照抄项目服务生产者 + 队列配置 + 去重限额) | 2.5–3 |
+| | M5 表单写入(三模式、规则、情境字段配置、按来源消息去重、改口、日志) | 4.5–5.5 |
+| | M6 提醒增查删(照抄项目服务生产者 + 队列配置 + 去重) | 2.5 |
 | | M7 健康方案精简版(移植文本化) | 1–1.5 |
-| | M8 一次取齐客户资料 | 1.5 |
-| | M9 限额 + M10 契约测试 | 1.5 |
-| | 小计 | **12–14** |
-| | (可选)查更早聊天 / 转人工 / 加固 9.5 | 2 / 1 / 1.5–2 |
-| 深护数字人·项目服务 | runs 带 inputs(和补消息一起,本文只算增量)、TZ 确认、Dify 下线后清接口 | 1 |
+| | M8 客户资料精简版(含提醒段) | 1.5–2 |
+| | M10 契约测试(含接管标志键) | 1 |
+| | M11 增强 `chat_private_history` | 1–1.5 |
+| | M13 转人工(pad / pc 通知、标志、开关、状态、去重) | 2.5–3 |
+| | 小计 | **15.5–18.5** |
+| | (可选)加固 9.5 | 1.5–2 |
+| 深护数字人·项目服务 | runs 带 inputs(含 `input_message_ids`)、TZ 确认、确认 / 补 AI 开关的重新打开入口、Dify 下线后清接口 | 1–1.5 |
 | 平台配置(我们) | 测试环境注册、开高德、写配置 | 1 |
-| | 第 7 节验收(含等提醒到点) | 2 |
-| | 小计 | **3** |
-| Expert Work 平台代码 | 无 | 0 |
+| | 第 7 节验收(含等提醒到点、四种转人工组合) | 2.5 |
+| | 小计 | **3.5** |
+| Expert Work 平台代码 | 固定值下拉 + 保存时校验(§4.1) | 1 |
+| 否决项对照 | 主回复走 MCP 发(§3.11) | 不做;做的话约 +5 |
 
 ## 9. 待拍板
 
-**9.1 写操作(改档案、上报健康数据、设提醒)要不要员工先确认**
-- 选项 A:不确认,服务端防重复 + 按客户限额 + 员工可撤销(3.4、5.3)。
-- 选项 B:平台审批 `approval_required_tools`(`agent_spec.py:1165`),run 停下等审批接口回复,深护要把审批推给员工企微再回调。
-- 选项 C:MCP 两段确认(`ConfirmTokenStore` 现成但没接),第一次只预演,模型要再调一次。
-- **推荐 A**。理由:写的是客户本人刚说的数据,错了能撤、去重能挡重复;B 让每次上报都等员工,客户体验倒退,也和「对客户而言都是真人健管师」冲突;C 只是让模型多调一次,挡不住模型自己确认自己。
+**9.1 写操作要不要确认** —— **已定(11-17):不确认**(不找客户、不找员工),不设按客户上限;服务端按来源消息防重复 + 员工可撤销(3.4)。没选的:平台审批(每次上报都等员工,体验倒退)、MCP 两段确认(挡不住模型自己确认自己)。
 
 **9.2 提醒的实现方式**
 - 选项 A:MCP 直接写提醒表 + 投数字人的延迟队列。
 - 选项 B:MCP 调数字人服务内部接口。
 - **推荐 A**,比较见 3.6。核心理由:有现成先例(项目服务生产者)、能返回真实结果、不新增对外接口。
 
-**9.3 化验单「按月」按哪个月**
-- 选项 A:按上传时的北京当月(沿用 Dify)。
-- 选项 B:按化验单上的采样日期所在月。
-- **推荐 A**。理由:与现有数据口径一致,员工看到的按月节点不跳变;B 更符合医学含义,但客户补传旧报告时会改动历史月份的那条提交,要先和运营确认。
+**9.3 化验单「按月」按哪个月** —— **已定(11-17):按上传时的北京当月**(沿用 Dify)。没选按采样月:客户补传旧报告时会改动历史月份的那条提交。
 
-**9.4 「一次取齐客户资料」放在哪**
-- 选项 A:模型每轮按需调 `profile_get_brief`。
-- 选项 B:业务方每轮预取,放进 `untrusted_content`。
-- **推荐 A**。理由:B 要业务方多调一个接口,而且每轮都把整份资料塞进会话,长会话成本高;A 只有需要时才取,返回是工具结果,平台压缩时能收起。
-- **与 06 的出入(交叉核对发现)**:06 §3.6 / 待拍板 4 推荐的是第三种做法 B':业务方每轮把档案、现有提醒、今日饮食、方案摘要四样作为**输入变量**传进来,渲染在系统提示词末尾(不进会话、不累积),其余按需调工具。06 的理由:A 每用一次资料就多一次模型调用(粗算 0.25~0.3 元、2~5 秒),而资料在大多数轮次都要用(Dify 每轮都预取);B' 每轮多约 3 千 token、约 0.05 元,查询在攒消息的几秒里并行做完。B' 的代价:01 §3.3.2 指出系统提示词每轮一变,会话历史的跨轮缓存就失效(01 自己的成本粗算也假设跨轮第一次调用通常不命中,所以实际损失有限);业务方要自己查四样(档案、饮食、方案摘要在项目服务,提醒表项目服务也能读)。
-- **综合推荐**:v1 先按 06 的 B'(延迟是客户直接感受到的,而且与 Dify 每轮预取一致),本文的 `profile_get_brief`(M8)暂缓,`health_plan_get_brief` 保留给「看方案完整内容」的按需查询;07 用同一批用例对照 A / B' 的调用次数、延迟、费用,不划算再换。04 / 06 两文以拍板结果统一。
+**9.4 客户资料怎么给模型** —— **已定(11-17):模型需要时自己调 `profile_get_brief`,业务方不每轮预取**(06 §3.6 同步改)。
+- 理由:`customer_code` 是绑定变量,模型看不到改不了;数据是最新的(本轮刚写的,下一次查就能看到);系统提示词每轮不变,厂商前缀缓存能用上;业务方不用多写查询。
+- 控制延迟:一个「客户资料精简版」工具一次返回档案、方案摘要、今日饮食、现有提醒、可写表单,最多多一步;提示词要求只在话题与健康有关时调、每轮最多一次,闲聊和天气不调;推广话术前查有没有方案、首轮补问看缺哪些档案项也用它。
+- 没选的:业务方每轮把四样作为变量带进系统提示词(提示词每轮一变、缓存失效,业务方要自己查四样);放进 `untrusted_content`(每轮塞进会话,越聊越长)。
+- `profile_get_brief`(M8)在 v1 做;`health_plan_get_brief` 留给「看方案完整内容」。
 
 **9.5 服务端核对归属(可选加固)做不做、做到哪一层**
 - 做法:
@@ -752,37 +908,43 @@ spec:
 - 代价:①② 每次调用多一次缓存查询,外加配置维护;③ 好友关系同步有延迟,群里成员也不一定是好友,会误拒。
 - **推荐**:上线前做 ②,首版或第二版做 ①,③ 不做。理由:绑定已挡住模型这条路,①② 是「绑定配错」和「key 泄露」的第二道闸,误拒风险低;③ 误拒代价大于收益。
 
-**9.6 写入去重的时间窗**
-- 选项 A:同一北京日。
-- 选项 B:滚动 24 小时。
-- 选项 C:永久。
-- **推荐 A**。理由:「今天早上空腹 7.2」第二天再报一次是新数据;同一天同内容基本都是重跑或重复说。
+**9.6 写入去重怎么判** —— **已定(11-17):按来源消息**(3.4),取代原先「同一北京日 + 同内容」的时间窗方案。理由:要挡的重复都来自同一批消息被处理两次;按天判会把一天两次喝水、两次散步这类真实重复误吞。
 
-**9.7 按客户限额的数值**
-- 推荐值:写表单每日 30 次,提醒生效中 20 条、每日新增 10 条。理由:Dify 时期没有限额,先给宽松值挡刷屏,上线后按 MCP 日志实际分布再收紧。
+**9.7 按客户限额** —— **已定(11-17):不设**。原 M9 取消。
 
-**9.8 按小时循环的提醒要不要加限制**
-- 背景:「每小时提醒我喝水」最长 30 天,约 720 条,夜里也发。
-- 选项 A:沿用 Dify。
-- 选项 B:按小时循环只在 7:00–22:00 发(要改数字人续期逻辑)。
-- 选项 C:按小时循环最长 3 天。
-- **推荐 C**。理由:只改 MCP 一处,不动数字人;要长期提醒的客户,可以改成每天几个固定点。
+**9.8 按小时循环的提醒** —— **已定(11-17):沿用 Dify,最长 30 天**(业务方已接受现状)。
 
-**9.9 「查更早聊天」「转人工」什么时候做**
-- 推荐:首版不做。
-- 上线后若出现以下情况,再按 5.8 / 5.9 做:客户问「我上周跟你说的……」而会话里没有;或需要把急症、投诉通知真人。
+**9.9 「查更早聊天」「转人工」什么时候做** —— **已定(11-17):v1 都做**。查更早聊天增强现有 `chat_private_history`(3.12),不新建工具;转人工新建 `handoff_to_human`(3.10)。
 
 **9.10 06 §4.2 列出的服务端要求,与本文设计不一致的几处**(交叉核对发现;06 声明「以 04 为准」,但这些是它依赖的规矩,需要逐条定)
 - ① **提醒短编号**:06(R41、§5.4)要求列表给短编号(如 R1),模型只抄短编号;本文 `reminder_list` / `reminder_delete` 用原始 `notify_code`(`notify_` + uuid,`agent-callback.service.ts:189`)。推荐加短编号:由服务端按客户分配、存一列,`reminder_delete` 两种都收。理由:长串手抄必错,抄错一位就是删不掉(安全上不越权,但客户体验差)。
 - ② **批量删除要带「客户已确认」**:06(R40、待拍板 8)要求一次删多条必须带这个参数;本文 `reminder_delete` 没有。推荐加一个可选参数 `confirmed_by_customer`(模型填,不绑定),多于 1 条且没带时服务端拒绝并提示先列出确认。
-- ③ **血糖必须带测量时段**:06(R54、§4.2)要求服务端硬拒;本文 §3.4 表最后一行写「语义判断留在提示词,服务端不拦」。推荐服务端加:按表单配置「必须同时出现的字段组」(血糖表 = 数值 + 时段),缺一项回 42200;规则确定、成本小。
-- ④ **按字段显示名写**:06 §4.2 要「改档案可按字段显示名写、服务端映射编码」;本文要求按 `field_code` 写、先调 `form_get_field_detail`。推荐本文做法(显示名可能重名、改名,编码精确);若采用 06 的本轮资料变量,可把常用表单的字段编码放进 `form_catalog`,省掉查字段那一次调用。
+- ③ ~~血糖必须带测量时段、服务端硬拒~~ **已定(11-17)**:改为所有表单通用的「情境字段」规则 —— 按表单配置、模型先按消息时间和上下文推断、推不出才问,服务端不因缺情境拒收(3.4)。
+- ④ **按字段显示名写**:06 §4.2 要「改档案可按字段显示名写、服务端映射编码」;本文要求按 `field_code` 写、先调 `form_get_field_detail`。推荐本文做法(显示名可能重名、改名,编码精确)。
 - ⑤ **查表单结束日裁到今天**:06(R64)要求;M4 没写。推荐并进 M4(几行代码)。
 - ⑥ **设提醒返回带星期**:06 §4.2 要求返回首次时间带星期;本文 `first_send_at` 只有 ISO。推荐加一个 `first_send_weekday`(或可读串),模型回复写「12 月 1 日 周一」客户能当场核对。
-- ⑦ **方案精简摘要给业务方用**:06 要业务方把方案摘要带进本轮资料;本文 `health_plan_get_brief` 是给模型调的工具。取决于 9.4。
+- ⑦ ~~方案精简摘要给业务方用~~ **随 9.4 作废(11-17)**:业务方不再每轮带资料,方案摘要在 `profile_get_brief` 里。
 
 **9.11 身份变量必填还是可选** —— **按推荐定(11-17,01 待拍板 12)**
 - 本文做法:声明变量全部 `required: true`(`attachment_urls` 除外),没建档 / 私聊传空串;漏传当场 422(§7 用例 5)。06 §5.1 / §5.5 已改成同一口径。
+
+**9.12 MCP 写接管标志用哪个 Redis 库(待核实,不是取舍)**:临时接管标志在数字人服务和 pad 同步 / dk 存档共用的库里(dk 存档服务代码注释写明「与 agent / pad 同库」,`human-answered.service.ts:44`)。库号与「提醒队列在 14 还是 15」(3.6)一起按部署环境核实;写错库,`silent` 会悄悄失效(6.17)。
+
+**9.13 AI 开关被关掉后,谁、在哪重新打开(实现前必须确认)**:读代码在项目服务找到两个接口(私聊、群成员各一个,§1.5),但员工端有没有入口在用没核实。推荐:深护确认员工后台有按钮;没有就补一个,随 M13 一起上。没有入口时不要启用 `afterwards=stop`。
+
+**9.14 找不到转人工通知对象时怎么办**
+- 选项 A:不写标志、不关开关,模型照常回复,服务端告警(5.9 现写法)。
+- 选项 B:照配置执行(可能本轮不回、之后也不回),只告警。
+- **推荐 A**。理由:同事收不到通知时 AI 再闭嘴,客户就没人管了;A 最坏只是「多回了一句」。
+
+**9.15 健管师默认用哪种转人工组合**
+- 选项:四种组合之一(3.10)。
+- **推荐先用 `reply` + `continue`**:对客户最接近现在(Dify 不转人工,AI 照常回复;现在只是多了一条给同事的通知);其余组合等业务方定触发条件后在控制台切换,不用改代码。
+
+**9.16 inputs 变量 `input_message_ids` 要不要改名**(与 03 顶层字段同名,6.16)
+- 选项 A:保持同名。03 落地前两处内容相同;落地后重跑时变量多带被取消那一批。
+- 选项 B:改名(如 `source_message_ids`),两处含义一眼可分。
+- **推荐 A**。理由:绝大多数轮次两处一模一样,业务方少维护一个名字;区别只在重跑,6.16 写清楚即可。
 
 ## 10. 出处
 
@@ -796,7 +958,8 @@ spec:
 - `src/modules/form/form.tool-provider.ts:15-397`;`src/modules/form/form.service.ts:272-279、391-394`:日期拼接。
 - `src/modules/health-plan/health-plan.tool-provider.ts:15-176`;`src/modules/health-plan/health-plan.service.ts:97-100`。
 - `src/modules/medication/medication.tool-provider.ts:154-160`;`src/modules/medication/medication-reminder-producer.service.ts:1-52`。
-- `src/modules/chat/chat.service.ts:54-55`:只读 `t_project_cpwx_chat_msg`。
+- `src/modules/chat/chat.service.ts:54-55`:读 `t_project_cpwx_chat_msg`;`:286-380` 私聊查询(员工 cpwx_userid ↔ 客户 external_userid);`chat.tool-provider.ts:116-160` 入参与上限。
+- `src/modules/message/message.service.ts:82-230`(pad 只发文字)、`message-pc.service.ts:150-215、347-369`(pc 只发文字,写 `t_machine_task`);全仓库无 `AI_SENT` / `markAiSent`(grep 0 条)。
 - `src/ir/confirm-token-store.ts`:未被任何工具使用。
 - `src/models/TOpenApiIdempotency.ts`(`uk_idem`)、`src/models/TProjectAiNotify.ts`、`src/models/TProjectFormSubmission(Detail).ts`、`src/models/TProjectOperationLog.ts`。
 - 工具数 45:各 `*.tool-provider.ts` 的 `name:` 计数。
@@ -806,7 +969,11 @@ spec:
 - `src/modules/agent-callback/agent-callback.service.ts:43-83`(转人工)、`:165-241`(新增提醒);`src/modules/agent-callback-dk/agent-callback-dk.service.ts:108-188`。
 - `src/modules/ai-notify/ai-notify.service.ts:38-64、66-105`。
 - `src/modules/agent-callback/send-notify.processor.ts:50-82、104-158、161-235`。
-- `src/modules/message/message.service.ts:72-87`;`src/modules/message/invoke-agent.processor.ts:371-391、844-866`。
+- `src/modules/message/message.service.ts:72-87、157-190`(群里只取该客户发的 + 员工 @ 该客户的;多对一群另带内部员工);`src/modules/message/invoke-agent.processor.ts:371-391、479-538(AI 开关调用前检查)、844-866`。
+- `src/modules/agent-callback/agent-callback.service.ts:43-125`(pad 转人工、`referral_human_status`);`src/modules/agent-callback-dk/agent-callback-dk.service.ts:6-7、70-104`(dk 转人工)。
+- `src/modules/agent-callback/send-agent-answer.processor.ts:488-497`(pad 发送前查临时接管标志);`src/modules/pc-send-task/pc-send-task.service.ts:55-57、206-223、292-296、324-330`(referral 任务:不过闸、不写 AI_SENT、30 分钟过期)、`:432-452`(dk 领任务时查标志)。
+- `src/modules/message/invoke-agent-message.processor.ts:338-371`(新消息到达取消正在跑的一轮)。
+- `src/models/TProjectCpwxPadMsg.ts:108`(`referral_human_status`);`TProjectCustomerCpwxRelation.ts:74`、`TProjectCpwxGroupMember.ts:74`(`is_enabled_agent_reply`)。
 - `src/guard/sign.guard.ts:34-38`;`src/guard/auth.guard.ts:37-39`。
 - `src/app.module.ts:105`;`src/config/redis.ts:21`;`dockerfile`、`pm2.json` 无 TZ(推断其影响)。
 
@@ -815,6 +982,13 @@ spec:
 - `src/modules/health-plan/customer-health-plan.service.ts:11065` 起;`src/modules/health-plan/health-plan.controller.ts:314`。
 - `src/modules/ai-notify/ai-notify.const.ts:1-14`;`src/modules/ai-notify/ai-notify.module.ts:9-14、36`;`src/modules/ai-notify/ai-notify.service.ts:63、82-106、108-166、221、264`;`src/config/redis.ts:24`。
 - `src/modules/expert-work/expert-work.types.ts:42-49`。
+- `src/modules/employee/employee.controller.ts:1033、1325`;`src/modules/employee/employee.service.ts:4520-4574、4659-4686`(改 AI 开关的接口;员工端入口未核实)。
+
+**pad 消息同步**(`0ff5743`,确认)
+- `src/modules/message/sync-pad-message.processor.ts:664-679`(客户开口删临时接管标志)、`:713-765`(员工号真人发言写标志)、`:1381-1419`(@ 名单)、`:1457-1552`(发送方 / 接收方存企微明文 id)、`:1602-1608`(`findOrCreate` 进 `t_project_cpwx_chat_msg`)。
+
+**dk 会话存档**(`ba0a89e`,确认)
+- `src/modules/archive/push/human-answered.service.ts:38`(先查 AI_SENT)、`:44`(与数字人 / pad 同库)、`:132-135`(客户开口删标志)、`:157-185`(员工发言、无 AI 标记即写标志)、`:225-232`(键格式)。
 
 **Expert Work**(`origin/main d9db26f79`,确认)
 - `packages/expert-work-protocol/src/expert_work/protocol/agent_spec.py:255-298、300-318、1165、1296-1365、1375-1425、1698-1760`。
@@ -824,6 +998,8 @@ spec:
 - `services/orchestrator/src/orchestrator/tools/mcp.py:115、560-575、1124-1170、1214-1216、1434-1450`。
 - `services/control-plane/src/control_plane/tenant_mcp_pool.py:50`;`services/control-plane/src/control_plane/api/mcp_servers.py:476-477、638、672-720`;`services/control-plane/src/control_plane/api/mcp_catalog.py:1-15`。
 - `services/orchestrator/src/orchestrator/tools/assembly.py:442-470`;`services/orchestrator/src/orchestrator/agent_factory.py:1203-1211`。
+- `services/orchestrator/src/orchestrator/graph_builder/memory.py:540-546、583-612`(记忆提炼每轮只取最终回答,工具调用只记名字)。
+- `apps/admin-ui/src/components/manifest-editor/widgets/McpToolPicker.tsx:740-760`(固定值文本框);`mcp_arg_bindings.ts:67-68`(只查非空、首尾空格)、`:125-128`(`ToolParam` 只有名字与是否必填)、`:151-171`(`paramsOf` 白名单读法);`agent_spec.py:1328-1353` `ArgBindingSpec._check_args_and_fixed`(只查非空、首尾空格,不看可选值)。
 - 本地 `.venv` 中 `mcp` 1.30.0:`client/session.py:412-441`、`client/streamable_http.py:372-377`(与 `uv.lock` 版本一致)。
 - `docs/runbooks/2026-09-24-prod-release-checklist.md:1453`;`docs/runbooks/pending-test-release-acceptance.md:1686`;`apps/admin-ui/src/components/manifest-editor/widgets/__tests__/McpToolPicker.test.tsx:37、148-149`(`maps_weather` 名称,推断)。
 
@@ -833,10 +1009,13 @@ spec:
 1. 共享背景说「提醒删除(1768787117123@8448)」:该节点标题在 8713 行,8448 附近是「是否要删除提醒」分支。
 2. `confirmRequired` 确实只是标注,但 MCP 里有一个写好未接入的两段确认存储 `ConfirmTokenStore`。
 3. 共享背景没提:**项目服务已有 AI 提醒的完整增删改查**,直接写表 + 投同一队列(第二个生产者),是方案 A 的先例,也是员工撤销提醒的入口。
-4. 共享背景没提:MCP 现有 `chat_*` 工具只读 dk 会话存档表,pad 通道历史查不到(推断)。
+4. ~~MCP 现有 `chat_*` 工具只读 dk 会话存档表,pad 通道历史查不到~~ **更正(11-17)**:`t_project_cpwx_chat_msg` pad 和 dk 都写(pad 同步服务 `sync-pad-message.processor.ts:1602` `findOrCreate`),此前的推断是错的。
 5. 共享背景说 arg_bindings「模型看不到改不了」:绑定**落空**时(工具名错 / 服务器没连上 / 内部名撞名)参数会回到模型手里,平台只给警告。
 6. 共享背景没提:平台 MCP 客户端会按 outputSchema 严格校验返回(6.8)。这决定了健康方案精简版必须另开新工具。
 7. 共享背景没提:群里没有客户档案的发言人 `customer_code` 为空,所以提醒要按 `customer_pad_userid` 绑定和查询(与现有数据一致)。
 8. 队列库号:数字人代码默认 14,项目服务注释称数字人部署在 15,以环境变量为准。
 9. 会话失效回 400 不止 POST,GET、DELETE、旧 SSE `/messages` 也是 400。
 10. Expert Work `origin/main` 当前是 `d9db26f79`(在 `5908fe554` 之上的一次部署提交),本文按它核对。
+11. 11-17 评审复核:记忆提炼「只看最终回答」的代码在 `memory.py:540-546、583-612`(`_turn`);同文件 368-377 行只是提炼提示词里的示例文字。
+12. 11-17 评审复核:MCP 现有 pc 发送写的是 `t_machine_task`,不是数字人服务的 `t_project_cpwx_pc_send_task`;转人工要建成后者里的 referral 任务,不能直接复用现有 pc 发送(3.10)。
+13. 11-17 评审复核:项目服务已有改 AI 开关的接口(`employee.service.ts:4520`、`:4659`),此前以为「没找到入口」;员工端是否在用仍待确认(9.13)。
