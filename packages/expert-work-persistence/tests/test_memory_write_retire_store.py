@@ -168,6 +168,109 @@ def test_a_summary_is_never_retired_unless_identical_and_weaker(
         assert (allowed is None) is (tier < tier_of(candidate))
 
 
+# ─── 第 10 版:第一次提炼的候选不带更正标记(§7.1 第 19 行;锁里重判,审查 LOW-1)──────
+
+
+@pytest.mark.parametrize("target", _EFFECTIVE)
+def test_may_retire_holds_a_non_correction_to_the_assistant_side(
+    target: EffectiveOrigin,
+) -> None:
+    """``needs_correction``(写回按候选一侧定的):用户说的、用户确认的退不掉;更正过的照旧是
+    ``corrected``;助手一方 / 未记录的照退。不受这条管时与原来一样。"""
+    held = may_retire(
+        "user_stated", tier_of(target), target_is_summary=False, needs_correction=True
+    )
+    plain = may_retire("user_stated", tier_of(target), target_is_summary=False)
+    if target == "user_corrected":
+        assert held == plain == "corrected"
+    elif target in ("user_stated", "user_confirmed"):
+        assert (held, plain) == ("not_correction", None)
+    else:
+        assert held is plain is None
+
+
+@pytest.mark.parametrize("target_origin", ["user_stated", "user_confirmed"])
+async def test_supersede_rejudges_the_correction_rule_under_the_lock(
+    store: MemoryStore, target_origin: str
+) -> None:
+    """写回预判时目标还是来自助手的,改库前用户在控制台把它改成了自己的话(来源变成用户说的,
+    ``control_plane/api/memory.py``):锁里按此刻的层级重判,不退、新行连着它;仍是助手一方的照退。"""
+    t, u = uuid4(), uuid4()
+    edited = _item(t, u, "the bike is kept in the hallway", origin=target_origin)
+    assistant = _item(t, u, "the bike is probably in the shed", origin="assistant_derived")
+    await store.write([edited, assistant])
+    new = _item(t, u, "the bike is kept on the balcony", origin="user_stated")
+    both = [edited.id, assistant.id]
+    got = await store.supersede(
+        tenant_id=t, user_id=u, new_item=new, old_ids=both, needs_correction_ids=both
+    )
+    assert got.inserted and got.retired == (assistant.id,)
+    assert dict(got.refused) == {edited.id: "not_correction"}
+    assert (await _row(store, t, u, edited.id)).invalid_at is None
+    alone = _item(t, u, "the bike is kept in the garage", origin="user_stated")
+    linked = await store.supersede(
+        tenant_id=t,
+        user_id=u,
+        new_item=alone,
+        old_ids=[edited.id],
+        needs_correction_ids=[edited.id],
+    )
+    assert dict(linked.refused) == {edited.id: "not_correction"}
+    assert linked.item.supersedes == edited.id  # 连线:指向的行仍有效
+    plain = _item(t, u, "the bike is kept in the cellar", origin="user_stated")
+    got = await store.supersede(tenant_id=t, user_id=u, new_item=plain, old_ids=[edited.id])
+    assert got.retired == (edited.id,)  # 不受这条管(带更正、restates……)的照退
+
+
+async def test_retire_rejudges_the_correction_rule_under_the_lock(store: MemoryStore) -> None:
+    t, u = uuid4(), uuid4()
+    anchor = _item(t, u, "governed by Singapore law", origin="user_stated")
+    stated = _item(t, u, "governed by Shanghai law", origin="user_stated")
+    assistant = _item(t, u, "governed by Hong Kong law", origin="assistant_derived")
+    await store.write([anchor, stated, assistant])
+    got = await store.retire(
+        tenant_id=t,
+        user_id=u,
+        old_ids=[stated.id, assistant.id],
+        anchor_id=anchor.id,
+        candidate_origin="user_stated",
+        needs_correction_ids=[stated.id, assistant.id],
+    )
+    assert got.anchor_live and got.retired == (assistant.id,)
+    assert dict(got.refused) == {stated.id: "not_correction"}
+    assert (await _row(store, t, u, stated.id)).invalid_at is None
+
+
+async def test_the_correction_rule_is_rejudged_for_summary_flags_under_the_lock(
+    store: MemoryStore,
+) -> None:
+    """汇总行打标同理(§7.1 第 18 行:其余各项都过才打):成员是用户一方的,不带更正的第一次候选
+    在锁里也打不上;成员全是助手一方的照打。"""
+    t, u = uuid4(), uuid4()
+    users = await _summary(
+        store, t, u, "commutes by metro; lives downtown", _item(t, u, "m1", origin="user_stated")
+    )
+    assistants = await _summary(
+        store, t, u, "takes line 2; has a pass", _item(t, u, "m2", origin="assistant_derived")
+    )
+    new = _item(t, u, "now drives to work", origin="user_stated")
+    ids = [users.id, assistants.id]
+    got = await store.supersede(
+        tenant_id=t, user_id=u, new_item=new, flag_summary_ids=ids, needs_correction_ids=ids
+    )
+    assert got.flagged == (assistants.id,)
+    assert (await _row(store, t, u, users.id)).review_flagged_at is None
+    said = _item(t, u, "lives in the suburbs", origin="user_stated")
+    await store.write([said])
+    assert (
+        await store.flag_summary(
+            tenant_id=t, user_id=u, summary_id=users.id, statement_id=said.id, needs_correction=True
+        )
+        is None
+    )
+    assert (await _row(store, t, u, users.id)).review_flagged_at is None
+
+
 # ─── supersede:零到多个目标 ────────────────────────────────────────────
 
 

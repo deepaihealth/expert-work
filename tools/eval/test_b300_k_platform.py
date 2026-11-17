@@ -295,6 +295,15 @@ def test_parse_reconcile_drops_unknown_ids_and_bad_lists() -> None:
     assert second["replaces"] == []
 
 
+def test_parse_reconcile_carries_the_candidates_correction_mark() -> None:
+    """第 10 版(§11.2a K-n1):K-n 按「带不带更正标记」分开报数,标记取自去重合并的材料。"""
+    material = json.loads(_material((0, "a", []), (1, "b", []), (2, "c", [])))
+    material["candidates"][0]["is_correction"] = True
+    material["candidates"][1]["is_correction"] = False
+    got = kp.parse_reconcile(json.dumps(material), json.dumps({"ops": []}))
+    assert [d["is_correction"] for d in got] == [True, False, None]  # 材料里没有 = 不知道
+
+
 def test_parse_reconcile_survives_unreadable_input() -> None:
     assert kp.parse_reconcile("not json", "{}") == []
     material = _material((0, "new", ["old a"]))

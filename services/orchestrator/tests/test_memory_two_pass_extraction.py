@@ -370,14 +370,16 @@ async def test_language_is_named_from_user_text_only() -> None:
     )
     for which in ("user", "conversation"):
         system = llm.system_of(which)
-        # 末句是第 10 版(用户 11-17)加的:只有 content 按这个语言写,键名与取值照格式用英文。
+        # 末句是第 10 版(用户 11-17)加的:只有 content 按这个语言写,键名与取值照格式用英文
+        # (审查 LOW-3:只举两次都有的取值,不点第一次没有的 basis)。
         assert system.endswith(
             "## Output language\n"
             'Write the "content" of every memory in Chinese, in the same script the user '
             "writes in.\n"
             "Keep names, codes, units and quoted terms exactly as they appear. Do not translate.\n"
-            'Only the "content" is written in this language: write every key, and the values of\n'
-            '"kind", "basis" and the like, in English exactly as the format above shows them.'
+            'Only the "content" is written in this language: write every key, and every value the\n'
+            'format above lists (such as "fact" or "episodic"), in English exactly as it shows '
+            "them."
         )
 
 

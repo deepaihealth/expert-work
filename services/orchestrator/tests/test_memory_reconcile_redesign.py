@@ -128,8 +128,8 @@ def _retiring(*rows: tuple[int, str]) -> str:
 _SAID_AT = _T0 + timedelta(days=30)
 
 
-def _said(item: MemoryItem) -> _Candidate:
-    return _Candidate(item, line_at=_SAID_AT, in_new_segment=True)
+def _said(item: MemoryItem, *, correction: bool = False) -> _Candidate:
+    return _Candidate(item, is_correction=correction, line_at=_SAID_AT, in_new_segment=True)
 
 
 async def _reconcile(
@@ -732,7 +732,9 @@ async def test_a_mid_batch_failure_hands_back_only_the_unwritten() -> None:
         (0, "UPDATE", "e0"), (1, "UPDATE", "e2"), (2, "UPDATE", "e1"), (3, "NOOP", "e0"),
         (4, "ADD", None),
     )  # fmt: skip
-    error = await _failed(store, _LLM([ops]), *(_said(m) for m in (a1, b, a2, a3, d)))
+    # a1 退用户说的 r0:第 10 版起第一次的候选要带更正标记,旧的 ``UPDATE`` 也一样(审查 M-1)。
+    said = (_said(a1, correction=True), *(_said(m) for m in (b, a2, a3, d)))
+    error = await _failed(store, _LLM([ops]), *said)
     assert [m.id for m in error.unwritten] == [b.id, a2.id, d.id]
     assert error.superseded == 1
     assert not _untouched(store, r0)
@@ -746,7 +748,7 @@ async def test_a_mid_batch_failure_hands_back_only_the_unwritten() -> None:
     store2 = _FailingStore("supersede", fail_on=s1.id)
     await store2.write([s0, s1])
     llm = _RoutingLLM(
-        _user_memories(("a1", 0.9), ("a2", 0.9), ("a3", 0.9)),
+        _user_memories(("a1", 0.9), ("a2", 0.9), ("a3", 0.9), corrections=("a1",)),
         '{"memories": []}',
         [_ops((0, "UPDATE", "e0"), (1, "UPDATE", "e1"), (2, "NOOP", "e0"))],
     )
@@ -905,11 +907,19 @@ async def _flush_with_dlq(
     )
 
 
-def _user_memories(*rows: tuple[str, float]) -> str:
+def _user_memories(*rows: tuple[str, float], corrections: tuple[str, ...] = ()) -> str:
+    """第一次提炼的回答;``corrections`` 里的那几条带更正标记。"""
     return json.dumps(
         {
             "memories": [
-                {"kind": "fact", "content": t, "confidence": conf, "turn": 1} for t, conf in rows
+                {
+                    "kind": "fact",
+                    "content": t,
+                    "confidence": conf,
+                    "turn": 1,
+                    "is_correction": t in corrections,
+                }
+                for t, conf in rows
             ]
         }
     )
@@ -967,8 +977,11 @@ async def test_after_a_reconcile_failure_the_dlq_gets_only_the_unwritten() -> No
     await store.write([r0, r1])
     store.fails = {"supersede", "write"}
     ops = _ops((0, "UPDATE", "e0"), (1, "UPDATE", "e1"), (2, "NOOP", "e0"))
+    # a1 退用户说的 r0 要带更正标记(第 10 版;旧的 ``UPDATE`` 也一样,审查 M-1)。
     llm = _RoutingLLM(
-        _user_memories(("a1", 0.9), ("a2", 0.9), ("a3", 0.9)), '{"memories": []}', [ops]
+        _user_memories(("a1", 0.9), ("a2", 0.9), ("a3", 0.9), corrections=("a1",)),
+        '{"memories": []}',
+        [ops],
     )
     dlq = _RecordingDLQ()
     outcome = await _flush_with_dlq(

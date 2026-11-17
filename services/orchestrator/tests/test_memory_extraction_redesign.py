@@ -314,9 +314,12 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
         '- "is_correction": true when the same message itself says that something said earlier '
         "has changed, was wrong or no longer exists, whether or not it gives the new value (e.g. "
         "the user says they moved, changed jobs, renamed a thing, or no longer has it); otherwise "
-        'false. A value or name on its own never is. For example: "借书证号我之前说错了,是 '
-        'L-3082" — the earlier one was wrong: true. "那张旧借书证已经注销了" — it no longer '
-        'exists: true. "我的借书证号是 L-3082" — it does not say that anything changed: false. '
+        "false. A line that finishes a sentence the user left unfinished on the line just before "
+        "it is read together with that line; apart from that, a value or name on its own never "
+        'is. For example: "借书证号我之前说错了,是 L-3082" — the earlier one was wrong: true. '
+        '"那张旧借书证已经注销了" — it no longer exists: true. "我的借书证号是 L-3082" — it does '
+        'not say that anything changed: false. "[1] 借书证号改成了" then "[2] L-3082" — line 2 '
+        "finishes a sentence that says it changed: true. "
         '- "turn": the number of the line that states it. - "event_date": only '
         "for a value that happened or was observed on one day (a reading, a count, a payment "
         "made), that day as YYYY-MM-DD; null for anything else, including an id, a number that "
@@ -345,14 +348,18 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
         "states nothing by itself: skip it, and do not guess what it was about. Skip it even "
         "when a line above shows what it refers to; the only exception is a line that finishes a "
         "sentence the user left unfinished on the line just before it. - A value or name on its "
-        "own" in system
+        "own, with nothing in the same message saying what it is, is never a correction and never "
+        "an update of an earlier memory, even when it differs from something said before. A line "
+        "that finishes a sentence the user left unfinished on the line just before it is not on "
+        "its own: read the two lines as one message. - A question" in system
     )
     assert "refers to something that is not shown here" not in system
     assert (
         "- A question, a hypothetical, a guess about something that is not the user's own, a "
         "repeat of what someone else said, an answer given while the user is being quizzed or "
-        'asked to say something again, or a recollection put as a question ("it\'s Z, right?") '
-        "is not a statement by the user: skip it. "
+        'tested on what they remember, or a recollection put as a question ("it\'s Z, right?") '
+        "is not a statement by the user: skip it. Something the user says again of their own "
+        "accord is still a statement. "
         "- When the user states something about themselves or their own things with doubt "
         '("I think", "maybe", "not sure"), record it and keep the doubt in the content. '
         'For example: "[1] 考考我,看我还记不记得自己的借书证号" above "=== new ===", then "[2] '
@@ -360,6 +367,12 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
         '"=== new ===", then "[2] L-3082" — line 2 finishes the user\'s own sentence: record '
         '"用户的借书证号是 L-3082" with "turn": 2.' in system
     )
+
+
+@pytest.mark.parametrize("language", ["Chinese", "English", None])
+def test_the_first_pass_is_never_told_about_basis(language: str | None) -> None:
+    """审查 LOW-3:第一次的格式里没有 ``basis``;两次共用的语言节也不点它的名。"""
+    assert "basis" not in memory_module._extract_system("user", language)
 
 
 @pytest.mark.parametrize("which", ["user", "conversation"])

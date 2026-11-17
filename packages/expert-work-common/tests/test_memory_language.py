@@ -245,8 +245,8 @@ def test_latin_script_section_points_at_the_users_own_messages() -> None:
 
 
 _KEYS_IN_ENGLISH = (
-    'Only the "content" is written in this language: write every key, and the values of\n'
-    '"kind", "basis" and the like, in English exactly as the format above shows them.'
+    'Only the "content" is written in this language: write every key, and every value the\n'
+    'format above lists (such as "fact" or "episodic"), in English exactly as it shows them.'
 )
 
 
@@ -256,6 +256,8 @@ def test_every_extraction_section_keeps_keys_and_values_in_english(language: str
     照格式原样用英文。整理汇总那一节不输出这些键,不加。"""
     assert extraction_language_section(language).endswith(_KEYS_IN_ENGLISH)
     assert _KEYS_IN_ENGLISH not in summary_language_section(language)
+    # 两次提炼共用这一节,第一次的格式里没有 ``basis``:不点它的名(审查 LOW-3)。
+    assert "basis" not in extraction_language_section(language)
 
 
 def test_summary_sections() -> None:

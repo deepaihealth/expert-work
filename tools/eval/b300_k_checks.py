@@ -300,6 +300,65 @@ def _guaranteed(rows: Rows, decision: Mapping[str, Any], tier: int) -> bool:
 # --------------------------------------------------------------------------- 逐类
 
 
+#: 去重合并里候选的来源 → 出自哪一次提炼(§4:第一次的产出一律是用户说的;第二次的是用户确认
+#: 或来自助手)。
+_PASS_OF_ORIGIN = {"user_stated": "pass1", "user_confirmed": "pass2", "assistant_derived": "pass2"}
+
+
+def _correction_tag(flag: object) -> str:
+    if flag is True:
+        return "correction"
+    return "no_correction" if flag is False else "unknown"
+
+
+def _candidate_tag(decision: Mapping[str, Any], labels: Mapping[str, str]) -> str:
+    """去重合并的一条候选 → ``<哪一次>_<带不带更正标记>``。"""
+    which = _PASS_OF_ORIGIN.get(str(labels.get(decision["source"])), "other")
+    return f"{which}_{_correction_tag(decision.get('is_correction'))}"
+
+
+def _non_statement_by_pass(
+    out: dict[str, Any], result: Mapping[str, Any], rows: Rows, z_key: str
+) -> None:
+    """§11.2a K-n1 / §11.3 K-n(第 10 版):候选出自哪一次提炼、带不带更正标记,分开报数(只报数)。
+
+    * ``z_extracted_<次>_<标记>``:两次提炼原样的回复里含 Z 的记忆;
+    * ``x_listed_by_<次>_<标记>``:把 X 列进 ``replaces`` / ``restates`` 的候选;
+    * ``x_retired_by_<次>_<标记>``:X 被退时退它的那一条 —— 算给 X 的 ``superseded_by`` 指向的行
+      (写下的候选,或它判重复的那一条);对不上就算第一条列了 X 的;谁都没列 = ``unknown``。
+
+    读法:``*_no_correction`` 退了 X 是代码错(第一次的靠 §7.1 第 19 行、第二次的靠默认规则);
+    ``pass1_correction`` 退了 X 是指令没挡住(附录 C 的 C1~C3),没有程序兜底。"""
+    counts, labels = out["counts"], result.get("origin_labels") or {}
+    for kind in ("pass1", "pass2"):
+        for m in pass_memories(result, kind):
+            if has_key(str(m.get("content", "")), z_key):
+                counts[f"z_extracted_{kind}_{_correction_tag(m.get('is_correction'))}"] += 1
+    x = rows.seed("x")
+    if not x:
+        return
+    x_text = _norm(x.get("content", ""))
+    listing = [
+        d
+        for d in _reconciled(result)
+        if x_text in {_norm(c) for c in (*d["replaces"], *d["restates"])}
+    ]
+    for d in listing:
+        counts[f"x_listed_by_{_candidate_tag(d, labels)}"] += 1
+    if x.get("live"):
+        return
+    into = _content_norm(rows.successor(x).get("content", ""))
+    retirer = next(
+        (
+            d
+            for d in listing
+            if into and into in {_content_norm(d["content"]), _content_norm(d["target"] or "")}
+        ),
+        listing[0] if listing else None,
+    )
+    counts[f"x_retired_by_{_candidate_tag(retirer, labels) if retirer else 'unknown'}"] += 1
+
+
 def _x_retired(out: dict[str, Any], rows: Rows, tag: str) -> None:
     retired = not rows.seed_live("x")
     out["x_retired"] = retired
@@ -538,6 +597,7 @@ def checks(record: Mapping[str, Any], scenario: Scenario) -> tuple[dict[str, Any
         )
     elif cls in {"K-n1", "K-n2"}:
         _x_retired(out, rows, s.variant)
+        _non_statement_by_pass(out, result, rows, it.z.key)
         stored = bool(rows.new_with(it.z.key, origins=USER_SIDE))
         counts["user_side_stored"] += int(stored)
         counts[f"user_side_stored_{s.variant}"] += int(stored)

@@ -202,6 +202,100 @@ def test_k_n_never_retires_x_and_reports_each_shape(cls: str) -> None:
         assert fine["x_retired"] is False and fine["counts"]["user_side_stored"] == 0
 
 
+_STATED, _CONFIRMED = "stated in user messages", "confirmed by the user"
+
+
+def _x(s: sc.Scenario) -> str:
+    return next(seed.content for seed in s.seeds if seed.key == "x")
+
+
+@pytest.mark.parametrize("cls", ["K-n1", "K-n2"])
+@pytest.mark.parametrize(
+    ("source", "correction", "tag"),
+    [
+        (_STATED, False, "pass1_no_correction"),  # 代码错(§7.1 第 19 行该挡)
+        (_STATED, True, "pass1_correction"),  # 指令没挡住(C1~C3)
+        (_CONFIRMED, False, "pass2_no_correction"),  # 代码错(默认规则该挡)
+        (_STATED, None, "pass1_unknown"),
+    ],
+)
+def test_k_n_reports_who_retired_x_by_pass_and_correction_mark(
+    cls: str, source: str, correction: bool | None, tag: str
+) -> None:
+    """§11.2a K-n1(第 10 版):X 被退时,按退它的候选出自哪一次提炼、带不带更正标记分开报数;
+    模型列了 X(不论退没退)另报。"""
+    s = _s(cls)
+    z = _z(s)
+    call = _reconcile(
+        0, z, [_x(s)], {"op": "ADD", "replaces": ["e0"]}, source=source, is_correction=correction
+    )
+    new = [_row("n1", z, origin=LABELS[source])]
+    retired = _check(s, new, retire={"x": "n1"}, calls=[call])["counts"]
+    assert retired[f"x_retired_by_{tag}"] == 1 and retired[f"x_listed_by_{tag}"] == 1
+    assert sum(v for k, v in retired.items() if k.startswith("x_retired_by_")) == 1
+    kept = _check(s, new, calls=[call])["counts"]
+    assert kept[f"x_listed_by_{tag}"] == 1
+    assert not any(k.startswith("x_retired_by_") for k in kept)
+
+
+def test_k_n_credits_x_to_the_candidate_it_was_retired_into() -> None:
+    """两条候选都列了 X:算给 X 的 ``superseded_by`` 指向的那一条(写下的,或它判重复的那一条);
+    谁都没列 X 却被退了 → ``unknown``。"""
+    s = _s("K-n1")
+    z, x = _z(s), _x(s)
+    first = _reconcile(
+        0, f"{z} (first)", [x], {"op": "ADD", "replaces": ["e0"]}, is_correction=False
+    )
+    second = _reconcile(
+        0, z, [x], {"op": "ADD", "restates": ["e0"]}, source=_CONFIRMED, is_correction=False
+    )
+    new = [_row("n1", z, origin="user_confirmed")]
+    got = _check(s, new, retire={"x": "n1"}, calls=[first, second])["counts"]
+    assert got["x_retired_by_pass2_no_correction"] == 1
+    assert got["x_retired_by_pass1_no_correction"] == 0
+    assert (got["x_listed_by_pass1_no_correction"], got["x_listed_by_pass2_no_correction"]) == (
+        1,
+        1,
+    )
+    anchor = _row("n2", "the row it repeats", origin="user_stated")
+    repeat = _reconcile(
+        0, z, [x, anchor["content"]], {"op": "NOOP", "target_id": "e1", "replaces": ["e0"]},
+        is_correction=True,
+    )  # fmt: skip
+    got = _check(s, [anchor], retire={"x": "n2"}, calls=[first, repeat])["counts"]
+    assert got["x_retired_by_pass1_correction"] == 1
+    assert got["x_retired_by_pass1_no_correction"] == 0
+    nobody = _check(s, new, retire={"x": "n1"})["counts"]
+    assert nobody["x_retired_by_unknown"] == 1
+
+
+@pytest.mark.parametrize("cls", ["K-n1", "K-n2"])
+def test_k_n_reports_how_each_pass_extracted_the_non_statement(cls: str) -> None:
+    """两次提炼原样的回复里含 Z 的记忆,按哪一次、带不带更正标记分开报数(只报数)。"""
+    s = _s(cls)
+    z = _z(s)
+
+    def extraction(kind: str, *memories: dict[str, Any]) -> dict[str, Any]:
+        return {"kind": kind, "reply": json.dumps({"memories": list(memories)})}
+
+    calls = [
+        extraction("pass1", {"kind": "fact", "content": z, "is_correction": False, "turn": 2}),
+        extraction(
+            "pass2",
+            {"kind": "fact", "content": z, "is_correction": True, "turn": 2},
+            {"kind": "fact", "content": "something else entirely", "turn": 1},
+        ),
+        extraction("pass1", {"kind": "fact", "content": z, "turn": 2}),
+    ]
+    got = _check(s, [], calls=calls)["counts"]
+    assert got["z_extracted_pass1_no_correction"] == 1
+    assert got["z_extracted_pass2_correction"] == 1
+    assert got["z_extracted_pass1_unknown"] == 1
+    assert sum(v for k, v in got.items() if k.startswith("z_extracted_")) == 3
+    other = _check(_s("K-a"), [], calls=calls)["counts"]
+    assert not any(k.startswith(("z_extracted_", "x_listed_by_")) for k in other)
+
+
 def test_k_e1_retires_x_onto_the_seeded_y_without_a_new_row() -> None:
     s = _s("K-e1")
     good = _check(s, [], retire={"x": "seed-y"})
@@ -398,14 +492,22 @@ def test_k_s_restatement_must_not_mark_or_change_the_summary() -> None:
 
 
 def _reconcile(
-    index: int, content: str, existing: list[str], decision: dict[str, Any]
+    index: int,
+    content: str,
+    existing: list[str],
+    decision: dict[str, Any],
+    *,
+    source: str = "stated in user messages",
+    is_correction: bool | None = None,
 ) -> dict[str, Any]:
+    flag = {} if is_correction is None else {"is_correction": is_correction}
     material = {
         "candidates": [
             {
                 "index": index,
                 "content": content,
-                "source": "stated in user messages",
+                "source": source,
+                **flag,
                 "existing": [{"id": f"e{n}", "content": text} for n, text in enumerate(existing)],
             }
         ]

@@ -80,7 +80,6 @@ from expert_work.persistence.memory.base import (
     MemoryInjectionBlockedError,
     may_retire,
     origin_tier,
-    tier_of,
 )
 from expert_work.persistence.rls import (
     bypass_rls_var,
@@ -231,11 +230,13 @@ Only extract what these messages state on their own.
   user left unfinished on the line just before it.
 - A value or name on its own, with nothing in the same message saying what it is, is never
   a correction and never an update of an earlier memory, even when it differs from
-  something said before.
+  something said before. A line that finishes a sentence the user left unfinished on the
+  line just before it is not on its own: read the two lines as one message.
 - A question, a hypothetical, a guess about something that is not the user's own, a repeat
-  of what someone else said, an answer given while the user is being quizzed or asked to
-  say something again, or a recollection put as a question ("it's Z, right?") is not a
-  statement by the user: skip it.
+  of what someone else said, an answer given while the user is being quizzed or tested on
+  what they remember, or a recollection put as a question ("it's Z, right?") is not a
+  statement by the user: skip it. Something the user says again of their own accord is
+  still a statement.
 - When the user states something about themselves or their own things with doubt
   ("I think", "maybe", "not sure"), record it and keep the doubt in the content.
 For example:
@@ -258,10 +259,14 @@ _SCORING_TAIL = (
     '- "is_correction": true when the same message itself says that something said '
     "earlier has changed, was wrong or no longer exists, whether or not it gives the new "
     "value (e.g. the user says they moved, changed jobs, renamed a thing, or no longer has "
-    "it); otherwise false. A value or name on its own never is. For example:\n"
+    "it); otherwise false. A line that finishes a sentence the user left unfinished on the "
+    "line just before it is read together with that line; apart from that, a value or name "
+    "on its own never is. For example:\n"
     '  "借书证号我之前说错了,是 L-3082" — the earlier one was wrong: true.\n'
     '  "那张旧借书证已经注销了" — it no longer exists: true.\n'
     '  "我的借书证号是 L-3082" — it does not say that anything changed: false.\n'
+    '  "[1] 借书证号改成了" then "[2] L-3082" — line 2 finishes a sentence that says it '
+    "changed: true.\n"
     '- "turn": the number of the line that states it.\n'
     '- "event_date": only for a value that happened or was observed on one day (a '
     "reading, a count, a payment made), that day as YYYY-MM-DD; null for anything else, "
@@ -1552,6 +1557,9 @@ class _Decision:
     restates: tuple[str, ...] = ()
     #: 模型仍回了旧的 ``UPDATE`` / ``DELETE``(已按 ``ADD`` + 清单改写)。
     legacy: bool = False
+    #: ``restates`` 里退用户一方时仍照 ``replaces`` 查更正标记的编号(旧的 ``UPDATE``、两张都列的;
+    #: 第 10 版审查 M-1)。
+    strict: tuple[str, ...] = ()
 
 
 _NO_DECISION = _Decision()
@@ -1600,22 +1608,27 @@ def _decision(row: Mapping[str, Any]) -> _Decision | None:
     target = str(raw) if raw is not None else None
     replaces, restates = _id_list(row.get("replaces")), _id_list(row.get("restates"))
     legacy = op in ("UPDATE", "DELETE")
+    strict: tuple[str, ...] = ()
     if legacy:
-        # 旧习惯:「更新」多半是「说得更全」→ restates(保守:不触发历史行,也不触发汇总行重写);
+        # 旧习惯:「更新」多半是「说得更全」→ restates(不触发历史行,也不触发汇总行重写);
         # 「删除」→ replaces。两种都写下候选。
         if target is not None and op == "UPDATE":
-            restates = (*restates, target)
+            restates, strict = (*restates, target), (target,)
         elif target is not None:
             replaces = (*replaces, target)
         op, target = "ADD", None
     restates = tuple(dict.fromkeys(restates))
-    # 同一个编号两张里都有 → 算 restates;等于 ``target_id`` 的 → 忽略。
+    # 同一个编号两张里都有 → 算 restates;等于 ``target_id`` 的 → 忽略。旧的「更新」与两张都列的
+    # 只在历史行、汇总行打标上按 restates 算(第 9 版的保守);第 10 版起退用户一方时照 replaces 查
+    # 更正标记(``strict``,审查 M-1)—— 否则这两种回法是第一次提炼的候选绕开那条规则最宽的路。
+    strict = tuple(dict.fromkeys((*strict, *(r for r in replaces if r in restates))))
     return _Decision(
         op=op,
         target=target,
         replaces=tuple(r for r in dict.fromkeys(replaces) if r not in restates and r != target),
         restates=tuple(r for r in restates if r != target),
         legacy=legacy,
+        strict=tuple(r for r in strict if r != target),
     )
 
 
@@ -2121,10 +2134,12 @@ def _would_write(entry: _Pending, decision: _Decision, by_short_id: Mapping[str,
 
 class _Listed(NamedTuple):
     """要退的清单里的一条。``kind``:``replaces`` / ``restates`` = 模型列的;``merged`` = 模型判
-    候选与它重复、它层级更低(§7.1 第 16 行);``forced`` = 内容相同、层级更低(第 17 行)。"""
+    候选与它重复、它层级更低(§7.1 第 16 行);``forced`` = 内容相同、层级更低(第 17 行)。
+    ``strict``:``restates`` 里来自旧的 ``UPDATE`` 或两张都列的(:attr:`_Decision.strict`)。"""
 
     target: MemoryItem
     kind: str
+    strict: bool = False
 
 
 def _listed(
@@ -2149,7 +2164,7 @@ def _listed(
             if named is None:
                 unknown += 1
             elif plan.duplicate is None or named.id != plan.duplicate.id:
-                out.setdefault(named.id, _Listed(named, kind))
+                out.setdefault(named.id, _Listed(named, kind, short in decision.strict))
     return list(out.values()), unknown
 
 
@@ -2158,6 +2173,7 @@ def _retire_refusal(
     listed: _Listed,
     duplicate: MemoryItem | None,
     message_times: Mapping[str, datetime],
+    held: bool,
 ) -> str | None:
     """§7.3 第二步第 3~8 项对清单里的一条(汇总行与行锁里的重判另算);``None`` = 过。
     程序并入的(``merged`` / ``forced``)不查名次与先后:同一句话换成来源更强的那条,没有东西会丢。"""
@@ -2184,16 +2200,17 @@ def _retire_refusal(
         said = _said_at(target, item, message_times)
         if said is not None and as_utc(candidate.line_at) < said:
             return "older_line"
-    reason = may_retire(effective_origin(item), entry.tiers[target.id], target_is_summary=False)
+    # ``held``(:func:`_needs_correction`)= 第 10 版那一项管不管这一条;层级由 ``may_retire`` 看,
+    # 存储在行锁里按此刻的层级再看一次(审查 LOW-1)。
+    reason = may_retire(
+        effective_origin(item),
+        entry.tiers[target.id],
+        target_is_summary=False,
+        needs_correction=held,
+    )
     if reason is not None:
         return reason
-    if _needs_correction(entry, listed):
-        return "not_correction"
     return "same_evidence" if _second_pass_over_first(item, target) else None
-
-
-#: 第一次提炼的候选退它们要带更正标记(用户说的、用户确认;更正过的谁也退不掉,另有一项)。
-_CORRECTION_ONLY_TIERS = frozenset({tier_of("user_stated"), tier_of("user_confirmed")})
 
 
 def _needs_correction(entry: _Pending, listed: _Listed) -> bool:
@@ -2201,14 +2218,18 @@ def _needs_correction(entry: _Pending, listed: _Listed) -> bool:
     「用户说的」)用模型列的 ``replaces`` 退用户一方(用户说的 / 用户确认,汇总行按成员算)的旧行,
     要带更正标记(``is_correction``);否则不退、新行连着它。被考时答的一个值、回忆「是 Z 吧?」被
     第一次读成了用户说的,一旦模型把旧值列进清单就会把用户自己说过的退掉 —— 这条路上原来没有
-    程序兜底(§6.5 第 3 点)。不受限:``restates``(说全了);程序并入的(``merged`` / ``forced``);
-    候选与一条有效的用户一方行内容完全相同(用户把记着的一句原样再说一遍,场景 e1、e2)。"""
+    程序兜底(§6.5 第 3 点)。不受限:``restates``(说全了;旧的 ``UPDATE`` 与两张都列的除外,审查
+    M-1);程序并入的(``merged`` / ``forced``);候选与一条有效的用户一方行内容完全相同(用户把
+    记着的一句原样再说一遍,场景 e1、e2)。
+
+    这里只定这条候选对这一条**受不受管**(候选一侧与模型怎么列的);目标是不是用户一方由
+    :func:`may_retire` 看(``needs_correction``,汇总行按成员算),存储在行锁里按此刻的层级再看
+    一次 —— 目标的层级在这几秒里会变:用户在控制台改了一条来自助手的行,它就成了用户说的
+    (审查 LOW-1)。"""
     item = entry.candidate.item
-    if listed.kind != "replaces" or entry.candidate.is_correction:
+    if (listed.kind != "replaces" and not listed.strict) or entry.candidate.is_correction:
         return False
     if effective_origin(item) != "user_stated":
-        return False
-    if entry.tiers[listed.target.id] not in _CORRECTION_ONLY_TIERS:
         return False
     same_text = _identical_neighbors(item, entry.neighbors)
     return not any(entry.tiers[n.id] > 0 for n in same_text)
@@ -2254,6 +2275,9 @@ class _Verdict:
     one_sided: set[UUID] = field(default_factory=set)
     #: 那条内容相同、带事件日期的更弱行的日期(候选不带时带到新行上,§7.1 第 17 行)。
     carried_event_date: date | None = None
+    #: 要退 / 要打标的里受第 10 版那一项管的(:func:`_needs_correction`):存储在行锁里按此刻的
+    #: 层级重判(审查 LOW-1)。
+    needs_correction: list[UUID] = field(default_factory=list)
 
 
 def _judge_listed(
@@ -2267,7 +2291,8 @@ def _judge_listed(
         target = one.target
         if one.kind in ("replaces", "restates"):
             _record_target(one.kind, entry, target)
-        refusal = _retire_refusal(entry, one, plan.duplicate, deps.message_times)
+        held = _needs_correction(entry, one)
+        refusal = _retire_refusal(entry, one, plan.duplicate, deps.message_times, held)
         same_sentence = one.kind == "forced"
         summary_rule = may_retire(
             origin, entry.tiers[target.id], target_is_summary=True, identical=same_sentence
@@ -2284,6 +2309,8 @@ def _judge_listed(
             )
             if basis and one.kind == "replaces" and origin in USER_SIDE_ORIGINS and refusal is None:
                 verdict.flag.append(target.id)
+                if held:
+                    verdict.needs_correction.append(target.id)
             continue
         if refusal is not None:
             logger.info("%s_reconcile_not_retired reason=%s", deps.log_label, refusal)
@@ -2303,6 +2330,8 @@ def _judge_listed(
                 verdict.link = verdict.link or target.id
             continue
         verdict.retire.append(target.id)
+        if held:
+            verdict.needs_correction.append(target.id)
         if same_sentence:
             verdict.identical.append(target.id)
             if item.occurred_on is None and target.occurred_on is not None:
@@ -2376,6 +2405,7 @@ async def _store(
                 identical_ids=verdict.identical,
                 flag_summary_ids=verdict.flag,
                 link_id=verdict.link,
+                needs_correction_ids=verdict.needs_correction,
             )
         )
     except MemoryInjectionBlockedError as exc:
@@ -2474,6 +2504,7 @@ async def _settle_duplicate(
                 old_ids=verdict.retire,
                 anchor_id=duplicate.id,
                 candidate_origin=effective_origin(item),
+                needs_correction_ids=verdict.needs_correction,
             )
         )
         if not result.anchor_live:
@@ -2497,6 +2528,7 @@ async def _settle_duplicate(
                 user_id=item.user_id,
                 summary_id=summary_id,
                 statement_id=duplicate.id,
+                needs_correction=summary_id in verdict.needs_correction,
             )
         )
         if flagged is not None:
