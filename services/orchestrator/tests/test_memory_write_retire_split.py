@@ -1805,6 +1805,26 @@ async def test_saying_a_stored_user_side_sentence_again_still_retires_what_it_re
     assert counts.delta() == {"retire_refused_not_correction": 0}
 
 
+async def test_an_identical_assistant_row_does_not_lift_the_correction_rule() -> None:
+    """例外 ③ 只认内容相同的**用户一方**行(第三轮审查 LOW-4):与候选相同的是一条来自助手的行时,
+    它由程序并入、照退(§7.1 第 17 行),模型列的用户说的旧值仍要更正标记才退。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    assistant = c.mem("employee id is A1074", _at(0.95), origin="assistant_derived")
+    x = c.mem("employee id is A1047", _at(0.9), origin="user_stated")
+    await store.write([assistant, x])
+    w = c.mem("employee id is A1074", origin="user_stated")
+    counts = _Counts("retire_refused_not_correction", "retire_forced_weaker", "retired")
+    # 邻居按余弦:assistant(e0)、x(e1)。
+    assert await _reconcile(store, _LLM([_ops(_add(replaces=["e1"]))]), _said(w)) == 1
+    assert _retired_into(store, assistant, w) and _untouched(store, x)
+    assert counts.delta() == {
+        "retire_refused_not_correction": 1,
+        "retire_forced_weaker": 1,
+        "retired": 1,
+    }
+
+
 async def test_a_reworded_first_pass_duplicate_without_a_correction_retires_nothing() -> None:
     """换了说法的重复(不是内容完全相同)不算例外:候选不写,模型列的用户说的旧值不退。"""
     c = _Ctx()

@@ -304,6 +304,18 @@ def test_parse_reconcile_carries_the_candidates_correction_mark() -> None:
     assert [d["is_correction"] for d in got] == [True, False, None]  # 材料里没有 = 不知道
 
 
+def test_parse_reconcile_keeps_each_neighbours_text_and_source() -> None:
+    """K-n 要分出走 §7.1 第 19 行例外 ③ 的退法:候选旁边有没有内容相同的用户一方行,看材料里邻居的
+    正文与来源。"""
+    material = json.loads(_material((0, "new", ["old a", "old b"])))
+    material["candidates"][0]["existing"][0]["source"] = "confirmed by the user"
+    (only,) = kp.parse_reconcile(json.dumps(material), json.dumps({"ops": []}))
+    assert only["neighbours"] == [
+        {"content": "old a", "source": "confirmed by the user"},
+        {"content": "old b", "source": ""},
+    ]
+
+
 def test_parse_reconcile_survives_unreadable_input() -> None:
     assert kp.parse_reconcile("not json", "{}") == []
     material = _material((0, "new", ["old a"]))

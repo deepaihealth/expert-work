@@ -269,6 +269,53 @@ def test_k_n_credits_x_to_the_candidate_it_was_retired_into() -> None:
     assert nobody["x_retired_by_unknown"] == 1
 
 
+def test_k_n_credits_x_to_the_first_lister_when_no_candidate_matches_the_successor() -> None:
+    """退了 X 的那一行与哪条候选都对不上(正文、判重复的那一条都不是):算给第一条列了 X 的。"""
+    s = _s("K-n1")
+    x = _x(s)
+    first = _reconcile(
+        0, "first wording", [x], {"op": "ADD", "replaces": ["e0"]}, is_correction=False
+    )
+    second = _reconcile(
+        0, "second wording", [x], {"op": "ADD", "restates": ["e0"]}, source=_CONFIRMED,
+        is_correction=False,
+    )  # fmt: skip
+    new = [_row("n1", "a row neither candidate wrote")]
+    got = _check(s, new, retire={"x": "n1"}, calls=[first, second])["counts"]
+    assert got["x_retired_by_pass1_no_correction"] == 1
+    assert (got["x_retired_by_pass2_no_correction"], got["x_retired_by_unknown"]) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("same_as", "via_exception"),
+    [
+        (_STATED, 1),  # 与一条有效的用户说的行相同(例如上一次被考时答的同一个值)
+        (_CONFIRMED, 1),  # 与一条用户确认的行相同
+        ("from the assistant", 0),  # 与助手一方的行相同:程序不放行,不在例外里
+        (None, 0),  # 没有内容相同的邻居
+    ],
+)
+def test_k_n_reports_retirements_through_the_identical_text_exception_apart(
+    same_as: str | None, via_exception: int
+) -> None:
+    """§7.1 第 19 行例外 ③(第三轮审查 MEDIUM-B,用户 11-17 接受为已知限制):第一次的候选与一条
+    有效的用户一方行内容完全相同时不查更正标记 —— 同一个错值原样再答一次就能退 X。这样退的另报
+    ``x_retired_same_text_by_<次>_<标记>``(``x_retired_by_…`` 里照样算一次),不算代码错。"""
+    s = _s("K-n1")
+    z, x = _z(s), _x(s)
+    existing = [x] if same_as is None else [x, z]
+    sources = {} if same_as is None else {z: same_as}
+    call = _reconcile(
+        0, z, existing, {"op": "ADD", "replaces": ["e0"]}, is_correction=False,
+        existing_sources=sources,
+    )  # fmt: skip
+    got = _check(s, [_row("n1", z)], retire={"x": "n1"}, calls=[call])["counts"]
+    assert got["x_retired_by_pass1_no_correction"] == 1
+    assert got["x_retired_same_text_by_pass1_no_correction"] == via_exception
+    kept = _check(s, [_row("n1", z)], calls=[call])["counts"]
+    assert not any(k.startswith("x_retired_same_text_by_") for k in kept)
+
+
 @pytest.mark.parametrize("cls", ["K-n1", "K-n2"])
 def test_k_n_reports_how_each_pass_extracted_the_non_statement(cls: str) -> None:
     """两次提炼原样的回复里含 Z 的记忆,按哪一次、带不带更正标记分开报数(只报数)。"""
@@ -499,8 +546,10 @@ def _reconcile(
     *,
     source: str = "stated in user messages",
     is_correction: bool | None = None,
+    existing_sources: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     flag = {} if is_correction is None else {"is_correction": is_correction}
+    sources = existing_sources or {}
     material = {
         "candidates": [
             {
@@ -508,7 +557,14 @@ def _reconcile(
                 "content": content,
                 "source": source,
                 **flag,
-                "existing": [{"id": f"e{n}", "content": text} for n, text in enumerate(existing)],
+                "existing": [
+                    {
+                        "id": f"e{n}",
+                        "content": text,
+                        **({"source": sources[text]} if text in sources else {}),
+                    }
+                    for n, text in enumerate(existing)
+                ],
             }
         ]
     }

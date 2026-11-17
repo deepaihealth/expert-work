@@ -292,7 +292,9 @@ _USER_TEXT_EXTRACTION_SYSTEM = _USER_TEXT_EXTRACTION_HEADER + "\n" + _SCORING_TA
 # 输入行(挂不上就降为「来自助手」,``memory_lines``)。回归闸门里空列表若回升,先怀疑例子 9
 # (验证码 → 空列表,设计 §11.1)。「方案三:折中」(用户 2026-11-16):事件日期那段加「写进内容的
 # 日期不是事件日期」与一对对照例子。例子 7 的读数仍是「事实」:经历只在本智能体召回,读数要各
-# 智能体共享(「去掉自检,读数共享」,用户 2026-11-16)。
+# 智能体共享(「去掉自检,读数共享」,用户 2026-11-16)。第 10 版第三轮审查 MEDIUM-A(用户 11-17
+# 「收尾,不再加程序规则」):第 2 点末加一句,与第一次同一条规矩 —— 被考、被测记不记得时的回答与
+# 「是 Z 吧?」式的回忆不记。第二次的用户确认退用户确认过的 Y 没有程序兜底,只靠这一句和 K-n。
 _CONVERSATION_EXTRACTION_SYSTEM = """You are a memory extraction module. The input is part of a conversation, one message per
 line. Each line starts with its number in brackets and a tag:
 - [user] — text the user typed, followed by the date it was sent.
@@ -319,6 +321,9 @@ Record two sorts of durable, reusable memories:
    state it, keeping any doubt the user expressed. A line that answers two questions gives
    two memories. When the user agrees to one proposal in a reply that also states other
    findings, only that proposal is the user's agreement; the findings stay the assistant's.
+   An answer given while the user is being quizzed or tested on what they remember, or a
+   recollection put as a question ("it's Z, right?"), settles nothing: record nothing for
+   it.
 When a reply changes or rejects something said earlier, set "is_correction" to true and
 write both what it was and what it is now.
 A value that happened or was observed on one day — a reading, a count, a payment made —

@@ -157,7 +157,10 @@ _NOTES: tuple[str, ...] = (
     "x_retired_by_<pass1|pass2>_<correction|no_correction|unknown> 是退掉 X 的那条候选(取材料里"
     "候选的来源与 is_correction;第一次的产出一律是用户说的),x_listed_by_<同上> 是把 X 列进清单的"
     "候选,z_extracted_<同上> 是两次提炼原样的回复里含 Z 的记忆。读法:*_no_correction 退了 X 是"
-    "代码错,pass1_correction 退了 X 是指令没挡住(没有程序兜底);线照旧是 x_retired 0 / 30。",
+    "代码错,pass1_correction 退了 X 是指令没挡住(没有程序兜底);线照旧是 x_retired 0 / 30。"
+    "例外:x_retired_same_text_by_<同上> 是其中候选旁边有一条内容相同的用户一方行的(§7.1 第 19 行"
+    "例外 ③ 放行,例如同一个错值原样答了第二次),用户 11-17 接受为已知限制,不算代码错 —— "
+    "pass1_no_correction 减去它才是代码错。",
     "近邻:除 K-late(设计写明不种)外每个单元两条,共 17 x 30 x 2 = 1,020 条;设计 §11.3 写的"
     "「900 条」是加 K-n2、K-late、K-s 之前的数。「模型列了、被程序挡下」按「回复里列了、那一行"
     "写回后仍有效」数(counts 的 listed_blocked / listed_blocked_on_neighbour),不读进程级计数。",

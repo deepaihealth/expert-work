@@ -325,10 +325,16 @@ def _non_statement_by_pass(
     * ``z_extracted_<次>_<标记>``:两次提炼原样的回复里含 Z 的记忆;
     * ``x_listed_by_<次>_<标记>``:把 X 列进 ``replaces`` / ``restates`` 的候选;
     * ``x_retired_by_<次>_<标记>``:X 被退时退它的那一条 —— 算给 X 的 ``superseded_by`` 指向的行
-      (写下的候选,或它判重复的那一条);对不上就算第一条列了 X 的;谁都没列 = ``unknown``。
+      (写下的候选,或它判重复的那一条);对不上就算第一条列了 X 的;谁都没列 = ``unknown``;
+    * ``x_retired_same_text_by_<次>_<标记>``:上一项里,那条候选旁边有一条内容相同(平台同一归一
+      口径)的用户一方邻居 —— 走的是 §7.1 第 19 行的例外 ③(候选与一条有效的用户一方行完全相同就
+      不查更正标记)。
 
-    读法:``*_no_correction`` 退了 X 是代码错(第一次的靠 §7.1 第 19 行、第二次的靠默认规则);
-    ``pass1_correction`` 退了 X 是指令没挡住(附录 C 的 C1~C3),没有程序兜底。"""
+    读法:``pass1_no_correction`` 退了 X,减去其中走例外 ③ 的,是代码错(§7.1 第 19 行该挡);走
+    例外 ③ 的不算代码错 —— 同一个错值原样再答一次(上一次答的那条照写成了有效的用户说的行)就会
+    这样退掉 X,用户 11-17 接受为已知限制(第三轮审查 MEDIUM-B)。``pass2_*`` 退了 X(用户说的)是
+    代码错(默认规则该挡)。``pass1_correction`` 退了 X 是指令没挡住(附录 C 的 C1~C3),没有程序
+    兜底。"""
     counts, labels = out["counts"], result.get("origin_labels") or {}
     for kind in ("pass1", "pass2"):
         for m in pass_memories(result, kind):
@@ -356,7 +362,17 @@ def _non_statement_by_pass(
         ),
         listing[0] if listing else None,
     )
-    counts[f"x_retired_by_{_candidate_tag(retirer, labels) if retirer else 'unknown'}"] += 1
+    if retirer is None:
+        counts["x_retired_by_unknown"] += 1
+        return
+    tag = _candidate_tag(retirer, labels)
+    counts[f"x_retired_by_{tag}"] += 1
+    text = _content_norm(retirer["content"])
+    if any(
+        _content_norm(n["content"]) == text and labels.get(n["source"]) in USER_SIDE
+        for n in retirer.get("neighbours", ())
+    ):
+        counts[f"x_retired_same_text_by_{tag}"] += 1
 
 
 def _x_retired(out: dict[str, Any], rows: Rows, tag: str) -> None:

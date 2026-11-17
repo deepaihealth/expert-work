@@ -79,6 +79,9 @@ Record two sorts of durable, reusable memories:
    state it, keeping any doubt the user expressed. A line that answers two questions gives
    two memories. When the user agrees to one proposal in a reply that also states other
    findings, only that proposal is the user's agreement; the findings stay the assistant's.
+   An answer given while the user is being quizzed or tested on what they remember, or a
+   recollection put as a question ("it's Z, right?"), settles nothing: record nothing for
+   it.
 When a reply changes or rejects something said earlier, set "is_correction" to true and
 write both what it was and what it is now.
 A value that happened or was observed on one day — a reading, a count, a payment made —
@@ -256,6 +259,23 @@ def _flat(text: str) -> str:
 
 def test_conversation_prompt_is_appendix_a_verbatim() -> None:
     assert _CONVERSATION_EXTRACTION_SYSTEM == _APPENDIX_A
+
+
+def test_the_second_pass_records_nothing_for_a_quiz_answer() -> None:
+    """第 10 版第三轮审查 MEDIUM-A(用户 11-17「收尾,不再加程序规则」):被考时答的值换由第二次记成
+    用户确认时,程序不挡它退用户确认过的 Y —— 只靠指令。第二次与第一次同一条规矩:被考、被测记不记得
+    时的回答,和「是 Z 吧?」式的回忆,不记。"""
+    system = _flat(_CONVERSATION_EXTRACTION_SYSTEM)
+    assert (
+        "the findings stay the assistant's. An answer given while the user is being quizzed or "
+        'tested on what they remember, or a recollection put as a question ("it\'s Z, right?"), '
+        "settles nothing: record nothing for it. When a reply changes" in system
+    )
+    first = _flat(_USER_TEXT_EXTRACTION_SYSTEM)
+    assert (
+        "an answer given while the user is being quizzed or tested on what they remember, or a "
+        'recollection put as a question ("it\'s Z, right?")' in first
+    )
 
 
 def test_conversation_prompt_keeps_the_secret_rule_and_drops_the_negative_rules() -> None:
