@@ -2,13 +2,15 @@
 
 > 所属:B-314 Dify「健管师」迁移(总览:00-overview.md)。状态:草稿 v1;11-17 用户已拍板 §9 全部 16 条,正文已按拍板统一。
 >
+> **修订(2026-11-17,PR 复核修正)**:run 表除 `2026-11-17-b314-04` 那两列外**不再加列**,§5.4 写明替代办法:我方取消 → 现有 `settle_skip_charge=1`;代次 → 由 `invoke_token` 推出(§3.5);用量成本、送达结果 v1 只打日志,送达的列随 03 加;§3.1、§3.6、§3.8、§4、§7 第 4 / 19 条相应改成 v1 实际能查的东西。§3.8 计费钩子写明用现有 `resolveDigitalHumanScenario` 和数字人对话三个科目、`hasOperationType` 自检要认企微聊天适配器、`incomplete` 扣不扣看适配器解析结果;§7 第 18 条加两种 `incomplete`。404 时会话行置 `archived`。§4 第 2b 条:S13 修法 A 挡在会话服务层(不只通用路由),归属按 `ew_user_id` 核对。§8 工作量重算(含 S13 修法 A 1.5~2 人天)。
+>
 > **修订(2026-11-17,04 评审结论)**:inputs 加 `source_message_ids`(本批消息 id,写工具判重用);客户资料不走变量,由智能体调深护 MCP 一次取齐,业务方不每轮预取;转人工由深护 MCP 直接通知同事、写现有接管标志 / AI 开关,不经数字人服务回调(§3.2);主回复不走 MCP 发的理由已核实(§9 第 1 条)。
 >
 > **修订(2026-11-17,06 评审结论)**:inputs 加 `self_introduction`(自我介绍),与 `self_appellation` 一起由项目服务原样转给 Expert Work(数字人服务已在传)。
 >
 > **修订(2026-11-17,用户 11-17 拍板)**:会话与 run 台账**复用**现有 `t_project_expert_work_session` / `t_project_expert_work_run`,不再新建 `t_project_dh_ew_*` 两张表(§5.4);项目服务按配置行上新加的 `adapter_type` 选适配器和计费,做一个**通用的企微聊天适配器**,以后再接企微聊天智能体只要加配置(§4);`wx:` 前缀定稿并写明代码改动(§3.4.1);康豆按场景固定价,要在计费里加按适配器的钩子,`incomplete` 只有拿到可用回答才扣(§3.8);等满 360 秒必须调取消(§3.7);兜底话术写死在项目服务代码里(§3.9);客户删除会级联删会话行(§6)。
 >
-> **修订(2026-11-17,越权读会话拍板)**:§4 第 2b 条按 08 S13 已定修法改写 —— 通用 `/expert-work/:agent_code/*` 路由拒绝 `adapter_type = wecom_chat` 智能体的会话、企微聊天模块核对归属,切换前必做;其余通用路由的核对进深护安全待办。
+> **修订(2026-11-17,越权读会话拍板)**:§4 第 2b 条按 08 S13 已定修法改写 —— 项目服务各 expert-work 服务入口拒绝 `adapter_type = wecom_chat` 智能体的会话、企微聊天模块按 `ew_user_id` 核对归属,切换前必做;其余通用路由的核对进深护安全待办。
 >
 > **修订(2026-11-17,独立核对后的修正)**:`source_message_ids` 在 03 之后怎么来定了做法 —— 数字人服务另传 `source_msg_keys`(本批 + 正在重跑的被取消批,§5.1),项目服务据此生成;未送达原因统一用 03 的取值(`send_failed` / `human_took_over` / `cancelled` / `other`,§5.4);滑窗口径改为「最近 20 轮」(第一轮已关掉);若干措辞按已定事项更新。
 >
@@ -94,12 +96,12 @@
 6. 平台跑这一轮:召回客户 A 的长期记忆(私聊和群里说过的都在),按需调深护 MCP 查档案、写健康数据,最后给出回答。项目服务在流里收到 `item.done`(`type=assistant_message`、`channel=final`),再收到 `end`(`status=success`)。
 7. 项目服务按场景扣康豆(口径见 §3.8),把最终回复按 02 解析(`media` 里的素材 id 查深护智能体素材表、校验、按类型取链接),按 §5.1 返回 `outcome: "reply"` 和 `answer_text[]`、`file_link_list[]` 及各自来源。
 8. 数字人服务确认这一轮没被标成「取消中」,按通道入发送队列(pad 进 `send-agent-answer-queue`,dk 进 `pcSendTaskService.enqueueAnswer`,防重种子用 run_id)。发送前的真人接管检查照旧。
-9. 发送结果(发出 / 被真人接管拦下 / 发送失败)记到 run 台账;没发出去的,按 03 报「未送达」(03 已定当场单独调 `:undelivered` 接口报;03 之前没有这个接口,属已知缺口,§3.11)。
+9. 发送结果(发出 / 被真人接管拦下 / 发送失败)回报给项目服务,v1 只打进项目服务日志(带 run_id,不落表;run 表不加列);没发出去的,03 时再落表并按 03 报「未送达」(03 已定当场单独调 `:undelivered` 接口报;03 之前没有这个接口,属已知缺口,§3.11)。
 
 **打断的那一版**:如果 14:32:10(第 6 步还在跑)客户 A 又发「对了,昨晚睡得不好」——
 
 - 数字人服务照旧:把轮次状态置为「取消中」,调项目服务取消入口;项目服务按 invoke_token 找到 run_id,调 `POST /v1/agents/{code}/runs/{run_id}:cancel`,并让第 5 步那个还在等的请求立刻返回 `{outcome: "cancelled"}`;
-- 不管这一轮最后是 `interrupted` 还是抢先跑完的 `success`,结果一律不发;如果它已经生成了最终回答,台账记为「未送达」,按 03 报;
+- 不管这一轮最后是 `interrupted` 还是抢先跑完的 `success`,结果一律不发,run 行置 `settle_skip_charge=1`(不扣);如果它已经生成了最终回答,v1 在项目服务日志里记一条「未送达 · cancelled」,03 时再按 03 报;
 - 8 秒防抖后,数字人服务用「新消息」再触发一轮,同一段会话、新的 Idempotency-Key。旧那批客户消息怎么带见 §3.6。
 
 ### 3.2 与 Dify 链路逐段对照
@@ -233,7 +235,7 @@ Dify 的 `agent_call_back_url`、`agent_api_url`、`project_service_api_url` 不
 已拍板(11-17):**不做「空闲 N 小时换新会话」**。一个客户在一个智能体下始终一段会话(私聊和群共用),成本靠调低压缩门槛控制(§3.4.4)。只有两种情况开新会话:
 
 1. 会话表里这一格还没有会话(这个客户第一次走本智能体,通常就是切换后的第一轮)。
-2. 平台返回 404 `SESSION_NOT_FOUND`(例如会话在控制台被物理删除)时,会话表标记关闭、开新会话、换新 Idempotency-Key 重发一次。归档不影响续用(query.md §5.5),不会触发这一条。
+2. 平台返回 404 `SESSION_NOT_FOUND`(例如会话在控制台被物理删除)时,会话行 `status` 置为 `archived`、开新会话、换新 Idempotency-Key 重发一次。归档不影响续用(query.md §5.5),不会触发这一条。
 
 另外:
 
@@ -293,7 +295,8 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 
 - **企微消息身份**:pad 用 `msg_app_info`,dk 用会话存档 msgid(与 03 的消息身份同一口径)。
 - **session_id 进键**:同一批消息换了会话,必须是新的一轮。
-- **代次**:默认 0。同一批消息**有意再跑一次**时加 1——典型情形:旧轮被打断后,触发打断的那条新消息又被客户撤回,重跑的那一批和被取消的那一批一模一样;不加代次,平台会把那个已经 `interrupted` 的旧轮原样还回来,客户什么都收不到。代次记在 run 台账里。
+- **代次**:默认 0。同一批消息**有意再跑一次**时加 1——典型情形:旧轮被打断后,触发打断的那条新消息又被客户撤回,重跑的那一批和被取消的那一批一模一样;不加代次,平台会把那个已经 `interrupted` 的旧轮原样还回来,客户什么都收不到。
+- **代次不单独存,用 run 行上的 `invoke_token` 推出来**(`2026-11-17-b314-04` 给 run 表加的 `invoke_token`、`source_msg_keys` 两列):项目服务发起前数一下「本会话里 `source_msg_keys`(排好序)与本批相同、`invoke_token` 与本次不同的 run 行」有几行,这个数就是代次。数字人服务每处理一次都生成新的 `invoke_token`(`invoke-agent.processor.ts:358`),所以打断后重跑同一批数到 1、再来一次数到 2;同一个 `invoke_token` 的重试数出来还是原来的数,键不变,复用同一行 run。
 - 总长 68 字符,不含任何密钥、客户信息。
 
 要做到「请求体一字不差」:
@@ -311,7 +314,7 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 | 项目服务进程在等待中死了 | 数字人服务这一批记失败、告警,不发兜底(§3.9、§9 第 16 条已定);本批客户消息如果没进会话,下一轮按 03 补进去;已经生成但没发的回答按 03 报未送达 |
 | 409 `THREAD_QUEUE_FULL` | 不算失败,见 §3.7 |
 | 404 `SESSION_NOT_FOUND` | 换新会话、新键,重发一次 |
-| 422 `IDEMPOTENCY_KEY_REUSED` | 客户端内部重试发的是同一份请求体,不会出现。出现说明请求体没做到确定性(例如跨进程重发时补消息里多了新内容):告警;代次加 1 重发一次,前一次若已生成回答按 03 报未送达 |
+| 422 `IDEMPOTENCY_KEY_REUSED` | 客户端内部重试发的是同一份请求体,不会出现。出现说明请求体没做到确定性(例如跨进程重发时补消息里多了新内容):告警;在数出来的代次上再加 1 重发一次(只在这次请求里加,不存),前一次若已生成回答记日志「未送达」(03 时按 03 报) |
 
 ### 3.6 取消与打断
 
@@ -327,9 +330,9 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 
 - **被取消的轮次,结果一律丢弃不发。** 平台的取消是尽力而为:取消在两个步骤之间生效,正在生成最后一段时它会照常以 `success` 收尾,即使取消接口返回了 `stopped: true`(run-control.md §4.1)。所以判断依据是「我方是否发过取消」,不是 `end.status`。
 - 数字人服务收到项目服务的回答后、入发送队列前,再看一次轮次状态;已经是「取消中」就丢弃(窗口很小,与现在一致)。
-- 我方取消、但平台那一轮已经生成了最终回答的:这条回答留在会话里,客户没收到。项目服务在台账里把它记成「未送达」,按 03 报给平台(03 之前无法报,属已知缺口,§3.11)。
+- 我方取消的 run 行置 `settle_skip_charge=1`(现有列,结算时不扣;§3.8)。平台那一轮已经生成了最终回答的:这条回答留在会话里,客户没收到。v1 项目服务只在日志里记「未送达 · cancelled」(run 表不加列),03 时落表并按 03 报给平台(03 之前无法报,属已知缺口,§3.11)。
 - 取消之前已经做完的工具调用(写了档案、设了提醒)不会回滚,留在会话里,下一轮模型看得到(共享背景)。这正好防止模型在重跑时再写一遍;服务端防重复见 04。
-- 取消后项目服务不等 `end`,收尾(记 end 状态、用量)交给后台补齐(§3.8)。
+- 取消后项目服务不等 `end`,收尾(补记 `end_status`、`finished_at`)交给后台巡检(§3.8)。
 
 打断后重跑时 input 放什么:
 
@@ -393,7 +396,11 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 
 现在 Dify 链路:按场景取固定价(文字 / 图片 / 图文,`kdou-cost-scenario.ts:105-119`),流正常结束才扣,被取消不扣,扣在发送之前(`agent.service.ts:820-847`)。项目服务里其它 Expert Work 智能体的口径不同:按用量折算;是否扣费由全局的 `shouldCharge` 决定,`paused` / `interrupted` 也扣、`error` 不扣(`expert-work-billing.service.ts:62-80`);计费项按 agent_code 精确匹配,认不出的不扣(`:39-56`)。
 
-**要改的(11-17 定)**:健管师沿用**按场景固定价**(文字 / 图片 / 图文),不按用量 × 单价。这需要在计费里加一个**按适配器的钩子**:`shouldCharge` 和单价都按 `adapter_type` 取(改 `expert-work-billing.service.ts:62-80、121`,`run-settlement.service.ts:182`);结算本来就按会话行的 agent_code 派发适配器和计费(`run-settlement.service.ts:171、189`),这里改成先看 `adapter_type`(§4)。
+**要改的(11-17 定)**:健管师沿用**按场景固定价**(文字 / 图片 / 图文),不按用量 × 单价。这需要在计费里加一个**按适配器的钩子**(结算现在按会话行的 agent_code 派发适配器和计费,`run-settlement.service.ts:171、189`,改成先看 `adapter_type`,§4):
+  - **科目和单价**:`adapter_type = wecom_chat` 时用现成的 `resolveDigitalHumanScenario`(`src/modules/billing/kdou-cost-scenario.ts:105`),科目是 `AI_DIGITAL_HUMAN_CHAT_TEXT` / `_IMAGE` / `_TEXT_IMAGE`(`src/config/global.ts:139-141`),单价按它给出的价格字段取(和 Dify 链路现在一样)。都是现有的,不加表、不改表。
+  - **启动自检**:巡检启动时用 `hasOperationType` 检查每个已开通智能体有没有登记科目(`expert-work-billing.service.ts:95`,`run-settlement.sweeper.ts:43`),现在只认 agent_code 精确登记的;要改成 `adapter_type = wecom_chat` 的智能体也算登记了,否则每次启动都报「未登记扣费科目」。
+  - **扣不扣**:按下表,由企微聊天适配器的解析结果决定。现有 `shouldCharge` 对 `incomplete` 只看 `delivered`(`expert-work-billing.service.ts:69-70`),不知道「有没有可用回答」;健管师的「`incomplete` 只有拿到可用回答才扣」要由适配器按解析结果给出(解析合法、含 `silent` 都算可用;解析不了、改发兜底算不可用)。
+  - **我方取消**:run 行置 `settle_skip_charge=1`(现有列),结算时就不扣;不用 `interrupted` 判断(现有 `shouldCharge` 对 `interrupted` 是扣的,`expert-work-billing.service.ts:74-75`)。
 
 已拍板(11-17,§9 第 5、15 条):沿用场景固定价;**智能体这一轮正常跑完就扣,包括不发消息的轮次(转人工选了「本轮不回」、群里不是对 AI 说的话);出错、超时、发兜底话术、被取消不扣**。
 
@@ -403,13 +410,13 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 | `incomplete` 且没有可用回答 | 发兜底,**不扣**(11-17 定) |
 | 模型判断这轮不回(`silent`,什么都不发:转人工选了「本轮不回」,或群里不是对 AI 说的话) | **扣**(11-17 用户定,§9 第 15 条) |
 | 取到回答但不可用,改发兜底话术 | 不扣 |
-| 我方取消(`interrupted`,或取消后抢先跑完的 `success`) | 不扣 |
+| 我方取消(`interrupted`,或取消后抢先跑完的 `success`) | 不扣(run 行 `settle_skip_charge=1`) |
 | `error`、超时、发起失败、409 | 不扣 |
 | `paused` | 不该出现(健管师不配审批);出现按 `error` 处理并告警 |
 
 - 群里「不是对 AI 说的话」的 `silent` 轮其实不多:绑定开了「群里需要 @ 才回」(`invoke_agent_need_at`)、且这个群不在免 @ 名单(`no_need_at_invoke_agent_prd_room_id`)时,没 @ 员工的消息数字人服务根本不调智能体(`invoke-agent.processor.ts:603-630`,记 `need_at_not_at_me` / `need_at_no_text`)。只有关了这个开关或群在免 @ 名单里的,才会出现这类扣费的 `silent` 轮。
 - 扣费幂等:台账每个 run 一行,按 run_id 只扣一次(沿用现有「`charged_k_dou` > 0 即已扣」的做法)。
-- 每轮的平台用量(`end.usage_by_model`,或 `GET .../runs/{id}/usage`)按价目折成成本记进台账,供核对「康豆收入 vs 模型成本」,不参与扣费。取消后不等 `end` 的轮次由后台巡检补记(照 `run-settlement.sweeper.ts` 的做法)。
+- 每轮的平台用量(`end.usage_by_model`,或 `GET .../runs/{id}/usage`)按价目折成成本,**v1 只打进项目服务日志**(带 run_id,run 表不加列),供核对「康豆收入 vs 模型成本」,不参与扣费。取消后不等 `end` 的轮次,终局(`end_status`、`finished_at`)由后台巡检补记(照 `run-settlement.sweeper.ts` 的做法)。
 - 扣谁的豆照旧:群聊按群上的合伙人,私聊按客户归属(`agent.service.ts:578-582`)。
 
 ### 3.9 失败与超时时客户收到什么
@@ -494,16 +501,16 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 1. 新入口 `POST /agent/invoke-digital-human-ew`,契约见 §5.1;现有 Dify 入口不动。
 2. **复用现有两张表**(11-17 定,§5.4):会话行用 `t_project_expert_work_session`(`employee_code` 留空串、填 `customer_code`、`ew_user_id = wx:…`),run 台账用 `t_project_expert_work_run`;不新建 `t_project_dh_ew_session` / `t_project_dh_ew_run`。已有先例:ai-strategy H5 的客户自发会话就是 `employee_code` 为空的会话行(`expert-work-run.service.ts:250、324`)。
 2a. **通用的企微聊天适配器**(11-17 定):`t_project_expert_work_config` 加一列可空的 `adapter_type`(如 `wecom_chat`);为空 = 照现在按 agent_code 精确注册的适配器(`agent-adapter.registry.ts:36-38`),现有智能体不受影响、不用回填。项目服务先按 `adapter_type` 选适配器和计费,没有再按 agent_code。企微聊天适配器管任何企微聊天智能体:组 inputs(`customer_code`、`self_appellation`、`self_introduction`、`source_message_ids` 等)、解析输出(`messages` + `media`)、计费。以后再接一个企微聊天智能体 = 在 Expert Work 上配好智能体 + 加配置行,不写代码。
-2b. **权限**(切换前必做,08 S13 修法 A):通用的 `/expert-work/:agent_code/*` 路由拒绝 `adapter_type = wecom_chat` 智能体的会话;企微聊天模块读写会话前核对「项目 + agent_code + customer_code」。不改前端,现有智能体(`adapter_type` 为空)不受影响。所有通用路由核对 agent_code、限制 `sessions/list`(修法 B)进深护安全待办。
+2b. **权限**(切换前必做,08 S13 修法 A,08 §3.13 列了全部入口):挡在会话服务层,不是只挡一条路由 —— 项目服务各 expert-work 服务入口(按会话 / run id 或按 agent_code 查会话的地方:改名 / 归档、读会话消息、会话列表、读条目、发起、重连、取消、附件下载)遇到 `adapter_type = wecom_chat` 智能体的会话一律拒绝,只放行企微聊天模块自己的调用;企微聊天模块核对「项目 + agent_code + `ew_user_id`」(不用 `customer_code`:群里没建档的发言人它是空串)。这样 `/expert-work/:agent_code/*`、`/ai-health-plan/*`、`/ai-health-report/*` 和其它复用这些服务的入口都挡住。不改前端,现有智能体(`adapter_type` 为空)不受影响。所有通用路由核对 agent_code、限制 `sessions/list`(修法 B)进深护安全待办。
 3. 会话:按 §3.4 查 / 建(不按空闲换;只有 404 时换)。
 4. 附件:下载(域名白名单)→ 按文件头判类型 → 带 session_id 上传 → 缓存 upload_id(§3.3.3)。
 5. input / inputs 组装(§3.3.1、§3.3.2),东八区时间显式计算;`source_message_ids` 由数字人服务传来的 `source_msg_keys` 加通道前缀生成(§5.1;03 之前它就等于本批的 `msg_key`)。不再每轮预取客户档案、提醒、饮食、方案(智能体自己查,04 §9.4)。
 6. Idempotency-Key 与代次、请求体确定性(§3.5)。
 7. 发起、等待、取最终回复(§3.8);409 返回 `busy`;从发起起等满 360 秒仍没有 `end` 就主动取消(§3.7);失败时拼兜底原文、按聊天窗口限频(§3.9)。
 8. 取消入口按 provider 分流:Expert Work 的走 `:cancel`(§3.6),沿用 `dh_invoke:{invoke_token}` 轮次状态和预取消墓碑。
-9. 康豆:沿用场景固定价与余额闸(§3.8);用量成本记台账;后台巡检补记被取消轮次的终局与用量。
+9. 康豆:沿用场景固定价与余额闸(§3.8);我方取消的 run 置 `settle_skip_charge=1`;用量成本 v1 只打日志;后台巡检补记被取消轮次的终局。
 10. 客户端改动:本链路请求日志遮蔽 `input` / `inputs` / `untrusted_content`;加 `wx:` user_id 生成函数、`isCustomerExternalUserId` 认 `wx:`(§3.4.1);加 `untrusted_content` 与 03 的字段(要用时)。
-10a. 计费:按 `adapter_type` 取 `shouldCharge` 与场景固定价的钩子(§3.8)。
+10a. 计费:按 `adapter_type` 的钩子(§3.8)—— 科目与单价用现有 `resolveDigitalHumanScenario`;`hasOperationType` 自检认企微聊天适配器;`incomplete` 扣不扣看适配器的解析结果。
 11. 接 03(最后做):把数字人服务查好的补消息字段(`backfill` 等,缺口查询在数字人服务,03 §4.3 S-6)原样转给平台;发送失败、被接管、被取消的轮按 03 调「未送达」接口(03 已定单独接口、当场报)。
 
 ### 深护数字人服务
@@ -512,7 +519,7 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 2. 绑定闸:走 Expert Work 的智能体不再要求 Dify 应用密钥。
 3. 锁键去掉密钥;发给项目服务的请求体里不再带 `agent_key`。
 4. 本批消息按 §5.1 的结构传(每条带企微消息身份、类型、发送时间、文字或 OSS 链接),不再在这里拼 query、截 10 个附件。
-5. 收到 `reply` 或 `fallback`:`answer_text`、`file_link_list` 都为空就不发;否则入发送队列前再查一次轮次状态,按通道入队(pad 进 `send-agent-answer-queue`;dk 调 `enqueueAnswer`,`idempotency_seed` 用 run_id),带上 run_id 与来源数组;发送结果回写项目服务台账(给 03 的未送达回报用)。兜底原文和限频都在项目服务,这里不再判断。
+5. 收到 `reply` 或 `fallback`:`answer_text`、`file_link_list` 都为空就不发;否则入发送队列前再查一次轮次状态,按通道入队(pad 进 `send-agent-answer-queue`;dk 调 `enqueueAnswer`,`idempotency_seed` 用 run_id),带上 run_id 与来源数组;发送结果回报给项目服务(v1 项目服务只打日志;03 时落表、给 03 的未送达回报用)。兜底原文和限频都在项目服务,这里不再判断。
 6. 收到 `cancelled`:照旧标记、合并重跑。
 7. 收到 `busy`:走现有 `locked_retry` 重排。
 8. 收到 `silent` / `offline`:不发;`offline` 告警。
@@ -647,18 +654,18 @@ Idempotency-Key: dh1:<64 位十六进制>
 | `employee_code` | **空串**(客户自发会话;ai-strategy H5 已有先例) |
 | `customer_code` | 客户编码(群里没建档的发言人为空,user_id 用 `wx:{项目}:ext:{企微账号}`) |
 | `ew_user_id` | `wx:…` |
-| `ew_session_id` / `status` | 平台会话 id;状态沿用现有取值 |
+| `ew_session_id` / `status` | 平台会话 id;状态沿用现有取值(`active` / `archived`) |
 
 - **加一个索引**:(`project_code`, `agent_code`, `ew_user_id`, `status`),查「这个客户在这个智能体下的活跃会话」用。
 - **一个客户只有一个活跃会话**:在代码里保证,放在现有的同客户锁(`invoke_lock:…`)里查 / 建,不靠唯一约束。
-- **续会话前先核对**:要续的 `ew_session_id` 确实属于这个客户 + 这个智能体,不对就不续(防串号)。
-- 现有的会话列表都按 agent_code 过滤(如 `ai-health-plan-chat.controller.ts:139`),健管师的会话不会混进别的智能体的列表。
+- **续会话前先核对**:要续的会话行「项目 + agent_code + `ew_user_id`」与本轮一致,不对就不续(防串号)。
+- 别的入口能不能碰到这些会话:见 §4 第 2b 条(08 S13 修法 A)。
 
 **run 台账:`t_project_expert_work_run`**
 
 - 加两列:`invoke_token`(数字人服务的轮次令牌)、`source_msg_keys`(JSON,这一轮要回答的客户消息身份,§5.1)。
-- 幂等键:64 位十六进制 sha256,放现有的幂等键列(§3.5)。
-- 扣费、取消、终局、用量照现有列记;`delivery`(未送达)相关的列等 03 再加。
+- 幂等键:放现有的 `idempotency_key` 列(varchar 64),只存 64 位十六进制 sha256,不带 `dh1:` 前缀(发请求时再拼上);同一次调用的重试复用同一行,不新建行(§3.5)。
+- **不再加别的列**,v1 用现有列或日志代替:我方取消 → `settle_skip_charge=1`;代次 → 由 `invoke_token` + `source_msg_keys` 推出(§3.5);扣费、终局照现有列(`charged_k_dou`、`end_status`、`finished_at`);用量成本 → v1 只打日志;送达结果(发出 / 被接管 / 发送失败 / 取消)→ v1 只打日志,落表的列随 03 期加。
 
 **配置行:`t_project_expert_work_config`**:加一列可空的 `adapter_type`(§4 第 2a 条)。
 
@@ -697,7 +704,7 @@ Idempotency-Key: dh1:<64 位十六进制>
 1. **单条私聊**:测试企微号给健管师号发一句话 → 平台 run 列表、数字人服务发送日志、台账 → 一个 run、`end=success`,客户只收到一条回复,内容与 `channel=final` 一致 → 没修好:收不到或收到两条。
 2. **防抖合并**:8 秒内连发 3 条(文字、语音、图片)→ 平台对话条目 → 只有一个 run,input 里三行按时间排好、语音行带标记,图片在附件里 → 没修好:3 个 run,或图片丢失。
 3. **打断**:发一句会触发查工具的话,run 进行中(看到工具调用)再发一句 → run 列表、台账 → 旧 run 被取消、客户只收到新一轮的一条回复,新一轮看得到新消息 → 没修好:收到两条回复,或旧回答被发出。
-4. **取消抢跑**:构造回答已生成后才到的取消(在 `item.done final` 之后、`end` 之前取消)→ 台账 → 旧回答没发,`delivery=cancelled`,(03 落地后)按 03 报了未送达 → 没修好:旧回答被发出,或下一轮模型以为客户收到了。
+4. **取消抢跑**:构造回答已生成后才到的取消(在 `item.done final` 之后、`end` 之前取消)→ run 行、项目服务日志、钱包流水 → 旧回答没发;run 行 `settle_skip_charge=1`、没扣康豆;日志里有这个 run_id 的「未送达 · cancelled」;(03 落地后)按 03 报了未送达 → 没修好:旧回答被发出,或被扣了康豆。
 5. **打断后重跑不重复**(03 落地后):同第 3 条 → 新一轮的对话条目 → 旧那批客户的话在会话里只出现一次 → 没修好:同一批话出现两次。
 6. **幂等重试**:让项目服务第一次发起后断网重试(或直接用同一个键、同一个请求体调两次)→ 平台 run 列表 → 只多 1 个 run,两次拿到同一个 run_id,康豆只扣一次 → 没修好:两个 run、扣两次。
 7. **请求体确定性**:带图片的一批,第一次发起后模拟进程重启再重试 → 平台响应 → 不出现 422 `IDEMPOTENCY_KEY_REUSED` → 没修好:重试必挂。
@@ -711,8 +718,8 @@ Idempotency-Key: dh1:<64 位十六进制>
 15. **缓存命中**:同一会话连发两句、间隔 1 分钟 → 两轮 `usage_by_model` → 每轮第 2 次起的调用 `cache_read_tokens` > 0;跨轮的第一次调用有命中更好(不强求) → 没修好:成本按全价走。
 16. **时限与收尾余量**:临时把 `run_deadline_s` 调到 30 秒、项目服务等待上限同步调成 90 秒(30 + 60),问一个要查多个工具的问题,重复 20 次 → `end`、台账 → `incomplete` + `deadline`,有收尾回答且被发出,项目服务没超时;记下每次「`end` 时刻 − 起跑 − 时限」,P99 不超过 60 秒(超过就按 §3.7 同步放宽两层)→ 没修好:业务方先超时,回答留在会话里没人发。
 17. **失败兜底与限频**:把智能体指到一个不存在的工具服务或临时禁用 → 客户在私聊连发 3 句,同时在一个测试群里发 1 句 → 私聊只收到 1 条兜底、10 分钟内不再收到;群里也收到 1 条(各窗口分开计);兜底文字等于项目配置的文案 → 没修好:每句都收到「开小差」,或私聊发过后群里收不到。
-18. **康豆口径**:分别造出 success(有回复)、success 但 `silent`(转人工「本轮不回」)、我方取消、error、兜底五种结果 → 钱包流水 → 只有前两种各扣一笔,金额等于场景固定价 → 没修好:`silent` 没扣、或取消 / error / 兜底也扣。
-19. **真人接管**:真人在企微里刚回过客户,客户再发消息 → 调用日志 → 照旧在闸门处跳过,不发起 run;run 进行中真人回复 → 回答没发,台账 `delivery=human_took_over` → 没修好:真人回完 AI 又插一句。
+18. **康豆口径**:分别造出 success(有回复)、success 但 `silent`(转人工「本轮不回」)、`incomplete` 有可用回答、`incomplete` 没有可用回答(改发兜底)、我方取消、error、兜底七种结果(`incomplete` 用第 16 条的调短时限造)→ 钱包流水 → 只有 success、`silent`、`incomplete` 有可用回答这三种各扣一笔,科目是数字人对话那三类之一、金额等于场景固定价 → 没修好:`silent` 没扣、或取消 / error / 兜底 / 没可用回答的 `incomplete` 也扣。
+19. **真人接管**:真人在企微里刚回过客户,客户再发消息 → 调用日志 → 照旧在闸门处跳过,不发起 run;run 进行中真人回复 → 回答没发,项目服务日志里有这个 run_id 的「未送达 · human_took_over」(v1 不落表)→ 没修好:真人回完 AI 又插一句。
 20. **密钥不出现**:跑完以上用例后,扫 Redis 键名、数字人服务和项目服务的日志、调用日志表 → 找不到 Dify 应用密钥和 Expert Work API key 的任何片段;日志里没有 input 正文 → 没修好:密钥或客户健康数据进了日志。
 21. **灰度与回退**:把某条员工绑定的 `is_expert_work` 置 0(或把 `t_project_expert_work_config` 对应行 `enabled` 置 0)→ 下一条消息 → 立刻走回 Dify 原路径,Dify 会话照常续上 → 没修好:切换要发版,或 `enabled=0` 不生效。
 
@@ -722,10 +729,10 @@ Idempotency-Key: dh1:<64 位十六进制>
 |---|---|---|
 | Expert Work 平台 | 01 本身无改动;可选「本轮时间」平台段 1-1.5 人天(03 PR-3 会取代它,一般不单独做)、「本轮输入」段精简 1 人天 | 0(可选 2-2.5) |
 | 智能体配置 | 时限、日期段、变量声明、上下文门槛(与 02 / 04 一起) | 0.5 人天 |
-| 深护项目服务 | 新入口、复用两张表(加列加索引)、配置行 `adapter_type` 与通用企微聊天适配器、会话、附件、input / inputs、幂等与代次、取最终回复、取消、康豆(按适配器的计费钩子)与巡检、日志遮蔽;越权读会话修法 A 另计 0.5~1(08 S13,切换前必做) | 7-9 人天(粗估) |
+| 深护项目服务 | 新入口、复用两张表(加列加索引)、配置行 `adapter_type` 与通用企微聊天适配器、会话、附件、input / inputs、幂等与代次、取最终回复、取消、康豆(按适配器的计费钩子)与巡检、日志遮蔽 7-9;越权读会话修法 A 1.5~2(08 S13,切换前必做) | 8.5-11 人天(粗估) |
 | 深护数字人服务 | 分流开关、锁键与绑定闸、消息结构、`is_first_contact` 查消息表、发送入队与回写、各 `outcome` 处理、HTTP 超时 390 秒 | 3-4 人天 |
 | 联调与真栈验收 | §7 的 21 条 | 3 人天 |
-| 合计 | 不含 02 / 03 / 04 | 约 12.5-15.5 人天(粗估) |
+| 合计 | 不含 02 / 03 / 04;0.5 + 8.5~11 + 3~4 + 3 | 约 15-18.5 人天(粗估) |
 
 依据:项目服务已有可直接复用的客户端(发起带幂等键、取消、续流、上传、条目、用量,`expert-work-client.ts:341-720`)、SSE 解帧与断线续传(`expert-work-sse.ts`)、附件白名单(`upload-validation.ts`)、用量折算(`billing/run-usage-cost.ts`)、收尾巡检的写法(`run-settlement.service.ts` / `.sweeper.ts`);要新写的是会话与台账、本链路的编排。现有通用接入层(`agent-adapter.ts`)是给员工控制台「浏览器 ↔ 平台」中继和产物交付设计的,不直接套用。
 
@@ -750,7 +757,7 @@ Idempotency-Key: dh1:<64 位十六进制>
 
 4. ~~会话切分~~ **已拍板(11-17)**:不做「空闲 N 小时换新会话」,一个客户在一个智能体下始终一段会话(私聊和群共用);成本靠调低压缩门槛控制(纯配置):`policies.tool_result_prune.absolute_cap_tokens: 40000`、`policies.working_memory.max_recent_turns: 20` 与 `absolute_cap_tokens: 40000`、`policies.context_compression.absolute_cap_tokens: 60000`(平台默认 20 万)。按原假设封顶约 ¥0.9 / 轮,数值待实测(§3.4.4)。上线后看真实费用,贵了再考虑加换会话(后续可选)。06 §3.10 / §5.5 已用同一组数。
 
-5. ~~康豆口径~~ **已拍板(11-17)**:A,沿用场景固定价;智能体这一轮正常跑完就扣(含 `silent`,第 15 条),取消、失败、超时、兜底不扣。用量成本照记,跑一个月有数据后再议是否改按用量。
+5. ~~康豆口径~~ **已拍板(11-17)**:A,沿用场景固定价;智能体这一轮正常跑完就扣(含 `silent`,第 15 条),取消、失败、超时、兜底不扣;`incomplete` 只有拿到可用回答才扣,否则发兜底不扣(§3.8)。用量成本 v1 先打日志,跑一个月有数据后再议是否改按用量。
 
 6. ~~每轮时限~~ **已拍板(11-17)**:`run_deadline_s: 300`。配套(建议值,§3.7):项目服务从发起起等 360 秒;数字人服务调项目服务新入口的 HTTP 超时从默认 300 秒改为 390 秒;同客户锁 600 秒不变、仍够。平台到点收尾没有硬上限,正常多出约 10~45 秒(推断,§7 第 16 条实测)。06 原来的 150 秒已改掉。
 

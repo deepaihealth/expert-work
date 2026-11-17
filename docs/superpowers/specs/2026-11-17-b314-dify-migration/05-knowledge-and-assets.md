@@ -2,6 +2,8 @@
 
 > 所属:B-314 Dify「健管师」迁移(总览:00-overview.md)。状态:草稿 v1;11-17 评审已过,各项决定见下方修订说明与第 9 节。
 >
+> **修订(2026-11-17,PR 复核修正)**:上线清单第 10 步改为执行 db-design `2026-11-17-b314-02~09`(`01` 最先已执行),`@created_by` 必填;第 14 步写明配置行 `adapter_type='wecom_chat'`、`enabled=1`、`api_key`;§4 改动清单不再提「素材 SQL」交付件(SQL 在 db-design);§5.2 只留建表骨架,初始化数据看 09 文件;§3.6.2 删掉重复的一句。
+>
 > **修订(2026-11-17,06 评审结论)**:`goods_info` / 小程序不迁(小程序不需要了);新增待办 —— 业务方如能提供「助糖 3 号」的一句话介绍(是什么、怎么吃),放进「公司与服务」库(不挡上线,§3.4)。
 >
 > **修订(2026-11-17,05 评审结论)**:①交付物是 Word / Excel 等文件,不进 git:知识库文章用 Word,配置书也是 Word(完整提示词 + 控制台步骤,YAML 放附录),放在用户机器上的本地交付文件夹;`docs/agents/health-manager/` 的 git 布局作废(§3.6)。②公司资料内容全部保留(业务方已授权),原先的清理建议作废,只改错别字和格式(§3.2.4、§3.2.5)。③不写「费用与报名」篇。④运动视频改走深护素材库,原「编号表 + 枚举 + 映射」整套作废;素材库没有后台页,助手交 SQL 脚本、用户在各环境执行(§3.3)。⑤每轮探测、重排保持平台默认,我们不跑对比;科普库本期不做;导出导入暂不做。
@@ -12,7 +14,7 @@
 >
 > **修订(2026-11-17,控制台)**:上线清单第 10 步加一句:保存后切到 YAML 视图核对三个上下文绝对上限(控制台表单没有这三项,06 §3.10)。
 >
-> **修订(2026-11-17,智能体专用素材表)**:深护为智能体**新建一张素材表** `t_project_agent_material`(表名是我们提的,待深护确认),`material_list` 只读这张表;原先「用 `t_project_material` + 分类表 + 分类关系表、标签分类、加 `description` 列」的设计作废。新表自带 `agent_code`(空 = 本项目所有智能体)、`media_type`、`description`、`tags`、`status`;建表与初始化脚本放交付文件夹 `素材库/Agent素材表建表与初始化.sql`(§3.3、§5)。
+> **修订(2026-11-17,智能体专用素材表)**:深护为智能体**新建一张素材表** `t_project_agent_material`(表名是我们提的,待深护确认),`material_list` 只读这张表;原先「用 `t_project_material` + 分类表 + 分类关系表、标签分类、加 `description` 列」的设计作废。新表自带 `agent_code`(空 = 本项目所有智能体)、`media_type`、`description`、`tags`、`status`;建表与初始化脚本放交付文件夹 `素材库/Agent素材表建表与初始化.sql`(§3.3、§5)。(已被 11-17 拍板修订取代)
 >
 > 本篇管三件事:Dify 里写死的「知识」迁到哪、运动视频怎么改走深护智能体素材表、测试环境建好的东西怎么原样搬到生产。
 > 输出字段总表、固定话术、提示词正文不在本篇,本篇只给它们需要的片段和约束(见总览里讲输出契约和智能体配置的那几篇)。
@@ -303,7 +305,7 @@ B-314健管师交付/                       ← 用户机器上的本地交付�
     健管师迁移测试用例.xlsx           工程师用的测试用例清单(07 §3.2)
 ```
 
-- **SQL 改放深护建库仓库(11-17)**:`deep-ai-health-db-design/1.5.7/project_tables/leyi/` 下以 `2026-11-17-b314-` 开头的一组文件,`00-README` 列了执行顺序和每个文件改什么。和本迁移 v1 有关的:`01` 调用记录三列、`02` 两张绑定表加 `is_expert_work`、`03` 会话表加客户索引、`04` run 表加 `invoke_token`(带索引)与 `source_msg_keys`、`05` 配置表加可空 `adapter_type`、`06` 提醒短编号、`07` 来源消息判重表、`08` 素材表建表、`09` 素材 41 条初始化;03 期才执行的:`10` 发送登记表、`11` 同步位置表、`12` PC 发送任务加两列。会话 / run 复用现有表所需的加列、加索引,以及配置行的 `adapter_type`(01 §5.4)也放这个目录。
+- **SQL 改放深护建库仓库(11-17)**:`deep-ai-health-db-design/1.5.7/project_tables/leyi/` 下以 `2026-11-17-b314-` 开头的一组文件,`00-README` 列了执行顺序和每个文件改什么。和本迁移 v1 有关的:`01` 调用记录三列、`02` 两张绑定表加 `is_expert_work`、`03` 会话表加客户索引、`04` run 表加 `invoke_token`(带索引)与 `source_msg_keys`、`05` 配置表加可空 `adapter_type`、`06` 提醒短编号、`07` 来源消息判重表、`08` 素材表建表、`09` 素材 41 条初始化;03 期才执行的:`10` 发送登记表、`11` 同步位置表、`12` PC 发送任务加两列。
 - 库目录里只放要上传的文件,避免把说明当文档误传;库设置写在配置书里。
 - 配置书首页写版本号和每个文件的名称、字节数,作为测试 / 生产核对的依据。
 - 原先的 `docs/agents/<agent_code>/` git 目录布局,以及随之要改 `docs/agents/README.md`「一个 Agent 一个文件」约定的提议,一并作废(原 §9 第 12 条)。
@@ -333,11 +335,11 @@ B-314健管师交付/                       ← 用户机器上的本地交付�
 | 7 | 建库 `公司与服务`(名字逐字一致),按配置书的库设置表填参数 | 用户 | 库设置页每项和表一致 |
 | 8 | 上传交付文件夹 `知识库/公司与服务/` 下全部文件 → 看预估金额 → 确认 → 等全部「就绪」 | 用户 | 每个文件的**文件名、大小**和第 0 步清单一致;**段数和切块参数指纹**与测试环境一致(不一致先查两边切块参数和向量模型) |
 | 9 | 库的检索测试页跑 3 个问题(地址、控糖服务内容、能否开药) | 用户 | 每题前 3 条里有对应文档 |
-| 10 | 执行 `deep-ai-health-db-design/1.5.7/project_tables/leyi/` 里的 `2026-11-17-b314-08-agent-material-table.sql` 和 `-09-agent-material-init.sql`(后者先填 `@project_code`、`@agent_code`(= 深护员工绑定上的 `agent_code`)、`@created_by`) | 用户 | 素材表 41 条启用、条数与测试一致。**必须在第 12 步冒烟之前做**:冒烟第 5、6 题要用到素材表 |
+| 10 | 执行 `deep-ai-health-db-design/1.5.7/project_tables/leyi/` 里的 `2026-11-17-b314-02` ~ `-09`(按编号;`01` 已在最先执行过,07 §3.8 第 9 条);`-09-agent-material-init.sql` 先填 `@project_code`、`@agent_code`(= 深护员工绑定上的 `agent_code`)、`@created_by`(必填,留 NULL 不写数据) | 深护运维 + 用户 | 各文件末尾的校验查询都对;素材表 41 条启用、条数与测试一致。**必须在第 12 步冒烟之前做**:冒烟第 5、6 题要用到素材表 |
 | 11 | 新建智能体 → YAML 页 → 粘贴配置书附录的 YAML → 填生产占位(若有)→ **保存草稿** | 用户 | 建好后切到 YAML 视图核对这三项:`tool_result_prune` 40000、`working_memory` 40000、`context_compression` 60000 的 `absolute_cap_tokens`(表单里没有,06 §3.10)。保存成功且**没有任何警告**。三类警告都要回头处理,不能带着发布:「平台没配凭证」→ 第 6 步;「MCP 连不上」→ 第 4–5 步;「参数绑定没匹配上任何工具」→ 第 5 步注册名不一致,这种情况下身份参数会退回给模型自己填,正是要防的事 |
 | 12 | 调试台**用草稿**跑冒烟问题(§3.6.5;第 5、6 题依赖第 10 步的素材表)| 用户 | 全部符合预期;`material_list` 能列出 41 条 |
 | 13 | 发布 | 用户 | 版本列表里是新版本 |
-| 14 | 深护生产配置平台地址、对外 API key、智能体编码;先放一个测试客户账号走真企微,跑冒烟里的 5、6 两题 | 深护运维 + 用户 | 收到文字 + 视频气泡;没要视频时只有文字 |
+| 14 | 深护生产配置平台地址、对外 API key、智能体编码:`t_project_expert_work_config` 健管师那一行 `adapter_type='wecom_chat'`、`enabled=1`、`api_key` 填生产对外 API key;先放一个测试客户账号走真企微,跑冒烟里的 5、6 两题 | 深护运维 + 用户 | 收到文字 + 视频气泡;没要视频时只有文字 |
 | 15 | 在配置书的上线记录里填:执行人、时间、各步结果、生产版本号 | 用户 | 记录写进交付文件夹的配置书 |
 
 两个环境**不同**的值(都不在配置书 YAML 里,或只在注释标出的占位里;素材 SQL 里的 `project_code` 等占位):深护 MCP 地址和 key;高德平台 MCP 配置;租户 `mcp_allowlist`;模型凭证;深护侧的平台地址、对外 API key;webhook 地址(如用)。
@@ -380,8 +382,8 @@ B-314健管师交付/                       ← 用户机器上的本地交付�
 | Expert Work 平台 | 智能体 + 知识库打包导出导入(§3.6.7) | 暂不做 |
 | 深护 MCP | 新工具 `material_list`(04 §5.12) | 必须 |
 | 深护项目服务 | 读 `media`,逐个查素材库校验、取链接、按类型放进发送载荷;不合格丢掉并记日志,文字照发(02);平台地址、API key、智能体编码按环境配置 | 必须 |
-| 深护数据 | 执行助手交付的素材 SQL(建 `t_project_agent_material` + 41 条),测试、生产各一次 | 必须 |
-| 智能体配置(交付文件) | 知识库绑定;提示词加「何时查库」、专家护栏、价格转人工;输出格式 `media`;放行并绑定 `material_list`;Word 文章 6 篇;配置书;素材 SQL 与清单 | 必须 |
+| 深护数据 | 执行 db-design `2026-11-17-b314-01~09`(见 §3.6.2),测试、生产各一次 | 必须 |
+| 智能体配置(交付文件) | 知识库绑定;提示词加「何时查库」、专家护栏、价格转人工;输出格式 `media`;放行并绑定 `material_list`;Word 文章 6 篇;配置书;素材清单.xlsx | 必须 |
 | 内容(深护) | 业务方核对整理稿与原文一致;运动教练给素材标签、确认 12 个无视频动作 | 必须 |
 
 ## 5. 接口与数据结构
@@ -400,14 +402,14 @@ ORDER BY sort, id
 
 业务方校验一个 id:上面的条件再加 `id = <id>`,有结果才发,按 `media_type` 发。
 
-### 5.2 素材表 SQL 骨架(以 `deep-ai-health-db-design/1.5.7/project_tables/leyi/2026-11-17-b314-08 / 09` 两个文件为准;值均为占位)
+### 5.2 素材表 SQL 骨架(只列建表;以 `deep-ai-health-db-design/1.5.7/project_tables/leyi/2026-11-17-b314-08 / 09` 两个文件为准,初始化数据见 09;值均为占位)
 
 ```sql
 SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
--- 1. 占位(必须填;没填时只建表、不写数据)
+-- 1. 占位(给 09 用;没填时 09 不写数据)
 SET @project_code = '<填项目编码>';
 SET @agent_code   = '<填健管师智能体编码>';   -- = 深护员工绑定上的 agent_code(06 §3.11)
-SET @created_by   = NULL;                      -- 创建人 ID,不知道问深护(默认 0)
+SET @created_by   = <填创建人 ID>;             -- 数字,必填(09 文件要求非 NULL);不知道问深护
 -- 2. 建表(已存在就跳过;DDL 隐式提交,放在事务外)
 CREATE TABLE IF NOT EXISTS `t_project_agent_material` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '自增主键;模型输出的素材短 id 就是它',
@@ -428,15 +430,8 @@ CREATE TABLE IF NOT EXISTS `t_project_agent_material` (
   UNIQUE KEY `uk_material_code` (`material_code`),
   KEY `idx_project_agent_status` (`project_code`, `agent_code`, `status`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
--- 3. 41 条运动视频(一个事务;按 material_code 判断,已存在的跳过,不恢复已停用 / 已软删的行)
---    material_code = 'mat_' + SHA1(项目编码 + 固定前缀 + 素材名称) 前 16 位十六进制
---    链接用 Dify 表里现有的 CDN 地址(不重新上传);标签是助手按动作名推断的建议,说明留空等运动教练补
-INSERT INTO t_project_agent_material (project_code, material_code, agent_code, name, media_type, url, description, tags, status, sort, created_at, updated_at, created_by, updated_by)
-SELECT @project_code, CONCAT('mat_', LEFT(SHA1(CONCAT(@project_code, '<固定前缀>', d.name)), 16)), @agent_code, d.name, 'video', d.url,
-       NULL, d.tags, 1, d.sort, NOW(), NOW(), COALESCE(@created_by, 0), COALESCE(@created_by, 0)
-FROM (SELECT '深蹲' AS name, 'https://<视频 CDN 主机>/no_logo_sport_video/<文件名>.mp4' AS url,
-             '["中等强度","站姿","徒手","臀腿","膝盖负担较大"]' AS tags, 33 AS sort
-      /* UNION ALL …… 其余 40 条 */) d;
+-- 3. 41 条初始化数据不在这里重复:见 2026-11-17-b314-09-agent-material-init.sql
+--    (要先填 @project_code、@agent_code、@created_by;@created_by 必须是数字,留 NULL 时一条都不写)
 ```
 
 执行前要确认的:表名、列长度(`name` 120、`description` 1000、`material_code` 64)、`material_code` 的格式、`created_by` 填什么。执行后核对条数;`description` 和 `tags` 空着不影响上线。回滚用 `09` 文件末尾注释掉的回滚段。
