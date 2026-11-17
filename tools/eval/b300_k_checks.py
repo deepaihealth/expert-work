@@ -317,6 +317,38 @@ def _candidate_tag(decision: Mapping[str, Any], labels: Mapping[str, str]) -> st
     return f"{which}_{_correction_tag(decision.get('is_correction'))}"
 
 
+def _how_listed(decision: Mapping[str, Any], x_text: str) -> str | None:
+    """这条候选怎么列的 X(与平台 ``_decision`` 同一口径):``restates_only`` = 只列在 ``restates``
+    里;``replaces`` = 其余列了 X 的 —— ``replaces``、两张都列、旧的 ``UPDATE`` / ``DELETE`` 的目标
+    (第一次的候选拿这几种退用户一方都查更正标记);没列 = ``None``。"""
+    if decision["op"].upper() in _LEGACY_OPS and _norm(decision["target"] or "") == x_text:
+        return "replaces"
+    if x_text in {_norm(c) for c in decision["replaces"]}:
+        return "replaces"
+    if x_text in {_norm(c) for c in decision["restates"]}:
+        return "restates_only"
+    return None
+
+
+def _same_text_user_side(decision: Mapping[str, Any], labels: Mapping[str, str]) -> bool:
+    """§7.1 第 19 行例外 ③ 的近似(平台 ``_identical_neighbors``):有一个邻居与候选内容相同(平台
+    同一归一口径)、同类型、两边事件日期不冲突(都有且不同才算冲突)、来源是用户一方。材料里没有
+    智能体名,同格只比到类型 —— 近似;邻居本来只取召回范围(共享的事实 + 本智能体的经历),事实不带
+    智能体名,所以实际很少多算。"""
+    text, kind, day = (
+        _content_norm(decision["content"]),
+        decision.get("kind"),
+        decision.get("event_date"),
+    )
+    return any(
+        _content_norm(n["content"]) == text
+        and n.get("kind") == kind
+        and not (day and n.get("event_date") and n.get("event_date") != day)
+        and labels.get(n["source"]) in USER_SIDE
+        for n in decision.get("neighbours", ())
+    )
+
+
 def _non_statement_by_pass(
     out: dict[str, Any], result: Mapping[str, Any], rows: Rows, z_key: str
 ) -> None:
@@ -326,15 +358,17 @@ def _non_statement_by_pass(
     * ``x_listed_by_<次>_<标记>``:把 X 列进 ``replaces`` / ``restates`` 的候选;
     * ``x_retired_by_<次>_<标记>``:X 被退时退它的那一条 —— 算给 X 的 ``superseded_by`` 指向的行
       (写下的候选,或它判重复的那一条);对不上就算第一条列了 X 的;谁都没列 = ``unknown``;
-    * ``x_retired_same_text_by_<次>_<标记>``:上一项里,那条候选旁边有一条内容相同(平台同一归一
-      口径)的用户一方邻居 —— 走的是 §7.1 第 19 行的例外 ③(候选与一条有效的用户一方行完全相同就
-      不查更正标记)。
+    * 上一项里第一次的候选(``pass1_*``)另分两种不查更正标记的退法(互斥,先看第一种):
+      ``x_retired_restates_only_by_<次>_<标记>`` —— 它只把 X 列在 ``restates`` 里(不是两张都列,
+      也不是旧的 ``UPDATE``,:func:`_how_listed`);``x_retired_same_text_by_<次>_<标记>`` —— 它旁边
+      有一条内容相同的用户一方邻居,走的是 §7.1 第 19 行例外 ③(:func:`_same_text_user_side`,
+      近似)。
 
-    读法:``pass1_no_correction`` 退了 X,减去其中走例外 ③ 的,是代码错(§7.1 第 19 行该挡);走
-    例外 ③ 的不算代码错 —— 同一个错值原样再答一次(上一次答的那条照写成了有效的用户说的行)就会
-    这样退掉 X,用户 11-17 接受为已知限制(第三轮审查 MEDIUM-B)。``pass2_*`` 退了 X(用户说的)是
-    代码错(默认规则该挡)。``pass1_correction`` 退了 X 是指令没挡住(附录 C 的 C1~C3),没有程序
-    兜底。"""
+    读法:``pass1_no_correction`` 减去 ``restates_only`` 与 ``same_text`` 两项,剩下的是代码错
+    (§7.1 第 19 行该挡)。只列在 ``restates`` 的按设计不受这一条管;走例外 ③ 的是用户 11-17 接受的
+    已知限制(同一个错值原样再答一次,第三轮审查 MEDIUM-B)。``pass2_*`` 退了 X(用户说的)一律是
+    代码错(默认规则只看来源,怎么列、内容相同不相同都不放行),所以第二次的不分这两种。
+    ``pass1_correction`` 退了 X 是指令没挡住(附录 C 的 C1~C3),没有程序兜底。"""
     counts, labels = out["counts"], result.get("origin_labels") or {}
     for kind in ("pass1", "pass2"):
         for m in pass_memories(result, kind):
@@ -344,11 +378,7 @@ def _non_statement_by_pass(
     if not x:
         return
     x_text = _norm(x.get("content", ""))
-    listing = [
-        d
-        for d in _reconciled(result)
-        if x_text in {_norm(c) for c in (*d["replaces"], *d["restates"])}
-    ]
+    listing = [d for d in _reconciled(result) if _how_listed(d, x_text)]
     for d in listing:
         counts[f"x_listed_by_{_candidate_tag(d, labels)}"] += 1
     if x.get("live"):
@@ -367,11 +397,11 @@ def _non_statement_by_pass(
         return
     tag = _candidate_tag(retirer, labels)
     counts[f"x_retired_by_{tag}"] += 1
-    text = _content_norm(retirer["content"])
-    if any(
-        _content_norm(n["content"]) == text and labels.get(n["source"]) in USER_SIDE
-        for n in retirer.get("neighbours", ())
-    ):
+    if not tag.startswith("pass1_"):
+        return
+    if _how_listed(retirer, x_text) == "restates_only":
+        counts[f"x_retired_restates_only_by_{tag}"] += 1
+    elif _same_text_user_side(retirer, labels):
         counts[f"x_retired_same_text_by_{tag}"] += 1
 
 

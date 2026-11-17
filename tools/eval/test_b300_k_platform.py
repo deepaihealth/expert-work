@@ -308,11 +308,20 @@ def test_parse_reconcile_keeps_each_neighbours_text_and_source() -> None:
     """K-n 要分出走 §7.1 第 19 行例外 ③ 的退法:候选旁边有没有内容相同的用户一方行,看材料里邻居的
     正文与来源。"""
     material = json.loads(_material((0, "new", ["old a", "old b"])))
-    material["candidates"][0]["existing"][0]["source"] = "confirmed by the user"
+    material["candidates"][0].update(kind="fact", event_date="2026-03-02")
+    material["candidates"][0]["existing"][0].update(
+        source="confirmed by the user", kind="episodic", event_date="2026-03-01"
+    )
     (only,) = kp.parse_reconcile(json.dumps(material), json.dumps({"ops": []}))
+    assert (only["kind"], only["event_date"]) == ("fact", "2026-03-02")
     assert only["neighbours"] == [
-        {"content": "old a", "source": "confirmed by the user"},
-        {"content": "old b", "source": ""},
+        {
+            "content": "old a",
+            "source": "confirmed by the user",
+            "kind": "episodic",
+            "event_date": "2026-03-01",
+        },
+        {"content": "old b", "source": "", "kind": "", "event_date": None},
     ]
 
 

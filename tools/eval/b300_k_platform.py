@@ -385,10 +385,11 @@ def _json(text: str) -> Any:
 
 
 def parse_reconcile(material: str, reply: str) -> list[dict[str, Any]]:
-    """一次去重合并调用 → 每条候选一项:``content`` / ``source``(显示文字)/ ``is_correction``
-    (材料里候选的更正标记;没有 = ``None``)/ ``neighbours``(材料里它的邻居:正文与来源的显示
-    文字)/ ``op`` / ``target``(重复的那一条的正文)/ ``replaces`` / ``restates``(被列的已有记忆
-    的正文)。纯函数;材料或回复读不懂 = 空。编号不认识的(模型编的)丢掉。"""
+    """一次去重合并调用 → 每条候选一项:``content`` / ``source``(显示文字)/ ``kind`` /
+    ``event_date`` / ``is_correction``(材料里候选的更正标记;没有 = ``None``)/ ``neighbours``
+    (材料里它的邻居:正文、来源的显示文字、``kind``、``event_date``)/ ``op`` / ``target``(重复的
+    那一条的正文;旧的 ``UPDATE`` / ``DELETE`` 是它的目标)/ ``replaces`` / ``restates``(被列的
+    已有记忆的正文)。纯函数;材料或回复读不懂 = 空。编号不认识的(模型编的)丢掉。"""
     data, answer = _json(material), _json(reply)
     candidates = data.get("candidates") if isinstance(data, Mapping) else None
     if not isinstance(candidates, list):
@@ -410,7 +411,12 @@ def parse_reconcile(material: str, reply: str) -> list[dict[str, Any]]:
             lists[name] = [existing[i] for i in listed if isinstance(i, str) and i in existing]
         flag = cand.get("is_correction")
         neighbours = [
-            {"content": str(e.get("content", "")), "source": str(e.get("source", ""))}
+            {
+                "content": str(e.get("content", "")),
+                "source": str(e.get("source", "")),
+                "kind": str(e.get("kind", "")),
+                "event_date": e.get("event_date"),
+            }
             for e in cand.get("existing") or []
             if isinstance(e, Mapping)
         ]
@@ -418,6 +424,8 @@ def parse_reconcile(material: str, reply: str) -> list[dict[str, Any]]:
             {
                 "content": str(cand.get("content", "")),
                 "source": str(cand.get("source", "")),
+                "kind": str(cand.get("kind", "")),
+                "event_date": cand.get("event_date"),
                 "is_correction": flag if isinstance(flag, bool) else None,
                 "neighbours": neighbours,
                 "op": str(decision.get("op", "")),
