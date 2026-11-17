@@ -257,8 +257,9 @@ class _Attempt:
 class LLMErrorHandlingMiddleware:
     """Wrap one provider attempt with in-place retry + the circuit breaker.
 
-    B-297 — the router passes two hints in ``ctx.payload`` (both absent =
-    ``False``; ``has_alternative`` defaults to ``has_fallback``):
+    B-297 — the router passes three hints in ``ctx.payload`` (absent
+    ``has_fallback`` = ``False``; ``has_alternative`` defaults to
+    ``has_fallback``, ``has_group_alternative`` to ``has_alternative``):
 
     * ``has_alternative`` — *any* later handle in this call's walk (a sibling
       key of the same provider, or another provider group). It decides the

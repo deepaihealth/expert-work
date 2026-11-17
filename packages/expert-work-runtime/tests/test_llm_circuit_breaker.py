@@ -16,7 +16,14 @@ from dataclasses import dataclass
 
 import pytest
 
-from expert_work.runtime.middleware import BreakerRegistry, CircuitBreaker
+from expert_work.runtime.middleware import (
+    BreakerRegistry,
+    CircuitBreaker,
+    CircuitOpenError,
+    LLMErrorHandlingMiddleware,
+    LLMRateLimitError,
+    MiddlewareContext,
+)
 
 
 @dataclass
@@ -459,3 +466,44 @@ async def test_provider_level_failures_and_an_expired_probe_lease_are_not_key_le
     clock.advance(60.0)
     assert await breaker.check_state() == "OPEN"  # lease expired → re-opened
     assert breaker.opened_by_key_level is False
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_probe_keeps_key_level() -> None:
+    """A half-open probe that meets another 429 re-opens the breaker as
+    key-level, so the next caller is still handed to a sibling key."""
+    clock = FakeClock()
+
+    async def _no_wait(_delay: float) -> None:
+        return None
+
+    mw = LLMErrorHandlingMiddleware(
+        breaker_registry=BreakerRegistry(clock=clock), sleeper=_no_wait, clock=clock
+    )
+    calls = 0
+
+    async def _rate_limited(_ctx: MiddlewareContext) -> None:
+        nonlocal calls
+        calls += 1
+        raise LLMRateLimitError("429")
+
+    def _ctx() -> MiddlewareContext:
+        return MiddlewareContext(
+            payload={
+                "provider_key": "p:m#0",
+                "has_fallback": True,
+                "has_alternative": True,
+                "has_group_alternative": True,
+            }
+        )
+
+    for _ in range(3):
+        with pytest.raises(LLMRateLimitError):
+            await mw(_ctx(), _rate_limited)
+    clock.advance(30.0)
+    with pytest.raises(LLMRateLimitError):  # the half-open probe meets another 429
+        await mw(_ctx(), _rate_limited)
+    with pytest.raises(CircuitOpenError) as excinfo:
+        await mw(_ctx(), _rate_limited)
+    assert excinfo.value.key_level is True
+    assert calls == 4
