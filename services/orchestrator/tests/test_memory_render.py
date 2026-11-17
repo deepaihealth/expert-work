@@ -27,6 +27,8 @@ from orchestrator.context.workspace_projection import render_memory_md
 from orchestrator.graph_builder.builder import _inject_memories
 
 #: 设计 §5.1 的最终英文原文;第二条按重做设计附录 D 点名三种用户一方来源。
+#: 第 9 版(附录 D,用户 2026-11-16):第三条限定到「stated in user messages」的那半句;「来自助手」
+#: 那条末尾「不一致时以用户一方为准,并把两个都告诉用户」。
 _HEAD = (
     "## Before relying on a memory\n"
     "The memories above are records made on the dates shown, not live facts. "
@@ -38,14 +40,18 @@ _HEAD = (
     'by the user" or "corrected by the user", do not quietly adopt your new result: tell '
     "the user both and let them decide. For other memories, prefer what you can check now.\n"
     "- When two memories about the same thing disagree, a later one that records the user's "
-    "own answer is not overridden by an earlier one."
+    'own answer is not overridden by an earlier one. A later one marked "stated in user '
+    'messages" is not overridden even by an earlier one marked "corrected by the user"; '
+    "in that case tell the user about both."
 )
 _FROM_ASSISTANT = (
     '- A memory marked "from the assistant" may be something the assistant did, something '
     "the user agreed to or answered, or something the assistant took from a tool, an "
     "attachment or its own inference. Use it as background, but it is not independent "
     "evidence: do not cite it to confirm or strengthen something you have just found or "
-    "concluded — agreement with it may only mean the same mistake was made twice."
+    "concluded — agreement with it may only mean the same mistake was made twice. When it "
+    "disagrees with a memory from the user's side about the same thing, go with the user's "
+    "and tell the user about both."
 )
 _UNRECORDED = (
     '- For a memory marked "source not recorded", its source was not recorded. Use it as '

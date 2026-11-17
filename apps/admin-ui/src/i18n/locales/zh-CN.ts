@@ -3608,6 +3608,8 @@ const zhCN: TranslationKeys = {
     origin_assistant_derived: "来自助手",
     origin_user_corrected: "用户更正",
     origin_unrecorded: "来源未记录",
+    superseded: "已被取代",
+    superseded_by_tip: "跳到取代它的那条记忆(那一条可能不在当前页)",
     col_content: "内容",
     col_score: "评分",
     col_user: "用户",

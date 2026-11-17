@@ -21,20 +21,26 @@ from expert_work.common.search.rrf import rrf_fuse_scored
 from expert_work.persistence.bulk_delete import count_where, delete_where
 from expert_work.persistence.knowledge.text_search import tokenize_for_search
 from expert_work.persistence.memory.base import (
+    FAIL_CLOSED_TIER,
+    MAX_STATEMENT_HOPS,
     USER_SIDE_ORIGINS,
     ConsolidationSourcesChangedError,
+    FlaggedSummary,
     MemberLoader,
     MemoryInjectionBlockedError,
     MemoryStore,
     MemoryWriteResult,
-    OriginStanding,
-    SupersedeTargetChangedError,
+    RetireRefusal,
+    RetireResult,
+    SummaryRewriteOutcome,
+    SupersedeResult,
     is_mixed_origin,
+    may_retire,
     origin_standing,
-    refuse_if_outranked,
     scan_memory_content,
     split_blocked,
     summary_fields,
+    tier_of,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.persistence.models import (
@@ -43,7 +49,7 @@ from expert_work.persistence.models import (
     MemoryItemRow,
 )
 from expert_work.protocol import MemoryItem
-from expert_work.protocol.memory_item import MemoryOrigin, effective_origin
+from expert_work.protocol.memory_item import EffectiveOrigin, MemoryOrigin, effective_origin
 
 #: Postgres ``tsvector`` configuration — ``simple`` so app-side jieba
 #: segmentation is what controls tokenization (mirrors J.5 knowledge).
@@ -173,14 +179,184 @@ def _member_loader(session: AsyncSession, tenant_id: UUID, user_id: UUID) -> Mem
     return load
 
 
-async def _refuse_if_outranked(
-    session: AsyncSession, row: MemoryItemRow, candidate: OriginStanding | None
-) -> None:
-    """B-300 redesign §6.3 — raise when the target outranks the candidate (the row is
-    already locked by the caller, so its source and confidence are the current ones;
-    members are read, not locked)."""
-    await refuse_if_outranked(
-        _row_to_item(row), _member_loader(session, row.tenant_id, row.user_id), candidate
+def _owned(tenant_id: UUID, user_id: UUID) -> list[ColumnElement[bool]]:
+    return [MemoryItemRow.tenant_id == tenant_id, MemoryItemRow.user_id == user_id]
+
+
+async def _lock_rows(
+    session: AsyncSession, tenant_id: UUID, user_id: UUID, ids: Sequence[UUID]
+) -> dict[UUID, MemoryItemRow]:
+    """Lock this user's rows in id order (the order ``write_consolidated`` and
+    ``delete_all_for_user`` lock in, so the writers cannot deadlock each other)."""
+    if not ids:
+        return {}
+    rows = (
+        (
+            await session.execute(
+                select(MemoryItemRow)
+                .where(MemoryItemRow.id.in_(list(ids)), *_owned(tenant_id, user_id))
+                .order_by(MemoryItemRow.id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {row.id: row for row in rows}
+
+
+async def _current_ids(
+    session: AsyncSession, tenant_id: UUID, user_id: UUID, ids: Sequence[UUID]
+) -> set[UUID]:
+    """Which of ``ids`` are currently valid — the same predicate recall uses."""
+    if not ids:
+        return set()
+    found = await session.execute(
+        select(MemoryItemRow.id).where(
+            MemoryItemRow.id.in_(list(ids)),
+            *_owned(tenant_id, user_id),
+            MemoryItemRow.deleted_at.is_(None),
+            *_retrieve_filter(),
+        )
+    )
+    return set(found.scalars().all())
+
+
+async def _judge_retirements(
+    session: AsyncSession,
+    locked: Mapping[UUID, MemoryItemRow],
+    current: set[UUID],
+    old_ids: Sequence[UUID],
+    candidate: EffectiveOrigin,
+    identical: frozenset[UUID],
+) -> tuple[list[MemoryItemRow], dict[UUID, RetireRefusal]]:
+    """B-300 redesign §7.8 — each target re-judged on its locked row (members are read,
+    not locked): which may be retired, and why the others may not."""
+    passed: list[MemoryItemRow] = []
+    refused: dict[UUID, RetireRefusal] = {}
+    for old_id in sorted(dict.fromkeys(old_ids)):
+        row = locked.get(old_id)
+        if row is None or old_id not in current:
+            refused[old_id] = "gone"
+            continue
+        tier = await origin_standing(
+            _row_to_item(row), _member_loader(session, row.tenant_id, row.user_id)
+        )
+        reason = may_retire(
+            candidate,
+            tier,
+            target_is_summary=bool(row.consolidated_from),
+            identical=old_id in identical,
+        )
+        if reason is None:
+            passed.append(row)
+        else:
+            refused[old_id] = reason
+    return passed, refused
+
+
+def _dedup_slot(
+    tenant_id: UUID, user_id: UUID, content_hash: str, agent_name: str | None
+) -> list[ColumnElement[bool]]:
+    """The predicate of ``memory_item_dedup_uniq`` (migration 0127): tenant + user +
+    content hash + agent name among live rows; kind and origin are not part of it."""
+    return [
+        *_owned(tenant_id, user_id),
+        MemoryItemRow.content_hash == content_hash,
+        func.coalesce(MemoryItemRow.agent_name, "") == (agent_name or ""),
+        MemoryItemRow.deleted_at.is_(None),
+        MemoryItemRow.invalid_at.is_(None),
+        MemoryItemRow.expired_at.is_(None),
+    ]
+
+
+async def _dedup_holder_id(
+    session: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    content_hash: str,
+    agent_name: str | None,
+) -> UUID | None:
+    """The id of the row occupying a dedup slot, read without a lock — so the caller can
+    put it into its one id-ordered lock (:func:`_lock_rows`) with everything else."""
+    slot = _dedup_slot(tenant_id, user_id, content_hash, agent_name)
+    found: UUID | None = (await session.execute(select(MemoryItemRow.id).where(*slot))).scalar()
+    return found
+
+
+async def _successor_ids(
+    session: AsyncSession, tenant_id: UUID, user_id: UUID, ids: Sequence[UUID]
+) -> dict[UUID, UUID]:
+    """``id → superseded_by`` for the rows among ``ids`` that were replaced, read without a
+    lock (same purpose as :func:`_dedup_holder_id`: lock everything once, in id order)."""
+    if not ids:
+        return {}
+    rows = await session.execute(
+        select(MemoryItemRow.id, MemoryItemRow.superseded_by).where(
+            MemoryItemRow.id.in_(list(ids)),
+            *_owned(tenant_id, user_id),
+            MemoryItemRow.superseded_by.is_not(None),
+        )
+    )
+    return {row[0]: row[1] for row in rows.all()}
+
+
+async def _lock_dedup_clash(
+    session: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    content_hash: str,
+    agent_name: str | None,
+) -> MemoryItemRow | None:
+    """The row occupying a dedup slot, re-read under a lock. Callers lock the holder they
+    pre-read (:func:`_dedup_holder_id`) in id order first, so this takes a new lock only
+    when another row slipped into the slot in between.
+
+    **Occupying the slot is not the same as being recallable**: the index only looks at
+    deleted / superseded / expired, so a member folded into a summary still holds it.
+    Callers must check the row against the recall predicate (:func:`_current_ids`) before
+    treating the sentence as "already there"."""
+    return (
+        await session.execute(
+            select(MemoryItemRow)
+            .where(*_dedup_slot(tenant_id, user_id, content_hash, agent_name))
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+
+
+def _new_row(new_item: MemoryItem, tenant_id: UUID, user_id: UUID, now: datetime) -> MemoryItemRow:
+    """The row :meth:`SqlMemoryStore.supersede` / ``write_history`` insert for a candidate."""
+    content = new_item.content
+    return MemoryItemRow(
+        id=new_item.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        kind=new_item.kind,
+        agent_name=new_item.agent_name,
+        content=content,
+        content_hash=new_item.content_hash or hash_content(content),
+        embedding=list(new_item.embedding),
+        importance=new_item.importance,
+        confidence=new_item.confidence,
+        source_thread_id=new_item.source_thread_id,
+        source_run_id=new_item.source_run_id,
+        content_tsv=func.to_tsvector(_TS_CONFIG, tokenize_for_search(content)),
+        created_at=now,
+        last_used_at=now,
+        valid_at=now,
+        expected_valid_days=new_item.expected_valid_days,
+        origin=new_item.origin,
+        embedding_model=new_item.embedding_model,
+        # B-300 redesign §9.2 — the new row carries the candidate's evidence
+        # pointer and event date (and, like the in-memory store, the rest of it).
+        evidence_message_id=new_item.evidence_message_id,
+        evidence_message_index=new_item.evidence_message_index,
+        occurred_on=new_item.occurred_on,
+        # Only user-side rows carry a confirmed date.
+        confirmed_at=new_item.confirmed_at
+        if effective_origin(new_item) in USER_SIDE_ORIGINS
+        else None,
     )
 
 
@@ -190,6 +366,135 @@ _USER_SIDE_ROW = or_(
     MemoryItemRow.confidence >= 1.0,
     MemoryItemRow.origin.in_(sorted(USER_SIDE_ORIGINS - {"user_corrected"})),
 )
+
+
+async def _still_holds(session: AsyncSession, tenant_id: UUID, user_id: UUID, row_id: UUID) -> bool:
+    """The row still says something true: not deleted, superseded, expired or archived.
+    Unlike the recall predicate, a row folded into a summary still counts — it is only no
+    longer recalled on its own (复审 L-1: the statement a summary was flagged by may be
+    folded by the consolidation sweep before the rewrite runs)."""
+    found = await session.execute(
+        select(MemoryItemRow.id).where(
+            MemoryItemRow.id == row_id,
+            *_owned(tenant_id, user_id),
+            MemoryItemRow.deleted_at.is_(None),
+            MemoryItemRow.status != "archived",
+            MemoryItemRow.invalid_at.is_(None),
+            or_(MemoryItemRow.expired_at.is_(None), MemoryItemRow.expired_at > func.now()),
+        )
+    )
+    return found.scalar() is not None
+
+
+def _said_order(item: MemoryItem) -> tuple[datetime, UUID]:
+    """When a statement was said: the later of its record time and its last restatement."""
+    stamps = [ts for ts in (item.created_at, item.confirmed_at) if ts is not None]
+    return (max(stamps) if stamps else datetime.min.replace(tzinfo=UTC), item.id)
+
+
+async def _valid_statement(
+    session: AsyncSession, tenant_id: UUID, user_id: UUID, start: UUID
+) -> MemoryItemRow | None:
+    """``start``, or — when it was replaced — the row at the end of its ``superseded_by``
+    chain, as long as that row still holds (:func:`_still_holds`; a row folded into a
+    summary does) and is on the user's side; at most :data:`MAX_STATEMENT_HOPS` steps
+    (also the guard against a loop). A deleted row, or a chain that does not get there,
+    gives ``None``."""
+    wanted: UUID | None = start
+    for _hop in range(MAX_STATEMENT_HOPS + 1):
+        if wanted is None:
+            return None
+        row = (
+            await session.execute(
+                select(MemoryItemRow).where(
+                    MemoryItemRow.id == wanted,
+                    *_owned(tenant_id, user_id),
+                    MemoryItemRow.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        user_side = effective_origin(_row_to_item(row)) in USER_SIDE_ORIGINS
+        if user_side and await _still_holds(session, tenant_id, user_id, row.id):
+            return row
+        wanted = row.superseded_by
+    return None
+
+
+async def _later_statements(session: AsyncSession, summary: MemoryItemRow) -> list[MemoryItem]:
+    """B-300 redesign §7.12 — what the user said that a summary is to be rewritten by,
+    in the order it was said (record time or last restatement, whichever is later — so the
+    prompt reads in time order and "nothing left" links to the latest): user-side rows
+    whose ``supersedes`` is the summary and that were recorded or last restated after it,
+    plus the row the summary's own ``supersedes`` names (the basis recorded when it was
+    flagged — it reaches a summary a statement could not link to itself: the second
+    summary one sentence denied, or one flagged by a candidate that was not written). A
+    statement that later ones replaced is followed along ``superseded_by`` to a
+    user-side successor that still holds — a row folded into a summary does
+    (:func:`_valid_statement`); a deleted one, or one without such a successor,
+    contributes nothing."""
+    tenant_id, user_id = summary.tenant_id, summary.user_id
+    said_at = func.greatest(MemoryItemRow.created_at, MemoryItemRow.confirmed_at)
+    linked = (
+        (
+            await session.execute(
+                select(MemoryItemRow.id)
+                .where(
+                    *_owned(tenant_id, user_id),
+                    MemoryItemRow.supersedes == summary.id,
+                    MemoryItemRow.deleted_at.is_(None),
+                    said_at > summary.created_at,
+                    _USER_SIDE_ROW,
+                )
+                .order_by(MemoryItemRow.created_at.asc(), MemoryItemRow.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    starts = [*linked, *([summary.supersedes] if summary.supersedes is not None else [])]
+    found: dict[UUID, MemoryItem] = {}
+    for start in starts:
+        row = await _valid_statement(session, tenant_id, user_id, start)
+        if row is not None:
+            found.setdefault(row.id, _row_to_item(row))
+    return sorted(found.values(), key=_said_order)
+
+
+async def _flag_summaries(
+    session: AsyncSession,
+    tenant_id: UUID,
+    user_id: UUID,
+    ids: Sequence[UUID],
+    locked: Mapping[UUID, MemoryItemRow],
+    current: set[UUID],
+    candidate: EffectiveOrigin,
+    now: datetime,
+    basis_id: UUID,
+) -> list[UUID]:
+    """B-300 redesign §7.12 step 1 — mark each summary "to rewrite" and record on it the
+    row to rewrite by (its own ``supersedes``); one already rewritten
+    is followed one step along ``superseded_by`` to the summary that replaced it. Takes
+    no lock of its own: the caller locked the summaries and their successors
+    (:func:`_successor_ids`) in id order."""
+    flagged: list[UUID] = []
+    if candidate not in USER_SIDE_ORIGINS:
+        return flagged  # only the user's own later statement triggers a rewrite
+    for summary_id in dict.fromkeys(ids):
+        row = locked.get(summary_id)
+        if row is not None and summary_id not in current:
+            successor = row.superseded_by
+            row = locked.get(successor) if successor in current else None
+        if row is None or row.status != "consolidated" or not row.consolidated_from:
+            continue
+        tier = await origin_standing(_row_to_item(row), _member_loader(session, tenant_id, user_id))
+        if may_retire(candidate, tier, target_is_summary=False) is not None:
+            continue
+        row.review_flagged_at = now
+        row.supersedes = basis_id
+        flagged.append(row.id)
+    return flagged
 
 
 class SqlMemoryStore(MemoryStore):
@@ -618,80 +923,220 @@ class SqlMemoryStore(MemoryStore):
         *,
         tenant_id: UUID,
         user_id: UUID,
-        old_id: UUID,
         new_item: MemoryItem,
-        candidate_standing: OriginStanding | None = None,
+        old_ids: Sequence[UUID] = (),
+        identical_ids: Sequence[UUID] = (),
+        flag_summary_ids: Sequence[UUID] = (),
+        link_id: UUID | None = None,
+    ) -> SupersedeResult:
+        hit = scan_memory_content(new_item.id, new_item.content)
+        if hit is not None:
+            raise MemoryInjectionBlockedError([hit])
+        now = datetime.now(UTC)
+        candidate = effective_origin(new_item)
+        content_hash = new_item.content_hash or hash_content(new_item.content)
+        async with self._sf() as session:
+            # One id-ordered lock over everything this call may change: the targets,
+            # the summaries to flag, and the row already holding this content (found
+            # unlocked first, re-read under the lock below).
+            holder = await _dedup_holder_id(
+                session, tenant_id, user_id, content_hash, new_item.agent_name
+            )
+            successors = await _successor_ids(session, tenant_id, user_id, flag_summary_ids)
+            wanted = {*old_ids, *flag_summary_ids, *successors.values()}
+            if holder is not None:
+                wanted.add(holder)
+            locked = await _lock_rows(session, tenant_id, user_id, sorted(wanted))
+            current = await _current_ids(session, tenant_id, user_id, sorted(wanted))
+            passed, refused = await _judge_retirements(
+                session, locked, current, old_ids, candidate, frozenset(identical_ids)
+            )
+            retired = [row.id for row in passed]
+            clash = await _lock_dedup_clash(
+                session, tenant_id, user_id, content_hash, new_item.agent_name
+            )
+            replaced: UUID | None = None
+            freed: MemoryItemRow | None = None
+            if clash is not None and clash.id in retired:
+                clash = None  # the row holding this content is one being retired
+            if clash is not None and not await _current_ids(
+                session, tenant_id, user_id, [clash.id]
+            ):
+                # 审查 H-1 —— the holder occupies the index but is not recalled (a member
+                # folded into a summary): the sentence is NOT "already there". It gives up
+                # the slot and the new row is inserted as usual.
+                freed, clash = clash, None
+            if clash is not None:
+                tier = await origin_standing(
+                    _row_to_item(clash), _member_loader(session, tenant_id, user_id)
+                )
+                if tier >= tier_of(candidate):
+                    # The sentence is already there, said by a source at least as strong:
+                    # nothing inserted, the retired rows link to it.
+                    for row in passed:
+                        row.invalid_at = now
+                        row.superseded_by = clash.id
+                    kept = _row_to_item(clash)
+                    await session.commit()
+                    return SupersedeResult(
+                        item=kept, inserted=False, retired=tuple(retired), refused=refused
+                    )
+                replaced = clash.id
+                passed = [*passed, clash]
+                retired = [*retired, clash.id]
+            for row in passed:
+                row.invalid_at = now
+                row.superseded_by = new_item.id
+            if freed is not None:
+                freed.invalid_at = now
+                freed.superseded_by = new_item.id
+            # The partial unique index is checked per statement, so the rows leaving it
+            # must be written before the new row enters. Flushed explicitly so this does
+            # not rest on SQLAlchemy's internal ordering of UPDATEs and INSERTs within one
+            # flush, which is not a documented contract (no behaviour test can pin it).
+            await session.flush()
+            flagged = await _flag_summaries(
+                session,
+                tenant_id,
+                user_id,
+                flag_summary_ids,
+                locked,
+                current,
+                candidate,
+                now,
+                new_item.id,
+            )
+            coexisting = next((i for i, r in refused.items() if r == "confirmed_vs_stated"), None)
+            linked: UUID | None = None
+            if link_id is not None:
+                linked = (
+                    await session.execute(
+                        select(MemoryItemRow.id).where(
+                            MemoryItemRow.id == link_id, *_owned(tenant_id, user_id)
+                        )
+                    )
+                ).scalar()
+            new_row = _new_row(new_item, tenant_id, user_id, now)
+            new_row.supersedes = next(
+                (i for i in (*flagged[:1], *retired[:1], coexisting, linked) if i), None
+            )
+            session.add(new_row)
+            await session.commit()
+            await session.refresh(new_row)
+            return SupersedeResult(
+                item=_row_to_item(new_row),
+                retired=tuple(retired),
+                refused=refused,
+                flagged=tuple(flagged),
+                collision_replaced=replaced,
+            )
+
+    async def retire(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        old_ids: Sequence[UUID],
+        anchor_id: UUID,
+        candidate_origin: EffectiveOrigin,
+    ) -> RetireResult:
+        now = datetime.now(UTC)
+        targets = [i for i in old_ids if i != anchor_id]
+        async with self._sf() as session:
+            wanted = sorted({*targets, anchor_id})
+            locked = await _lock_rows(session, tenant_id, user_id, wanted)
+            current = await _current_ids(session, tenant_id, user_id, wanted)
+            anchor = locked.get(anchor_id)
+            if anchor is None or anchor_id not in current:
+                return RetireResult(anchor_live=False)
+            tier = await origin_standing(
+                _row_to_item(anchor), _member_loader(session, tenant_id, user_id)
+            )
+            if tier < tier_of(candidate_origin):
+                return RetireResult(anchor_live=False)
+            passed, refused = await _judge_retirements(
+                session, locked, current, targets, candidate_origin, frozenset()
+            )
+            for row in passed:
+                row.invalid_at = now
+                row.superseded_by = anchor_id
+            await session.commit()
+        return RetireResult(
+            anchor_live=True, retired=tuple(row.id for row in passed), refused=refused
+        )
+
+    async def write_history(
+        self, *, tenant_id: UUID, user_id: UUID, anchor_id: UUID, new_item: MemoryItem
     ) -> MemoryItem | None:
         hit = scan_memory_content(new_item.id, new_item.content)
         if hit is not None:
             raise MemoryInjectionBlockedError([hit])
         now = datetime.now(UTC)
         async with self._sf() as session:
-            target: list[ColumnElement[bool]] = [
-                MemoryItemRow.id == old_id,
-                MemoryItemRow.tenant_id == tenant_id,
-                MemoryItemRow.user_id == user_id,
-            ]
-            # B-300 D1 (other direction) — lock the target: a summary folding it
-            # (``write_consolidated``) either commits first and is seen below, or
-            # waits for this commit.
-            old = (
-                await session.execute(
-                    select(MemoryItemRow)
-                    .where(*target)
-                    .order_by(MemoryItemRow.id)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            if old is None or old.deleted_at is not None or old.invalid_at is not None:
+            await _lock_rows(session, tenant_id, user_id, [anchor_id])
+            if anchor_id not in await _current_ids(session, tenant_id, user_id, [anchor_id]):
                 return None
-            # The same "currently valid" predicate recall uses.
-            current = (
-                await session.execute(select(func.count()).where(*target, *_retrieve_filter()))
-            ).scalar_one()
-            if current != 1:
-                msg = f"memory item {old_id} is no longer current; not superseding it"
-                raise SupersedeTargetChangedError(msg)
-            # B-300 review MEDIUM-1 / MEDIUM-3 — re-judged on the locked row.
-            await _refuse_if_outranked(session, old, candidate_standing)
-            old.invalid_at = now
-            old.superseded_by = new_item.id
-            content = new_item.content
-            new_row = MemoryItemRow(
-                id=new_item.id,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                kind=new_item.kind,
-                agent_name=new_item.agent_name,
-                content=content,
-                content_hash=new_item.content_hash or hash_content(content),
-                embedding=list(new_item.embedding),
-                importance=new_item.importance,
-                confidence=new_item.confidence,
-                source_thread_id=new_item.source_thread_id,
-                source_run_id=new_item.source_run_id,
-                content_tsv=func.to_tsvector(_TS_CONFIG, tokenize_for_search(content)),
-                created_at=now,
-                last_used_at=now,
-                valid_at=now,
-                supersedes=old_id,
-                expected_valid_days=new_item.expected_valid_days,
-                origin=new_item.origin,
-                embedding_model=new_item.embedding_model,
-                # B-300 redesign §9.2 — the new row carries the candidate's evidence
-                # pointer and event date (and, like the in-memory store, the rest of it).
-                evidence_message_id=new_item.evidence_message_id,
-                evidence_message_index=new_item.evidence_message_index,
-                occurred_on=new_item.occurred_on,
-                # Only user-side rows carry a confirmed date.
-                confirmed_at=new_item.confirmed_at
-                if effective_origin(new_item) in USER_SIDE_ORIGINS
-                else None,
+            # A retried job must not add the same history row again.
+            content_hash = new_item.content_hash or hash_content(new_item.content)
+            existing = (
+                (
+                    await session.execute(
+                        select(MemoryItemRow)
+                        .where(
+                            *_owned(tenant_id, user_id),
+                            MemoryItemRow.superseded_by == anchor_id,
+                            MemoryItemRow.invalid_at.is_not(None),
+                            MemoryItemRow.deleted_at.is_(None),
+                            MemoryItemRow.content_hash == content_hash,
+                            func.coalesce(MemoryItemRow.agent_name, "")
+                            == (new_item.agent_name or ""),
+                        )
+                        .order_by(MemoryItemRow.created_at.asc(), MemoryItemRow.id.asc())
+                        .limit(1)
+                    )
+                )
+                .scalars()
+                .first()
             )
+            if existing is not None:
+                return _row_to_item(existing)
+            new_row = _new_row(new_item, tenant_id, user_id, now)
+            # Already superseded when it lands: it never enters the dedup index.
+            new_row.invalid_at = now
+            new_row.superseded_by = anchor_id
             session.add(new_row)
             await session.commit()
             await session.refresh(new_row)
             return _row_to_item(new_row)
+
+    async def flag_summary(
+        self, *, tenant_id: UUID, user_id: UUID, summary_id: UUID, statement_id: UUID
+    ) -> UUID | None:
+        now = datetime.now(UTC)
+        async with self._sf() as session:
+            successors = await _successor_ids(session, tenant_id, user_id, [summary_id])
+            wanted = sorted({summary_id, statement_id, *successors.values()})
+            locked = await _lock_rows(session, tenant_id, user_id, wanted)
+            current = await _current_ids(session, tenant_id, user_id, wanted)
+            statement = locked.get(statement_id)
+            if statement is None or statement_id not in current:
+                return None
+            origin = effective_origin(_row_to_item(statement))
+            flagged = await _flag_summaries(
+                session,
+                tenant_id,
+                user_id,
+                [summary_id],
+                locked,
+                current,
+                origin,
+                now,
+                statement_id,
+            )
+            if not flagged:
+                return None
+            await session.commit()
+            return flagged[0]
 
     async def expire(
         self,
@@ -699,12 +1144,10 @@ class SqlMemoryStore(MemoryStore):
         tenant_id: UUID,
         user_id: UUID,
         memory_id: UUID,
-        candidate_standing: OriginStanding | None = None,
     ) -> bool:
         now = datetime.now(UTC)
         async with self._sf() as session:
-            # B-300 review MEDIUM-1 — lock the one target row (single-row lock, so
-            # PR A's id-ordered locking holds) and re-judge it before changing it.
+            # B-300 review MEDIUM-1 — lock the one target row before changing it.
             row = (
                 await session.execute(
                     select(MemoryItemRow)
@@ -719,14 +1162,13 @@ class SqlMemoryStore(MemoryStore):
             ).scalar_one_or_none()
             if row is None:
                 return False
-            await _refuse_if_outranked(session, row, candidate_standing)
             row.expired_at = now
             await session.commit()
         return True
 
     async def origin_standing(
         self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID
-    ) -> OriginStanding | None:
+    ) -> int | None:
         async with self._sf() as session:
             row = (
                 await session.execute(
@@ -1188,6 +1630,157 @@ class SqlMemoryStore(MemoryStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_item(r) for r in rows]
+
+    async def list_flagged_summaries(
+        self, *, tenant_id: UUID, user_id: UUID, limit: int
+    ) -> list[FlaggedSummary]:
+        stmt = (
+            select(MemoryItemRow)
+            .where(
+                *_owned(tenant_id, user_id),
+                MemoryItemRow.deleted_at.is_(None),
+                MemoryItemRow.status == "consolidated",
+                MemoryItemRow.review_flagged_at.is_not(None),
+                *_retrieve_filter(),
+            )
+            .order_by(MemoryItemRow.review_flagged_at.asc(), MemoryItemRow.id.asc())
+            .limit(limit)
+        )
+        out: list[FlaggedSummary] = []
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+            load = _member_loader(session, tenant_id, user_id)
+            for row in rows:
+                summary = _row_to_item(row)
+                members = await load(list(summary.consolidated_from))
+                statements = await _later_statements(session, row)
+                out.append(FlaggedSummary(summary, tuple(members), tuple(statements)))
+        return out
+
+    async def rewrite_summary(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        summary_id: UUID,
+        flagged_at: datetime,
+        content: str | None,
+        embedding: Sequence[float] = (),
+        embedding_model: str | None = None,
+        unchanged: bool = False,
+    ) -> SummaryRewriteOutcome:
+        new_id = uuid4()
+        if content is not None and not unchanged:
+            hit = scan_memory_content(new_id, content)
+            if hit is not None:
+                raise MemoryInjectionBlockedError([hit])
+        now = datetime.now(UTC)
+        storing = content is not None and not unchanged
+        content_hash = hash_content(content) if content is not None else ""
+        async with self._sf() as session:
+            holder = (
+                await _dedup_holder_id(session, tenant_id, user_id, content_hash, None)
+                if storing
+                else None
+            )
+            wanted = sorted({summary_id, *([holder] if holder is not None else [])})
+            locked = await _lock_rows(session, tenant_id, user_id, wanted)
+            old = locked.get(summary_id)
+            if (
+                old is None
+                or old.status != "consolidated"
+                or old.review_flagged_at != flagged_at
+                or summary_id not in await _current_ids(session, tenant_id, user_id, [summary_id])
+            ):
+                return "stale"
+            load = _member_loader(session, tenant_id, user_id)
+            old_item = _row_to_item(old)
+            # 终审 L-2 —— a member corrected in the console since the flag was set.
+            if await origin_standing(old_item, load) >= FAIL_CLOSED_TIER:
+                old.review_flagged_at = None
+                await session.commit()
+                return "corrected_member"
+            if unchanged:
+                old.review_flagged_at = None
+                await session.commit()
+                return "unchanged"
+            if content is None:
+                statements = await _later_statements(session, old)
+                if not statements:
+                    # Nothing to link the retired summary to: change nothing.
+                    return "stale"
+                old.invalid_at = now
+                old.review_flagged_at = None
+                old.superseded_by = statements[-1].id
+                await session.commit()
+                return "emptied"
+            old.invalid_at = now
+            old.review_flagged_at = None
+            clash = await _lock_dedup_clash(session, tenant_id, user_id, content_hash, None)
+            if clash is not None and clash.id != old.id:
+                if await _current_ids(session, tenant_id, user_id, [clash.id]):
+                    old.superseded_by = clash.id
+                    await session.commit()
+                    return "collided"
+                # 审查 H-2 —— the holder is not recalled (typically one of this summary's
+                # own members): it gives up the slot and the new summary is stored.
+                clash.invalid_at = now
+                clash.superseded_by = new_id
+            old.superseded_by = new_id
+            # The old summary (and a freed holder) leave the dedup index before the new
+            # one enters — flushed explicitly, see :meth:`supersede`.
+            await session.flush()
+            members = await load(list(old_item.consolidated_from))
+            inherited = summary_fields(members) if members else None
+            session.add(
+                MemoryItemRow(
+                    id=new_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    kind="fact",
+                    content=content,
+                    content_hash=content_hash,
+                    embedding=list(embedding),
+                    created_at=now,
+                    last_used_at=now,
+                    valid_at=now,
+                    content_tsv=func.to_tsvector(_TS_CONFIG, tokenize_for_search(content)),
+                    status="consolidated",
+                    consolidated_from=[str(sid) for sid in old_item.consolidated_from],
+                    source_thread_id=inherited.source_thread_id
+                    if inherited
+                    else old.source_thread_id,
+                    source_run_id=inherited.source_run_id if inherited else old.source_run_id,
+                    importance=inherited.importance if inherited else old.importance,
+                    confidence=inherited.confidence if inherited else old.confidence,
+                    origin=inherited.origin if inherited else old.origin,
+                    embedding_model=embedding_model,
+                )
+            )
+            await session.execute(
+                update(MemoryItemRow)
+                .where(*_owned(tenant_id, user_id), MemoryItemRow.consolidated_into == summary_id)
+                .values(consolidated_into=new_id)
+            )
+            await session.commit()
+        return "rewritten"
+
+    async def defer_summary_rewrite(
+        self, *, tenant_id: UUID, user_id: UUID, summary_id: UUID
+    ) -> bool:
+        stmt = (
+            update(MemoryItemRow)
+            .where(
+                MemoryItemRow.id == summary_id,
+                *_owned(tenant_id, user_id),
+                MemoryItemRow.deleted_at.is_(None),
+            )
+            .values(last_reviewed_at=datetime.now(UTC))
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
 
     async def list_due_for_review(
         self,

@@ -279,7 +279,8 @@ async def test_prompts_carry_the_design_text() -> None:
         "conversation, one per line, oldest first, each starting with its number in brackets.\n"
         "The other side of the conversation is not shown."
     )
-    assert "- A question, a guess, a hypothetical, or a repeat of what someone else said" in first
+    assert "a guess about something that is not the user's own, or a" in first
+    assert "record it and keep the doubt in the content." in first
     # 打分、有效天数、JSON 格式沿用现有文字;is_correction 一句用户 11-14 改过(设计 §4.2)。
     assert '"expected_valid_days"' in first
     assert '"is_correction": true ONLY when the same message itself says' in first

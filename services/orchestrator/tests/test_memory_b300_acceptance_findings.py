@@ -14,9 +14,11 @@
    否则按记录时间);② 第二次的 ``user_confirmed`` 候选被模型判成「重复」一条证据消息相同、事件
    日期不冲突的用户一方记忆 → 就是同一句话的重述:NOOP,不刷新确认日期,计数
    ``noop_same_evidence``。判「更新」的照常走(用户 11-16「只拦真重复」,第 4 节)。
-3. 用户 2026-11-16「被拦时与旧的并存」(run ``8e5a1f0d``):用户确认的候选被层级拦下、又不是更正
-   → 以前丢弃(猫名「蛋黄」丢了,「还没起名字」留着);改为按新增与旧的并存,计数
-   ``blocked_update_added_confirmed``。来自助手的候选照旧丢弃。
+3. run ``8e5a1f0d``:用户确认的候选要改用户说的那条 —— 最早被丢弃(猫名「蛋黄」丢了,「还没起名字」
+   留着),第 8 版改成并存。第 9 版「写和退分开」(设计 §7.3)之后不再有「被拦」:候选一定写下,旧行
+   退不退另判 —— 用户确认默认不退用户说的(两条都有效、新行连着旧行,计数
+   ``retire_refused_confirmed_vs_stated``);用户确认之间、用户说的之间按先后退,不看置信度;来自
+   助手的候选也写下(标「来自助手」),只是退不掉用户一方的。
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ from expert_work.protocol import MemoryItem
 from expert_work.runtime.cancellation import CancellationToken
 from orchestrator.graph_builder import memory as memory_module
 from orchestrator.graph_builder import memory_lines
-from orchestrator.graph_builder.memory import _Candidate, _reconcile_and_apply
+from orchestrator.graph_builder.memory import _Candidate, _Decision, _reconcile_and_apply
 from orchestrator.graph_builder.memory_lines import ExtractionLine
 from orchestrator.graph_builder.memory_slice import SegmentStart
 
@@ -138,6 +140,11 @@ def _ops(*rows: tuple[int, str, str | None]) -> str:
     )
 
 
+def _lists(**lists: list[str]) -> str:
+    """一条候选:写下(``ADD``),并给出两张清单(``replaces`` / ``restates``)。"""
+    return json.dumps({"ops": [{"index": 0, "op": "ADD", **lists}]})
+
+
 @dataclass
 class _RoutingLLM:
     """第一次 / 第二次提炼按系统提示词分;其余是去重合并,依次给 ``ops``(不够就判全部新增)。"""
@@ -197,6 +204,21 @@ def _live(store: InMemoryMemoryStore) -> list[MemoryItem]:
     return [
         r for r in store._rows if r.invalid_at is None and r.expired_at is None and not r.deleted_at
     ]
+
+
+def _row(store: InMemoryMemoryStore, memory_id: UUID) -> MemoryItem:
+    return next(r for r in store._rows if r.id == memory_id)
+
+
+def _coexist_linked(store: InMemoryMemoryStore, old: MemoryItem, new: MemoryItem) -> bool:
+    """两条都有效,新行的 ``supersedes`` 连着旧行(旧行没作废)。"""
+    live = {r.id for r in _live(store)}
+    return {old.id, new.id} <= live and _row(store, new.id).supersedes == old.id
+
+
+def _retired_into(store: InMemoryMemoryStore, old: MemoryItem, new: MemoryItem) -> bool:
+    row = _row(store, old.id)
+    return row.invalid_at is not None and row.superseded_by == new.id
 
 
 # ─── 1. 上下文行不再被提炼(run 1fec5018 / 8051ac10)──────────────────────────────
@@ -341,8 +363,8 @@ async def test_another_fact_from_the_same_message_is_still_added() -> None:
 
 @pytest.mark.asyncio
 async def test_an_assistant_restatement_written_seconds_after_is_not_an_older_line() -> None:
-    """同一任务里:第二次的来自助手的候选「更新」第一段几秒前写下的用户说的。那一行(助手回复)
-    晚于目标的证据消息,不算更旧 → 走层级拦截、丢弃;以前被「更旧」改成新增,多出一条复述。"""
+    """同一任务里:第二次的来自助手的候选要替掉第一段几秒前写下的用户说的。那一行(助手回复)晚于
+    目标的证据消息,不算更旧;退不掉是因为来源(助手一方退不掉用户一方),候选自己照写。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     llm = _RoutingLLM(
@@ -350,13 +372,17 @@ async def test_an_assistant_restatement_written_seconds_after_is_not_an_older_li
         conversation_reply=_reply(
             {"kind": "fact", "content": "助手记下用户的猫叫蛋黄", "basis": "assistant", "turn": 4},
         ),
-        ops=[_ops((0, "UPDATE", "e0"))],
+        ops=[_lists(restates=["e0"])],
     )  # fmt: skip
     embeddings = {"用户的猫叫蛋黄": _E, "助手记下用户的猫叫蛋黄": _at(0.95)}
-    older, blocked = _count("refused_older_line"), _count("blocked_update_dropped")
+    older, refused = _count("retire_refused_older_line"), _count("retire_refused_assistant")
     await _flush(c, store, _named_the_cat(), llm, embeddings)
-    assert [r.content for r in _live(store)] == ["用户的猫叫蛋黄"]
-    assert (_count("refused_older_line"), _count("blocked_update_dropped")) == (older, blocked + 1)
+    rows = {r.content: r.origin for r in _live(store)}
+    assert rows == {"用户的猫叫蛋黄": "user_stated", "助手记下用户的猫叫蛋黄": "assistant_derived"}
+    assert (_count("retire_refused_older_line"), _count("retire_refused_assistant")) == (
+        older,
+        refused + 1,
+    )
 
 
 async def _reconcile(
@@ -401,6 +427,8 @@ class _FixedLLM:
 async def test_the_older_line_rule_reads_the_targets_evidence_time(
     evidence_at: datetime | None, same_thread: bool, applied: bool
 ) -> None:
+    """候选更旧 → 目标不退;候选照写,两条并存并连线(这里倒过来「用户确认退用户说的」过不了,
+    所以不是历史行)。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     target = c.mem(
@@ -413,17 +441,20 @@ async def test_the_older_line_rule_reads_the_targets_evidence_time(
     times = {} if evidence_at is None else {"m1": evidence_at}
     result = await _reconcile(
         store,
-        _FixedLLM(_ops((0, "UPDATE", "e0"))),
+        _FixedLLM(_lists(restates=["e0"])),
         _Candidate(cand, line_at=_T0 + timedelta(days=1), in_new_segment=True),
         times,
     )
-    assert result.superseded == (1 if applied else 0)
-    assert [m.id for m in result.direct] == ([] if applied else [cand.id])
+    assert (result.superseded, result.direct) == (1, [])
+    if applied:
+        assert _retired_into(store, target, cand)
+    else:
+        assert _coexist_linked(store, target, cand)
 
 
 @pytest.mark.asyncio
 async def test_a_later_restatement_still_counts_against_an_older_line() -> None:
-    """证据消息早,但用户之后又说过一遍(确认日期晚于候选那一行):仍算更旧,改为新增。"""
+    """证据消息早,但用户之后又说过一遍(确认日期晚于候选那一行):仍算更旧,目标不退。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     target = c.mem(
@@ -432,51 +463,57 @@ async def test_a_later_restatement_still_counts_against_an_older_line() -> None:
     )  # fmt: skip
     await store.write([target])
     cand = c.mem("the car is a red hatchback", origin="user_stated", confidence=0.9)
-    result = await _reconcile(
+    before = _count("retire_refused_older_line")
+    await _reconcile(
         store,
-        _FixedLLM(_ops((0, "UPDATE", "e0"))),
+        _FixedLLM(_lists(restates=["e0"])),
         _Candidate(cand, line_at=_T0 + timedelta(days=1), in_new_segment=True),
         {"m1": _T0},
     )
-    assert (result.superseded, [m.id for m in result.direct]) == (0, [cand.id])
+    assert _coexist_linked(store, target, cand)
+    assert _count("retire_refused_older_line") == before + 1
 
 
-# ─── 3. 被拦的用户确认与旧的并存(run 8e5a1f0d,用户 2026-11-16)────────────────────
+# ─── 3. 用户确认碰上已有记忆(run 8e5a1f0d;第 9 版:写和退分开)──────────────────────
 
 
 @pytest.mark.asyncio
-async def test_a_blocked_user_confirmed_update_is_added_alongside() -> None:
+async def test_a_user_confirmed_candidate_coexists_with_what_the_user_stated() -> None:
     """用户先说「猫还没起名字」(``user_stated``);后来同意了助手提的「蛋黄」(``user_confirmed``,
-    不是更正)。去重合并判「更新」,层级拦下 → 以前丢了「蛋黄」;现在与旧的并存。"""
+    不是更正)。最早「蛋黄」被丢;现在一定写下,用户说的那条默认不退,两条都有效并连线。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     old = c.mem("用户的猫还没起名字", _at(0.9), origin="user_stated", confidence=0.9)
     await store.write([old])
     cand = c.mem("用户的猫叫蛋黄", origin="user_confirmed", confidence=0.8)
-    before = _count("blocked_update_added_confirmed")
-    dropped = _count("blocked_update_dropped")
+    before = _count("retire_refused_confirmed_vs_stated")
     result = await _reconcile(
         store,
-        _FixedLLM(_ops((0, "UPDATE", "e0"))),
+        _FixedLLM(_lists(replaces=["e0"])),
         _Candidate(cand, line_at=_T0 + timedelta(days=1), in_new_segment=True),
     )
-    assert [m.id for m in result.direct] == [cand.id]
-    assert [r.id for r in _live(store)] == [old.id]  # 旧的不动(新的由调用方写)
-    assert _count("blocked_update_added_confirmed") == before + 1
-    assert _count("blocked_update_dropped") == dropped
+    assert (result.superseded, result.direct) == (1, [])
+    assert _coexist_linked(store, old, cand)
+    assert _count("retire_refused_confirmed_vs_stated") == before + 1
 
 
 @pytest.mark.asyncio
-async def test_a_blocked_assistant_update_is_still_dropped() -> None:
+async def test_an_assistant_candidate_is_written_and_does_not_retire_what_the_user_stated() -> None:
+    """用户 2026-11-16(§15 第 11 条 ①):助手的不同说法写下、标「来自助手」,退不掉用户说的。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     old = c.mem("用户的猫还没起名字", _at(0.9), origin="user_stated", confidence=0.9)
     await store.write([old])
     cand = c.mem("助手建议猫叫蛋黄", origin="assistant_derived", confidence=0.6)
-    before = _count("blocked_update_dropped")
-    result = await _reconcile(store, _FixedLLM(_ops((0, "UPDATE", "e0"))), _Candidate(cand))
-    assert result.direct == []
-    assert _count("blocked_update_dropped") == before + 1
+    before = _count("retire_refused_assistant")
+    result = await _reconcile(
+        store,
+        _FixedLLM(_lists(replaces=["e0"])),
+        _Candidate(cand, line_at=_T0 + timedelta(days=1), in_new_segment=True),
+    )
+    assert [m.id for m in result.direct] == [cand.id]  # 助手一方、什么都不退 → 走普通写入
+    assert [r.id for r in _live(store)] == [old.id]
+    assert _count("retire_refused_assistant") == before + 1
 
 
 @dataclass
@@ -496,112 +533,73 @@ class _CorrectingLLM:
             embedding=self.target.embedding,
             confidence=1.0,
         )
-        return AIMessage(content=_ops((0, "UPDATE", "e0")))
+        return AIMessage(content=_lists(replaces=["e0"]))
 
 
 @pytest.mark.asyncio
-async def test_a_user_confirmed_update_blocked_under_the_lock_is_added_alongside() -> None:
+async def test_a_target_corrected_meanwhile_is_kept_and_the_candidate_still_written() -> None:
     c = _Ctx()
     store = InMemoryMemoryStore()
     target = c.mem("猫的名字待定", _at(0.9), origin="assistant_derived", confidence=0.5)
     await store.write([target])
     cand = c.mem("用户的猫叫蛋黄", origin="user_confirmed", confidence=0.8)
-    before = _count("blocked_update_added_confirmed")
-    result = await _reconcile(store, _CorrectingLLM(store, target), _Candidate(cand))
-    assert [m.id for m in result.direct] == [cand.id]
-    assert [r.content for r in _live(store)] == ["corrected by the user"]
-    assert _count("blocked_update_added_confirmed") == before + 1
+    before = _count("retire_refused_corrected")
+    result = await _reconcile(
+        store,
+        _CorrectingLLM(store, target),
+        _Candidate(cand, line_at=_T0 + timedelta(days=1), in_new_segment=True),
+    )
+    assert (result.superseded, result.direct) == (1, [])
+    assert sorted(r.content for r in _live(store)) == ["corrected by the user", "用户的猫叫蛋黄"]
+    assert _count("retire_refused_corrected") == before + 1
 
 
 @pytest.mark.asyncio
-async def test_a_less_certain_user_confirmed_of_the_same_tier_is_added_alongside() -> None:
-    """审查 M-3(用户 11-16「也和旧的并存」):用户确认过猫叫蛋黄(0.8);后来又同意了助手提的
-    「布丁」,这次没那么确定(0.7),去重合并判「更新」→ 同层级、置信度更低被拦 —— 以前丢弃,
-    现在与旧的并存,计数 ``lower_confidence_update_added_confirmed``。重试时内容相同的不再多一行。"""
+async def test_a_later_user_confirmed_retires_the_earlier_one_whatever_the_confidence() -> None:
+    """用户确认过猫叫蛋黄(0.8);后来又同意了助手提的「布丁」,这次没那么确定(0.7)。第 8 版是
+    两条并存(``lower_confidence_update_added_confirmed``);第 9 版同为用户确认按先后:「布丁」
+    写下,「蛋黄」被退并连到它,置信度不参与。重试时内容相同的不再多一行。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     old = c.mem("用户的猫叫蛋黄", _at(0.9), origin="user_confirmed", confidence=0.8)
     await store.write([old])
     cand = c.mem("用户的猫叫布丁", origin="user_confirmed", confidence=0.7)
-    added, dropped = (
-        _count("lower_confidence_update_added_confirmed"),
-        _count("lower_confidence_update_dropped"),
+    retired = _count("retired")
+    result = await _reconcile(
+        store,
+        _FixedLLM(_lists(replaces=["e0"])),
+        _Candidate(cand, line_at=_T0 + timedelta(days=1), in_new_segment=True),
     )
-    result = await _reconcile(store, _FixedLLM(_ops((0, "UPDATE", "e0"))), _Candidate(cand))
-    assert [m.id for m in result.direct] == [cand.id]
-    assert _count("lower_confidence_update_added_confirmed") == added + 1
-    assert _count("lower_confidence_update_dropped") == dropped
-    await store.write(result.direct)
-    assert sorted(r.content for r in _live(store)) == ["用户的猫叫布丁", "用户的猫叫蛋黄"]
+    assert (result.superseded, result.direct) == (1, [])
+    assert _retired_into(store, old, cand)
+    assert [r.content for r in _live(store)] == ["用户的猫叫布丁"]
+    assert _count("retired") == retired + 1
 
     again = c.mem("用户的猫叫布丁", origin="user_confirmed", confidence=0.7)
-    retry = await _reconcile(store, _FixedLLM(_ops((0, "UPDATE", "e0"))), _Candidate(again))
-    assert retry.direct == []
-
-
-@pytest.mark.asyncio
-async def test_a_less_certain_user_stated_of_the_same_tier_is_still_dropped() -> None:
-    """只改用户确认的候选;用户说的候选同层级、置信度更低照旧丢弃。"""
-    c = _Ctx()
-    store = InMemoryMemoryStore()
-    old = c.mem("用户的猫叫蛋黄", _at(0.9), origin="user_stated", confidence=0.9)
-    await store.write([old])
-    cand = c.mem("用户的猫好像叫蛋黄", origin="user_stated", confidence=0.5)
-    before = _count("lower_confidence_update_dropped")
-    result = await _reconcile(store, _FixedLLM(_ops((0, "UPDATE", "e0"))), _Candidate(cand))
-    assert result.direct == []
-    assert _count("lower_confidence_update_dropped") == before + 1
-
-
-@dataclass
-class _MoreCertainMeanwhileLLM:
-    """判的那几秒里目标变得更确定(同层级):预判放行,锁里重判时被拦。"""
-
-    store: InMemoryMemoryStore
-    target: MemoryItem
-
-    async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
-        del messages, tools
-        await self.store.update_content(
-            tenant_id=self.target.tenant_id,
-            user_id=self.target.user_id,
-            memory_id=self.target.id,
-            content=self.target.content,
-            embedding=self.target.embedding,
-            confidence=0.8,
-        )
-        return AIMessage(content=_ops((0, "UPDATE", "e0")))
-
-
-@pytest.mark.asyncio
-async def test_a_less_certain_user_confirmed_blocked_under_the_lock_is_added_alongside() -> None:
-    c = _Ctx()
-    store = InMemoryMemoryStore()
-    target = c.mem("用户的猫叫蛋黄", _at(0.9), origin="user_confirmed", confidence=0.6)
-    await store.write([target])
-    cand = c.mem("用户的猫叫布丁", origin="user_confirmed", confidence=0.7)
-    before = _count("lower_confidence_update_added_confirmed")
-    result = await _reconcile(store, _MoreCertainMeanwhileLLM(store, target), _Candidate(cand))
-    assert ([m.id for m in result.direct], result.superseded) == ([cand.id], 0)
-    assert [r.content for r in _live(store)] == ["用户的猫叫蛋黄"]
-    assert _count("lower_confidence_update_added_confirmed") == before + 1
+    retry = await _reconcile(
+        store,
+        _FixedLLM(_lists(replaces=["e0"])),
+        _Candidate(again, line_at=_T0 + timedelta(days=1), in_new_segment=True),
+    )
+    assert (retry.superseded, retry.direct) == (0, [])
+    assert [r.content for r in _live(store)] == ["用户的猫叫布丁"]
 
 
 @pytest.mark.parametrize(
-    ("cand_origin", "target_origin", "op", "superseded", "direct"),
+    ("cand_origin", "target_origin", "retired"),
     [
-        # 用户说的候选、用户确认的目标:照常「更新」(升格),不算重述。
-        ("user_stated", "user_confirmed", "UPDATE", 1, False),
-        # 来自助手的目标不是用户一方:用户确认照常「更新」它。
-        ("user_confirmed", "assistant_derived", "UPDATE", 1, False),
-        # 来自助手的候选:走层级拦截(丢弃),不是重述。
-        ("assistant_derived", "user_stated", "UPDATE", 0, False),
+        # 用户说的候选、用户确认的目标:照常退(「用户后来自己说全了」),不算重述。
+        ("user_stated", "user_confirmed", True),
+        # 来自助手的目标不是用户一方:用户确认照常退它。
+        ("user_confirmed", "assistant_derived", True),
+        # 来自助手的候选:退不掉用户说的(来源),自己照写,不是重述。
+        ("assistant_derived", "user_stated", False),
     ],
     ids=["stated-on-confirmed", "confirmed-on-assistant", "assistant-on-stated"],
 )
 @pytest.mark.asyncio
 async def test_only_a_user_confirmed_on_a_user_side_row_is_a_same_message_restatement(
-    cand_origin: str, target_origin: str, op: str, superseded: int, direct: bool
+    cand_origin: str, target_origin: str, retired: bool
 ) -> None:
     c = _Ctx()
     store = InMemoryMemoryStore()
@@ -611,8 +609,15 @@ async def test_only_a_user_confirmed_on_a_user_side_row_is_a_same_message_restat
     await store.write([target])
     cand = c.mem("用户的猫名叫蛋黄", origin=cand_origin, confidence=0.6, evidence_message_id="u2")
     before = _count("noop_same_evidence")
-    result = await _reconcile(store, _FixedLLM(_ops((0, op, "e0"))), _Candidate(cand))
-    assert (result.superseded, bool(result.direct)) == (superseded, direct)
+    result = await _reconcile(
+        store,
+        _FixedLLM(_lists(restates=["e0"])),
+        _Candidate(cand, line_at=_T0, in_new_segment=True),
+        {"u2": _T0},
+    )
+    await store.write(result.direct)
+    assert cand.id in {r.id for r in _live(store)}
+    assert _retired_into(store, target, cand) is retired
     assert _count("noop_same_evidence") == before
 
 
@@ -631,35 +636,49 @@ async def test_a_same_message_noop_outside_recall_scope_is_still_written() -> No
         "用户的猫叫蛋黄", origin="user_confirmed", confidence=0.8, evidence_message_id="u2"
     )
     result = await _reconcile(store, _FixedLLM(_ops((0, "NOOP", "e0"))), _Candidate(cand))
-    assert [m.id for m in result.direct] == [cand.id]
+    assert (result.superseded, result.direct) == (1, [])
+    assert {r.id for r in _live(store)} == {target.id, cand.id}
 
 
 @pytest.mark.asyncio
-async def test_a_blocked_user_confirmed_delete_still_does_nothing() -> None:
-    """只改被拦的「更新」;被拦的删除(不是更正)照旧什么都不做、候选不存。"""
+async def test_a_user_confirmed_denial_is_written_and_keeps_what_the_user_stated() -> None:
+    """模型仍回旧的「删除」(按 ``ADD`` + ``replaces`` 读):那句话本身写下;用户说的那条默认不退。
+    以前被拦的删除什么都不做、候选也不存。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     old = c.mem("用户的猫还没起名字", _at(0.9), origin="user_stated", confidence=0.9)
     await store.write([old])
     cand = c.mem("用户的猫不是没名字", origin="user_confirmed", confidence=0.8)
-    before = _count("blocked_delete")
-    result = await _reconcile(store, _FixedLLM(_ops((0, "DELETE", "e0"))), _Candidate(cand))
-    assert result.direct == []
-    assert [r.id for r in _live(store)] == [old.id]
-    assert _count("blocked_delete") == before + 1
+    legacy, refused = _count("legacy_op"), _count("retire_refused_confirmed_vs_stated")
+    await _reconcile(
+        store,
+        _FixedLLM(_ops((0, "DELETE", "e0"))),
+        _Candidate(cand, line_at=_T0 + timedelta(days=1), in_new_segment=True),
+    )
+    assert _coexist_linked(store, old, cand)
+    assert _row(store, old.id).expired_at is None
+    assert (_count("legacy_op"), _count("retire_refused_confirmed_vs_stated")) == (
+        legacy + 1,
+        refused + 1,
+    )
 
 
 # ─── 4. 独立审查(11-16)与用户拍板「只拦真重复」「这种情况照旧保存」────────────────────
 
 
 @pytest.mark.parametrize(
-    ("op", "counter"), [("UPDATE", "refused_event_date"), ("NOOP", "noop_other_event_date")]
+    ("reply", "counter"),
+    [
+        (_lists(replaces=["e0"]), "retire_refused_event_date"),
+        (_ops((0, "NOOP", "e0")), "noop_other_event_date"),
+    ],
+    ids=["replaces", "noop"],
 )
 @pytest.mark.asyncio
-async def test_same_evidence_with_different_event_dates_is_added(op: str, counter: str) -> None:
+async def test_same_evidence_with_different_event_dates_is_added(reply: str, counter: str) -> None:
     """M-1:用户一句话里说了「昨天 130,今天 125」;第一次记下「昨天 130」(带日期),第二次给出
-    「今天 125」,证据是同一条消息、事件日期不同 —— 是两次读数,不是重述:模型判「更新」被事件日期
-    规则改为新增,判「重复」按 ``noop_other_event_date`` 新增。"""
+    「今天 125」,证据是同一条消息、事件日期不同 —— 是两次读数,不是重述:模型要它替掉那条 → 事件
+    日期规则不退,两条都在;判「重复」按 ``noop_other_event_date`` 写下。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     target = c.mem(
@@ -674,11 +693,12 @@ async def test_same_evidence_with_different_event_dates_is_added(op: str, counte
     same, before = _count("noop_same_evidence"), _count(counter)
     result = await _reconcile(
         store,
-        _FixedLLM(_ops((0, op, "e0"))),
+        _FixedLLM(reply),
         _Candidate(cand, line_at=_T0, in_new_segment=True),
         {"u2": _T0},
     )
-    assert ([m.id for m in result.direct], result.superseded) == ([cand.id], 0)
+    assert (result.superseded, result.direct) == (1, [])
+    assert {r.id for r in _live(store)} == {target.id, cand.id}
     assert (_count("noop_same_evidence"), _count(counter)) == (same, before + 1)
 
 
@@ -696,10 +716,11 @@ _MORNING = "用户喜欢上午上课,因为下午要接孩子"
 
 
 @pytest.mark.asyncio
-async def test_a_same_message_update_blocked_by_tier_is_added_alongside() -> None:
+async def test_a_second_pass_answer_is_kept_next_to_the_first_pass_statement() -> None:
     """M-2(用户 11-16「只拦真重复」):同一条消息,第一次记下「下午要接孩子」(``user_stated``),
-    第二次给出「喜欢上午上课,因为下午接孩子」(``user_confirmed``),模型判「更新」那条 —— 不再当成
-    重述吞掉:层级拦下 → 与旧的并存(``blocked_update_added_confirmed``),「喜欢上午」不丢。"""
+    第二次给出「喜欢上午上课,因为下午接孩子」(``user_confirmed``),模型要它替掉那条 —— 不当成
+    重述吞掉,也不退用户说的:两条都在、连线(``retire_refused_confirmed_vs_stated``),「喜欢上午」
+    不丢。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     llm = _RoutingLLM(
@@ -707,34 +728,35 @@ async def test_a_same_message_update_blocked_by_tier_is_added_alongside() -> Non
         conversation_reply=_reply(
             {"kind": "fact", "content": _MORNING, "basis": "user_answer", "turn": 3}
         ),
-        ops=[_ops((0, "UPDATE", "e0"))],
+        ops=[_lists(restates=["e0"])],
     )
     embeddings = {_PICKUP: _E, _MORNING: _at(0.9)}
-    same, added = _count("noop_same_evidence"), _count("blocked_update_added_confirmed")
+    same, refused = _count("noop_same_evidence"), _count("retire_refused_confirmed_vs_stated")
     outcome = await _flush(c, store, _picked_the_class_time(), llm, embeddings)
     rows = {r.content: r for r in _live(store)}
     assert sorted(rows) == sorted([_PICKUP, _MORNING])
     assert (rows[_PICKUP].origin, rows[_MORNING].origin) == ("user_stated", "user_confirmed")
     assert rows[_MORNING].evidence_message_id == "u2"
+    assert rows[_MORNING].supersedes == rows[_PICKUP].id
     assert outcome.written == 2
     assert _count("noop_same_evidence") == same
-    assert _count("blocked_update_added_confirmed") == added + 1
+    assert _count("retire_refused_confirmed_vs_stated") == refused + 1
 
-    # 任务重试再跑一遍:内容相同 → 确定性「重复」,不再多出行。
-    again = await _flush(c, store, _picked_the_class_time(), _RoutingLLM(
-        user_reply=llm.user_reply, conversation_reply=llm.conversation_reply
-    ), embeddings)  # fmt: skip
+    # 任务重试再跑一遍:内容相同 → 确定性「重复」,不再多出行,也不再问模型。
+    retried = _RoutingLLM(user_reply=llm.user_reply, conversation_reply=llm.conversation_reply)
+    again = await _flush(c, store, _picked_the_class_time(), retried, embeddings)
     assert sorted(r.content for r in _live(store)) == sorted([_PICKUP, _MORNING])
     assert again.written == 0
+    assert retried.reconcile_calls == []
 
-    # 重试换了说法、模型判「更新」并存的那条(同层级、同一条证据):原地更新,仍是两行。
+    # 重试换了说法、模型要它替掉上一次那条(同为第二次的产出、同一条证据):退掉、换成新说法,仍是两行。
     reworded = "用户偏好上午上课,下午要接孩子"
     retry = _RoutingLLM(
         user_reply=llm.user_reply,
         conversation_reply=_reply(
             {"kind": "fact", "content": reworded, "basis": "user_answer", "turn": 3}
         ),
-        ops=[_ops((0, "UPDATE", "e0"))],
+        ops=[_lists(restates=["e0"])],
     )
     await _flush(c, store, _picked_the_class_time(), retry, {**embeddings, reworded: _at(0.9)})
     assert sorted(r.content for r in _live(store)) == sorted([_PICKUP, reworded])
@@ -742,7 +764,7 @@ async def test_a_same_message_update_blocked_by_tier_is_added_alongside() -> Non
 
 @pytest.mark.asyncio
 async def test_a_same_message_update_of_the_same_tier_is_applied() -> None:
-    """M-2:证据相同、同层级(用户确认改用户确认),模型判「更新」→ 照常更新(同一条消息不算更旧)。"""
+    """M-2:证据相同、同为用户确认,模型说候选把它说全了 → 照常退掉旧的(同一条消息不算更旧)。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     target = c.mem(
@@ -754,7 +776,7 @@ async def test_a_same_message_update_of_the_same_tier_is_applied() -> None:
     same = _count("noop_same_evidence")
     result = await _reconcile(
         store,
-        _FixedLLM(_ops((0, "UPDATE", "e0"))),
+        _FixedLLM(_lists(restates=["e0"])),
         _Candidate(cand, line_at=_T0 + timedelta(minutes=1), in_new_segment=True),
         {"u2": _T0 + timedelta(minutes=1)},
     )
@@ -764,21 +786,20 @@ async def test_a_same_message_update_of_the_same_tier_is_applied() -> None:
 
 
 @pytest.mark.parametrize(
-    ("op", "cand_day", "writes"),
+    ("decision", "cand_day", "writes"),
     [
-        ("NOOP", None, False),  # 同一条消息的重述:不写
-        ("NOOP", _TODAY, True),  # 事件日期不同:另一次,按新增写
-        ("UPDATE", None, True),  # 判「更新」、层级拦下的用户确认:与旧的并存
+        (_Decision("NOOP", "e0"), None, False),  # 同一条消息的重述:不写
+        (_Decision("NOOP", "e0"), _TODAY, True),  # 事件日期不同:另一次,写下
+        (_Decision("ADD", None, (), ("e0",)), None, True),  # 判写下并替掉它:旧的不退,候选照写
     ],
-    ids=["noop", "noop-other-date", "update"],
+    ids=["noop", "noop-other-date", "add"],
 )
 @pytest.mark.asyncio
 async def test_a_failed_reconcile_writes_what_applying_would_write_for_the_same_message(
-    op: str, cand_day: object, writes: bool
+    decision: _Decision, cand_day: object, writes: bool
 ) -> None:
     """L-1:去重合并中途出错时,还没落完的候选按 ``_would_write`` 收尾(写或进失败队列)—— 它必须与
-    真正落库时对同一条消息的判法一致:落库不写的(重述)收尾也不写,落库会写的(并存)收尾也写。
-    第 8 版初稿正是两边不一致(落库把「更新」当重述吞掉,收尾却写)。"""
+    真正落库时对同一条消息的判法一致:落库不写的(重述)收尾也不写,落库会写的收尾也写。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     target = c.mem(
@@ -790,10 +811,22 @@ async def test_a_failed_reconcile_writes_what_applying_would_write_for_the_same_
         "读数 130", origin="user_confirmed", confidence=0.8, evidence_message_id="u2",
         occurred_on=cand_day or (_TODAY - timedelta(days=1)),
     )  # fmt: skip
-    applied = await _reconcile(store, _FixedLLM(_ops((0, op, "e0"))), _Candidate(cand))
-    pending = memory_module._Pending(_Candidate(cand), (target,), frozenset())
-    on_failure = memory_module._would_write(pending, op, "e0", {"e0": target.id})
-    assert (cand.id in [m.id for m in applied.direct], on_failure) == (writes, writes)
+    reply = json.dumps(
+        {
+            "ops": [
+                {
+                    "index": 0,
+                    "op": decision.op,
+                    "target_id": decision.target,
+                    "restates": list(decision.restates),
+                }
+            ]
+        }
+    )
+    await _reconcile(store, _FixedLLM(reply), _Candidate(cand))
+    pending = memory_module._Pending(_Candidate(cand), (target,), {target.id: 2})
+    on_failure = memory_module._would_write(pending, decision, {"e0": target.id})
+    assert (cand.id in {r.id for r in _live(store)}, on_failure) == (writes, writes)
 
 
 def test_message_times_include_superseded_messages() -> None:
@@ -846,7 +879,7 @@ async def test_the_targets_date_shown_to_the_model_is_its_evidence_time() -> Non
 @pytest.mark.asyncio
 async def test_unknown_conversations_are_not_the_same_conversation() -> None:
     """L-4:两边都没有 ``source_thread_id`` 不算同一对话 —— 证据消息的时间不能拿来比先后(按记录
-    时间:更旧,改为新增),同一条证据也不算重述。"""
+    时间:更旧,目标不退、两条并存),同一条证据也不算重述。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     target = c.mem(
@@ -858,16 +891,22 @@ async def test_unknown_conversations_are_not_the_same_conversation() -> None:
         "the car is a red hatchback", origin="user_confirmed", confidence=0.8,
         evidence_message_id="m1", source_thread_id=None,
     )  # fmt: skip
-    result = await _reconcile(
+    older = _count("retire_refused_older_line")
+    await _reconcile(
         store,
-        _FixedLLM(_ops((0, "UPDATE", "e0"))),
+        _FixedLLM(_lists(restates=["e0"])),
         _Candidate(cand, line_at=_T0 + timedelta(days=1), in_new_segment=True),
         {"m1": _T0},
     )
-    assert (result.superseded, [m.id for m in result.direct]) == (0, [cand.id])
+    assert _coexist_linked(store, target, cand)
+    assert _count("retire_refused_older_line") == older + 1
 
     same = _count("noop_same_evidence")
-    await _reconcile(store, _FixedLLM(_ops((0, "NOOP", "e0"))), _Candidate(cand), {"m1": _T0})
+    again = c.mem(
+        "the car is a hatchback, a red one", _at(0.99), origin="user_confirmed",
+        evidence_message_id="m1", source_thread_id=None,
+    )  # fmt: skip
+    await _reconcile(store, _FixedLLM(_ops((0, "NOOP", "e0"))), _Candidate(again), {"m1": _T0})
     assert _count("noop_same_evidence") == same
 
 
@@ -949,8 +988,8 @@ async def test_the_reanchored_answer_is_kept_alongside_what_the_user_said_before
     checks: list[tuple[str, str]],
 ) -> None:
     """端到端:用户先前说过「猫还没起名字」(``user_stated``);上一轮以「建议叫它蛋黄」结束,新段
-    「好,就叫这个」;模型把 ``turn`` 指在助手那一行,去重合并判「更新」那条用户说的 → 改挂成用户
-    确认,层级拦下 → 与旧的并存:名字存下了,不丢。"""
+    「好,就叫这个」;模型把 ``turn`` 指在助手那一行,去重合并要它替掉那条用户说的 → 改挂成用户
+    确认;用户确认默认不退用户说的 → 两条并存并连线:名字存下了,不丢。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     old = c.mem(
@@ -969,9 +1008,9 @@ async def test_the_reanchored_answer_is_kept_alongside_what_the_user_said_before
             {"kind": "fact", "content": "用户的猫叫蛋黄", "basis": "user_agreement", "turn": 2,
              "confidence": 0.9},
         ),
-        ops=[_ops((0, "UPDATE", "e0"))],
+        ops=[_lists(replaces=["e0"])],
     )  # fmt: skip
-    added = _count("blocked_update_added_confirmed")
+    added = _count("retire_refused_confirmed_vs_stated")
     outcome = await _flush(
         c, store, messages, llm, {"用户的猫叫蛋黄": _E}, SegmentStart(message_index=2)
     )
@@ -984,12 +1023,13 @@ async def test_the_reanchored_answer_is_kept_alongside_what_the_user_said_before
         2,
     )
     assert named.confidence <= 0.8
+    assert named.supersedes == old.id
     assert outcome.written == 1
-    assert _count("blocked_update_added_confirmed") == added + 1
+    assert _count("retire_refused_confirmed_vs_stated") == added + 1
     assert checks == [("conversation", "turn_reanchored_context")]
 
 
-# ─── 5. 第二轮审查(11-16):同层级置信度更低的用户确认也与旧的并存;逐字重述 ──────────────
+# ─── 5. 第二轮审查(11-16):逐字重述 ───────────────────────────────────────────────
 
 
 @pytest.mark.asyncio

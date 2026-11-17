@@ -28,7 +28,6 @@ from expert_work.persistence import InMemoryMemoryStore
 from expert_work.persistence.memory.base import (
     ConsolidationSourcesChangedError,
     MemoryInjectionBlockedError,
-    SupersedeTargetChangedError,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
@@ -77,7 +76,7 @@ async def test_consolidation_reads_skip_superseded_and_expired_rows() -> None:
     await store.supersede(
         tenant_id=t,
         user_id=u,
-        old_id=old.id,
+        old_ids=[old.id],
         new_item=_item(tenant=t, user=u, content="new value", embedding=(0.0, 1.0)),
     )
     await store.expire(tenant_id=t, user_id=u, memory_id=gone.id)
@@ -101,7 +100,7 @@ async def test_write_consolidated_writes_nothing_when_a_member_was_superseded() 
     await store.supersede(
         tenant_id=t,
         user_id=u,
-        old_id=members[0].id,
+        old_ids=[members[0].id],
         new_item=_item(tenant=t, user=u, content="new value", embedding=(0.0, 1.0)),
     )
     before = len(store._rows)
@@ -161,7 +160,7 @@ async def test_supersede_with_blocked_content_keeps_the_old_row_current() -> Non
     await store.write([old])
     bad = _item(tenant=t, user=u, content=_INJECTION)
     with pytest.raises(MemoryInjectionBlockedError) as exc_info:
-        await store.supersede(tenant_id=t, user_id=u, old_id=old.id, new_item=bad)
+        await store.supersede(tenant_id=t, user_id=u, old_ids=[old.id], new_item=bad)
     assert [b.item_id for b in exc_info.value.blocked] == [bad.id]
     [row] = store._rows
     assert row.id == old.id
@@ -293,9 +292,9 @@ async def test_write_consolidated_writes_nothing_when_a_member_was_corrected_mea
 
 
 @pytest.mark.asyncio
-async def test_supersede_refuses_a_target_folded_into_a_summary() -> None:
-    """MEDIUM-2 — the target was folded into a summary after the write-back
-    picked it: no new row, the target untouched, a dedicated error."""
+async def test_supersede_skips_a_target_folded_into_a_summary() -> None:
+    """MEDIUM-2 / redesign §7.8 — the target was folded into a summary after the
+    write-back picked it: the target is untouched (``gone``), the new row is written."""
     store = InMemoryMemoryStore()
     t, u = uuid4(), uuid4()
     members = await _seed_three(store, t, u)
@@ -309,13 +308,14 @@ async def test_supersede_refuses_a_target_folded_into_a_summary() -> None:
     )
     before = list(store._rows)
     new = _item(tenant=t, user=u, content="changed value", embedding=(0.0, 1.0))
-    with pytest.raises(SupersedeTargetChangedError):
-        await store.supersede(tenant_id=t, user_id=u, old_id=members[0].id, new_item=new)
-    assert store._rows == before
+    got = await store.supersede(tenant_id=t, user_id=u, old_ids=[members[0].id], new_item=new)
+    assert got.inserted and dict(got.refused) == {members[0].id: "gone"}
+    assert store._rows[:-1] == before
+    assert store._rows[-1].id == new.id and store._rows[-1].supersedes is None
 
 
 @pytest.mark.asyncio
-async def test_supersede_refuses_an_expired_target() -> None:
+async def test_supersede_skips_an_expired_target() -> None:
     store = InMemoryMemoryStore()
     t, u = uuid4(), uuid4()
     old = _item(tenant=t, user=u, content="lives in the north")
@@ -323,6 +323,6 @@ async def test_supersede_refuses_an_expired_target() -> None:
     await store.expire(tenant_id=t, user_id=u, memory_id=old.id)
     before = list(store._rows)
     new = _item(tenant=t, user=u, content="lives in the south")
-    with pytest.raises(SupersedeTargetChangedError):
-        await store.supersede(tenant_id=t, user_id=u, old_id=old.id, new_item=new)
-    assert store._rows == before
+    got = await store.supersede(tenant_id=t, user_id=u, old_ids=[old.id], new_item=new)
+    assert got.inserted and dict(got.refused) == {old.id: "gone"}
+    assert store._rows[:-1] == before

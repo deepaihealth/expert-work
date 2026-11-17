@@ -41,7 +41,6 @@ from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.memory.base import (
     ConsolidationSourcesChangedError,
     MemoryInjectionBlockedError,
-    SupersedeTargetChangedError,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
@@ -130,7 +129,7 @@ async def test_consolidation_reads_skip_superseded_and_expired_rows(
         await store.supersede(
             tenant_id=t,
             user_id=u,
-            old_id=old.id,
+            old_ids=[old.id],
             new_item=_item(tenant=t, user=u, content="new value", embedding=_vec(0.0, 1.0)),
         )
         await store.expire(tenant_id=t, user_id=u, memory_id=gone.id)
@@ -160,7 +159,7 @@ async def test_write_consolidated_writes_nothing_when_a_member_stopped_being_cur
                 await store.supersede(
                     tenant_id=t,
                     user_id=u,
-                    old_id=members[0].id,
+                    old_ids=[members[0].id],
                     new_item=_item(tenant=t, user=u, content="new value", embedding=_vec(0.0, 1.0)),
                 )
             else:
@@ -213,7 +212,7 @@ async def test_supersede_with_blocked_content_keeps_the_old_row_current(
         await store.write([old])
         bad = _item(tenant=t, user=u, content=_INJECTION)
         with pytest.raises(MemoryInjectionBlockedError):
-            await store.supersede(tenant_id=t, user_id=u, old_id=old.id, new_item=bad)
+            await store.supersede(tenant_id=t, user_id=u, old_ids=[old.id], new_item=bad)
         [row] = await store.list_for_user(tenant_id=t, user_id=u)
         assert row.id == old.id
         assert row.invalid_at is None
@@ -410,7 +409,7 @@ async def test_write_consolidated_waits_for_a_correction_in_flight(
 
 
 @pytest.mark.asyncio
-async def test_supersede_refuses_a_target_folded_into_a_summary(
+async def test_supersede_skips_a_target_folded_into_a_summary(
     sql_store: SqlStoreFixture,
 ) -> None:
     store, engine = sql_store
@@ -426,10 +425,11 @@ async def test_supersede_refuses_a_target_folded_into_a_summary(
             source_hashes=_hashes(members),
         )
         new = _item(tenant=t, user=u, content="changed value", embedding=_vec(0.0, 1.0))
-        with pytest.raises(SupersedeTargetChangedError):
-            await store.supersede(tenant_id=t, user_id=u, old_id=members[0].id, new_item=new)
+        got = await store.supersede(tenant_id=t, user_id=u, old_ids=[members[0].id], new_item=new)
+        # Redesign §7.8 — the folded target is skipped, the new row is written anyway.
+        assert got.inserted and dict(got.refused) == {members[0].id: "gone"}
         listed = await store.list_for_user(tenant_id=t, user_id=u)
-        assert new.id not in {m.id for m in listed}
+        assert new.id in {m.id for m in listed}
         assert all(m.invalid_at is None for m in listed)
     finally:
         await engine.dispose()
@@ -438,7 +438,8 @@ async def test_supersede_refuses_a_target_folded_into_a_summary(
 @pytest.mark.asyncio
 async def test_supersede_waits_for_a_fold_in_flight(sql_store: SqlStoreFixture) -> None:
     """The consolidator holds the target's row lock while folding it; the
-    supersede must wait for it and then refuse the folded target."""
+    supersede must wait for it and then skip the folded target (the new row is
+    still written, redesign §7.8)."""
     store, engine = sql_store
     try:
         t, u = uuid4(), uuid4()
@@ -452,15 +453,15 @@ async def test_supersede_waits_for_a_fold_in_flight(sql_store: SqlStoreFixture) 
             )
             new = _item(tenant=t, user=u, content="changed value", embedding=_vec(0.0, 1.0))
             task = asyncio.create_task(
-                store.supersede(tenant_id=t, user_id=u, old_id=target.id, new_item=new)
+                store.supersede(tenant_id=t, user_id=u, old_ids=[target.id], new_item=new)
             )
             await asyncio.sleep(0.5)
             assert not task.done()
             await conn.commit()
-        with pytest.raises(SupersedeTargetChangedError):
-            _ = await task
-        listed = await store.list_for_user(tenant_id=t, user_id=u)
-        assert new.id not in {m.id for m in listed}
+        got = await task
+        assert got.inserted and dict(got.refused) == {target.id: "gone"}
+        listed = {m.id: m for m in await store.list_for_user(tenant_id=t, user_id=u)}
+        assert new.id in listed and listed[target.id].invalid_at is None
     finally:
         await engine.dispose()
 

@@ -594,6 +594,63 @@ describe("MemoryAdmin — source label (B-300 PR 2)", () => {
   });
 });
 
+describe("MemoryAdmin — superseded rows (B-300 redesign rev 9)", () => {
+  it("marks a superseded row and links it to the row that replaced it; live rows carry no mark", async () => {
+    const rows = [
+      // Replaced: invalid_at is set, superseded_by names the row that replaced it.
+      {
+        ...memRow,
+        id: "old1",
+        content: "old value",
+        invalid_at: "2026-11-16T08:00:00Z",
+        superseded_by: "new1",
+      },
+      { ...memRow, id: "new1", content: "new value", supersedes: "old1" },
+      // Linked to a row that is still valid (coexisting): neither side is marked.
+      { ...memRow, id: "beside1", content: "said beside it", supersedes: "new1" },
+      // Superseded without a known replacement: the mark, no link.
+      { ...memRow, id: "old2", content: "gone value", invalid_at: "2026-11-16T08:00:00Z" },
+    ];
+    installAdapter([
+      {
+        match: (u) => u.startsWith("/v1/memory"),
+        respond: () => ({
+          success: true,
+          data: { items: rows, total: rows.length, cross_tenant: false },
+          error: null,
+        }),
+      },
+    ]);
+    renderMemory();
+    await waitFor(() => expect(screen.getByText("old value")).toBeInTheDocument());
+
+    expect(screen.getByTestId("memory-superseded-old1")).toHaveTextContent(
+      i18n.t("memory.superseded"),
+    );
+    const link = screen.getByTestId("memory-superseded-link-old1");
+    expect(link).toHaveAttribute("href", "#memory-row-new1");
+    expect(link).toHaveAttribute("title", i18n.t("memory.superseded_by_tip"));
+    // The link's target exists on the page: the replacing row carries that anchor.
+    expect(document.getElementById("memory-row-new1")).not.toBeNull();
+
+    expect(screen.queryByTestId("memory-superseded-new1")).toBeNull();
+    expect(screen.queryByTestId("memory-superseded-beside1")).toBeNull();
+
+    expect(screen.getByTestId("memory-superseded-old2")).toBeInTheDocument();
+    expect(screen.queryByTestId("memory-superseded-link-old2")).toBeNull();
+  });
+
+  it("names the mark in both locales", () => {
+    expect(i18n.t("memory.superseded", { lng: "zh-CN" })).toBe("已被取代");
+    expect(i18n.t("memory.superseded", { lng: "en" })).toBe("superseded");
+    // The link only jumps within the page: the hover text says so.
+    expect(i18n.t("memory.superseded_by_tip", { lng: "zh-CN" })).toContain("可能不在当前页");
+    expect(i18n.t("memory.superseded_by_tip", { lng: "en" })).toContain(
+      "may not be on this page",
+    );
+  });
+});
+
 describe("MemoryAdmin — confirmed by the user (B-300 redesign PR M)", () => {
   it("labels user_confirmed in both locales; confidence 1.0 still wins", async () => {
     expect(i18n.t("memory.origin_user_confirmed", { lng: "en" })).toBe("confirmed by the user");

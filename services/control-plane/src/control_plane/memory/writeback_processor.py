@@ -28,6 +28,10 @@
 * 配置类错误(智能体配置已删、记忆模型解析不出、凭据被拒)不重试:直接收尾为 ``done``、
   ``failed`` 置真、计数 —— 重试只会在同样的错上再花两次。
 
+**汇总行重写**(B-300 重做第 9 版 §7.12):写回成功收尾后,当场把这个用户所有打了「要重写」
+标记的汇总行重写一遍(``rewrite_summaries``,整理器的同一个函数;用量记在整理那一类)。它失败
+不让任务失败:标留着,任务重试或整理巡检兜底。
+
 **记账**(§8 问题 3 拍板 (b)):后台记忆调用不归 run,按平台开销记 ——
 ``usage_kind = platform_overhead``,同重排序。run 内的记账靠 LangGraph 节点的 config
 (``usage_metering.charge_in_run``),在 run 外**静默不记**,所以这里直接调
@@ -46,7 +50,7 @@ import secrets
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 import httpx
@@ -103,6 +107,21 @@ _CHECKPOINT_READ_DELAYS_S: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
 CallerFactory = Callable[[AgentSpec, ModelSpec, UUID], Awaitable[LLMCaller]]
 #: 展开 ``extends``(fork 的模板继承)—— 与构建时同一取法;``None`` = 原样用存的配置。
 SpecResolver = Callable[[AgentSpec], Awaitable[AgentSpec]]
+
+
+class SummaryRewrite(Protocol):
+    """B-300 重做第 9 版 §7.12 —— 重写一个用户打了标的汇总行,至多 ``limit`` 条
+    (:meth:`control_plane.memory_consolidator.SummaryRewriter.rewrite_for_user`)。"""
+
+    async def __call__(
+        self, *, tenant_id: UUID, user_id: UUID, limit: int | None = None
+    ) -> object: ...
+
+
+#: 任务收尾时一次最多重写几条汇总行。重写在这条写回任务的租约里跑(每条 1 次辅助模型调用 +
+#: 1 次向量化,撞车时再各一次),租约不续:给一个小上限,剩下的留给任务重试或整理巡检。
+SUMMARY_REWRITES_PER_JOB = 3
+
 
 #: B-300 重做 §8.1 —— 没有更早的任务时,开轮时间在这么多天内的轮次是本段。这个 30 天跟着任务行的
 #: 保留期走:retention-cleanup-job 的 ``memory_writeback_job_retention_days``(默认 30,``0162``)只删
@@ -249,8 +268,11 @@ class MemoryWritebackProcessor:
         audit_logger: AuditLogger | None = None,
         max_attempts: int = 3,
         clock: Callable[[], datetime] = _utcnow,
+        rewrite_summaries: SummaryRewrite | None = None,
     ) -> None:
         self._agents = agent_specs
+        #: §7.12 第 2 步 —— 任务收尾时当场重写打了标的汇总行;``None`` = 只靠整理巡检。
+        self._rewrite_summaries = rewrite_summaries
         #: B-176 M2-1 —— 起点从同一对话的前一个任务算。
         self._jobs = jobs
         #: 与 worker 的同一个上限:最后一次尝试才把失败队列交给写回(§7.6)。
@@ -400,7 +422,25 @@ class MemoryWritebackProcessor:
                 msg = "memory writeback job recheck failed"
                 raise RuntimeError(msg) from recheck_error[0]
             return WritebackOutcome(written_count=0, failed=False, discarded=True)
+        await self._rewrite_flagged_summaries(job)
         return WritebackOutcome(written_count=outcome.written, failed=outcome.failed)
+
+    async def _rewrite_flagged_summaries(self, job: MemoryWritebackJob) -> None:
+        """§7.12 第 2 步 —— 写回做完之后(用户早已收到这一轮的回答)重写这个用户打了标的汇总行
+        (至多 :data:`SUMMARY_REWRITES_PER_JOB` 条,其余留给巡检),
+        不只是本次尝试打的:任务重试时候选走确定性「重复」、不会再打标,上一次尝试留下的标由这里
+        补上。任何失败都不让写回任务失败(标留着,等重试或整理巡检)。"""
+        if self._rewrite_summaries is None:
+            return
+        try:
+            await self._rewrite_summaries(
+                tenant_id=job.tenant_id, user_id=job.user_id, limit=SUMMARY_REWRITES_PER_JOB
+            )
+        except Exception:
+            logger.exception(
+                "memory.writeback_processor.summary_rewrite_failed job_id=%s — left to the sweep",
+                job.id,
+            )
 
     async def _read_turn_end(self, job: MemoryWritebackJob) -> list[Any]:
         """本轮结束时的对话。

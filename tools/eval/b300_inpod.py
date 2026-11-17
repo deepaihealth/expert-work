@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import sys
@@ -148,6 +149,26 @@ def _memory_item(
     return MemoryItem(**fields)
 
 
+async def _supersede_seed(
+    store: Any, *, tenant_id: UUID, user_id: UUID, old_id: UUID, new_item: Any
+) -> str:
+    """种「已被取代」的种子。**接口假设**(与 ``b300_k_platform`` 的 A1 / A2 是同一条;这个文件要
+    整份喂进 pod,不能 import 那边,所以在这里再写一遍):第 9 版的 ``supersede`` 收 ``old_ids``
+    (零到多个),返回 ``SupersedeResult``(``item`` = 新行或它撞上的那条);之前的收 ``old_id``,返回
+    新行或 ``None``。按签名认是哪一种。返回新行的 id(没写成 = 空串)。旧行没被退(来源组合不许
+    退,``refused``)时新行照写 —— 种子里「已被取代」的那一对要用许退的组合。"""
+    if "old_ids" in inspect.signature(store.supersede).parameters:
+        result = await store.supersede(
+            tenant_id=tenant_id, user_id=user_id, old_ids=[old_id], new_item=new_item
+        )
+        row = result.item
+    else:
+        row = await store.supersede(
+            tenant_id=tenant_id, user_id=user_id, old_id=old_id, new_item=new_item
+        )
+    return str(row.id) if row is not None else ""
+
+
 async def seed(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str], None]) -> None:
     """``payload["entries"]``:``{key, tenant_id, user, agent_name, seeds: [...]}``。
 
@@ -182,13 +203,13 @@ async def seed(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str], Non
                 target = s.get("superseded_by")
                 if not target:
                     continue
-                new = await deps.memory.supersede(
+                ids[target] = await _supersede_seed(
+                    deps.memory,
                     tenant_id=tenant_id,
                     user_id=user_id,
                     old_id=items[s["key"]].id,
                     new_item=items[target],
                 )
-                ids[target] = str(new.id) if new is not None else ""
         emit(
             json.dumps(
                 {

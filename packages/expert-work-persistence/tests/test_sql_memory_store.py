@@ -801,10 +801,11 @@ async def test_supersede_closes_old_opens_new(sql_store: SqlStoreFixture) -> Non
             content="user lives in Shanghai",
             embedding=_vec(0.9, 0.1),
         )
-        written = await store.supersede(
-            tenant_id=tenant, user_id=user, old_id=old_id, new_item=new_item
+        result = await store.supersede(
+            tenant_id=tenant, user_id=user, old_ids=[old_id], new_item=new_item
         )
-        assert written is not None
+        written = result.item
+        assert result.retired == (old_id,)
         assert written.supersedes == old_id
         assert written.valid_at is not None
 
@@ -829,9 +830,9 @@ async def test_supersede_closes_old_opens_new(sql_store: SqlStoreFixture) -> Non
 
 
 @pytest.mark.asyncio
-async def test_supersede_unknown_old_returns_none(sql_store: SqlStoreFixture) -> None:
-    """SQL counterpart of the in-memory test of the same name — an unknown
-    ``old_id`` returns ``None`` and writes nothing (no orphan new row)."""
+async def test_supersede_unknown_old_still_writes_the_new_row(sql_store: SqlStoreFixture) -> None:
+    """SQL counterpart of the in-memory test of the same name (B-300 redesign §7.8) —
+    an unknown target is skipped (``gone``) and the new row is written anyway."""
     store, engine = sql_store
     try:
         tenant, user = uuid4(), uuid4()
@@ -843,33 +844,22 @@ async def test_supersede_unknown_old_returns_none(sql_store: SqlStoreFixture) ->
             content="x",
             embedding=_vec(1.0, 0.0),
         )
+        unknown = uuid4()
         out = await store.supersede(
-            tenant_id=tenant, user_id=user, old_id=uuid4(), new_item=new_item
+            tenant_id=tenant, user_id=user, old_ids=[unknown], new_item=new_item
         )
-        assert out is None
-
-        # Nothing was written under this (fresh, test-local) tenant/user.
-        assert await store.list_for_user(tenant_id=tenant, user_id=user, limit=10) == []
-        async with engine.connect() as conn:
-            count = (
-                await conn.execute(
-                    text("SELECT count(*) FROM memory_item WHERE id = :id"),
-                    {"id": new_item.id},
-                )
-            ).scalar_one()
-        assert count == 0
+        assert out.inserted and dict(out.refused) == {unknown: "gone"}
+        [row] = await store.list_for_user(tenant_id=tenant, user_id=user, limit=10)
+        assert row.id == new_item.id and row.supersedes is None
     finally:
         await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_supersede_already_superseded_returns_none(sql_store: SqlStoreFixture) -> None:
-    """Double-supersede: once ``old_id`` has already been superseded
-    (``invalid_at`` set), a second supersede() attempt against the same
-    ``old_id`` must return ``None`` and must not write a second new row.
-    This pins the ``MemoryItemRow.invalid_at.is_(None)`` guard in the
-    old-row SELECT — without it, the second call would silently succeed
-    and re-point ``superseded_by``."""
+async def test_supersede_already_superseded_target_is_skipped(sql_store: SqlStoreFixture) -> None:
+    """Double-supersede: once a target has been superseded (``invalid_at`` set), a
+    second supersede() naming it must not re-point its ``superseded_by`` — the target
+    is skipped (``gone``) and the second new row is written as a row of its own."""
     store, engine = sql_store
     try:
         tenant, user = uuid4(), uuid4()
@@ -895,9 +885,9 @@ async def test_supersede_already_superseded_returns_none(sql_store: SqlStoreFixt
             embedding=_vec(0.9, 0.1),
         )
         first = await store.supersede(
-            tenant_id=tenant, user_id=user, old_id=old_id, new_item=first_new
+            tenant_id=tenant, user_id=user, old_ids=[old_id], new_item=first_new
         )
-        assert first is not None
+        assert first.retired == (old_id,)
 
         second_new = MemoryItem(
             id=uuid4(),
@@ -908,22 +898,15 @@ async def test_supersede_already_superseded_returns_none(sql_store: SqlStoreFixt
             embedding=_vec(0.8, 0.2),
         )
         second = await store.supersede(
-            tenant_id=tenant, user_id=user, old_id=old_id, new_item=second_new
+            tenant_id=tenant, user_id=user, old_ids=[old_id], new_item=second_new
         )
-        assert second is None
+        assert second.inserted and dict(second.refused) == {old_id: "gone"}
+        assert second.item.supersedes is None
 
-        # No second new row landed — only "v1" (closed) and "v2" (the first
-        # supersession) exist; "v3" never made it to the table.
-        rows = await store.list_for_user(tenant_id=tenant, user_id=user, limit=10)
-        assert {r.content for r in rows} == {"v1", "v2"}
-        async with engine.connect() as conn:
-            count = (
-                await conn.execute(
-                    text("SELECT count(*) FROM memory_item WHERE id = :id"),
-                    {"id": second_new.id},
-                )
-            ).scalar_one()
-        assert count == 0
+        rows = {r.content: r for r in await store.list_for_user(tenant_id=tenant, user_id=user)}
+        assert set(rows) == {"v1", "v2", "v3"}
+        # The old row still points at the first replacement.
+        assert rows["v1"].superseded_by == first_new.id
     finally:
         await engine.dispose()
 
@@ -932,7 +915,7 @@ async def test_supersede_already_superseded_returns_none(sql_store: SqlStoreFixt
 async def test_supersede_scoped_to_tenant_and_user(sql_store: SqlStoreFixture) -> None:
     """The tenant/user predicate is defensive — supersede() must not touch
     a row that belongs to a different tenant or a different user, even
-    when the caller passes the correct old_id."""
+    when the caller passes the correct id: the foreign row is skipped (``gone``)."""
     store, engine = sql_store
     try:
         tenant, user, other_tenant, other_user = uuid4(), uuid4(), uuid4(), uuid4()
@@ -959,9 +942,9 @@ async def test_supersede_scoped_to_tenant_and_user(sql_store: SqlStoreFixture) -
             embedding=_vec(0.9, 0.0),
         )
         out_wrong_user = await store.supersede(
-            tenant_id=tenant, user_id=other_user, old_id=old_id, new_item=wrong_user_new
+            tenant_id=tenant, user_id=other_user, old_ids=[old_id], new_item=wrong_user_new
         )
-        assert out_wrong_user is None
+        assert dict(out_wrong_user.refused) == {old_id: "gone"}
 
         wrong_tenant_new = MemoryItem(
             id=uuid4(),
@@ -972,18 +955,20 @@ async def test_supersede_scoped_to_tenant_and_user(sql_store: SqlStoreFixture) -
             embedding=_vec(0.8, 0.0),
         )
         out_wrong_tenant = await store.supersede(
-            tenant_id=other_tenant, user_id=user, old_id=old_id, new_item=wrong_tenant_new
+            tenant_id=other_tenant, user_id=user, old_ids=[old_id], new_item=wrong_tenant_new
         )
-        assert out_wrong_tenant is None
+        assert dict(out_wrong_tenant.refused) == {old_id: "gone"}
 
-        # The original row is untouched, and neither wrong-scope attempt
-        # wrote anything under its own scope.
+        # The original row is untouched; each attempt only wrote its own new row
+        # under its own scope, linked to nothing.
         [row] = await store.list_for_user(tenant_id=tenant, user_id=user, limit=10)
         assert row.content == "mine"
         assert row.invalid_at is None
         assert row.superseded_by is None
-        assert await store.list_for_user(tenant_id=tenant, user_id=other_user, limit=10) == []
-        assert await store.list_for_user(tenant_id=other_tenant, user_id=user, limit=10) == []
+        [theirs] = await store.list_for_user(tenant_id=tenant, user_id=other_user, limit=10)
+        assert (theirs.content, theirs.supersedes) == ("wrong-user", None)
+        [elsewhere] = await store.list_for_user(tenant_id=other_tenant, user_id=user, limit=10)
+        assert (elsewhere.content, elsewhere.supersedes) == ("wrong-tenant", None)
     finally:
         await engine.dispose()
 
@@ -1031,8 +1016,8 @@ async def test_supersede_revert_to_same_content_after_dedup_fix(
             content="user lives in Shanghai",
             embedding=_vec(0.9, 0.1),
         )
-        to_b = await store.supersede(tenant_id=tenant, user_id=user, old_id=v1_id, new_item=v2)
-        assert to_b is not None
+        to_b = await store.supersede(tenant_id=tenant, user_id=user, old_ids=[v1_id], new_item=v2)
+        assert to_b.retired == (v1_id,)
 
         # Reconcile reverts back to the original content — v3's content_hash
         # collides with v1's (still deleted_at IS NULL, only invalid_at set).
@@ -1046,8 +1031,10 @@ async def test_supersede_revert_to_same_content_after_dedup_fix(
             content=content_a,
             embedding=_vec(1.0, 0.0),
         )
-        reverted = await store.supersede(tenant_id=tenant, user_id=user, old_id=v2.id, new_item=v3)
-        assert reverted is not None
+        reverted = await store.supersede(
+            tenant_id=tenant, user_id=user, old_ids=[v2.id], new_item=v3
+        )
+        assert reverted.inserted and reverted.retired == (v2.id,)
 
         hits = await store.retrieve(
             tenant_id=tenant, user_id=user, query_embedding=_vec(1.0, 0.0), limit=10

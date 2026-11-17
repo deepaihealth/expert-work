@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import abc
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal, NamedTuple
+from typing import Literal
 from uuid import UUID
 
 from expert_work.common.threat_patterns import ThreatFinding, scan_for_threats
@@ -49,19 +49,54 @@ def origin_tier(item: MemoryItem) -> int:
     return _ORIGIN_TIERS[effective_origin(item)]
 
 
-class OriginStanding(NamedTuple):
-    """拦截规则比的两样:层级,以及同层(用户一方)时比的置信度。"""
+#: B-300 重做 §6.5(用户 2026-11-16「先不能,评测过线再放开」)—— 用户确认的候选能不能退用户说的
+#: 记忆。默认不能:新行照写、旧行不动、两条连线。评测线过了、用户说放开时只改这一处。
+CONFIRMED_RETIRES_STATED = False
 
-    tier: int
-    confidence: float
+#: 一条旧记忆没被退的原因(存储在行锁里重判时给的;写回的预判用同一个 :func:`may_retire`):
+#: ``gone`` 不存在 / 已删 / 已作废 / 已不是当前有效;``summary`` 是汇总行;``corrected`` 控制台
+#: 更正过;``assistant`` 助手一方的候选对用户一方的记忆;``confirmed_vs_stated`` 见上。
+RetireRefusal = Literal["gone", "summary", "corrected", "assistant", "confirmed_vs_stated"]
+
+_CORRECTED_TIER = _ORIGIN_TIERS["user_corrected"]
+_STATED_TIER = _ORIGIN_TIERS["user_stated"]
 
 
-def outranks(target: OriginStanding, candidate: OriginStanding) -> bool:
-    """B-300 重做 §6.3 —— 候选不得更新 / 删除目标:候选层级低于目标;或同一层级、是用户一方、
-    目标的置信度高于候选。来自助手与未记录同为 0 层,彼此不比置信度。"""
-    if target.tier != candidate.tier:
-        return target.tier > candidate.tier
-    return target.tier > 0 and target.confidence > candidate.confidence
+def tier_of(origin: EffectiveOrigin) -> int:
+    """一种有效来源的层级(:data:`_ORIGIN_TIERS`)。"""
+    return _ORIGIN_TIERS[origin]
+
+
+def may_retire(
+    candidate: EffectiveOrigin,
+    target_tier: int,
+    *,
+    target_is_summary: bool,
+    identical: bool = False,
+) -> RetireRefusal | None:
+    """B-300 重做 §7.8 —— 来源为 ``candidate`` 的候选能不能退一条层级为 ``target_tier`` 的旧记忆
+    (汇总行的层级按成员算,:func:`origin_standing`);``None`` = 能。只看来源,不看置信度。
+
+    * 汇总行 → 不能(候选通常只否认其中一件);唯一的例外是 ``identical``:内容与候选逐字相同、
+      且层级低于候选(同一句话换成来源更强的那条,没有东西会丢);
+    * 控制台更正过的 → 谁也不能;
+    * 助手一方(来自助手 / 未记录)的候选对用户一方的记忆 → 不能;
+    * 用户确认的候选对用户说的记忆 → 默认不能(:data:`CONFIRMED_RETIRES_STATED`);
+    * 其余 → 能。先后、事件日期、同一条消息这三项只在写回里查。"""
+    own = _ORIGIN_TIERS[candidate]
+    if target_is_summary and not (identical and target_tier < own):
+        return "summary"
+    if target_tier >= _CORRECTED_TIER:
+        return "corrected"
+    if own == 0 and target_tier > 0:
+        return "assistant"
+    if (
+        candidate == "user_confirmed"
+        and target_tier == _STATED_TIER
+        and not CONFIRMED_RETIRES_STATED
+    ):
+        return "confirmed_vs_stated"
+    return None
 
 
 def is_mixed_origin(members: Sequence[MemoryItem]) -> bool:
@@ -114,25 +149,27 @@ def summary_fields(members: Sequence[MemoryItem]) -> SummaryFields:
 #: 嵌套汇总向下查成员的层数上限;查到上限还有没查的成员,按「受保护」处理(保守方向)。
 MAX_SUMMARY_DEPTH = 8
 
+#: 取「用户后来的说法」时顺取代链(``superseded_by``)最多走这么多步去找仍有效的那条;走不到就
+#: 当作没有可用的说法(也防环)。
+MAX_STATEMENT_HOPS = 5
+
 #: 按 id 取一批记忆(不看是否仍有效、是否已删):受保护判断向下查汇总成员用。
 MemberLoader = Callable[[Sequence[UUID]], Awaitable[Sequence[MemoryItem]]]
 
 
-#: 汇总成员查不完时按这个算(保守方向:等于用户更正,任何提炼出的候选都改不动它)。
-FAIL_CLOSED_STANDING = OriginStanding(tier=3, confidence=1.0)
+#: 汇总成员查不完时按这个算(保守方向:等于用户更正,任何提炼出的候选都退不掉它)。
+FAIL_CLOSED_TIER = _CORRECTED_TIER
 
 
-async def origin_standing(item: MemoryItem, load: MemberLoader) -> OriginStanding:
-    """B-300 重做 §6.3 —— 拦截规则看的目标层级与置信度。
+async def origin_standing(item: MemoryItem, load: MemberLoader) -> int:
+    """B-300 重做 §6.3 —— 「谁能退谁」看的目标层级(第 9 版起不带置信度)。
 
-    * 不是汇总行:它自己的层级与置信度;
-    * 汇总行:它自己与成员 —— 一层层往下,成员本身是汇总的接着查它的成员 —— 里最高的层级,
-      置信度取这一层里成员的最高值(不用汇总行自己那一行的成员最小值,否则一条用户更正 1.0
-      和未记录的成员汇在一起,就会被置信度一般的用户候选取代)。成员早已被汇总、取代或过期,
-      照样算(汇总句里还有它的内容)。
+    * 不是汇总行:它自己的层级;
+    * 汇总行:它自己与成员 —— 一层层往下,成员本身是汇总的接着查它的成员 —— 里最高的层级。
+      成员早已被汇总、取代或过期,照样算(汇总句里还有它的内容)。
 
-    ``visited`` 防环;``MAX_SUMMARY_DEPTH`` 层之后还有没查的成员 → :data:`FAIL_CLOSED_STANDING`。"""
-    found = [OriginStanding(origin_tier(item), item.confidence)]
+    ``visited`` 防环;``MAX_SUMMARY_DEPTH`` 层之后还有没查的成员 → :data:`FAIL_CLOSED_TIER`。"""
+    top = origin_tier(item)
     visited = {item.id}
     frontier = [sid for sid in item.consolidated_from if sid not in visited]
     for _depth in range(MAX_SUMMARY_DEPTH):
@@ -140,46 +177,11 @@ async def origin_standing(item: MemoryItem, load: MemberLoader) -> OriginStandin
             break
         visited.update(frontier)
         members = await load(frontier)
-        found.extend(OriginStanding(origin_tier(m), m.confidence) for m in members)
+        top = max([top, *(origin_tier(m) for m in members)])
         frontier = list(
             dict.fromkeys(sid for m in members for sid in m.consolidated_from if sid not in visited)
         )
-    if frontier:
-        return FAIL_CLOSED_STANDING
-    top = max(s.tier for s in found)
-    return OriginStanding(top, max(s.confidence for s in found if s.tier == top))
-
-
-class UserSideTargetError(RuntimeError):
-    """B-300 审查 MEDIUM-1 —— 带保护的 ``supersede`` / ``expire``(``candidate_standing``)
-    在锁里重读目标,发现它(或它汇总的成员)的来源层级高于候选:什么都没改。
-
-    去重合并读邻居与真正改库之间隔着一次模型调用,用户可能恰好在这几秒里「更正」了这一条;
-    调用方按拦截规则处理(被拦的更新带更正 → 按新增,否则丢弃;被拦的删除 → 不动)。"""
-
-
-class UserSideHigherConfidenceError(UserSideTargetError):
-    """B-300 用户 11-14 —— 锁里重读的目标与候选同在用户一方的同一层级、且它此刻的置信度高于
-    候选:什么都没改。是 :class:`UserSideTargetError` 的子类,同一条处理路径接得住;调用方据
-    类型分开计数。"""
-
-
-async def refuse_if_outranked(
-    row: MemoryItem, load: MemberLoader, candidate: OriginStanding | None
-) -> None:
-    """两个存储实现在行锁里共用的重判(行已由调用方锁住 / 重读,成员只读),与写回的预判是
-    同一个 :func:`outranks`:目标层级更高 → :class:`UserSideTargetError`;同层、用户一方、
-    目标更确定 → :class:`UserSideHigherConfidenceError`。``candidate`` 为 ``None`` 不判。"""
-    if candidate is None:
-        return
-    target = await origin_standing(row, load)
-    if not outranks(target, candidate):
-        return
-    if target.tier > candidate.tier:
-        msg = f"memory item {row.id} has a stronger source; not changing it"
-        raise UserSideTargetError(msg)
-    msg = f"memory item {row.id} is on the user's side and more certain; not changing it"
-    raise UserSideHigherConfidenceError(msg)
+    return FAIL_CLOSED_TIER if frontier else top
 
 
 @dataclass(frozen=True)
@@ -251,12 +253,51 @@ class MemoryInjectionBlockedError(Exception):
         self.blocked = tuple(blocked)
 
 
-class SupersedeTargetChangedError(RuntimeError):
-    """B-300 D1 (the other direction) — the memory an UPDATE meant to replace
-    was folded into a summary, expired or archived after the write-back picked
-    it. Raised by :meth:`MemoryStore.supersede` under the target's row lock,
-    before anything changes; the caller stores the new fact as a plain write
-    instead, so it is not lost."""
+@dataclass(frozen=True)
+class SupersedeResult:
+    """B-300 重做 §7.8 —— :meth:`MemoryStore.supersede` 做了什么。
+
+    ``item``:新写的行;没有插入(``inserted`` 为假)时是它撞上的那条内容相同、层级不低于它的
+    有效行(那句话已经由它说着,被退的旧行连到它)。``retired``:作废了的旧行(含
+    ``collision_replaced`` 那一条);``refused``:没退的旧行各自的原因;``flagged``:打上「要重写」
+    标记的汇总行(可能是被点到的那条已被重写出的新汇总行);``collision_replaced``:撞上唯一索引、
+    层级低于候选而在同一次事务里被退掉的那条。"""
+
+    item: MemoryItem
+    inserted: bool = True
+    retired: tuple[UUID, ...] = ()
+    refused: Mapping[UUID, RetireRefusal] = field(default_factory=dict)
+    flagged: tuple[UUID, ...] = ()
+    collision_replaced: UUID | None = None
+
+
+@dataclass(frozen=True)
+class RetireResult:
+    """B-300 重做 §7.8 —— :meth:`MemoryStore.retire`(只退不写)做了什么。``anchor_live`` 为假 =
+    要连过去的那条已有的行此刻不是同一用户的有效行、或层级低于候选:什么都没改。"""
+
+    anchor_live: bool
+    retired: tuple[UUID, ...] = ()
+    refused: Mapping[UUID, RetireRefusal] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FlaggedSummary:
+    """B-300 重做 §7.12 —— 一条打了「要重写」标记、仍有效的汇总行,连同重写要看的材料:它的成员
+    (不论此刻是否有效)与用户后来的说法:``supersedes`` 指向它的用户一方的行(记录或最后再说的
+    时间晚于它),加上它自己的 ``supersedes`` 指着的那一行(打标时记下的依据);其中已被更晚一句
+    取代的,顺 ``superseded_by`` 走到仍有效的用户一方后继(至多 :data:`MAX_STATEMENT_HOPS` 步);
+    被删掉的、走不到这样后继的不算。"""
+
+    summary: MemoryItem
+    members: tuple[MemoryItem, ...]
+    statements: tuple[MemoryItem, ...]
+
+
+#: :meth:`MemoryStore.rewrite_summary` 的结果(§7.12 第 3 步)。
+SummaryRewriteOutcome = Literal[
+    "rewritten", "emptied", "unchanged", "collided", "stale", "corrected_member"
+]
 
 
 class ConsolidationSourcesChangedError(RuntimeError):
@@ -441,37 +482,99 @@ class MemoryStore(abc.ABC):
         *,
         tenant_id: UUID,
         user_id: UUID,
-        old_id: UUID,
         new_item: MemoryItem,
-        candidate_standing: OriginStanding | None = None,
+        old_ids: Sequence[UUID] = (),
+        identical_ids: Sequence[UUID] = (),
+        flag_summary_ids: Sequence[UUID] = (),
+        link_id: UUID | None = None,
+    ) -> SupersedeResult:
+        """P5b / B-300 redesign §7.8 — write ``new_item`` and, in the same transaction,
+        retire zero or more older rows (``invalid_at=now``, ``superseded_by`` = the new
+        row). **The write never depends on a retirement**: a target that cannot be
+        retired is skipped with its reason and the new row is written all the same.
+        Tenant- AND user-scoped. The old rows are KEPT (history) but leave recall.
+
+        ``old_ids`` are locked in id order and each is re-judged under the lock: unknown /
+        deleted / already superseded / no longer current (folded into a summary, expired,
+        archived) → skipped, ``gone``; otherwise :func:`may_retire` with the new row's
+        effective origin and the target's tier by members (``summary`` / ``corrected`` /
+        ``assistant`` / ``confirmed_vs_stated``). ``identical_ids`` (a subset of
+        ``old_ids``) are rows whose content is the same as the new one: for them the
+        summary rule has its one exception (same sentence, weaker source).
+
+        Dedup index (tenant + user + content hash + agent name, kind and origin not
+        included): when another row already holds the same content **and is currently
+        valid** (the recall predicate), its tier decides — not lower than the new row's →
+        nothing is inserted, the retired rows link to it and it is returned
+        (``inserted=False``); lower → it is retired as well (``collision_replaced``) and
+        the new row is inserted. A holder that only occupies the index — a member folded
+        into a summary is not recalled — does not count as "already there": it is marked
+        superseded by the new row to give up the slot (not reported in ``retired``) and
+        the new row is inserted.
+
+        ``flag_summary_ids`` (§7.12 step 1; the caller passes summaries the model itself
+        listed as no longer true, for a user-side candidate — a new row that is not on
+        the user's side flags nothing): **each** still-current summary
+        whose members hold no console correction gets ``review_flagged_at=now`` and its
+        own ``supersedes`` set to the new row's id — the row the rewrite goes by (the
+        column has no other use on a summary row; a rewritten summary does not inherit
+        it); one that was rewritten meanwhile is followed one step along
+        ``superseded_by`` to the current summary. Only when the new row is inserted.
+
+        The new row's ``supersedes``: the first flagged summary (the rewrite finds the
+        user's statement through this link; what the row retired is still found through
+        the retired rows' ``superseded_by``); else the first retired row; else the first
+        target refused as ``confirmed_vs_stated``; else ``link_id`` (when that row exists
+        for this user). Except for a retired row, what it points at is still valid — the
+        link only says "about the same thing"; whether a row was replaced is read from
+        that row's ``invalid_at``.
+
+        B-300 D2 — ``new_item`` goes through the strict scan; when blocked,
+        :class:`MemoryInjectionBlockedError` is raised before anything changes.
+        B-300 redesign §9.2 — ``confirmed_at`` exists only on user-side rows."""
+
+    @abc.abstractmethod
+    async def retire(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        old_ids: Sequence[UUID],
+        anchor_id: UUID,
+        candidate_origin: EffectiveOrigin,
+    ) -> RetireResult:
+        """B-300 redesign §7.8 — retire without writing: the candidate repeats the live
+        row ``anchor_id``, and ``old_ids`` are no longer needed. Same locks and the same
+        re-judgement as :meth:`supersede`; retired rows get ``superseded_by=anchor_id``.
+        The anchor must be this user's currently valid row whose tier (by members) is not
+        lower than the candidate's — otherwise nothing changes (``anchor_live=False``)."""
+
+    @abc.abstractmethod
+    async def write_history(
+        self, *, tenant_id: UUID, user_id: UUID, anchor_id: UUID, new_item: MemoryItem
     ) -> MemoryItem | None:
-        """P5b — append-only UPDATE. Atomically close ``old_id`` (set
-        ``invalid_at=now``, ``superseded_by=new_item.id``) and insert
-        ``new_item`` with ``supersedes=old_id`` + ``valid_at=now``. The old
-        row is KEPT (history/audit) but excluded from default retrieve.
+        """B-300 redesign §7.1 row 11 — store ``new_item`` as a history row: already
+        superseded when it lands (``invalid_at=now``, ``superseded_by=anchor_id``), no
+        other row touched. ``None`` (nothing written) when the anchor is no longer this
+        user's currently valid row — the caller then writes a normal row. A history row
+        does not take part in the dedup index. Idempotent: when a history row with the
+        same content already hangs off this anchor (a retried job), that row is returned
+        and nothing is written — its ``id`` differs from ``new_item.id``. Strict scan as
+        :meth:`supersede`."""
 
-        Returns the newly written item, or ``None`` when ``old_id`` is
-        unknown / wrong tenant-user / already superseded (``invalid_at`` set) —
-        in which case NO new row is written (the caller falls back to a plain
-        write). Tenant- AND user-scoped.
-
-        B-300 D2 — ``new_item`` goes through the same strict scan as
-        :meth:`write`; when blocked, :class:`MemoryInjectionBlockedError` is
-        raised before anything changes: the old row stays current.
-
-        B-300 D1 (the other direction) — the target is re-read under a row lock;
-        when it was folded into a summary, expired or archived since the caller
-        picked it, :class:`SupersedeTargetChangedError` is raised and nothing
-        changes (``None`` keeps meaning unknown / deleted / already superseded).
-
-        B-300 redesign §6.3 — ``candidate_standing`` (the write-back passes the
-        candidate's tier and confidence): under the same row lock, a target that
-        :func:`outranks` it raises :class:`UserSideTargetError` (a higher tier) or
-        :class:`UserSideHigherConfidenceError` (same user-side tier, more certain)
-        and nothing changes (:func:`refuse_if_outranked`).
-
-        B-300 redesign §9.2 — ``confirmed_at`` exists only on user-side rows: a new
-        row whose effective origin is not on the user's side is written without it."""
+    @abc.abstractmethod
+    async def flag_summary(
+        self, *, tenant_id: UUID, user_id: UUID, summary_id: UUID, statement_id: UUID
+    ) -> UUID | None:
+        """B-300 redesign §7.12 step 1, for a candidate that is **not written** because it
+        repeats ``statement_id``: the user denied something the summary says, so the
+        summary is flagged all the same, with the row the candidate repeats as the
+        statement to rewrite by. That row must be this user's currently valid user-side
+        row; the summary is judged as in :meth:`supersede` (members without a console
+        correction; one step along ``superseded_by`` when it was rewritten meanwhile).
+        The basis is recorded on the **summary** (its ``supersedes`` = ``statement_id``);
+        the statement row itself is not changed. Returns the flagged summary's id, or
+        ``None`` when nothing was flagged."""
 
     @abc.abstractmethod
     async def expire(
@@ -480,23 +583,23 @@ class MemoryStore(abc.ABC):
         tenant_id: UUID,
         user_id: UUID,
         memory_id: UUID,
-        candidate_standing: OriginStanding | None = None,
     ) -> bool:
         """P5b — retraction: stamp ``expired_at=now`` on a fact that stopped
         being true in the world with NO successor (orthogonal to ``supersede``'s
         ``invalid_at``). The row is KEPT (history/audit) but excluded from
         default retrieve. Returns ``False`` for unknown id / wrong tenant-user.
-        Tenant- AND user-scoped.
+        Tenant- AND user-scoped. Used by consolidation's due review; the write-back
+        no longer expires anything (B-300 redesign §7.3).
 
         B-300 review MEDIUM-1 — the target row is locked (``FOR UPDATE``) before
-        it is changed; ``candidate_standing`` as in :meth:`supersede`."""
+        it is changed."""
 
     @abc.abstractmethod
     async def origin_standing(
         self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID
-    ) -> OriginStanding | None:
-        """B-300 redesign §6.3 — :func:`origin_standing` for one row, its summary
-        members read whatever their current validity. Unknown id → None."""
+    ) -> int | None:
+        """B-300 redesign §6.3 — :func:`origin_standing` (the tier by members) for one
+        row, its summary members read whatever their current validity. Unknown id → None."""
 
     @abc.abstractmethod
     async def refresh_confirmed_at(
@@ -729,6 +832,61 @@ class MemoryStore(abc.ABC):
         review filter — a user 👎 re-opens even a previously-reviewed
         item.
         """
+
+    @abc.abstractmethod
+    async def list_flagged_summaries(
+        self, *, tenant_id: UUID, user_id: UUID, limit: int
+    ) -> list[FlaggedSummary]:
+        """B-300 redesign §7.12 — this user's currently valid summary rows
+        (``status='consolidated'``) with ``review_flagged_at`` set, oldest flag first,
+        each with its members and the user's later statements. The thumbs-down flag on
+        transient rows (:meth:`list_review_flagged`) is the same column and never mixes
+        with this: the two read different ``status`` values."""
+
+    @abc.abstractmethod
+    async def rewrite_summary(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        summary_id: UUID,
+        flagged_at: datetime,
+        content: str | None,
+        embedding: Sequence[float] = (),
+        embedding_model: str | None = None,
+        unchanged: bool = False,
+    ) -> SummaryRewriteOutcome:
+        """B-300 redesign §7.12 step 3 — replace a flagged summary, under its row lock.
+
+        * no longer current, or its ``review_flagged_at`` differs from ``flagged_at`` (a
+          new denial was linked while the rewrite ran) → ``stale``, nothing changes, the
+          flag stays;
+        * a member (down the tree) was corrected in the console meanwhile →
+          ``corrected_member``: summary untouched, flag cleared;
+        * ``unchanged`` → flag cleared, nothing else;
+        * ``content is None`` (nothing of it remains true) → the summary is retired with
+          ``superseded_by`` = the user's latest later statement; ``emptied``. With no
+          such statement left there is nothing to link it to: ``stale``, nothing changes;
+        * another **currently valid** row already holds ``content`` → nothing inserted,
+          the summary is retired with ``superseded_by`` = that row, members untouched;
+          ``collided``. A holder that is not recalled (one of the summary's own members,
+          say) gives up the index slot instead and the new summary is stored;
+        * otherwise a new summary row is inserted (same ``consolidated_from``; source and
+          scores recomputed from the members, :func:`summary_fields`), the old one is
+          retired and linked to it, the members' ``consolidated_into`` moves to it and
+          the flag is gone; the new row does not inherit links to the old one;
+          ``rewritten``.
+
+        ``content`` goes through the strict scan first; blocked →
+        :class:`MemoryInjectionBlockedError`, nothing changed (the caller clears the flag)."""
+
+    @abc.abstractmethod
+    async def defer_summary_rewrite(
+        self, *, tenant_id: UUID, user_id: UUID, summary_id: UUID
+    ) -> bool:
+        """B-300 redesign §7.12 — a rewrite attempt failed: stamp ``last_reviewed_at=now``
+        on the summary and keep its flag (a summary has no review window, so the column
+        has no other use on it). Returns whether a row was stamped."""
 
     @abc.abstractmethod
     async def list_due_for_review(

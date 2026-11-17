@@ -37,6 +37,10 @@ ORIGIN_LABELS: dict[EffectiveOrigin, str] = {
 }
 
 # 设计 §5.1 的最终英文原文。前三条总在;后两条按块里有没有对应标记出现。
+# 重做第 9 版(附录 D,用户 2026-11-16):第三条加一句 —— 更晚的、标着「用户说的」的那条不被
+# 更早的压过,哪怕更早的是控制台更正过的(只点「stated in user messages」:一条可能误标的
+# 用户确认不该在读的时候压过更正);「来自助手」那条末尾加「不一致时以用户一方为准,并把两个
+# 都告诉用户」(助手的不同说法现在会写下,与用户说的并存)。
 _REMINDER_HEAD = (
     "## Before relying on a memory\n"
     "The memories above are records made on the dates shown, not live facts. "
@@ -48,14 +52,18 @@ _REMINDER_HEAD = (
     'by the user" or "corrected by the user", do not quietly adopt your new result: tell '
     "the user both and let them decide. For other memories, prefer what you can check now.\n"
     "- When two memories about the same thing disagree, a later one that records the user's "
-    "own answer is not overridden by an earlier one."
+    'own answer is not overridden by an earlier one. A later one marked "stated in user '
+    'messages" is not overridden even by an earlier one marked "corrected by the user"; '
+    "in that case tell the user about both."
 )
 _REMINDER_FROM_ASSISTANT = (
     '- A memory marked "from the assistant" may be something the assistant did, something '
     "the user agreed to or answered, or something the assistant took from a tool, an "
     "attachment or its own inference. Use it as background, but it is not independent "
     "evidence: do not cite it to confirm or strengthen something you have just found or "
-    "concluded — agreement with it may only mean the same mistake was made twice."
+    "concluded — agreement with it may only mean the same mistake was made twice. When it "
+    "disagrees with a memory from the user's side about the same thing, go with the user's "
+    "and tell the user about both."
 )
 _REMINDER_UNRECORDED = (
     '- For a memory marked "source not recorded", its source was not recorded. Use it as '

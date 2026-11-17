@@ -177,13 +177,27 @@ class MemoryItem(BaseModel):
     )
     supersedes: UUID | None = Field(
         default=None,
-        description="P5b — the older memory id this row replaces (forward link of the "
-        "append-only version chain).",
+        description="P5b — the older memory id this row is linked to. Two meanings since "
+        "B-300 redesign rev 9, told apart by the row it points at (not by this column): "
+        "that row has ``invalid_at`` set — this row replaced it (the forward link of the "
+        "append-only version chain; when one row replaced several, this holds the first "
+        "and the others are found through their ``superseded_by``); that row is still "
+        "valid — the two are about the same thing and the older one was not retired "
+        "(a user-confirmed row next to a user-stated one, an earlier statement that "
+        "arrived late, a summary waiting to be rewritten). On a **summary** row "
+        "(``consolidated_from`` set) it means something else: the row holding the "
+        "user's statement the summary was flagged by — the basis of its rewrite; "
+        "written when the flag is set, never inherited by the rewritten summary. "
+        "The links can form a two-node cycle (a new row pointing at the summary it "
+        "flagged, the summary pointing back at that row): never follow this column "
+        "as a chain without a step limit and de-duplication by id.",
     )
     superseded_by: UUID | None = Field(
         default=None,
         description="P5b — the newer memory id that replaced this row (reverse link; "
-        "set together with invalid_at when superseded).",
+        "set together with invalid_at when superseded). Several rows may point at the "
+        "same newer row. A history row (an earlier statement stored after the later one, "
+        "B-300 redesign rev 9) carries both from the moment it is written.",
     )
     expected_valid_days: int | None = Field(
         default=None,

@@ -2,8 +2,8 @@
 
 同一组用例跑两遍:内存实现(单元)与 SQL 实现(集成,迁移到 head)。
 
-* 层级:用户更正 3 > 用户说的 2 > 用户确认 1 > 来自助手 = 未记录 0;低层不得改高层;同层且是
-  用户一方时再比置信度;汇总行取成员(一层层往下)里最高的层级,同层取成员的最高置信度;
+* 层级:用户更正 3 > 用户说的 2 > 用户确认 1 > 来自助手 = 未记录 0;汇总行取成员(一层层往下)
+  里最高的层级(第 9 版起不带置信度;「谁能退谁」在 ``test_memory_write_retire_store.py``);
 * 整理:用户一方层级不同的成员同簇也算混合,不汇总;
 * 确认日期只在用户一方的行上:刷新只改用户一方的、只往后挪;取代时来自助手的新行不带;
   别人在控制台改写(来源置空)时清掉;
@@ -34,13 +34,9 @@ from expert_work.persistence.memory.base import (
     MAX_SUMMARY_DEPTH,
     ConsolidationSourcesChangedError,
     MemoryStore,
-    OriginStanding,
-    UserSideHigherConfidenceError,
-    UserSideTargetError,
     is_mixed_origin,
     origin_standing,
     origin_tier,
-    outranks,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
@@ -122,44 +118,8 @@ def test_origin_tier_of_each_effective_origin() -> None:
     assert tiers == [3, 2, 1, 0, 0]
 
 
-def _standing(origin: str | None, confidence: float) -> OriginStanding:
-    item = _item(uuid4(), uuid4(), "x", origin=origin, confidence=confidence)
-    return OriginStanding(origin_tier(item), item.confidence)
-
-
-@pytest.mark.parametrize("candidate", ["user_stated", "user_confirmed", "assistant_derived"])
-@pytest.mark.parametrize("target", _ORIGINS)
-def test_a_lower_tier_never_changes_a_higher_one(candidate: str, target: str | None) -> None:
-    """五个层级两两组合:候选层级低于目标 → 拒,不管置信度(候选 0.99 也不行)。"""
-    cand = _standing(candidate, 0.99)
-    tgt = _standing(target, 0.1 if target != "corrected" else 1.0)
-    assert outranks(tgt, cand) is (tgt.tier > cand.tier)
-
-
-def test_user_confirmed_cannot_change_a_less_certain_user_stated() -> None:
-    """审查 H2 的反例:0.8 的用户确认改不动 0.5 的用户说的。"""
-    assert outranks(_standing("user_stated", 0.5), _standing("user_confirmed", 0.8))
-
-
-def test_user_stated_changes_user_confirmed_whatever_the_confidence() -> None:
-    """用户说的(层级更高)可以改用户确认的 —— 是「用户后来自己说全了」。"""
-    assert not outranks(_standing("user_confirmed", 0.8), _standing("user_stated", 0.3))
-
-
-@pytest.mark.parametrize("origin", ["user_stated", "user_confirmed"])
-def test_same_user_side_tier_compares_confidence(origin: str) -> None:
-    assert outranks(_standing(origin, 0.7), _standing(origin, 0.6))
-    assert not outranks(_standing(origin, 0.6), _standing(origin, 0.6))
-    assert not outranks(_standing(origin, 0.5), _standing(origin, 0.6))
-
-
-def test_assistant_and_unrecorded_are_one_tier_and_never_compare_confidence() -> None:
-    assert not outranks(_standing(None, 0.99), _standing("assistant_derived", 0.1))
-    assert not outranks(_standing("assistant_derived", 0.6), _standing("assistant_derived", 0.1))
-
-
 @pytest.mark.asyncio
-async def test_summary_standing_is_its_members_top_tier_and_that_tiers_top_confidence() -> None:
+async def test_summary_standing_is_its_members_top_tier() -> None:
     t, u = uuid4(), uuid4()
     members = [
         _item(t, u, "a", origin="user_confirmed", confidence=0.8),
@@ -175,14 +135,14 @@ async def test_summary_standing_is_its_members_top_tier_and_that_tiers_top_confi
     async def load(ids: Sequence[UUID]) -> list[MemoryItem]:
         return [rows[i] for i in ids if i in rows]
 
-    assert await origin_standing(summary, load) == OriginStanding(2, 0.7)
+    assert await origin_standing(summary, load) == 2
     plain = _item(t, u, "plain", origin="user_confirmed", confidence=0.8)
-    assert await origin_standing(plain, load) == OriginStanding(1, 0.8)
+    assert await origin_standing(plain, load) == 1
 
 
 @pytest.mark.asyncio
 async def test_summary_standing_fails_closed_past_the_depth_bound() -> None:
-    """嵌套汇总查到 ``MAX_SUMMARY_DEPTH`` 层还有没查的成员 → 按层级 3、置信度 1.0。"""
+    """嵌套汇总查到 ``MAX_SUMMARY_DEPTH`` 层还有没查的成员 → 按层级 3。"""
     t, u = uuid4(), uuid4()
     chain = [_item(t, u, f"level {i}") for i in range(MAX_SUMMARY_DEPTH + 2)]
     rows = {
@@ -194,7 +154,7 @@ async def test_summary_standing_fails_closed_past_the_depth_bound() -> None:
     async def load(ids: Sequence[UUID]) -> list[MemoryItem]:
         return [rows[i] for i in ids if i in rows]
 
-    assert await origin_standing(rows[chain[0].id], load) == OriginStanding(3, 1.0)
+    assert await origin_standing(rows[chain[0].id], load) == 3
 
 
 def test_user_side_members_of_different_tiers_are_mixed() -> None:
@@ -213,63 +173,7 @@ def test_user_side_members_of_different_tiers_are_mixed() -> None:
     assert not is_mixed_origin(group("assistant_derived", None))
 
 
-# ─── 取代 / 作废在锁里按层级重判 ─────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_user_confirmed_candidate_is_refused_on_a_less_certain_user_stated_target(
-    store: MemoryStore,
-) -> None:
-    t, u = uuid4(), uuid4()
-    target = _item(t, u, "stated", origin="user_stated", confidence=0.5)
-    await store.write([target])
-    cand = _item(t, u, "confirmed", origin="user_confirmed", confidence=0.8)
-    standing = OriginStanding(1, 0.8)
-    with pytest.raises(UserSideTargetError) as raised:
-        await store.supersede(
-            tenant_id=t, user_id=u, old_id=target.id, new_item=cand, candidate_standing=standing
-        )
-    assert not isinstance(raised.value, UserSideHigherConfidenceError)
-    with pytest.raises(UserSideTargetError):
-        await store.expire(tenant_id=t, user_id=u, memory_id=target.id, candidate_standing=standing)
-    await _assert_untouched(store, t, u, target)
-
-
-@pytest.mark.asyncio
-async def test_user_stated_candidate_replaces_a_more_certain_user_confirmed_target(
-    store: MemoryStore,
-) -> None:
-    t, u = uuid4(), uuid4()
-    target = _item(t, u, "confirmed", origin="user_confirmed", confidence=0.8)
-    other = _item(t, u, "confirmed 2", origin="user_confirmed", confidence=0.8)
-    await store.write([target, other])
-    cand = _item(t, u, "stated", origin="user_stated", confidence=0.3)
-    standing = OriginStanding(2, 0.3)
-    assert await store.supersede(
-        tenant_id=t, user_id=u, old_id=target.id, new_item=cand, candidate_standing=standing
-    )
-    assert await store.expire(
-        tenant_id=t, user_id=u, memory_id=other.id, candidate_standing=standing
-    )
-
-
-@pytest.mark.asyncio
-async def test_same_tier_more_certain_target_raises_the_confidence_error(
-    store: MemoryStore,
-) -> None:
-    t, u = uuid4(), uuid4()
-    target = _item(t, u, "confirmed", origin="user_confirmed", confidence=0.8)
-    await store.write([target])
-    standing = OriginStanding(1, 0.6)
-    with pytest.raises(UserSideHigherConfidenceError):
-        await store.supersede(
-            tenant_id=t, user_id=u, old_id=target.id,
-            new_item=_item(t, u, "c2", origin="user_confirmed", confidence=0.6),
-            candidate_standing=standing,
-        )  # fmt: skip
-    with pytest.raises(UserSideHigherConfidenceError):
-        await store.expire(tenant_id=t, user_id=u, memory_id=target.id, candidate_standing=standing)
-    await _assert_untouched(store, t, u, target)
+# ─── 存储按成员算层级 ────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -287,19 +191,8 @@ async def test_store_origin_standing_reads_a_summary_through_its_members(
         source_ids=[m.id for m in members],
         source_hashes={m.id: hash_content(m.content) for m in members},
     )  # fmt: skip
-    got = await store.origin_standing(tenant_id=t, user_id=u, memory_id=summary.id)
-    assert got == OriginStanding(1, 0.8)
+    assert await store.origin_standing(tenant_id=t, user_id=u, memory_id=summary.id) == 1
     assert await store.origin_standing(tenant_id=t, user_id=u, memory_id=uuid4()) is None
-    with pytest.raises(UserSideTargetError):
-        await store.expire(
-            tenant_id=t, user_id=u, memory_id=summary.id,
-            candidate_standing=OriginStanding(0, 0.6),
-        )  # fmt: skip
-    with pytest.raises(UserSideHigherConfidenceError):
-        await store.expire(
-            tenant_id=t, user_id=u, memory_id=summary.id,
-            candidate_standing=OriginStanding(1, 0.7),
-        )  # fmt: skip
 
 
 @pytest.mark.asyncio
@@ -369,7 +262,8 @@ async def test_refresh_confirmed_at_leaves_superseded_and_expired_rows_alone(
     )
     await store.write([replaced, retracted])
     new = _item(t, u, "new", origin="user_stated")
-    assert await store.supersede(tenant_id=t, user_id=u, old_id=replaced.id, new_item=new)
+    got = await store.supersede(tenant_id=t, user_id=u, old_ids=[replaced.id], new_item=new)
+    assert got.retired == (replaced.id,)
     assert await store.expire(tenant_id=t, user_id=u, memory_id=retracted.id)
     for row in (replaced, retracted):
         assert not await store.refresh_confirmed_at(
@@ -387,7 +281,8 @@ async def test_supersede_drops_a_confirmed_date_on_a_non_user_side_new_row(
         old = _item(t, u, f"old {origin}", origin="assistant_derived")
         await store.write([old])
         new = _item(t, u, f"new {origin}", origin=origin, confirmed_at=_T0)
-        assert await store.supersede(tenant_id=t, user_id=u, old_id=old.id, new_item=new)
+        got = await store.supersede(tenant_id=t, user_id=u, old_ids=[old.id], new_item=new)
+        assert got.retired == (old.id,)
         assert (await _row(store, t, u, new.id)).confirmed_at is None
 
 

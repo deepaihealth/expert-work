@@ -806,10 +806,11 @@ async def test_supersede_closes_old_opens_new() -> None:
         content="user lives in Shanghai",
         embedding=(0.9, 0.1, 0.0),
     )
-    written = await store.supersede(
-        tenant_id=tenant, user_id=user, old_id=old_id, new_item=new_item
+    result = await store.supersede(
+        tenant_id=tenant, user_id=user, old_ids=[old_id], new_item=new_item
     )
-    assert written is not None
+    written = result.item
+    assert result.retired == (old_id,)
     assert written.supersedes == old_id
     assert written.valid_at is not None
 
@@ -825,7 +826,9 @@ async def test_supersede_closes_old_opens_new() -> None:
     assert old.superseded_by == new_item.id
 
 
-async def test_supersede_unknown_old_returns_none() -> None:
+async def test_supersede_unknown_old_still_writes_the_new_row() -> None:
+    """B-300 redesign §7.8 — an unknown target is skipped (``gone``); the write
+    never depends on a retirement."""
     from uuid import uuid4
 
     from expert_work.persistence.memory.memory import InMemoryMemoryStore
@@ -841,9 +844,13 @@ async def test_supersede_unknown_old_returns_none() -> None:
         content="x",
         embedding=(1.0, 0.0, 0.0),
     )
-    out = await store.supersede(tenant_id=tenant, user_id=user, old_id=uuid4(), new_item=new_item)
-    assert out is None
-    assert store._rows == []
+    unknown = uuid4()
+    out = await store.supersede(
+        tenant_id=tenant, user_id=user, old_ids=[unknown], new_item=new_item
+    )
+    assert out.inserted and dict(out.refused) == {unknown: "gone"}
+    assert [r.id for r in store._rows] == [new_item.id]
+    assert store._rows[0].supersedes is None
 
 
 async def test_supersede_revert_to_same_content_after_dedup_fix() -> None:
@@ -884,8 +891,8 @@ async def test_supersede_revert_to_same_content_after_dedup_fix() -> None:
         content="user lives in Shanghai",
         embedding=(0.9, 0.1, 0.0),
     )
-    to_b = await store.supersede(tenant_id=tenant, user_id=user, old_id=v1_id, new_item=v2)
-    assert to_b is not None
+    to_b = await store.supersede(tenant_id=tenant, user_id=user, old_ids=[v1_id], new_item=v2)
+    assert to_b.retired == (v1_id,)
 
     v3 = MemoryItem(
         id=uuid4(),
@@ -895,8 +902,8 @@ async def test_supersede_revert_to_same_content_after_dedup_fix() -> None:
         content=content_a,
         embedding=(1.0, 0.0, 0.0),
     )
-    reverted = await store.supersede(tenant_id=tenant, user_id=user, old_id=v2.id, new_item=v3)
-    assert reverted is not None
+    reverted = await store.supersede(tenant_id=tenant, user_id=user, old_ids=[v2.id], new_item=v3)
+    assert reverted.inserted and reverted.retired == (v2.id,)
 
     got = await store.retrieve(
         tenant_id=tenant, user_id=user, query_embedding=(1.0, 0.0, 0.0), limit=10

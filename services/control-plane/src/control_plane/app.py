@@ -208,6 +208,7 @@ from control_plane.memory.writeback_processor import (
 from control_plane.memory_consolidator import (
     ConsolidatorAuxModel,
     MemoryConsolidator,
+    SummaryRewriter,
     make_consolidator_embedder,
 )
 from control_plane.middleware import (
@@ -2007,6 +2008,27 @@ def create_app(
                     async def _resolve_memory_spec(spec: AgentSpec) -> AgentSpec:
                         return await _resolve_template_extends(spec, _memory_template_resolver)
 
+                    # B-300 重做第 9 版 §7.12 —— 任务收尾时当场重写被用户的新说法点到的汇总行:
+                    # 与整理器同一个类、同一个辅助模型取法(用量记在整理那一类),不另起任务。
+                    summary_rewriter = SummaryRewriter(
+                        memory_store=resolved_memory_store,
+                        aux_model=make_llm_router_aux_model(
+                            resolver=credentials_resolver,
+                            secret_store=resolved_secret_store,
+                            default_provider=(
+                                resolved_settings.memory_consolidator_default_aux_provider
+                            ),
+                            default_model=resolved_settings.memory_consolidator_default_aux_model,
+                            secret_cache=credential_value_cache,
+                            rate_limiter_factory=llm_rate_limiter_factory,
+                        ),
+                        embedder=make_consolidator_embedder(embedder),
+                        audit_logger=resolved_audit,
+                        usage_store=resolved_token_usage,
+                        default_aux_model_name=(
+                            resolved_settings.memory_consolidator_default_aux_model
+                        ),
+                    )
                     memory_writeback_worker = MemoryWritebackWorker(
                         store=resolved_memory_writeback_jobs,
                         processor=MemoryWritebackProcessor(
@@ -2027,6 +2049,7 @@ def create_app(
                             max_attempts=resolved_settings.memory_writeback_max_attempts,
                             resolve_spec=_resolve_memory_spec,
                             audit_logger=resolved_audit,
+                            rewrite_summaries=summary_rewriter.rewrite_for_user,
                         ),
                         interval_s=resolved_settings.memory_writeback_worker_interval_s,
                         lease_s=resolved_settings.memory_writeback_lease_s,
