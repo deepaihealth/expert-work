@@ -200,8 +200,10 @@ async def _reconcile(
     *candidates: _Candidate,
     agent: str | None = _AGENT,
     message_times: dict[str, datetime] | None = None,
+    task_corrections: dict[UUID, bool] | None = None,
 ) -> int:
-    """跑一次去重合并,把交回的直写项也写下(与写回的调用方一样);返回落库的行数。"""
+    """跑一次去重合并,把交回的直写项也写下(与写回的调用方一样);返回落库的行数。
+    ``task_corrections``:本任务里各候选 / 先写下的行 → 它的更正标记(写回按两段传的那一份)。"""
     result = await _reconcile_and_apply(
         list(candidates),
         agent_name=agent,
@@ -211,6 +213,7 @@ async def _reconcile(
         token=CancellationToken(),
         log_label="test",
         message_times=message_times,
+        task_corrections=task_corrections,
     )
     assert result.blocked == []
     written = await store.write(result.direct)
@@ -1000,8 +1003,10 @@ def _two_turns(
     c: _Ctx, *, later_origin: str = "user_confirmed", earlier_origin: str = "user_confirmed"
 ) -> tuple[MemoryItem, MemoryItem, dict[str, datetime]]:
     """场景 j:晚说的(t2)先写、早说的(t1)后到,同一个对话。默认两条都是用户确认(两轮里用户各
-    同意了一个名字):第 10 版起晚说的若是用户说的(第一次的产出),倒过来「它退早说的」要带更正
-    标记,库里的行没有 → 算不过,两条并存(见 ``first_pass_later``)。"""
+    同意了一个名字)。晚说的若是用户说的(第一次的产出),倒过来「它退早说的」要带更正标记:库里的
+    行不存这个标记,只有本任务先写下的那条程序还记得(用户 11-17 选 (b),见
+    ``test_a_first_pass_later_row_is_an_anchor_only_if_written_here_as_a_correction``);不是本任务
+    写的 → 算不过,两条并存(``first_pass_later``)。"""
     later = c.mem(
         "the cat is called Songfeng",
         _at(0.9),
@@ -1061,7 +1066,8 @@ async def test_without_any_one_of_the_five_the_earlier_candidate_coexists_and_li
     c = _Ctx()
     store = InMemoryMemoryStore()
     # 倒过来「目标退候选」查不过:目标是助手的(退不掉用户一方)、「确认对说的」,或(第 10 版)
-    # 目标是用户说的 —— 第一次的产出退用户一方要带更正标记,库里的行没有这个标记。
+    # 目标是用户说的、又不是本任务带着更正标记写下的 —— 第一次的产出退用户一方要带更正标记,库里
+    # 的行不存这个标记(这里没传本任务的标记 = 以前的任务写的)。
     later_origin = {"assistant": "assistant_derived", "first_pass_later": "user_stated"}
     later, earlier, times = _two_turns(
         c,
@@ -1095,6 +1101,85 @@ async def test_without_any_one_of_the_five_the_earlier_candidate_coexists_and_li
         "older_coexists": 1,
         "retire_refused_older_line": 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("written_here", "history"),
+    [
+        # 场景 j:本任务第一段先写下「还是叫松风」,带着更正标记(C3)→ 倒过来过得了,写成历史。
+        (True, True),
+        # 本任务先写下、不带更正标记(例如被考时答的值)→ 倒过来过不了,两条并存。
+        (False, False),
+        # 不是本任务写的(以前的任务写下、库里不存标记):照第 10 版,两条并存。本任务的标记表
+        # 不是空的(有早说的这条候选自己),只是没有晚说的那一行。
+        (None, False),
+    ],
+)
+async def test_a_first_pass_later_row_is_an_anchor_only_if_written_here_as_a_correction(
+    written_here: bool | None, history: bool
+) -> None:
+    """第 10 版审查 MEDIUM-2,用户 11-17 选 (b):晚说的是用户说的时,只有它是**本任务**带着更正
+    标记写下的,早说的才写成连到它的历史行;其余照第 10 版并存、连线。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    later, earlier, times = _two_turns(c, later_origin="user_stated")
+    await store.write([later])
+    task = {earlier.id: False}
+    if written_here is not None:
+        task[later.id] = written_here
+    counts = _Counts("written_as_history", "older_coexists", "retire_refused_older_line")
+    stored = await _reconcile(
+        store,
+        _LLM([_ops(_add(replaces=["e0"]))]),
+        _said(earlier, at=_T0),
+        message_times=times,
+        task_corrections=task,
+    )
+    assert stored == 1 and _untouched(store, later)
+    row = _row(store, earlier.id)
+    if history:
+        assert row.invalid_at is not None and row.superseded_by == later.id
+        assert _write_guarantee_holds(store, earlier)
+    else:
+        assert _stored(store, earlier) and row.supersedes == later.id
+    assert counts.delta() == {
+        "written_as_history": int(history),
+        "older_coexists": int(not history),
+        "retire_refused_older_line": 1,
+    }
+
+
+@pytest.mark.parametrize("later_is_correction", [True, False])
+async def test_two_first_pass_statements_extracted_latest_first(later_is_correction: bool) -> None:
+    """审查 MEDIUM-2 提到的第三种:两条都是第一次的产出(用户说的),提炼把晚说的排在前面。同一批
+    里先到的那条没有邻居、取邻居时当场写下,早说的那条取邻居时才看得到它(两条都有别的邻居时,同一
+    批里互不相见,各自只与库里原有的比,不会走到这里)。模型把晚说的列进早说的 ``replaces`` → 早说的
+    更早(``older_line``)→ 查历史行:晚说的是本任务写的,带更正标记(「改成……了」)→ 早说的写成
+    历史、连到它;不带(只是又说了个值)→ 两条并存、早说的连着它。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    later = c.mem("the cat is called Songfeng", source_thread_id=_THREAD, evidence_message_id="m-2")
+    earlier = c.mem(
+        "the cat is called Nanzhi", _at(0.9), source_thread_id=_THREAD, evidence_message_id="m-1"
+    )
+    t2 = _T0 + timedelta(minutes=5)
+    times = {"m-1": _T0, "m-2": t2}
+    llm = _LLM([_ops(_add(replaces=["e0"]))])
+    stored = await _reconcile(
+        store,
+        llm,
+        _said(later, at=t2, correction=later_is_correction),
+        _said(earlier, at=_T0),
+        message_times=times,
+        task_corrections={later.id: later_is_correction, earlier.id: False},
+    )
+    assert stored == 2 and _untouched(store, later)
+    assert [x["content"] for x in llm.payload()["candidates"]] == [earlier.content]
+    row = _row(store, earlier.id)
+    if later_is_correction:
+        assert row.invalid_at is not None and row.superseded_by == later.id
+    else:
+        assert _stored(store, earlier) and row.supersedes == later.id
 
 
 async def test_a_history_anchor_that_is_gone_makes_the_candidate_a_valid_row() -> None:

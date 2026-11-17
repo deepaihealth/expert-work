@@ -1903,6 +1903,9 @@ class _ReconcileDeps:
     before_store: BeforeStore | None
     #: 本对话里各消息的发送时间(消息 id → UTC),比先后用(:func:`_said_at`)。
     message_times: Mapping[str, datetime] = field(default_factory=dict)
+    #: 本任务的每条候选(写下时行 id 就是候选的 id)→ 它的更正标记。库里的行不存这个标记,本任务
+    #: 先写下的那几条程序还记得(历史行倒过来查用,:func:`_is_history_of`)。
+    task_corrections: Mapping[UUID, bool] = field(default_factory=dict)
 
 
 async def _refresh_if_restated(
@@ -1989,6 +1992,7 @@ async def _reconcile_and_apply(
     log_label: str,
     before_store: BeforeStore | None = None,
     message_times: Mapping[str, datetime] | None = None,
+    task_corrections: Mapping[UUID, bool] | None = None,
 ) -> _Reconciled:
     """Stream CM-7 Mem0-style extract→reconcile, B-300 redesign §7 (rev 9: the write and
     the retirements are decided separately, §7.3).
@@ -2012,7 +2016,9 @@ async def _reconcile_and_apply(
     B-300 D2 —— 新内容被写入扫描拦下的候选:不落库、什么旧记忆都不退,也**不**退回直接写入;
     交回 ``blocked`` 由调用方发审计(``positions`` = 候选在本次提炼结果里的序号)。
     """
-    deps = _ReconcileDeps(memory_store, token, log_label, before_store, message_times or {})
+    deps = _ReconcileDeps(
+        memory_store, token, log_label, before_store, message_times or {}, task_corrections or {}
+    )
     progress = _Progress()
     try:
         await _reconcile_into(progress, candidates, agent_name, positions, llm_caller, deps)
@@ -2236,7 +2242,10 @@ def _needs_correction(entry: _Pending, listed: _Listed) -> bool:
 
 
 def _is_history_of(
-    entry: _Pending, target: MemoryItem, message_times: Mapping[str, datetime]
+    entry: _Pending,
+    target: MemoryItem,
+    message_times: Mapping[str, datetime],
+    task_corrections: Mapping[UUID, bool],
 ) -> bool:
     """§7.1 第 11 行(用户 2026-11-16「记成历史」,按审查 N-1 收窄)—— 候选更早、模型说目标让它
     「不再成立」(调用方已核:在 ``replaces`` 里、先后那一项才没过)时,候选能不能写成连到目标的
@@ -2245,7 +2254,10 @@ def _is_history_of(
     候选不带事件日期时,倒过来的事件日期那一项本来就不拒绝)。加锁时目标是否仍有效由存储查。
 
     第 10 版:倒过来退的一方若是用户说的(第一次的产出),它退用户一方要带更正标记(
-    :func:`_needs_correction`),库里的行没有这个标记 → 算不过,两条并存、连线。"""
+    :func:`_needs_correction`)。库里的行不存这个标记;第 10 版审查 MEDIUM-2(用户 11-17 选 (b)):
+    **本任务**先写下的行程序还记得它当时带没带(``task_corrections``)—— 带了算过(场景 j:「算了,
+    还是叫松风」是更正,早说的「南枝」写成历史);没带、或不是本任务写的 → 算不过,两条并存、连线
+    (倒过来的 T39:被考时答的值先写下,早说的用户确认不会因此变成历史)。"""
     candidate = entry.candidate
     item = candidate.item
     if effective_origin(item) not in USER_SIDE_ORIGINS or item.occurred_on is not None:
@@ -2253,7 +2265,7 @@ def _is_history_of(
     evidence = _evidence_at(target, item, message_times)
     if evidence is None or candidate.line_at is None or as_utc(candidate.line_at) >= evidence:
         return False
-    if effective_origin(target) == "user_stated":
+    if effective_origin(target) == "user_stated" and task_corrections.get(target.id) is not True:
         return False
     reversed_refusal = may_retire(
         effective_origin(target), origin_tier(item), target_is_summary=False
@@ -2319,7 +2331,7 @@ def _judge_listed(
                 if (
                     one.kind == "replaces"
                     and verdict.history is None
-                    and _is_history_of(entry, target, deps.message_times)
+                    and _is_history_of(entry, target, deps.message_times, deps.task_corrections)
                 ):
                     verdict.history = target.id
                 else:
@@ -3038,6 +3050,9 @@ async def flush_messages_with_outcome(
             else [candidates]
         )
         message_times = _message_times(messages, user_text_messages or ()) if reconcile else {}
+        # 第 10 版审查 MEDIUM-2(用户 11-17 选 (b)):第二段查历史行时要知道第一段写下的行带没带
+        # 更正标记 —— 库里不存,这里按候选记下(写下时行 id 就是候选的 id)。
+        task_corrections = {c.item.id: c.is_correction for c in candidates}
         for number, stage in enumerate(stages):
             later = [(str(c.item.kind), c.item.content) for s in stages[number + 1 :] for c in s]
             retry_pairs = [(str(c.item.kind), c.item.content) for c in stage] + later
@@ -3054,6 +3069,7 @@ async def flush_messages_with_outcome(
                         log_label=log_label,
                         before_store=before_store,
                         message_times=message_times,
+                        task_corrections=task_corrections,
                     )
                 except ReconcileFailedError as exc:
                     # 重做 §7.6(PR S)—— 不再直接写入:抛给任务重试(重试会完整地再做一遍拦截与

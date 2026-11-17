@@ -1132,3 +1132,97 @@ async def test_the_same_output_settles_the_same_however_the_write_back_is_sliced
         ("conversation", "turn_reanchored_context"),
         ("conversation", "turn_reanchored_in_segment"),
     ]
+
+
+# ─── 7. 第 10 版审查 MEDIUM-2:早说的后到,看本任务里先写的那条带没带更正(用户 11-17 选 (b))────
+
+
+def _agreed_then_renamed(later: str) -> list[BaseMessage]:
+    """场景 j:第 1 轮同意助手提的名字(第二次提炼,用户确认),第 2 轮整句改口(第一次提炼,用户
+    说的)。一个任务覆盖两轮:两段合并先写第 2 轮那句,第 1 轮那句后到。"""
+    return [
+        _user("帮我想想猫的名字", _T0, "u1"),
+        _assistant("叫「南枝」怎么样?", _T0 + timedelta(seconds=5), "a1"),
+        _user("好", _T0 + timedelta(minutes=1), "u2"),
+        _assistant("好的,就叫南枝。", _T0 + timedelta(minutes=1, seconds=5), "a2"),
+        _user(later, _T0 + timedelta(minutes=5), "u3"),
+        _assistant("好的。", _T0 + timedelta(minutes=5, seconds=5), "a3"),
+    ]
+
+
+def _first_and_second(later: str, *, correction: bool) -> _RoutingLLM:
+    """第一次:第 2 轮那句(用户行编号 3);第二次:第 1 轮的同意(整段编号 3,上一行是助手的提议);
+    去重合并:模型把先写下的那句列进后到那句的 ``replaces``(配成了一对)。"""
+    return _RoutingLLM(
+        user_reply=_reply(
+            {"kind": "fact", "content": later, "turn": 3, "is_correction": correction}
+        ),
+        conversation_reply=_reply(
+            {"kind": "fact", "content": "用户的猫叫南枝", "basis": "user_agreement", "turn": 3}
+        ),
+        ops=[_lists(replaces=["e0"])],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("correction", [True, False])
+async def test_an_agreement_that_reaches_the_store_after_the_change_follows_the_change_mark(
+    correction: bool,
+) -> None:
+    """场景 j(用户 11-16「记成历史」;11-17 选 (b)):「算了,还是叫松风」按 C3 是更正 → 本任务
+    先写下它时带着更正标记,倒过来「它退南枝」过得了 → 南枝写成历史行、连到松风。同一句若没带
+    更正标记(提炼没认出改口),倒过来过不了 → 两条并存、南枝连着松风。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    llm = _first_and_second("用户的猫叫松风", correction=correction)
+    embeddings = {"用户的猫叫松风": _E, "用户的猫叫南枝": _at(0.9)}
+    history, coexists = _count("written_as_history"), _count("older_coexists")
+    await _flush(c, store, _agreed_then_renamed("算了,还是叫松风"), llm, embeddings)
+    later = next(r for r in store._rows if r.content == "用户的猫叫松风")
+    earlier = next(r for r in store._rows if r.content == "用户的猫叫南枝")
+    assert (later.origin, earlier.origin) == ("user_stated", "user_confirmed")
+    assert later.invalid_at is None and later.superseded_by is None
+    if correction:
+        assert earlier.invalid_at is not None and earlier.superseded_by == later.id
+    else:
+        assert _coexist_linked(store, later, earlier)
+    assert (_count("written_as_history") - history, _count("older_coexists") - coexists) == (
+        int(correction),
+        int(not correction),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_quiz_answer_written_first_in_one_task_does_not_make_the_agreement_history() -> (
+    None
+):
+    """倒过来的 T39(审查 MEDIUM-2 选 (b) 时要挡住的那一半):一个任务里,用户先同意了 Y(第二次,
+    用户确认),后来被考时答了一个错值 W(第一次,用户说的、不带更正标记)。W 先写下,Y 后到;模型
+    把 W 列进 Y 的 ``replaces`` → Y 不写成历史行:两条并存、Y 连着 W。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    messages = [
+        _user("帮我查一下我的工号", _T0, "u1"),
+        _assistant("是 A1407 吗?", _T0 + timedelta(seconds=5), "a1"),
+        _user("对", _T0 + timedelta(minutes=1), "u2"),
+        _assistant("好的。", _T0 + timedelta(minutes=1, seconds=5), "a2"),
+        _user("A1074", _T0 + timedelta(minutes=5), "u3"),
+        _assistant("不对,是 A1407。", _T0 + timedelta(minutes=5, seconds=5), "a3"),
+    ]
+    llm = _RoutingLLM(
+        user_reply=_reply(
+            {"kind": "fact", "content": "用户的工号是 A1074", "turn": 3, "is_correction": False}
+        ),
+        conversation_reply=_reply(
+            {"kind": "fact", "content": "用户的工号是 A1407", "basis": "user_agreement", "turn": 3}
+        ),
+        ops=[_lists(replaces=["e0"])],
+    )
+    embeddings = {"用户的工号是 A1074": _E, "用户的工号是 A1407": _at(0.95)}
+    history = _count("written_as_history")
+    await _flush(c, store, messages, llm, embeddings)
+    w = next(r for r in store._rows if r.content == "用户的工号是 A1074")
+    y = next(r for r in store._rows if r.content == "用户的工号是 A1407")
+    assert y.invalid_at is None and w.invalid_at is None
+    assert _coexist_linked(store, w, y)
+    assert _count("written_as_history") == history
