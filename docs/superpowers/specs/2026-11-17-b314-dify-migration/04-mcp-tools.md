@@ -410,7 +410,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 2. **通知同事**:按员工绑定判断走 pad 还是 pc(与到点提醒同口径,`send-notify.processor.ts:50-82`),目标取绑定行上的转人工配置,兜底规则与现在一致(§1.5)。目标是内部同事 / 内部群,所以**和现在 dk 的转人工一样,不写 AI 标记、不过人工接管检查**。
    - **pad**:用 MCP 现有的 pad 文字发送,发给转人工目标(同事 pad id,或内部群)。
    - **pc(已定 11-17)**:照数字人服务的 `enqueueReferral`(`pc-send-task.service.ts:190-225`)往 `t_project_cpwx_pc_send_task` 插 referral 任务 —— 同样用 `PcReferralResolver.pickTargets(项目, 同事 userid 列表, 群 chat_id)` 的规则选目标(`pc-referral.resolver.ts:43`),字段照搬:`task_id = referral_<uuid>:<sha1(目标)前 16 位>`、`customer_external_userid = ''`、`referral_userid`、`room_chat_id`、`texts`、`task_kind = referral`。领取时的行为(不过接管检查、不写 AI 标记、30 分钟过期、最后发放、领取时再解析同事 / 群名)全部留在数字人服务,MCP 不碰。这是 MCP 与数字人服务之间的跨服务约定,两边要有契约测试。**不走** MCP 现有 pc 发送用的 `t_machine_task`:它的收件人只能是外部联系人或群,发不了给内部同事的私聊,而且领取时会写 AI 已发标记(§1.4)。转人工状态照现在标:pad 私聊把本批客户消息标 `referral_human_status=1`(从 `source_message_ids` 取 `msg_app_info`);dk 没有状态列,referral 任务本身就是记录。
-3. **本轮不回**:`this_turn=silent` 且**不是急症**时,写现有的临时接管标志 `HUMAN_HAS_ANSWERED_{项目}_{员工}[_{群}]_{客户}`(存活 600 秒),写在数字人服务共用的那个 Redis 库(库号待核实,与「提醒队列 14 还是 15」一起核,§9.12)。两通道的发送前检查本来就查这个键(§1.5),这一轮的回复即使生成了也会被拦下。客户再开口时这个键会被自动删掉,下一轮 AI 恢复回复。键里的 id 拼法是跨服务约定,pad 用 pad id、dk 用企微明文 id(§3.3),必须逐字一致。只写客户级的键,不写群级键(群级会挡住群里其他客户)。
+3. **本轮不回**:`this_turn=silent` 且**不是急症**时,写现有的临时接管标志 `HUMAN_HAS_ANSWERED_{项目}_{员工}[_{群}]_{客户}`(存活 600 秒),写在数字人服务的缓存库(`CACHE_REDIS_DB_INDEX`,代码默认 0;不是提醒队列库,§9.12)。两通道的发送前检查本来就查这个键(§1.5),这一轮的回复即使生成了也会被拦下。客户再开口时这个键会被自动删掉,下一轮 AI 恢复回复。键里的 id 拼法是跨服务约定,pad 用 pad id、dk 用企微明文 id(§3.3),必须逐字一致。只写客户级的键,不写群级键(群级会挡住群里其他客户)。
 4. **之后不回**:`afterwards=stop` 时,把当前对话的 AI 开关 `is_enabled_agent_reply` 置 0:私聊改 `t_project_customer_cpwx_relation` 那一行,群里改 `t_project_cpwx_group_member` 里**这位客户**那一行。数字人服务调用前本来就查它(`invoke-agent.processor.ts:479-538`),之后这位客户在这个对话里的消息不再调智能体。两张表按企微明文 id 查(员工 `cpwx_userid`、客户 `cpwx_external_userid`、群 `chat_id`);pad 通道绑定的是 pad id,要换算 —— **v1 定为 MCP 自己反查**(按员工、客户、群查 `t_project_customer_cpwx_relation` / 群成员表等),不新增 inputs;查不到(如群里未建档的发言人)就**不动开关**,记告警日志,通知同事照常发。
 5. **返回**:告诉模型本轮怎么做 —— `reply`:「本轮只回一句稳住的话(如『我确认一下,稍后回复您』),不回答交出去的问题,不要说已转人工」;`silent`:「本轮不用写回复,输出空」。
 
@@ -978,7 +978,9 @@ spec:
 **9.11 身份变量必填还是可选** —— **按推荐定(11-17,01 待拍板 12)**
 - 本文做法:声明变量全部 `required: true`(`attachment_urls` 除外),没建档 / 私聊传空串;漏传当场 422(§7 用例 5)。06 §5.1 / §5.5 已改成同一口径。
 
-**9.12 MCP 写接管标志用哪个 Redis 库(待核实,不是取舍)**:临时接管标志在数字人服务和 pad 同步 / dk 存档共用的库里(dk 存档服务代码注释写明「与 agent / pad 同库」,`human-answered.service.ts:44`)。库号与「提醒队列在 14 还是 15」(3.6)一起按部署环境核实;写错库,`silent` 会悄悄失效(6.17)。
+**9.12 Redis 库号(11-17 已核)**:
+- **提醒队列**:生产数字人服务 `QUEUE_REDIS_DB_INDEX = 15`(用户 11-17 查生产配置确认;代码默认 14 未生效)。MCP 投提醒按 15 连(与项目服务 `ai-notify` 一致,`ai-notify.const.ts:10-12`)。
+- **临时接管标志**:不在队列库,在数字人服务的缓存库(`CACHE_REDIS_DB_INDEX`,`src/config/redis.ts:18`,代码默认 0;`app.module.ts:89`),pad 同步 / dk 存档与它同库(`human-answered.service.ts:44`)。只在转人工配成「本轮不回」时才写;健管师默认是「本轮回复」(11-17),所以默认用不到。将来要配成本轮不回之前,先按生产配置核这个库号;写错库,`silent` 会悄悄失效(6.17)。
 
 **9.13 AI 开关被关掉后,谁、在哪重新打开(实现前必须确认)**:读代码在项目服务找到两个接口(私聊、群成员各一个,§1.5),但员工端有没有入口在用没核实。推荐:深护确认员工后台有按钮;没有就补一个,随 M13 一起上。没有入口时不要启用 `afterwards=stop`。
 
@@ -1060,7 +1062,7 @@ spec:
 5. 共享背景说 arg_bindings「模型看不到改不了」:绑定**落空**时(工具名错 / 服务器没连上 / 内部名撞名)参数会回到模型手里,平台只给警告。
 6. 共享背景没提:平台 MCP 客户端会按 outputSchema 严格校验返回(6.8)。这决定了健康方案精简版必须另开新工具。
 7. 共享背景没提:群里没有客户档案的发言人 `customer_code` 为空,所以提醒要按 `customer_pad_userid` 绑定和查询(与现有数据一致)。
-8. 队列库号:数字人代码默认 14,项目服务注释称数字人部署在 15,以环境变量为准。
+8. 队列库号:数字人代码默认 14,生产 `QUEUE_REDIS_DB_INDEX` = 15(11-17 用户核实)。
 9. 会话失效回 400 不止 POST,GET、DELETE、旧 SSE `/messages` 也是 400。
 10. Expert Work `origin/main` 当前是 `d9db26f79`(在 `5908fe554` 之上的一次部署提交),本文按它核对。
 11. 11-17 评审复核:记忆提炼「只看最终回答」的代码在 `memory.py:540-546、583-612`(`_turn`);同文件 368-377 行只是提炼提示词里的示例文字。
