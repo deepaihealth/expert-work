@@ -6,7 +6,7 @@
 >
 > **修订(2026-11-17,06 评审结论)**:inputs 加 `self_introduction`(自我介绍),与 `self_appellation` 一起由项目服务原样转给 Expert Work(数字人服务已在传)。
 >
-> **修订(2026-11-18,用户 11-18 拍板)**:会话与 run 台账**复用**现有 `t_project_expert_work_session` / `t_project_expert_work_run`,不再新建 `t_project_dh_ew_*` 两张表(§5.4);项目服务按配置行上新加的 `adapter_type` 选适配器和计费,做一个**通用的企微聊天适配器**,以后再接企微聊天智能体只要加配置(§4);`wx:` 前缀定稿并写明代码改动(§3.4.1);康豆按场景固定价,要在计费里加按适配器的钩子,`incomplete` 只有拿到可用回答才扣(§3.8);等满 360 秒必须调取消(§3.7);兜底话术写死在项目服务代码里(§3.9);客户删除会级联删会话行(§6)。
+> **修订(2026-11-17,用户 11-17 拍板)**:会话与 run 台账**复用**现有 `t_project_expert_work_session` / `t_project_expert_work_run`,不再新建 `t_project_dh_ew_*` 两张表(§5.4);项目服务按配置行上新加的 `adapter_type` 选适配器和计费,做一个**通用的企微聊天适配器**,以后再接企微聊天智能体只要加配置(§4);`wx:` 前缀定稿并写明代码改动(§3.4.1);康豆按场景固定价,要在计费里加按适配器的钩子,`incomplete` 只有拿到可用回答才扣(§3.8);等满 360 秒必须调取消(§3.7);兜底话术写死在项目服务代码里(§3.9);客户删除会级联删会话行(§6)。
 >
 > **修订(2026-11-17,独立核对后的修正)**:`source_message_ids` 在 03 之后怎么来定了做法 —— 数字人服务另传 `source_msg_keys`(本批 + 正在重跑的被取消批,§5.1),项目服务据此生成;未送达原因统一用 03 的取值(`send_failed` / `human_took_over` / `cancelled` / `other`,§5.4);滑窗口径改为「最近 20 轮」(第一轮已关掉);若干措辞按已定事项更新。
 >
@@ -211,7 +211,7 @@ Dify 的 `agent_call_back_url`、`agent_api_url`、`project_service_api_url` 不
 - 现有前缀(读代码确认,`expert-work-user.ts:3-29`):员工侧 `pc:{项目}:emp:{员工}`(ai-health-plan 等)、员工代客户 `pc:{项目}:emp:{员工}:cus:{客户}`、H5 里客户本人 `h5:{项目}:cus:{客户}`。
 - 前缀 **`wx:`**(wx = 企微)与员工侧不撞,也不与 H5 的 `h5:` 共用(共用等于让企微健管师和 H5 里客户自用的智能体共享长期记忆,且 `h5:` 在项目服务里用于计费归属判断)。平台按(租户, user_id)隔离长期记忆,同一个 user_id 下「事实」类记忆跨该用户的所有智能体共享(共享背景),所以前缀选择就是「和谁共享记忆」的选择。
 - 长度 ≤ 255、不含 NUL,沿用 `assertValidExternalUserId`。项目服务里按前缀判断「是不是客户发起」的 `isCustomerExternalUserId` 只认 `h5:`(`src/modules/expert-work/service/client/expert-work-user.ts:9-14、23-25`),新前缀要补。
-- **已定(11-18)用 `wx:`,代码改两处**(路径相对 `deep-ai-health-project-service`,11-18 项目服务代码核对):① 在 `expert-work-run.service.ts:290-294` 旁边加一个 `wx:` 的 user_id 生成函数(现有的只会拼 `pc:` / `h5:`);② 放宽 `isCustomerExternalUserId`,让 `wx:` 也算客户发起,钱包流水才能挂到客户上。理由:健管师的长期记忆要和 ai-strategy H5 里同一客户的 `h5:` 分开。
+- **已定(11-17)用 `wx:`,代码改两处**(路径相对 `deep-ai-health-project-service`,11-17 项目服务代码核对):① 在 `expert-work-run.service.ts:290-294` 旁边加一个 `wx:` 的 user_id 生成函数(现有的只会拼 `pc:` / `h5:`);② 放宽 `isCustomerExternalUserId`,让 `wx:` 也算客户发起,钱包流水才能挂到客户上。理由:健管师的长期记忆要和 ai-strategy H5 里同一客户的 `h5:` 分开。
 - 同一个客户的私聊和所有群用同一个 user_id,长期记忆因此共享;会话也共用一段(下一节)。
 - 已知限制:群里没建档的发言人(`ext:`)之后建了档,user_id 换成 `cus:`,旧 `ext:` 下的长期记忆不会自动合并过来。
 
@@ -391,14 +391,14 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 
 现在 Dify 链路:按场景取固定价(文字 / 图片 / 图文,`kdou-cost-scenario.ts:105-119`),流正常结束才扣,被取消不扣,扣在发送之前(`agent.service.ts:820-847`)。项目服务里其它 Expert Work 智能体的口径不同:按用量折算;是否扣费由全局的 `shouldCharge` 决定,`paused` / `interrupted` 也扣、`error` 不扣(`expert-work-billing.service.ts:62-80`);计费项按 agent_code 精确匹配,认不出的不扣(`:39-56`)。
 
-**要改的(11-18 定)**:健管师沿用**按场景固定价**(文字 / 图片 / 图文),不按用量 × 单价。这需要在计费里加一个**按适配器的钩子**:`shouldCharge` 和单价都按 `adapter_type` 取(改 `expert-work-billing.service.ts:62-80、121`,`run-settlement.service.ts:182`);结算本来就按会话行的 agent_code 派发适配器和计费(`run-settlement.service.ts:171、189`),这里改成先看 `adapter_type`(§4)。
+**要改的(11-17 定)**:健管师沿用**按场景固定价**(文字 / 图片 / 图文),不按用量 × 单价。这需要在计费里加一个**按适配器的钩子**:`shouldCharge` 和单价都按 `adapter_type` 取(改 `expert-work-billing.service.ts:62-80、121`,`run-settlement.service.ts:182`);结算本来就按会话行的 agent_code 派发适配器和计费(`run-settlement.service.ts:171、189`),这里改成先看 `adapter_type`(§4)。
 
 已拍板(11-17,§9 第 5、15 条):沿用场景固定价;**智能体这一轮正常跑完就扣,包括不发消息的轮次(转人工选了「本轮不回」、群里不是对 AI 说的话);出错、超时、发兜底话术、被取消不扣**。
 
 | 本轮结果 | 扣不扣 |
 |---|---|
 | `success`,或 `incomplete`(被最大步数 / token 预算截断)但取到了可用回答 | 扣,沿用现在的场景固定价;扣在取到回答时,发送失败或被真人接管不退(与现在一致) |
-| `incomplete` 且没有可用回答 | 发兜底,**不扣**(11-18 定) |
+| `incomplete` 且没有可用回答 | 发兜底,**不扣**(11-17 定) |
 | 模型判断这轮不回(`silent`,什么都不发:转人工选了「本轮不回」,或群里不是对 AI 说的话) | **扣**(11-17 用户定,§9 第 15 条) |
 | 取到回答但不可用,改发兜底话术 | 不扣 |
 | 我方取消(`interrupted`,或取消后抢先跑完的 `success`) | 不扣 |
@@ -432,7 +432,7 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 
 已拍板(11-17,§9 第 8 条):
 
-- **兜底原文由项目服务拼**(文案**写死在项目服务代码里**,沿用 Dify 原文,不存库;11-18 定,02 §3.7 / §5.6),放进 `answer_text`、来源标 `fallback`,返回 `outcome: "fallback"`;数字人服务按普通回复入发送队列,发送前的真人接管检查照样生效。
+- **兜底原文由项目服务拼**(文案**写死在项目服务代码里**,沿用 Dify 原文,不存库;11-17 定,02 §3.7 / §5.6),放进 `answer_text`、来源标 `fallback`,返回 `outcome: "fallback"`;数字人服务按普通回复入发送队列,发送前的真人接管检查照样生效。
 - **限频**:同一聊天窗口 10 分钟最多发一次兜底,私聊和各群分开计 —— 私聊按「员工企微号 × 客户企微号」,群按群(群里所有人都看得到)。项目服务拼兜底前 `SET NX EX 600`(键见 §5.4);设置不成功(10 分钟内这个窗口发过)就返回 `answer_text: []`、只记日志。平台整体故障时,不会每个客户每说一句就收一条「开小差」。
 - **数字人服务调项目服务本身失败**(连不上、390 秒超时、项目服务进程挂了):拿不到兜底原文,不发、记日志并告警(已定 11-17,§9 第 16 条;与现在 Dify 链路一致:`invoke-agent.processor.ts:913-921` 只记 `error` / `send_chat_error`,什么都不发)。
 - 兜底话术由员工企微号发出,按已拍板的人机混合规则算健管师一方的消息,03 落地后下一轮会被补进会话。
@@ -490,8 +490,8 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 ### 深护项目服务
 
 1. 新入口 `POST /agent/invoke-digital-human-ew`,契约见 §5.1;现有 Dify 入口不动。
-2. **复用现有两张表**(11-18 定,§5.4):会话行用 `t_project_expert_work_session`(`employee_code` 留空串、填 `customer_code`、`ew_user_id = wx:…`),run 台账用 `t_project_expert_work_run`;不新建 `t_project_dh_ew_session` / `t_project_dh_ew_run`。已有先例:ai-strategy H5 的客户自发会话就是 `employee_code` 为空的会话行(`expert-work-run.service.ts:250、324`)。
-2a. **通用的企微聊天适配器**(11-18 定):`t_project_expert_work_config` 加一列可空的 `adapter_type`(如 `wecom_chat`);为空 = 照现在按 agent_code 精确注册的适配器(`agent-adapter.registry.ts:36-38`),现有智能体不受影响、不用回填。项目服务先按 `adapter_type` 选适配器和计费,没有再按 agent_code。企微聊天适配器管任何企微聊天智能体:组 inputs(`customer_code`、`self_appellation`、`self_introduction`、`source_message_ids` 等)、解析输出(`messages` + `media`)、计费。以后再接一个企微聊天智能体 = 在 Expert Work 上配好智能体 + 加配置行,不写代码。
+2. **复用现有两张表**(11-17 定,§5.4):会话行用 `t_project_expert_work_session`(`employee_code` 留空串、填 `customer_code`、`ew_user_id = wx:…`),run 台账用 `t_project_expert_work_run`;不新建 `t_project_dh_ew_session` / `t_project_dh_ew_run`。已有先例:ai-strategy H5 的客户自发会话就是 `employee_code` 为空的会话行(`expert-work-run.service.ts:250、324`)。
+2a. **通用的企微聊天适配器**(11-17 定):`t_project_expert_work_config` 加一列可空的 `adapter_type`(如 `wecom_chat`);为空 = 照现在按 agent_code 精确注册的适配器(`agent-adapter.registry.ts:36-38`),现有智能体不受影响、不用回填。项目服务先按 `adapter_type` 选适配器和计费,没有再按 agent_code。企微聊天适配器管任何企微聊天智能体:组 inputs(`customer_code`、`self_appellation`、`self_introduction`、`source_message_ids` 等)、解析输出(`messages` + `media`)、计费。以后再接一个企微聊天智能体 = 在 Expert Work 上配好智能体 + 加配置行,不写代码。
 2b. **权限**(建议切换前修,待用户确认,08 S13):企微聊天模块读写会话前核对「项目 + agent_code + customer_code」;通用 expert-work 路由核对会话行的 agent_code 与路径一致。
 3. 会话:按 §3.4 查 / 建(不按空闲换;只有 404 时换)。
 4. 附件:下载(域名白名单)→ 按文件头判类型 → 带 session_id 上传 → 缓存 upload_id(§3.3.3)。
@@ -635,7 +635,7 @@ Idempotency-Key: dh1:<64 位十六进制>
 | `GET /v1/agents/{code}/sessions/{id}/items?user_id=&limit=` | 续不上时按 run_id 找最终回复 |
 | `GET /v1/agents/{code}/runs/{run_id}/usage?user_id=` | 后台补记用量 |
 
-### 5.4 项目服务的表:复用现有两张(11-18 定)
+### 5.4 项目服务的表:复用现有两张(11-17 定)
 
 **会话行:`t_project_expert_work_session`**
 
@@ -660,7 +660,7 @@ Idempotency-Key: dh1:<64 位十六进制>
 
 **配置行:`t_project_expert_work_config`**:加一列可空的 `adapter_type`(§4 第 2a 条)。
 
-建表 / 加列的 SQL 在 `deep-ai-health-db-design/1.5.7/project_tables/leyi/`,文件名以 `2026-11-18-b314-` 开头(05 §3.6.2 列了清单)。
+建表 / 加列的 SQL 在 `deep-ai-health-db-design/1.5.7/project_tables/leyi/`,文件名以 `2026-11-17-b314-` 开头(05 §3.6.2 列了清单)。
 
 **Redis**(都不含密钥):
 
@@ -755,7 +755,7 @@ Idempotency-Key: dh1:<64 位十六进制>
 7. ~~本轮时间放哪~~ **按推荐定(11-17)**:A,放 input 首行 + 每行 `HH:mm`;06 不另传 `current_time`、不加【】前缀,提示词「时间以本轮消息首行为准」(06 已同步)。C(平台「本轮时间」平台段)作后续:§7 第 14 条若发现时间行进了记忆或明显干扰检索再做。03 PR-3 上线时本智能体是否去掉首行时间、统一成平台标注,在 03 待拍板 13 定。
    - 选项:A 放 input 首行;B 系统提示词变量(每轮系统提示词都变,客户连续聊天时缓存全断);C 平台加「本轮时间」平台段。
 
-8. ~~失败兜底~~ **已拍板(11-17)**:失败 / 超时发兜底话术,同一聊天窗口 10 分钟最多一次(私聊和各群分开计);兜底原文由项目服务拼,文案写死在代码里(11-18 改定,§3.9)。
+8. ~~失败兜底~~ **已拍板(11-17)**:失败 / 超时发兜底话术,同一聊天窗口 10 分钟最多一次(私聊和各群分开计);兜底原文由项目服务拼,文案写死在代码里(11-17 改定,§3.9)。
 
 9. ~~灰度与回退~~ **已拍板(11-17)**:按员工绑定切换 —— 两张绑定表加 `is_expert_work`(默认 0),置 1 即走 Expert Work,按「项目 + 同一 agent_code」查 `t_project_expert_work_config`;置 0 即切回;配置行 `enabled=0` 为项目级总开关。Dify 路径保留到全部切完。理由:一个开关、随时切回;Dify 会话缓存保留,切回去还能接着聊。
 

@@ -2,7 +2,7 @@
 
 > 所属:B-314 Dify「健管师」迁移(总览:00-overview.md)。状态:草稿 v1;11-17 评审已过,各项决定见下方修订说明与第 9 节。
 >
-> **修订(2026-11-18,用户 11-18 拍板)**:新增 **S13**:项目服务通用 expert-work 路由能按 id 读别的客户的对话 —— 健管师的客户会话也会落在这里,**建议切换前修,待用户确认**,列为「迁移需要」(§0、§3.14、§3.13)。
+> **修订(2026-11-17,用户 11-17 拍板)**:新增 **S13**:项目服务通用 expert-work 路由能按 id 读别的客户的对话 —— 健管师的客户会话也会落在这里,**建议切换前修,待用户确认**,列为「迁移需要」(§0、§3.14、§3.13)。
 >
 > **修订(2026-11-17,07 评审结论)**:07 不做生产影子运行,删去本文里的「影子密钥」及密钥配置里的 `shadow` 项;Expert Work 平台的固定值下拉(04 §4.1)不属于安全整改,这里注明。
 >
@@ -12,7 +12,7 @@
 
 迁移**真正需要**的只有三件:①深护生产 MCP 的密钥白名单 `AGENT_KEYS` 不能为空 —— **已确认已配置**(11-17);②迁移新写的代码遵守两条开发约定:密钥不进 git、聊天正文和健康内容不进日志(§5.4);③写深护 MCP 新工具时顺手把「未预料异常原文回给模型」(S7)改掉(可选,不单列任务)。DSL 里的两把第三方密钥(S9)在 Dify 下线时作废(07 §3.11);pad 竞态(S12)归 03。
 
-**另有一项新发现(S13,11-18,建议切换前修,待用户确认)**:项目服务通用的 expert-work 路由只核对会话 id + `project_code`(`expert-work-session.service.ts:153、286`,`expert-work-items.service.ts:101`,`expert-work-run.service.ts:514、605`,`agent-chat.controller.ts:254`;`/sessions/list` 不带 `employee_code` 时列出项目里全部会话,`expert-work-session.service.ts:218-229`),项目里任何登录账号(包括小程序里的客户)都能按 id 列出、读取别的客户的对话。健管师的客户会话也存在同一张会话表里(01 §5.4),修法约 0.5~1 人天,在项目服务(§3.14)。今天 ai-strategy 的客户会话已经受这个问题影响。
+**另有一项新发现(S13,11-17,建议切换前修,待用户确认)**:项目服务通用的 expert-work 路由只核对会话 id + `project_code`(`expert-work-session.service.ts:153、286`,`expert-work-items.service.ts:101`,`expert-work-run.service.ts:514、605`,`agent-chat.controller.ts:254`;`/sessions/list` 不带 `employee_code` 时列出项目里全部会话,`expert-work-session.service.ts:218-229`),项目里任何登录账号(包括小程序里的客户)都能按 id 列出、读取别的客户的对话。健管师的客户会话也存在同一张会话表里(01 §5.4),修法约 0.5~1 人天,在项目服务(§3.14)。今天 ai-strategy 的客户会话已经受这个问题影响。
 
 其余问题(S1 调试豁免头、S2 跨域、S3 Dify 密钥进 user 字段、S4 配置文件进 git、S5 存量日志、S8、S10 限流、S11 时区、服务端核对客户归属、按密钥限项目 / 工具)**都不卡迁移**,移入「深护安全待办」(§3.13),由深护另行排期,不属于 B-314。理由:Expert Work 只带密钥调深护 MCP,MCP 直接写库、投队列,不经过数字人服务和项目服务的接口(01 / 02 / 04)。
 
@@ -225,11 +225,11 @@
 **修法**:细节在 03(S-3)。方向:数字人服务在调 pad 发送**之前**,对所有以「不是真人」身份发出的消息写 `AI_SENT` 标记(复用 dk 的 `ai-sent.util.ts`),同步服务在「员工本人、不是数字人」分支先查这个标记,命中就按数字人处理、不设接管标志;不论回调和回写谁先到结果都一样。SOP、用药提醒等其它以员工号发消息的服务按同一做法跟进(03 S-3)。
 **归属(11-17 定)**:归 03(S-3),不在本文。已知风险:03 之前,pad 上多气泡回复的后几条可能被误拦(02 把一轮回复拆成多条后更容易触发,推断);已定(11-17)先不管,随 03 一起做,不单独提前(00 §5、03 §9)。**工作量**:0.5 人天(计入 03)。
 
-### 3.14 S13 项目服务通用 expert-work 路由能读别的客户的对话(11-18 新发现)
+### 3.14 S13 项目服务通用 expert-work 路由能读别的客户的对话(11-17 新发现)
 
 **场景**:小程序里登录的客户 A(或同项目任何员工)拿到一个会话 id,调项目服务通用的 expert-work 路由,就能读到客户 B 和健管师的对话;调 `/sessions/list` 不带员工编码,能列出项目里全部会话。
 
-**证据**(路径相对 `deep-ai-health-project-service`,11-18 项目服务代码核对):项目服务通用的 expert-work 路由只核对会话 id + `project_code`(`expert-work-session.service.ts:153、286`,`expert-work-items.service.ts:101`,`expert-work-run.service.ts:514、605`,`agent-chat.controller.ts:254`;`/sessions/list` 不带 `employee_code` 时列出项目里全部会话,`expert-work-session.service.ts:218-229`),项目里任何登录账号(包括小程序里的客户)都能按 id 列出、读取别的客户的对话。
+**证据**(路径相对 `deep-ai-health-project-service`,11-17 项目服务代码核对):项目服务通用的 expert-work 路由只核对会话 id + `project_code`(`expert-work-session.service.ts:153、286`,`expert-work-items.service.ts:101`,`expert-work-run.service.ts:514、605`,`agent-chat.controller.ts:254`;`/sessions/list` 不带 `employee_code` 时列出项目里全部会话,`expert-work-session.service.ts:218-229`),项目里任何登录账号(包括小程序里的客户)都能按 id 列出、读取别的客户的对话。
 
 **修法**:健管师 / 企微聊天模块读写会话前核对「项目 + agent_code + customer_code」;通用路由核对会话行的 `agent_code` 与路径里的智能体一致(或直接拒绝专用的智能体编码)。约 0.5~1 人天,项目服务。
 
