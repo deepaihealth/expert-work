@@ -1,10 +1,12 @@
 # B-314-06 智能体配置:从 17 个大模型节点到一个智能体
 
-> 所属:B-314 Dify「健管师」迁移(总览:00-overview.md)。状态:草稿 v1,待逐个过;11-17 已按 01 / 02 的拍板同步(本轮时间、变量清单、时限与上下文门槛、固定话术、首轮补问)。
+> 所属:B-314 Dify「健管师」迁移(总览:00-overview.md)。状态:草稿 v1;11-17 评审已过(§9 全部已定),并已按 01 / 02 的拍板同步(本轮时间、变量清单、时限与上下文门槛、固定话术、首轮补问)。
 > 本文是将来那份配置书(Word:系统提示词全文 + 控制台步骤,YAML 放附录)的设计依据;配置书本身在本文过审后另写,放处见 §3.11。
 > 文中工具名都是暂名,工具的最终名字、参数与服务端行为以 04 为准;输出结构以 02 为准;调用字段与会话以 01 为准;补消息以 03 为准;知识库与素材以 05 为准。
 >
 > **修订(2026-11-17,05 评审结论)**:节 I 去掉视频目录,改为「客户明确要视频时调 `material_list` 拿全量清单、挑 ≤3 个填进 `media`」(R20);新增 R79「不替客户约专家、不承诺某位专家亲自服务」、R80「问服务价格不报数字、转人工」;转人工默认配置定为「本轮不回 + 之后照常」,交出去那一轮输出空、不说稳住的话(节 R);配置书改为 Word 交付文件,不进 git(§3.11)。
+>
+> **修订(2026-11-17,03 评审结论)**:变量 `input_message_ids` 改名为 `source_message_ids`(§5.1、§5.5、§5.6;含义见 01 §3.3.2)。
 >
 > **修订(2026-11-17,07 评审结论)**:测试与评估由工程师按 07 的测试用例清单做,不做 Dify 回放对照;文中「07 实测」均指工程师测试与上线后监控。
 >
@@ -398,7 +400,7 @@ v1 **一项必须**:MCP 工具参数的固定值在工具声明了可选值时�
 
 ### 4.3 深护数字人 · 项目服务(细节以 01 / 02 为准)
 
-- 每轮传 §5.1 的变量:身份变量(没有就传空串);`is_first_contact`(数字人服务查消息表算出);本轮附件原始地址数组;本批消息 id `input_message_ids`。客户资料不再预取(11-17 定)。
+- 每轮传 §5.1 的变量:身份变量(没有就传空串);`is_first_contact`(数字人服务查消息表算出);本轮附件原始地址数组;本批消息 id `source_message_ids`。客户资料不再预取(11-17 定)。
 - 本轮时间写在 input 首行(明确按 Asia/Shanghai,带星期)、每条消息行首带 `HH:mm`(01 §3.3.1);不另传 `current_time`、不加【】前缀(按推荐定 11-17)。
 - 取回结果后:`media` 里的素材 id 逐个查深护素材库校验、按类型发;固定话术已由模型写在 `messages` 里,原样发;回复为空不发、也不发兜底(02)。
 - 不再传智能体用不到的字段(`agent_call_back_url`、`agent_api_url` 等),多传未声明的键平台会 422。
@@ -425,7 +427,7 @@ v1 **一项必须**:MCP 工具参数的固定值在工具声明了可选值时�
 | `is_first_contact` | 是 | 否 | 是(分支) | — | `"1"` / `"0"`;沿用 Dify 口径:这名员工与这个客户之间从没有过文字消息才是 `"1"`,由数字人服务查消息表算出(已拍板 11-17;不用「Expert Work 上第一轮」,否则从 Dify 切过来的老客户都会被重问) |
 | `self_appellation` | 是 | 否 | 是 | — | 自称,≤ 100 字;数字人服务已在传,按员工绑定行 → 智能体行 → 员工名取,最后兜底空串(`invoke-agent.processor.ts:861`;`t_project_ai_agent` 与两张员工绑定表都有这一列);模板里空时用「健管师」 |
 | `self_introduction` | 是 | 否 | 是(分支) | — | 自我介绍,≤ 2048 字,可空;取法同上(`:862`)。运营在深护后台配,不是客户输入,所以 `trusted: true` |
-| `input_message_ids` | 是 | 是 | 否 | 写表单、转人工(判重) | 本批客户消息 id,JSON 数组,带通道前缀(01 §3.3.2) |
+| `source_message_ids` | 是 | 是 | 否 | 写表单、转人工(判重) | 本批客户消息 id,JSON 数组,带通道前缀(01 §3.3.2) |
 
 原有的 `customer_profile`、`active_reminders`、`today_food_log`、`health_plan_summary`、`form_catalog` 五个变量删掉:客户资料改由模型调客户资料工具取(11-17 定,§3.6)。
 
@@ -439,9 +441,9 @@ v1 **一项必须**:MCP 工具参数的固定值在工具声明了可选值时�
 | 设提醒 | project_code、customer_pad_userid、employee_pad_userid、employee_code、room_conversation_id、customer_code |
 | 查提醒 / 删提醒 | project_code、customer_pad_userid(查提醒另加 room_conversation_id) |
 | 改档案 / 查表单 / 查方案 | project_code、customer_code(工具里可能叫 owner_code) |
-| 上报健康数据 / 录化验单 | project_code、customer_code、employee_code、附件参数 ← attachment_urls、input_message_ids |
+| 上报健康数据 / 录化验单 | project_code、customer_code、employee_code、附件参数 ← attachment_urls、source_message_ids |
 | 查更早聊天 | project_code、employee_code、customer_code;固定 `scope: customer` |
-| 转人工 | project_code、employee_code、employee_pad_userid、customer_code、customer_pad_userid、room_conversation_id、input_message_ids;固定 `this_turn: silent`、`afterwards: continue`(健管师默认,11-17 定;控制台下拉可改,04 §3.10) |
+| 转人工 | project_code、employee_code、employee_pad_userid、customer_code、customer_pad_userid、room_conversation_id、source_message_ids;固定 `this_turn: silent`、`afterwards: continue`(健管师默认,11-17 定;控制台下拉可改,04 §3.10) |
 | 素材清单 | project_code;固定 `category_code`(「健管师可发素材」分类,05 §3.3) |
 | 天气 | 无(平台级高德 MCP,只放行天气一个工具) |
 
@@ -507,7 +509,7 @@ spec:
       - { name: is_first_contact, trusted: true, required: false }
       - { name: self_appellation, trusted: true, required: false }
       - { name: self_introduction, trusted: true, required: false }
-      - { name: input_message_ids, trusted: true, required: true, render: raw }   # 只给工具绑定
+      - { name: source_message_ids, trusted: true, required: true, render: raw }   # 只给工具绑定
     template: |
       你是 {{ self_appellation or '健管师' }}。{% if self_introduction %}{{ self_introduction }}{% else %}(默认人设一段,见配置书){% endif %}
       # 节 A 其余 …… 节 R(全文见配置书;规则编号见 06 §3.3)
@@ -570,7 +572,7 @@ spec:
   "employee_pad_userid": "wx_emp_demo",
   "room_conversation_id": "room_demo",
   "attachment_urls": ["https://oss.example.com/demo/lab-1.jpg"],
-  "input_message_ids": ["pad:APPINFO_demo_01", "pad:APPINFO_demo_02"],
+  "source_message_ids": ["pad:APPINFO_demo_01", "pad:APPINFO_demo_02"],
   "is_first_contact": "0",
   "self_appellation": "王老师",
   "self_introduction": "国家二级健康管理师,做慢病管理 8 年"
@@ -674,7 +676,7 @@ spec:
 | 智能体配置 | 系统提示词全文、manifest、配置书(Word) | 2~3 人天 | 参照 ai-health-plan 配置书的体量;粗估 |
 | 智能体配置 | 跑 §7 用例、调提示词(2~3 轮) | 3~5 人天 + 模型费 | 粗估;费用开跑前报价 |
 | 深护 MCP | §4.2 的服务端规矩 | 计入 04 | — |
-| 深护项目服务 / 数字人服务 | input 首行时间、附件数组、`input_message_ids`、首次标记(数字人服务查消息表);不再预取客户资料 | 计入 01 | — |
+| 深护项目服务 / 数字人服务 | input 首行时间、附件数组、`source_message_ids`、首次标记(数字人服务查消息表);不再预取客户资料 | 计入 01 | — |
 | Expert Work 平台 | 固定值下拉 + 保存时校验(04 §4.1);§4.1 另三项先实测,改的话每项另估 | 1(计入 04) | 粗估 |
 
 ## 9. 待拍板
@@ -700,7 +702,7 @@ spec:
 
 16. ~~本文 §4.2 对 04 的服务端要求~~ **已定(11-17)**:按 04 §9.10 的推荐 —— 提醒短编号、批量删除带「客户已确认」、查表单结束日裁到今天、设提醒返回带星期都加进 04;改档案按字段编码写(不按显示名);「血糖时段服务端硬拒」由数据情境规则取代;「方案摘要给业务方用」随第 4 条作废(`profile_get_brief` v1 就做)。
 
-17. ~~变量清单与必填~~ **按推荐定(11-17,01 待拍板 12)**:身份变量必填、没有就传空串;不传 `source`、`customer_display_name`;不传 `current_time`;加 `is_first_contact`(沿用 Dify 口径,数字人服务查消息表算出)、`attachment_urls`;04 评审后再加 `input_message_ids`。§5.1、§5.5 已同步。本轮资料四样随第 4 条取消。
+17. ~~变量清单与必填~~ **按推荐定(11-17,01 待拍板 12)**:身份变量必填、没有就传空串;不传 `source`、`customer_display_name`;不传 `current_time`;加 `is_first_contact`(沿用 Dify 口径,数字人服务查消息表算出)、`attachment_urls`;04 评审后再加 `source_message_ids`。§5.1、§5.5 已同步。本轮资料四样随第 4 条取消。
 
 ## 10. 出处
 
