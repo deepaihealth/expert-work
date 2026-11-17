@@ -2871,6 +2871,7 @@ async def build_llm_router(
                     breaker_key=breaker_key_for(
                         key, secret_ref, provider_key.base_url or entry.base_url
                     ),
+                    custom_endpoint=provider_key.base_url is not None,
                 )
             )
     return LLMRouter(

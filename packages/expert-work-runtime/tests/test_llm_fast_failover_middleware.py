@@ -624,3 +624,79 @@ async def test_probe_lease_follows_the_routers_attempt_deadline() -> None:
     await mw(ctx, _slow_but_healthy)
     assert checked == ["HALF_OPEN"]
     assert await breaker.check_state() == "CLOSED"
+
+
+# ---------------------------------------------------------------------------
+# B-308 — the open breaker says what opened it; a key with its own request
+# address is refused only when another group can serve
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("failure", "key_level"),
+    [
+        (LLMKeyUnavailableError("402"), True),
+        (LLMRateLimitError("429"), True),
+        (LLMServerError("503"), False),
+        (LLMNetworkError("refused"), False),
+        (LLMStreamStaleError("no first token"), False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_circuit_open_error_says_whether_key_level_failures_opened_it(
+    failure: Exception, key_level: bool
+) -> None:
+    clock = FakeClock()
+    sleeper = ClockSleeper(clock)
+    mw = _mw(clock, sleeper)
+    for _ in range(3):
+        with pytest.raises(type(failure)):
+            await mw(_sibling_ctx(), Terminal([failure] * 4, clock))
+        breaker = await mw.breaker_registry.get("p:m#0")
+        if await breaker.check_state() == "OPEN":
+            break
+    terminal = Terminal([None], clock)
+    with pytest.raises(CircuitOpenError) as excinfo:
+        await mw(_sibling_ctx(), terminal)
+    assert excinfo.value.key_level is key_level
+    assert terminal.calls == 0
+
+
+def _custom_key_ctx(*, has_group_alternative: bool) -> MiddlewareContext:
+    return MiddlewareContext(
+        payload={
+            "provider_key": "p:m#0",
+            "has_fallback": False,
+            "has_alternative": True,
+            "has_group_alternative": has_group_alternative,
+        }
+    )
+
+
+@pytest.mark.parametrize("key_level", [False, True])
+@pytest.mark.asyncio
+async def test_group_alternative_hint_decides_refusal_of_an_upstream_open_breaker(
+    key_level: bool,
+) -> None:
+    """Opened by the upstream failing: refused only when another group can
+    serve. Opened by key-level failures: refused as before (a sibling key can)."""
+    clock = FakeClock()
+    sleeper = ClockSleeper(clock)
+    mw = _mw(clock, sleeper)
+    breaker = await mw.breaker_registry.get("p:m#0")
+    for _ in range(3):
+        await breaker.acquire()
+        await breaker.record_failure(key_level=key_level)
+
+    with pytest.raises(CircuitOpenError):
+        await mw(_custom_key_ctx(has_group_alternative=True), Terminal([None], clock))
+
+    terminal = Terminal([None], clock)
+    if key_level:
+        with pytest.raises(CircuitOpenError):
+            await mw(_custom_key_ctx(has_group_alternative=False), terminal)
+        assert terminal.calls == 0
+    else:
+        await mw(_custom_key_ctx(has_group_alternative=False), terminal)
+        assert terminal.calls == 1
+        assert await breaker.check_state() == "CLOSED"  # the upstream answered

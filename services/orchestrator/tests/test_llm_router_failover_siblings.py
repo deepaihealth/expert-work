@@ -172,6 +172,33 @@ async def test_last_resort_pass_skips_an_open_sibling(run_id: UUID) -> None:
 
 
 @pytest.mark.asyncio
+async def test_last_resort_custom_address_key_is_tried_not_its_sibling(run_id: UUID) -> None:
+    """B-308 — the same walk with a#0 behind a custom request address, its
+    breaker opened by 5xx: in the last-resort pass no group follows a, so the
+    breaker lets the proxy through (it may be back) and the official-address
+    sibling a#1 is not used."""
+    registry, sleeps = BreakerRegistry(), _Sleeps()
+    a0 = _Provider("a0", fail_with=LLMServerError("503"))
+    a1 = _Provider("a1")
+    b = _Provider("b")
+    router = LLMRouter(
+        providers=[
+            ProviderHandle(provider=a0, key="a:m#0", group="a:m", custom_endpoint=True),
+            ProviderHandle(provider=a1, key="a:m#1", group="a:m"),
+            ProviderHandle(provider=b, key="b:m", group="b:m"),
+        ],
+        around_llm_chain=_real_chain(registry, sleeps),
+        sticky_store=StickyRouteStore(),
+    )
+    assert await _call(router) == "b"  # a#0 5xx skips the whole a group → sticky b
+    await _force_open(registry, "a:m#0")
+    a0.fail_with = None  # the proxy is back while its breaker cools down
+    b.fail_with = LLMServerError("503")
+    assert await _call(router) == "a0"
+    assert a1.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_payload_hints_distinguish_fallback_from_alternative() -> None:
     seen: list[tuple[object, object]] = []
 
