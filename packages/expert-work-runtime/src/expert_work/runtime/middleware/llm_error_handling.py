@@ -176,12 +176,15 @@ class CircuitOpenError(LLMError):
     """Breaker is OPEN; raised immediately without dispatching the call.
 
     Carries the breaker key so callers (E.11 LLMRouter) can decide to
-    fall back to a different provider key.
+    fall back to a different provider key, and ``key_level`` (B-308): the
+    breaker was opened by this key's own failures (429 / dead key / no
+    credit), not by the upstream failing (5xx / network / timeout).
     """
 
-    def __init__(self, key: str) -> None:
+    def __init__(self, key: str, *, key_level: bool = False) -> None:
         super().__init__(f"circuit breaker OPEN for key={key!r}")
         self.key = key
+        self.key_level = key_level
 
 
 _RETRYABLE_ERRORS: tuple[type[LLMError], ...] = (
@@ -204,6 +207,9 @@ _COUNTED_NOT_RETRIED: tuple[type[LLMError], ...] = (
     LLMStreamStaleError,
     LLMStreamInterruptedError,
 )
+
+#: B-308 — failures of this key / account, not of the upstream behind it.
+_KEY_LEVEL: tuple[type[LLMError], ...] = (LLMRateLimitError, LLMKeyUnavailableError)
 
 #: B-297 — set by the middleware around a half-open *probe* attempt; the router
 #: calls :func:`notify_first_progress` at the attempt's first progress delta so
@@ -242,6 +248,7 @@ class _Attempt:
     key: str
     has_fallback: bool
     has_alternative: bool
+    has_group_alternative: bool
     started: float
     slept: float = 0.0
 
@@ -261,6 +268,12 @@ class LLMErrorHandlingMiddleware:
       With no alternative at all, the breaker is fed but never refuses —
       refusing the only option turns a maybe-transient blip into a certain
       failure (LiteLLM likewise never cools down a group's only deployment).
+    * ``has_group_alternative`` (B-308, defaults to ``has_alternative``) — a
+      handle of *another provider group* follows. Sent for a key with its own
+      request address, whose sibling keys are no alternative when the upstream
+      itself fails: a breaker opened by such failures refuses only when this
+      is true; one opened by key-level failures (429 / dead key) still refuses
+      by ``has_alternative``.
     * ``has_fallback`` — a *different provider group* follows. It decides the
       **retry budget**: at most ``fallback_max_retries`` (1) same-provider retry
       after a short jittered backoff (≤ ``fallback_max_delay_s``, 1 s), only
@@ -305,22 +318,27 @@ class LLMErrorHandlingMiddleware:
         # when not streaming): a half-open probe's lease never undercuts it.
         deadline = ctx.payload.get("attempt_deadline_s")
         probe_lease = float(deadline) if isinstance(deadline, int | float) else None
+        has_alternative = bool(ctx.payload.get("has_alternative", has_fallback))
         call = _Attempt(
             breaker=await self.breaker_registry.get(key, label=provider_key),
             provider_key=provider_key,
             key=key,
             has_fallback=has_fallback,
-            has_alternative=bool(ctx.payload.get("has_alternative", has_fallback)),
+            has_alternative=has_alternative,
+            has_group_alternative=bool(ctx.payload.get("has_group_alternative", has_alternative)),
             started=self.clock(),
         )
         last_exc: LLMError | None = None
         attempt = 0
         while True:
             permit = await call.breaker.admit(probe_lease_s=probe_lease)
-            if permit.admission == "rejected" and call.has_alternative:
-                if last_exc is not None:
-                    raise last_exc
-                raise CircuitOpenError(key)
+            if permit.admission == "rejected":
+                key_level = call.breaker.opened_by_key_level
+                can_move_on = call.has_alternative if key_level else call.has_group_alternative
+                if can_move_on:
+                    if last_exc is not None:
+                        raise last_exc
+                    raise CircuitOpenError(key, key_level=key_level)
             last_exc = await self._attempt(call, permit, ctx, call_next, attempt)
             if last_exc is None:
                 return
@@ -352,15 +370,17 @@ class LLMErrorHandlingMiddleware:
         attempt_started = self.clock()
         try:
             await call_next(ctx)
-        except _COUNTED_NOT_RETRIED:
-            await self._record_failure(call, permit)
+        except _COUNTED_NOT_RETRIED as exc:
+            await self._record_failure(call, permit, key_level=isinstance(exc, _KEY_LEVEL))
             raise
         except LLMClientError:
             # 4xx: the request's fault, not the upstream's — neutral.
             await breaker.release(permit=permit)
             raise
         except _RETRYABLE_ERRORS as exc:
-            opened = await self._record_failure(call, permit, retry_after_s=exc.retry_after_s)
+            opened = await self._record_failure(
+                call, permit, retry_after_s=exc.retry_after_s, key_level=isinstance(exc, _KEY_LEVEL)
+            )
             now = self.clock()
             delay = self._retry_delay(
                 exc,
@@ -438,8 +458,15 @@ class LLMErrorHandlingMiddleware:
         return delay
 
     async def _record_failure(
-        self, call: _Attempt, permit: Permit, *, retry_after_s: float | None = None
+        self,
+        call: _Attempt,
+        permit: Permit,
+        *,
+        retry_after_s: float | None = None,
+        key_level: bool = False,
     ) -> bool:
         # The open metric / ``llm_breaker.open`` log are emitted by the breaker
         # itself, so lease-expiry opens are counted too.
-        return await call.breaker.record_failure(permit=permit, retry_after_s=retry_after_s)
+        return await call.breaker.record_failure(
+            permit=permit, retry_after_s=retry_after_s, key_level=key_level
+        )

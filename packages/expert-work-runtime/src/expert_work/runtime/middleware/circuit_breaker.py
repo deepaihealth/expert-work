@@ -137,6 +137,7 @@ class CircuitBreaker:
         self._probe_id = 0
         self._probe_started = 0.0
         self._probe_lease_current = probe_lease_s
+        self._opened_by_key_level = False
 
     # -- reads ---------------------------------------------------------------
 
@@ -149,6 +150,16 @@ class CircuitBreaker:
     @property
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
+
+    @property
+    def opened_by_key_level(self) -> bool:
+        """Whether the failure that last opened the breaker was key-level (a
+        429 or a dead key / no credit: ``record_failure(key_level=True)``) rather
+        than the upstream failing. B-308: a key with its own request address
+        hands its turn to a sibling key only in the key-level case. An expired
+        probe lease is not key-level."""
+        with self._lock:
+            return self._opened_by_key_level
 
     # -- admission -----------------------------------------------------------
 
@@ -207,16 +218,19 @@ class CircuitBreaker:
         probe: bool = False,
         permit: Permit | None = None,
         retry_after_s: float | None = None,
+        key_level: bool = False,
     ) -> bool:
         """Count one failed attempt. Returns ``True`` when this failure opened
-        the breaker (callers emit the open metric / stop retrying)."""
+        the breaker (callers emit the open metric / stop retrying).
+        ``key_level`` — the failure was this key's own (429, dead key / no
+        credit), not the upstream's; see :attr:`opened_by_key_level`."""
         with self._lock:
             now = self._clock()
             self._consecutive_failures += 1
             if self._is_current_probe(probe, permit):
                 self._probe_in_flight = False
                 if self._state == "HALF_OPEN":
-                    self._open(now, retry_after_s)
+                    self._open(now, retry_after_s, key_level=key_level)
                     return True
             if self._state != "CLOSED":
                 # Stale evidence from a call admitted before the breaker
@@ -224,7 +238,7 @@ class CircuitBreaker:
                 return False
             self._push(now, ok=False)
             if self._consecutive_failures >= self._failure_threshold or self._rate_tripped():
-                self._open(now, retry_after_s)
+                self._open(now, retry_after_s, key_level=key_level)
                 return True
             return False
 
@@ -271,7 +285,8 @@ class CircuitBreaker:
         failures = sum(1 for _, ok in self._outcomes if not ok)
         return failures / total >= self._failure_rate
 
-    def _open(self, now: float, retry_after_s: float | None) -> None:
+    def _open(self, now: float, retry_after_s: float | None, *, key_level: bool = False) -> None:
+        self._opened_by_key_level = key_level
         self._open_streak += 1
         cooldown = min(self._max_cooldown_s, self._cooldown_s * 2 ** (self._open_streak - 1))
         if retry_after_s is not None and retry_after_s > cooldown:

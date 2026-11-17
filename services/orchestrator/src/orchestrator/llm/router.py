@@ -189,6 +189,11 @@ class ProviderHandle:
     timeout). Defaults to empty, in which case :func:`_group_of` falls
     back to ``key`` so a legacy single-key handle is its own singleton
     group — preserving the pre-Y-MK flat-chain behaviour exactly.
+
+    ``custom_endpoint`` (B-308) marks a key that sends to a credential's
+    custom request address. Its open breaker counts as provider-level when
+    the upstream failing opened it (5xx / network / timeout: skip the rest
+    of the group, design §4.3), key-level when 429s / a dead key did.
     """
 
     provider: LLMProvider
@@ -198,8 +203,7 @@ class ProviderHandle:
     #: fingerprint, :func:`~orchestrator.llm.failover.breaker_key_for`); empty
     #: → the breaker keys by ``key``. Metrics keep using ``key``.
     breaker_key: str = ""
-    #: B-308 — this key sends to a credential's custom request address. An open
-    #: breaker on it then skips the sibling keys (see ``_dispatch``).
+    #: B-308 — this key sends to a credential's custom request address.
     custom_endpoint: bool = False
 
 
@@ -210,7 +214,8 @@ class ProviderHandle:
 # run for OAuth providers), so a revoked key tries a sibling too.
 # ``CircuitOpenError`` is per-key (E.4 breaker), so an open breaker on one key
 # should try a sibling, not abandon the whole provider — except on a key with
-# a custom request address (B-308, ``_dispatch``).
+# a custom request address whose breaker the upstream failing opened (B-308,
+# ``_dispatch``).
 _KEY_LEVEL_ERRORS: tuple[type[LLMError], ...] = (
     LLMRateLimitError,
     LLMKeyUnavailableError,
@@ -409,13 +414,14 @@ _delta_sink: ContextVar[Callable[[LLMDelta], Awaitable[None]] | None] = ContextV
     "_llm_delta_sink", default=None
 )
 
-# B-297 — ``(has_fallback, has_alternative)`` of the provider attempt in flight
-# (see :class:`~orchestrator.llm.failover.WalkPlan`); set per attempt in
-# ``_dispatch``, copied into the E.4 payload in ``_invoke_once`` and read by
+# B-297 — ``(has_fallback, has_alternative, has_group_alternative)`` of the
+# provider attempt in flight (see :class:`~orchestrator.llm.failover.WalkPlan`;
+# the third — B-308 — is "a handle of another group follows"); set per attempt
+# in ``_dispatch``, copied into the E.4 payload in ``_invoke_once`` and read by
 # ``_invoke_provider`` for the first-token cap. ContextVar for the same reason
 # as ``_delta_sink``: no threading through the OAuth / validation call chain.
-_attempt_hints: ContextVar[tuple[bool, bool]] = ContextVar(
-    "_llm_attempt_hints", default=(False, False)
+_attempt_hints: ContextVar[tuple[bool, bool, bool]] = ContextVar(
+    "_llm_attempt_hints", default=(False, False, False)
 )
 # B-297 PR2 — ``WalkPlan.can_redo_elsewhere`` of the attempt in flight: a
 # reasoning-only stall may be discarded and redone on the next group.
@@ -533,7 +539,13 @@ class LLMRouter:
             if failed is not None and failed[0] != groups[i]:
                 await announce_failover(failed[0], groups[i], failed[1])
             failed = None
-            token = _attempt_hints.set((plan.has_fallback(pos), plan.has_alternative(pos)))
+            token = _attempt_hints.set(
+                (
+                    plan.has_fallback(pos),
+                    plan.has_alternative(pos),
+                    plan.next_group(pos) < len(plan.order),
+                )
+            )
             redo_token = _redo_elsewhere.set(plan.can_redo_elsewhere(pos))
             try:
                 response = await self._call_one(
@@ -560,11 +572,15 @@ class LLMRouter:
                     type(exc).__name__,
                 )
                 # B-308 §4.3 — a key with its own request address whose breaker
-                # is open skips its siblings, like the 5xx / network / timeout
-                # failures that open it: the turn must not move to another key
-                # of the same provider (official address included). The breaker
-                # does not say why it opened, so one opened by 429s skips too.
-                if handle.custom_endpoint and isinstance(exc, CircuitOpenError):
+                # the upstream failing opened (5xx / network / timeout) skips
+                # its siblings, as those failures do: the turn must not move to
+                # another key of the same provider (official address included).
+                # Opened by 429s / a dead key, it hands over to a sibling.
+                if (
+                    handle.custom_endpoint
+                    and isinstance(exc, CircuitOpenError)
+                    and not exc.key_level
+                ):
                     pos = plan.next_group(pos)
                 else:
                     pos += 1
@@ -717,7 +733,7 @@ class LLMRouter:
             assert isinstance(result, AIMessage)  # noqa: S101 - provider Protocol contract
             return result
 
-        has_fallback, has_alternative = _attempt_hints.get()
+        has_fallback, has_alternative, has_group_alternative = _attempt_hints.get()
         payload: dict[str, Any] = {
             "provider_key": handle.key,
             # B-297 — E.4 picks its retry budget by ``has_fallback`` (another
@@ -739,6 +755,11 @@ class LLMRouter:
         }
         if handle.breaker_key:
             payload["breaker_key"] = handle.breaker_key
+        if handle.custom_endpoint:
+            # B-308 — its sibling keys are no way out when the upstream behind
+            # it fails, so E.4 refuses such an open breaker only when another
+            # group can serve (``_dispatch`` would skip the siblings).
+            payload["has_group_alternative"] = has_group_alternative
         if output_schema is not None:
             # RT-1 — informational for observability middlewares; absent
             # on unstructured calls so the payload stays byte-identical.

@@ -426,3 +426,36 @@ def test_registry_is_safe_across_threads_and_loops() -> None:
     for t in threads:
         t.join()
     assert len({id(b) for b in seen}) == 1
+
+
+# ---------------------------------------------------------------------------
+# B-308 — what opened it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_open_remembers_whether_key_level_failures_opened_it() -> None:
+    clock = FakeClock()
+    breaker = _breaker(clock)
+    await _fail(breaker, 3, key_level=True)
+    assert breaker.opened_by_key_level is True
+    clock.advance(30.0)
+    assert await breaker.acquire() == "probe"
+    assert await breaker.record_failure(probe=True) is True  # the probe met a 5xx
+    assert breaker.opened_by_key_level is False
+
+
+@pytest.mark.asyncio
+async def test_provider_level_failures_and_an_expired_probe_lease_are_not_key_level() -> None:
+    clock = FakeClock()
+    breaker = _breaker(clock)
+    await _fail(breaker, 3)
+    assert breaker.opened_by_key_level is False
+
+    breaker = _breaker(clock)
+    await _fail(breaker, 3, key_level=True)
+    clock.advance(30.0)
+    assert await breaker.acquire() == "probe"
+    clock.advance(60.0)
+    assert await breaker.check_state() == "OPEN"  # lease expired → re-opened
+    assert breaker.opened_by_key_level is False

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -18,12 +19,14 @@ import httpx
 import pytest
 from langchain_core.messages import HumanMessage
 
+from expert_work.common import url_validation
 from expert_work.protocol import ModelSpec
 from expert_work.runtime.middleware import (
     BreakerRegistry,
-    CircuitOpenError,
     LLMError,
     LLMErrorHandlingMiddleware,
+    LLMNetworkError,
+    LLMServerError,
     MiddlewareChain,
 )
 from expert_work.runtime.secret_store import LocalDevSecretStore
@@ -40,6 +43,7 @@ from orchestrator.llm.endpoints import (
     endpoint_host,
 )
 from orchestrator.llm.providers import _http
+from orchestrator.llm.providers._checked_endpoint import make_checked_client
 from orchestrator.llm.rerank import dashscope_rerank_client
 from orchestrator.llm.rerank_cohere import cohere_style_client
 
@@ -502,13 +506,19 @@ async def test_provider_level_failure_moves_to_the_fallback_model() -> None:
 # --- 9b. the breaker those failures open does not hand the turn to the backup key
 # (test-env acceptance 120.10, 5908fe554: three 503s opened the proxy key's
 # breaker, the retried turn met CircuitOpenError and was served by the
-# official-address backup key) ---------------------------------------------------
+# official-address backup key); a breaker opened by 429 / 402 still does ---------
 
 _CUSTOM_CHAT = "https://p.example.com/v1/chat/completions"
+_PROXY = ("sk-primary", _CUSTOM_CHAT)
+_OFFICIAL_BACKUP = ("sk-backup", _LEGACY_CHAT_URLS["openai"])
 
 
 async def _no_wait(_delay: float) -> None:
     return None
+
+
+async def _ask(router: Any) -> Any:
+    return await router(messages=[HumanMessage(content="hi")], tools=[])
 
 
 async def _breaker_router(
@@ -518,10 +528,12 @@ async def _breaker_router(
     registry: BreakerRegistry,
     *,
     fallback: bool = False,
+    checked_client: httpx.AsyncClient | None = None,
 ) -> tuple[Any, httpx.AsyncClient, httpx.AsyncClient]:
     """Primary key (at ``primary_ref_url``) + an official-address backup key,
     under the real E.4 retry + breaker. Every request is recorded as
-    ``(key, url)``; the primary key gets ``primary_reply``, any other key 200."""
+    ``(key, url)``; the primary key gets ``primary_reply``, any other key 200.
+    ``checked_client`` replaces the recording address-checking client."""
 
     def _answer(request: httpx.Request) -> httpx.Response:
         key = request.headers["authorization"].removeprefix("Bearer ")
@@ -537,7 +549,7 @@ async def _breaker_router(
             return [ProviderKey(_PRIMARY_REF, primary_ref_url), ProviderKey(_BACKUP_REF, None)]
         return [ProviderKey(_BACKUP_REF, None)]
 
-    checked = httpx.AsyncClient(transport=httpx.MockTransport(_answer))
+    checked = checked_client or httpx.AsyncClient(transport=httpx.MockTransport(_answer))
     shared = httpx.AsyncClient(transport=httpx.MockTransport(_answer))
     _http.register_checked_client(checked)
     router = await build_llm_router(
@@ -558,6 +570,7 @@ async def _breaker_router(
 
 
 async def _force_open(registry: BreakerRegistry, breaker_key: str) -> None:
+    """Open the breaker as the upstream failing (5xx / network) would."""
     breaker = await registry.get(breaker_key)
     for _ in range(3):
         await breaker.acquire()
@@ -566,33 +579,63 @@ async def _force_open(registry: BreakerRegistry, breaker_key: str) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "primary",
+    ("primary", "error"),
     [
-        httpx.Response(503, text="upstream down"),
-        httpx.ConnectError("connection refused"),
-        httpx.ConnectError("name or service not known"),
-        httpx.ReadTimeout("timed out"),
+        (httpx.Response(503, text="upstream down"), LLMServerError),
+        (httpx.ConnectError("[Errno 61] Connection refused"), LLMNetworkError),
+        (httpx.ReadTimeout("timed out"), LLMNetworkError),
     ],
-    ids=["503", "refused", "dns", "timeout"],
+    ids=["503", "refused", "timeout"],
 )
 async def test_open_breaker_on_the_custom_address_does_not_try_the_backup_key(
-    primary: httpx.Response | Exception,
+    primary: httpx.Response | Exception, error: type[LLMError]
 ) -> None:
     """Turn 1: the proxy fails three times, the key's breaker opens, the turn
-    errors (no fallback model). Turn 2: the open breaker must skip the
-    official-address backup key exactly as the errors that opened it did."""
+    errors (no fallback model). Turn 2, breaker open: the turn errors again and
+    the official-address backup key is never asked."""
     seen: list[tuple[str, str]] = []
     router, checked, shared = await _breaker_router(_CUSTOM, primary, seen, BreakerRegistry())
     try:
-        with pytest.raises(LLMError):
-            await router(messages=[HumanMessage(content="hi")], tools=[])
-        with pytest.raises(AllProvidersExhaustedError) as turn_two:
-            await router(messages=[HumanMessage(content="hi")], tools=[])
+        for _ in range(2):
+            with pytest.raises(AllProvidersExhaustedError) as turn:
+                await _ask(router)
+            assert isinstance(turn.value.last_exc, error)
     finally:
         await _close(checked, shared)
 
-    assert isinstance(turn_two.value.last_exc, CircuitOpenError)  # met the open breaker
-    assert seen == [("sk-primary", _CUSTOM_CHAT)] * 3  # turn 2 sent nothing
+    assert seen and set(seen) == {_PROXY}
+
+
+@pytest.mark.asyncio
+async def test_dns_failure_on_the_custom_address_never_reaches_the_backup_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real address-checking client, with a name that does not resolve."""
+    lookups: list[str] = []
+
+    async def _no_such_host(host: str, _port: int) -> list[tuple[Any, ...]]:
+        lookups.append(host)
+        raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+
+    monkeypatch.setattr(url_validation, "_getaddrinfo", _no_such_host)
+    seen: list[tuple[str, str]] = []
+    router, checked, shared = await _breaker_router(
+        _CUSTOM,
+        httpx.Response(200, json=_OPENAI_REPLY),
+        seen,
+        BreakerRegistry(),
+        checked_client=make_checked_client(),
+    )
+    try:
+        for _ in range(2):  # the second turn meets the open breaker
+            with pytest.raises(AllProvidersExhaustedError) as turn:
+                await _ask(router)
+            assert isinstance(turn.value.last_exc, LLMNetworkError)
+    finally:
+        await _close(checked, shared)
+
+    assert lookups and set(lookups) == {"p.example.com"}
+    assert seen == []  # nothing reached the official-address backup key
 
 
 @pytest.mark.asyncio
@@ -604,11 +647,62 @@ async def test_open_breaker_on_the_custom_address_moves_to_the_fallback_model() 
     )
     try:
         await _force_open(registry, router.providers[0].breaker_key)
-        await router(messages=[HumanMessage(content="hi")], tools=[])
+        await _ask(router)
     finally:
         await _close(checked, shared)
 
     assert seen == [("sk-backup", _LEGACY_CHAT_URLS["deepseek"])]
+
+
+@pytest.mark.asyncio
+async def test_open_breaker_on_the_custom_address_lets_the_only_option_through() -> None:
+    """The proxy is back while its breaker still cools down. With no other model
+    to go to, refusing the proxy key would end the turn with nothing tried (the
+    backup key is not an option), so the call goes to the proxy."""
+    seen: list[tuple[str, str]] = []
+    registry = BreakerRegistry()
+    router, checked, shared = await _breaker_router(
+        _CUSTOM, httpx.Response(200, json=_OPENAI_REPLY), seen, registry
+    )
+    try:
+        await _force_open(registry, router.providers[0].breaker_key)
+        await _ask(router)
+        breaker = await registry.get(router.providers[0].breaker_key)
+        state = await breaker.check_state()
+    finally:
+        await _close(checked, shared)
+
+    assert seen == [_PROXY]
+    assert state == "CLOSED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_and_body",
+    [
+        (402, {"error": {"message": "insufficient balance"}}),
+        (429, {"error": {"message": "rate limited", "type": "rate_limit_error"}}),
+    ],
+    ids=["402", "429"],
+)
+async def test_key_level_failures_on_the_custom_address_hand_over_after_the_breaker_opens(
+    status_and_body: tuple[int, dict[str, Any]],
+) -> None:
+    """Design §0 / §4.3: no credit or rate limited on the proxy key → the
+    official-address backup key serves; still so once three of them opened the
+    proxy key's breaker (turn 4 goes straight to the backup)."""
+    status, body = status_and_body
+    seen: list[tuple[str, str]] = []
+    router, checked, shared = await _breaker_router(
+        _CUSTOM, httpx.Response(status, content=json.dumps(body)), seen, BreakerRegistry()
+    )
+    try:
+        for _ in range(4):
+            await _ask(router)
+    finally:
+        await _close(checked, shared)
+
+    assert seen == [_PROXY, _OFFICIAL_BACKUP] * 3 + [_OFFICIAL_BACKUP]
 
 
 @pytest.mark.asyncio
@@ -620,11 +714,11 @@ async def test_open_breaker_on_an_official_key_still_tries_the_sibling_key() -> 
     router, checked, shared = await _breaker_router(None, httpx.Response(503), seen, registry)
     try:
         await _force_open(registry, router.providers[0].breaker_key)
-        await router(messages=[HumanMessage(content="hi")], tools=[])
+        await _ask(router)
     finally:
         await _close(checked, shared)
 
-    assert seen == [("sk-backup", _LEGACY_CHAT_URLS["openai"])]
+    assert seen == [_OFFICIAL_BACKUP]
 
 
 # --- 8 (orchestrator half) — every router build_agent builds gets the address ---
