@@ -10,7 +10,9 @@ provider's official docs — do NOT carry stale names. Mark retired models
 ``deprecated=True`` so they stay referenceable but drop out of the dropdown
 (``models_for_provider``).
 
-Last verified: 2026-11 (qwen3.8-max-0902 / doubao-seed-2-1-pro-260915: image input,
+Last verified: 2026-11-17 (qwen4-max: vendor model page only — modalities, context
+window and prices; thinking / output-cap fields copied from qwen3.8-max, not probed) /
+2026-11 (qwen3.8-max-0902 / doubao-seed-2-1-pro-260915: image input,
 thinking on/off and the thinking / output-cap parameters probed; context window
 and max output from the vendor console pages, 2026-11-11) / 2026-10 (deepseek-flash) / 2026-08
 (glm/qwen additions) against each provider's official API docs; other providers
@@ -690,7 +692,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         ModelEntry(name="glm-4.1v-thinking", vision=True, context_window=32_000, deprecated=True),
     ),
     # Alibaba Qwen / DashScope (Model Studio / 百炼) — help.aliyun.com/zh/model-studio (2026-08)
-    # qwen3.8-max (released 2026-08; 2.4T MoE) is the current flagship — natively
+    # qwen4-max (vendor model page 2026-11-17) is the current flagship; see its
+    # entry. qwen3.8-max (released 2026-08; 2.4T MoE) is the previous flagship — natively
     # multimodal (image/video/text input per the Model Studio product page) with
     # a 1M context; thinking stays the enable_thinking + thinking_budget shape
     # (Model Studio deep-thinking docs list it as supported). qwen3.7-max (text,
@@ -699,6 +702,22 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # unset where not confirmed against the 百炼 console. Legacy qwen-max /
     # qwen-vl-max kept deprecated.
     "qwen": (
+        # 2026-11-17 —— Qwen4-Max,新的通义旗舰,排在下拉第一个(不是任何东西的默认)。只按厂商
+        # 模型页(用户截图)填:输入文字 + 图片 + 视频(非实时)、输出文字,支持深度思考 / 函数
+        # 调用 / 结构化输出;上下文 1M。没有实调(不花钱):思考形态、默认开关、输出上限字段与
+        # thinking_budget 照抄 qwen3.8-max,随测试发布验收补跑 B-105 探针(开思考 + cap=300、
+        # 关思考、cap=10,000,000)。max_output_tokens 不设,理由同 qwen3.8-max-0902:
+        # max_completion_tokens 是思考 + 回答的合计上限,页面分开报最大输出 131K(思考模式
+        # 262K)、最大思维链 262K,合计范围没核过 —— 设了可能在构建期拦掉厂商其实接受的配置。
+        ModelEntry(
+            name="qwen4-max",
+            vision=True,
+            context_window=1_000_000,
+            thinking="budget",
+            thinking_default=True,
+            output_cap_field="max_completion_tokens",
+            thinking_cap=True,
+        ),
         ModelEntry(
             name="qwen3.8-max",
             vision=True,

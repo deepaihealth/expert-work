@@ -2799,3 +2799,34 @@ PY
 - [ ] **120.16 收尾**:删 120.10 加的备用密钥和两个临时智能体(若是新建的);确认 120.8 ③ 的租户覆盖已删、智谱各把密钥都是「官方」;删 nginx 的 Deployment / Service 和 Ingress 上的 `/b308-proxy` 路由。
 
 **生产**:没有开关;两个 PR 同一班车,迁移先上再滚动换镜像(120.1)。上去之后不需要配任何地址;打开「平台凭证」确认每把密钥的「请求地址」都是「官方」、编辑弹窗里有这一项,即算发版通过。真要给某家配转发地址,等用户说再配,配之前先读 120.2 的回滚核对。
+
+## §121 模型目录:新增通义 `qwen4-max`(价目表迁移 0192)
+
+**背景**:模型目录新增 `qwen / qwen4-max`(排在通义下拉第一个,不是任何默认);迁移 `0192_rate_card_qwen4_max` 补平台价目行(厂商模型页 2026-11-17:输入 10、输出 30、缓存命中 0.5 元 / 百万 token;缓存创建 0)。思考形态、默认开关、输出上限字段照抄 `qwen3.8-max`,**上架前没实调**,下面 121.4 补跑 B-105 探针。迁移排在 B-308 的 0191 之后。
+
+**怎么进(只在测试环境)**:同 §111 —— 在 release canary 的租户里用存储层建临时智能体(照 `release-canary` 的清单,主模型改 `qwen / qwen4-max`,不配备用),用 Secret `canary-credentials` 的 key 从 control-plane pod 内走对外平面发 run(key 走 stdin 首行),做完先标删除再彻底删除。提示词全是合成内容。价目表查询走只读连接。
+
+- [ ] **121.1 价目表 0192**:判据:`model_rate_card` 平台行(`tenant_id IS NULL`)`qwen / qwen4-max` 为 10 000 000 / 30 000 000 / 0 / 500 000;`qwen3.8-max-0902` 仍是 12 000 000 / 36 000 000 / 0 / 1 500 000。**没修好时**:没有 `qwen4-max` 行,它的用量记成「未定价」、成本 0。
+- [ ] **121.2 下拉里能选**(要控制台登录):智能体编辑页选 qwen → 模型下拉。判据:第一个是 `qwen4-max`,`qwen3.8-max`、`qwen3.8-max-0902` 仍在;选中后「能看图」可勾、思考开关默认开、「思考长度上限」可填。**没修好时**:下拉里没有它,或保存时报模型不在目录里。
+- [ ] **121.3 平台上一轮真调 + 记上了钱**:上面建的临时智能体(思考按目录默认开)发一轮「用一句话回答:1+1 等于几?」。判据:`end` 为 `success`;`token_usage` 有 `model='qwen4-max'` 的行;按价目表算出的金额大于 0(`token_usage` 没有金额列,用这条只读 SQL 按本轮 `trace_id` 联价目表算,只打印数字):
+
+  ```sql
+  SELECT u.model, u.input_tokens, u.output_tokens, u.cache_read_tokens,
+         r.model IS NOT NULL AS priced,
+         (u.input_tokens * r.input_per_mtok_micros + u.output_tokens * r.output_per_mtok_micros
+          + u.cache_read_tokens * r.cache_read_per_mtok_micros) / 1e12 AS approx_yuan
+    FROM token_usage u
+    LEFT JOIN model_rate_card r
+      ON r.tenant_id IS NULL AND r.provider = 'qwen' AND r.model = u.model
+   WHERE u.trace_id = '<本轮 trace_id>';
+  ```
+
+  **没修好时**:`priced=false` / `approx_yuan` 为空(没有价目行,账单里记「未计价」);或 run 失败(模型名厂商不认)。
+- [ ] **121.4 B-105 上架探针(直接调厂商,照 B-105 T0 / `qwen3.8-max-0902` 的做法)**:目录里的思考形态、默认开关、`output_cap_field`、`thinking_cap`、`max_output_tokens` 都是照抄 `qwen3.8-max` 的,要用这几次调用核。从 control-plane pod 内用平台通义 key(stdin 首行读入,不落盘、不打印)直接发 `POST https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`,`model=qwen4-max`、`stream=false`,参数名与平台发的一致(`enable_thinking`、`thinking_budget`、`max_completion_tokens`)。每次只打印回包里的 `finish_reason`、`usage.completion_tokens`、`usage.completion_tokens_details.reasoning_tokens`、正文前 80 字,以及非 200 时的状态码和报错。题目 P(保证会思考的多步应用题,同 B-105 T0 用排列组合题):「一个书架有 3 层,要把 5 本不同的书放上去,每层至少 1 本,同层的书有先后顺序。一共有多少种放法?写出推理过程。」
+  - **a. 合计上限管得住思考**:P,`enable_thinking=true`、`max_completion_tokens=300`。判据:200;`finish_reason=length`;`completion_tokens` ≤ 300(含思考,`reasoning_tokens` > 0)。**红了**(`stop` 且 completion > 300)= 合计字段对它不生效,目录要改 `output_cap_field`(如 `split`),不能合。
+  - **b. 思考长度上限是硬上限**:P,`enable_thinking=true`、`thinking_budget=200`、不发 `max_completion_tokens`。判据:200;`reasoning_tokens` ≤ 约 201;`finish_reason=stop` 且正文非空(思考停住后照常作答)。控制台「思考长度上限」填的就是这个值(121.2)。**红了**(400,或思考远超 200)= `thinking_cap` 要改成 False。
+  - **c. 关思考真关**:P,`enable_thinking=false`、`max_completion_tokens=2000`。判据:200;`reasoning_tokens` 为 0 或回包没有这个字段;正文非空。**红了** = 不能真关,目录要标 `always_thinking`。
+  - **d. 超大上限不报错**:「用一句话回答:1+1 等于几?」,`enable_thinking=false`、`max_completion_tokens=10000000`。判据:200(目录 `max_output_tokens` 不设的依据)。**红了**(400 且报错给了范围)= 把范围上限写进 `max_output_tokens`。
+  - **e. 能看图**:一张合成 PNG(白底黑字大号数字 `4721`,约 400×200),以 `image_url` 的 data URL 发,问「图里的数字是多少?只回答数字。」,`enable_thinking=false`。判据:200,正文含 `4721`。**红了** = `vision` 要改 False。
+  - 结果和日期写在本条下;任何一条与目录不符,先改目录条目、重发测试再勾。
+- **花费(121.3 + 121.4)**:输入 ¥10、输出 ¥30 / 百万 token。121.3 一轮平台 run(系统提示 + 工具描述约 1~2 万输入 token、默认开思考输出约 1~3 千)≈ ¥0.3;121.4 五次直调,输出最多的是 b(思考 200 + 作答约 1 千)≈ ¥0.05,其余各 ≤ ¥0.02 —— 合计约 ¥0.5,止损 ¥2。

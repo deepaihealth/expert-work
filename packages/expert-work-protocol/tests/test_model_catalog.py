@@ -153,6 +153,8 @@ def test_current_context_windows() -> None:
         # 2026-11-11 厂商控制台页面:Seed 2.1 pro 上下文 1024k;Qwen3.8-Max 1M。
         ("doubao", "doubao-seed-2-1-pro-260915"): 1_024_000,
         ("qwen", "qwen3.8-max-0902"): 1_000_000,
+        # 2026-11-17 厂商模型页:Qwen4-Max 上下文 1M。
+        ("qwen", "qwen4-max"): 1_000_000,
     }
     for (provider, name), window in expected.items():
         entry = catalog_entry(provider, name)
@@ -400,6 +402,7 @@ def test_max_output_tokens_match_vendor_ranges() -> None:
 
 def test_thinking_cap_only_on_qwen_thinking_models() -> None:
     capped = {
+        "qwen4-max",
         "qwen3.8-max",
         "qwen3.8-max-0902",
         "qwen3.7-max",
@@ -778,3 +781,23 @@ def test_2026_11_dated_ids_mirror_their_predecessors() -> None:
     qwen = [e.name for e in models_for_provider("qwen")]
     assert q_old.deprecated is False
     assert qwen.index("qwen3.8-max") < qwen.index("qwen3.8-max-0902")
+
+
+def test_qwen4_max_mirrors_the_qwen_flagship() -> None:
+    """2026-11-17 —— qwen4-max 上架。厂商模型页:输入文字 / 图片 / 视频、输出文字,支持深度思考;
+    上下文 1M。思考形态与输出上限字段没有实调(不花钱),照抄同族旗舰 qwen3.8-max,随测试发布
+    验收补跑 B-105 探针。"""
+    new = _e("qwen", "qwen4-max")
+    flagship = _e("qwen", "qwen3.8-max")
+    assert new.vision is True
+    assert new.context_window == 1_000_000
+    assert (new.thinking, new.thinking_default) == ("budget", True)
+    assert new.output_cap_field == "max_completion_tokens"
+    assert new.thinking_cap is True
+    # 合计上限字段;厂商页的最大输出 131K / 思考模式 262K 是分开报的,合计范围没有实调过,不校验。
+    assert new.max_output_tokens is None
+    assert new.model_dump(exclude={"name"}) == flagship.model_dump(exclude={"name"})
+    # 新的旗舰排在通义下拉第一个;旧的旗舰照样可选。
+    qwen = [e.name for e in models_for_provider("qwen")]
+    assert qwen[0] == "qwen4-max"
+    assert {"qwen3.8-max", "qwen3.8-max-0902"} <= set(qwen)
