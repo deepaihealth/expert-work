@@ -2,7 +2,9 @@
 
 > 所属:B-314 Dify「健管师」迁移(总览:00-overview.md)。状态:草稿 v1;11-17 用户已拍板 §9 全部按推荐(「后面再按测试情况调整」)。
 >
-> **修订(2026-11-17,独立核对后的修正)**:S-7 / S-8 加上数字人服务另传 `source_msg_keys`(本批 + 正在重跑的被取消批),项目服务据此生成业务方的 inputs 变量 `source_message_ids`;S-5 是否与 01 的会话映射表合并由深护实现时定;§9-13 每行 `HH:mm` 留不留有意留到 PR-3 实测;§3.7 / §3.8 的「推荐」改为已定;版本号口径统一为 `origin/main d9db26f79`。
+> **修订(2026-11-17,PR 复核修正)**:S-7 和 §6 第 8 条:缺口查询结果不再「按 `invoke_token` 缓存」,改为随数字人服务发给项目服务的请求体按「本批 + 代次」缓存、再处理时除 `invoke_token` 外原样复用(01 §3.5)。S-9:扫过的最大行号随请求体一起缓存,复用时按缓存里的值前进。
+>
+> **修订(2026-11-17,独立核对后的修正)**:S-7 / S-8 加上数字人服务另传 `source_msg_keys`(本批 + 正在重跑的被取消批),项目服务据此生成业务方的 inputs 变量 `source_message_ids`;S-5 是否与 01 的会话映射表合并由深护实现时定(已被 11-17 拍板修订取代);§9-13 每行 `HH:mm` 留不留有意留到 PR-3 实测;§3.7 / §3.8 的「推荐」改为已定;版本号口径统一为 `origin/main d9db26f79`。
 >
 > **修订(2026-11-17,03 评审结论)**:§9 第 1~11、13、14 条按推荐定稿,上线后按测试情况调整;pad 竞态(S-3)**先不管**,留在本文随 03 一起做,不提前 —— 03 之前 pad 上一轮多条气泡的后几条可能被误拦(已知风险,08 S12);§3.8 加一行:转人工选了「本轮不回」时的未送达口径;业务方给写工具判重的 inputs 变量改名为 `source_message_ids`,本文的顶层字段仍叫 `input_message_ids`。
 >
@@ -363,11 +365,11 @@ pad 发第一条文字就报错,这一批一条都没发出去 → 报「未送�
 | S-2 | pad 登记 | DHA `send-agent-answer.processor.ts:78-107`(文字)及 :174-192、:243-261、:311-329、:385-403(媒体) | 发送任务新增 `ew_session_id`、`ew_run_id`、`part_seq`(取回 run 结果后入队时带上;提醒、兜底话术不带)。每条发送成功后,带 `ew_run_id` 的才写登记:`msg_key = "pad:" + 回执.app_info`,`match_kind = receipt`。回执缺 `app_info` 时不登记,记一条计数日志(不打正文),交给平台内容兜底。登记直接写库,不经同步队列(回执缺 `msgtype` 时同步队列会静默丢弃该任务,SYNC :126-129)。 |
 | S-3 | pad 竞态修复 | DHA 发送前;SYNC `sync-pad-message.processor.ts:629-637,713-765` | 复用 dk 的做法:DHA 对**所有**以「不是真人」身份发出的消息(回答、提醒、兜底话术),在调 pad 发送**之前**写 `AI_SENT` 标记(同一工具 `ai-sent.util.ts` 的键格式与文字归一化;键里的员工用 pad id)。SYNC 在「员工本人、`!is_digital_human`」分支先查这个标记,命中就按数字人处理:不写接管标志、不调 `processReferralHuman`。回写任务后到时仍按现在的逻辑直接 return。效果:谁先到都一样。SOP、用药提醒、唤醒、MCP 发送等其它以员工号发消息的服务也有同样的竞态(它们同样只靠回写带 `is_digital_human`),第一期只修数字人服务自己发的,其它服务照同一做法跟进;开放接口服务的 pad 发送现在不带 `is_digital_human`(`deep-ai-health-open-api-service` `pad-send.service.ts:183-194`),按真人处理,不在本次范围。 |
 | S-4 | dk 登记 | DHA `pc-send-task.service.ts:315,521-541`;`t_project_cpwx_pc_send_task` 加列 `ew_session_id`、`ew_run_id`;ARCH `human-answered.service.ts:193-218` | 发放任务写 `AI_SENT` 时,带 `ew_run_id` 的任务再写一份登记用标记 `AI_SENT_RUN:{项目}:{员工}:{对象}`(成员 = 原成员 + run_id + 分段序号,600 秒)。ARCH `isAiSent` 命中后,查同一时间窗里的 `AI_SENT_RUN`:文字按指纹取、媒体按类型取时间最近且还没被登记的那一个,写登记 `msg_key = "dk:" + msgid`,`match_kind = fingerprint`。现有接管判断逻辑一字不改。 |
-| S-5 | 同步位置表 | 项目库新表 `t_project_ew_session_sync`(§5.6) | 每个平台会话(= 客户 + 智能体,私聊和各群共用,已拍板)每个通道一行,记本会话已经补到消息表的哪一行(按入库自增 id)。要不要和 01 的会话映射表(`t_project_dh_ew_session`)合成一张,由深护实现时定,不影响任何接口。 |
+| S-5 | 同步位置表 | 项目库新表 `t_project_ew_session_sync`(§5.6) | 每个平台会话(= 客户 + 智能体,私聊和各群共用,已拍板)每个通道一行,记本会话已经补到消息表的哪一行(按入库自增 id)。要不要并进 01 复用的会话表 `t_project_expert_work_session`(11-17 定复用,01 §5.4),由深护实现时定,不影响任何接口。 |
 | S-6 | 缺口查询 | DHA `src/modules/message/` 新函数,复用 `message.service.ts:142-192`(pad)、`:296-331`(dk)的范围条件 | 规则见 §5.7。 |
-| S-7 | 调用改造 | DHA `invoke-agent.processor.ts:746-801`(汇总本批)、`:844-866`(请求);PS `src/modules/expert-work/service/client/expert-work.types.ts:42-48` `EwRunRequest` 与发起请求处 | 本批成员 `msg_app_info` 加通道前缀成 `input_message_ids`;调缺口查询得到 `backfill` 与 `backfill_omitted_before`;经项目服务原样转给平台。另外把「这一轮要回答的客户消息」的身份作为 `source_msg_keys`(01 §5.1)传给项目服务:本批,加上 S-8 重跑时的被取消那批;项目服务加通道前缀生成 inputs 变量 `source_message_ids`(给深护 MCP 写工具判重,04 §6.16)。`backfill` 不变。缺口查询的结果随 `invoke_token` 存一份,同一次调用重试时原样复用(否则幂等键报 `IDEMPOTENCY_KEY_REUSED`)。 |
+| S-7 | 调用改造 | DHA `invoke-agent.processor.ts:746-801`(汇总本批)、`:844-866`(请求);PS `src/modules/expert-work/service/client/expert-work.types.ts:42-48` `EwRunRequest` 与发起请求处 | 本批成员 `msg_app_info` 加通道前缀成 `input_message_ids`;调缺口查询得到 `backfill` 与 `backfill_omitted_before`;经项目服务原样转给平台。另外把「这一轮要回答的客户消息」的身份作为 `source_msg_keys`(01 §5.1)传给项目服务:本批,加上 S-8 重跑时的被取消那批;项目服务加通道前缀生成 inputs 变量 `source_message_ids`(给深护 MCP 写工具判重,04 §6.16)。`backfill` 不变。缺口查询的结果放在数字人服务发给项目服务的请求体里,随请求体按「本批 + 代次」缓存(01 §3.5),同一批同一代次再处理时除 `invoke_token` 外原样复用、不重新查(否则幂等键报 `IDEMPOTENCY_KEY_REUSED`)。 |
 | S-8 | 打断后的重跑改造 | DHA `invoke-agent.processor.ts:875-990` | 现在被取消那一批会合并进重跑的 input。改成:重跑的 `input` 只放取消之后新到的消息;被取消那一批的客户消息不进 input,由缺口查询作为补消息带上(同步位置在取消时不前进,所以它们一定在缺口里),平台按身份判断它们是否已在会话里(§3.2 a)。被取消那批的身份**仍要放进 `source_msg_keys`**(S-7),否则模型重跑时重复写入判不出来。 |
-| S-9 | 同步位置前进 | DHA 调用结束处 | run 以 success / incomplete 结束才前进到这次缺口查询扫过的最大行号;error、取消、请求被拒都不前进(下次重扫,平台去重)。 |
+| S-9 | 同步位置前进 | DHA 调用结束处 | run 以 success / incomplete 结束才前进到这次缺口查询扫过的最大行号;error、取消、请求被拒都不前进(下次重扫,平台去重)。这个最大行号和请求体一起缓存(01 §3.5);同一批再处理、复用缓存的请求体时,同步位置按缓存里的值前进 —— 不能按这次没做的新查询算,否则两次处理之间进来的消息会被永远跳过。 |
 | S-10 | 未送达回报 | DHA `send-agent-answer.processor.ts` 发送入口(`handlerProcessSendAgentAnswer`,覆盖 :415-417、:466-468、:477-480、:507-509 的静默返回和 :770 的兜错);dk 任务终态处(`pc-send-task.service.ts:301-305,595-631,667-698`);取消处;PS `expert-work-client.ts:572` 旁加 `markUndelivered` | 规则见 §3.8 表。发送前接管命中现在不留记录,改成记一条调用日志(复用 `t_project_ai_agent_invoke_log` 的 result_type)。 |
 | S-11 | 新会话补最近一段 | S-6 | 平台会话第一次被调用(没有同步位置)时,补最近 48 小时、最多 30 条(§9-9)。首次切换走这条(01 已拍板不按空闲换会话;404 重建会话时也走)。 |
 | S-12 | 日志 | 新增代码 | 不打印正文、客户名、发送人名(深护现有日志问题见 08 文档)。 |
@@ -580,7 +582,7 @@ CREATE TABLE t_project_ew_session_sync (
 5. **消息补进来之后被撤回**:会话里不撤(平台不提供删除补消息的接口)。撤回通常是发错,影响有限;以后需要再加。
 6. **超过 50 条**:只补最后 50 条,第一条标注写「更早还有 N 条没带」。智能体可在提示词里被告知此时不要假装知道更早的内容。
 7. **会话正忙**(深护有同一客户锁,正常不会):本轮排队,补消息在轮到它时写,写在前一轮回答之后。
-8. **重试**:同一次调用重试必须带同一批补消息和同一个幂等键;深护按 `invoke_token` 缓存缺口查询结果(S-7)。换了一批又用同一个键会得到 422 `IDEMPOTENCY_KEY_REUSED`。
+8. **重试**:同一批再处理必须带同一批补消息和同一个幂等键;深护按「本批 + 代次」缓存发给项目服务的请求体、除 `invoke_token` 外原样复用(S-7、01 §3.5)。换了一批又用同一个键会得到 422 `IDEMPOTENCY_KEY_REUSED`。
 9. **本轮被取消在排队时**:它的输入从没写进会话;下一次调用里这批消息作为补消息出现(S-8),平台写入。
 10. **重新生成 / 编辑重发**:补消息没有 run 戳,不会被剔除,也不会被带进重放的原件。
 11. **长会话变大**:补消息让会话增长更快。会话已拍板不切(01 §3.4.3),压缩门槛见 01 §3.4.4;压缩时补消息和其它消息一样会被摘要,摘要里不保证留时间。
