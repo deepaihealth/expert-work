@@ -7,6 +7,8 @@
 > **修订(2026-11-17,06 评审结论)**:inputs 加 `self_introduction`(自我介绍),与 `self_appellation` 一起由项目服务原样转给 Expert Work(数字人服务已在传)。
 >
 > **修订(2026-11-17,用户 11-17 拍板)**:会话与 run 台账**复用**现有 `t_project_expert_work_session` / `t_project_expert_work_run`,不再新建 `t_project_dh_ew_*` 两张表(§5.4);项目服务按配置行上新加的 `adapter_type` 选适配器和计费,做一个**通用的企微聊天适配器**,以后再接企微聊天智能体只要加配置(§4);`wx:` 前缀定稿并写明代码改动(§3.4.1);康豆按场景固定价,要在计费里加按适配器的钩子,`incomplete` 只有拿到可用回答才扣(§3.8);等满 360 秒必须调取消(§3.7);兜底话术写死在项目服务代码里(§3.9);客户删除会级联删会话行(§6)。
+
+> **修订(2026-11-17,越权读会话拍板)**:§4 第 2b 条按 08 S13 已定修法改写 —— 通用 `/expert-work/:agent_code/*` 路由拒绝 `adapter_type = wecom_chat` 智能体的会话、企微聊天模块核对归属,切换前必做;其余通用路由的核对进深护安全待办。
 >
 > **修订(2026-11-17,独立核对后的修正)**:`source_message_ids` 在 03 之后怎么来定了做法 —— 数字人服务另传 `source_msg_keys`(本批 + 正在重跑的被取消批,§5.1),项目服务据此生成;未送达原因统一用 03 的取值(`send_failed` / `human_took_over` / `cancelled` / `other`,§5.4);滑窗口径改为「最近 20 轮」(第一轮已关掉);若干措辞按已定事项更新。
 >
@@ -492,7 +494,7 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 1. 新入口 `POST /agent/invoke-digital-human-ew`,契约见 §5.1;现有 Dify 入口不动。
 2. **复用现有两张表**(11-17 定,§5.4):会话行用 `t_project_expert_work_session`(`employee_code` 留空串、填 `customer_code`、`ew_user_id = wx:…`),run 台账用 `t_project_expert_work_run`;不新建 `t_project_dh_ew_session` / `t_project_dh_ew_run`。已有先例:ai-strategy H5 的客户自发会话就是 `employee_code` 为空的会话行(`expert-work-run.service.ts:250、324`)。
 2a. **通用的企微聊天适配器**(11-17 定):`t_project_expert_work_config` 加一列可空的 `adapter_type`(如 `wecom_chat`);为空 = 照现在按 agent_code 精确注册的适配器(`agent-adapter.registry.ts:36-38`),现有智能体不受影响、不用回填。项目服务先按 `adapter_type` 选适配器和计费,没有再按 agent_code。企微聊天适配器管任何企微聊天智能体:组 inputs(`customer_code`、`self_appellation`、`self_introduction`、`source_message_ids` 等)、解析输出(`messages` + `media`)、计费。以后再接一个企微聊天智能体 = 在 Expert Work 上配好智能体 + 加配置行,不写代码。
-2b. **权限**(建议切换前修,待用户确认,08 S13):企微聊天模块读写会话前核对「项目 + agent_code + customer_code」;通用 expert-work 路由核对会话行的 agent_code 与路径一致。
+2b. **权限**(切换前必做,08 S13 修法 A):通用的 `/expert-work/:agent_code/*` 路由拒绝 `adapter_type = wecom_chat` 智能体的会话;企微聊天模块读写会话前核对「项目 + agent_code + customer_code」。不改前端,现有智能体(`adapter_type` 为空)不受影响。所有通用路由核对 agent_code、限制 `sessions/list`(修法 B)进深护安全待办。
 3. 会话:按 §3.4 查 / 建(不按空闲换;只有 404 时换)。
 4. 附件:下载(域名白名单)→ 按文件头判类型 → 带 session_id 上传 → 缓存 upload_id(§3.3.3)。
 5. input / inputs 组装(§3.3.1、§3.3.2),东八区时间显式计算;`source_message_ids` 由数字人服务传来的 `source_msg_keys` 加通道前缀生成(§5.1;03 之前它就等于本批的 `msg_key`)。不再每轮预取客户档案、提醒、饮食、方案(智能体自己查,04 §9.4)。
@@ -720,7 +722,7 @@ Idempotency-Key: dh1:<64 位十六进制>
 |---|---|---|
 | Expert Work 平台 | 01 本身无改动;可选「本轮时间」平台段 1-1.5 人天(03 PR-3 会取代它,一般不单独做)、「本轮输入」段精简 1 人天 | 0(可选 2-2.5) |
 | 智能体配置 | 时限、日期段、变量声明、上下文门槛(与 02 / 04 一起) | 0.5 人天 |
-| 深护项目服务 | 新入口、复用两张表(加列加索引)、配置行 `adapter_type` 与通用企微聊天适配器、会话、附件、input / inputs、幂等与代次、取最终回复、取消、康豆(按适配器的计费钩子)与巡检、日志遮蔽;越权读会话修复另计 0.5~1(08 S13,待用户确认) | 7-9 人天(粗估) |
+| 深护项目服务 | 新入口、复用两张表(加列加索引)、配置行 `adapter_type` 与通用企微聊天适配器、会话、附件、input / inputs、幂等与代次、取最终回复、取消、康豆(按适配器的计费钩子)与巡检、日志遮蔽;越权读会话修法 A 另计 0.5~1(08 S13,切换前必做) | 7-9 人天(粗估) |
 | 深护数字人服务 | 分流开关、锁键与绑定闸、消息结构、`is_first_contact` 查消息表、发送入队与回写、各 `outcome` 处理、HTTP 超时 390 秒 | 3-4 人天 |
 | 联调与真栈验收 | §7 的 21 条 | 3 人天 |
 | 合计 | 不含 02 / 03 / 04 | 约 12.5-15.5 人天(粗估) |
