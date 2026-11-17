@@ -692,7 +692,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         ModelEntry(name="glm-4.1v-thinking", vision=True, context_window=32_000, deprecated=True),
     ),
     # Alibaba Qwen / DashScope (Model Studio / 百炼) — help.aliyun.com/zh/model-studio (2026-08)
-    # qwen3.8-max (released 2026-08; 2.4T MoE) is the current flagship — natively
+    # qwen4-max (vendor model page 2026-11-17) is the current flagship; see its
+    # entry. qwen3.8-max (released 2026-08; 2.4T MoE) is the previous flagship — natively
     # multimodal (image/video/text input per the Model Studio product page) with
     # a 1M context; thinking stays the enable_thinking + thinking_budget shape
     # (Model Studio deep-thinking docs list it as supported). qwen3.7-max (text,
