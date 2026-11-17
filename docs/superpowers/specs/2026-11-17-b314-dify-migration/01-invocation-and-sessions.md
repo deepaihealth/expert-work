@@ -455,7 +455,7 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 
 ### 深护数字人服务
 
-1. 按智能体分流:绑定的智能体标记为走 Expert Work 时调新入口,否则走原 Dify 路径(灰度与回退,§9 第 9 条)。智能体表加一个「接入方式」字段。
+1. 按员工绑定分流(用户 11-17 定):`t_project_employee_cpwx_pad_relation` / `t_project_employee_cpwx_pc_relation` 各加字段 `is_expert_work`(默认 0)。为 0 照旧按 `agent_code` 走 Dify;为 1 时调新入口,项目服务用(项目, 同一个 `agent_code`)查 `t_project_expert_work_config` 取开通状态与密钥 —— 约定 Expert Work 上的智能体编码与 Dify 那一行的 `agent_code` 相同(Expert Work 智能体名只限长度 1~128,一般编码可直接用;上线前核对健管师现有编码)。`agent_code` 仍指向 Dify 那一行,回复时段、群 / 私聊开关、自称、自我介绍继续从那一行读,不复制。该配置行 `enabled=0` 时这个项目的所有绑定退回 Dify(项目级总开关)。
 2. 绑定闸:走 Expert Work 的智能体不再要求 Dify 应用密钥。
 3. 锁键去掉密钥;发给项目服务的请求体里不再带 `agent_key`。
 4. 本批消息按 §5.1 的结构传(每条带企微消息身份、类型、发送时间、文字或 OSS 链接),不再在这里拼 query、截 10 个附件。
@@ -651,7 +651,7 @@ Redis(都不含密钥):
 18. **康豆口径**:分别造出 success、我方取消、error 三种结果 → 钱包流水 → 只有 success 扣了一笔,金额等于场景固定价 → 没修好:取消也扣、或 error 也扣。
 19. **真人接管**:真人在企微里刚回过客户,客户再发消息 → 调用日志 → 照旧在闸门处跳过,不发起 run;run 进行中真人回复 → 回答没发,台账 `delivery=blocked_by_human` → 没修好:真人回完 AI 又插一句。
 20. **密钥不出现**:跑完以上用例后,扫 Redis 键名、数字人服务和项目服务的日志、调用日志表 → 找不到 Dify 应用密钥和 Expert Work API key 的任何片段;日志里没有 input 正文 → 没修好:密钥或客户健康数据进了日志。
-21. **灰度与回退**:把某个智能体的接入方式切回 Dify → 数字人服务 → 立刻走回原路径,Dify 会话照常续上 → 没修好:切换要发版。
+21. **灰度与回退**:把某条员工绑定的 `is_expert_work` 置 0(或把 `t_project_expert_work_config` 对应行 `enabled` 置 0)→ 下一条消息 → 立刻走回 Dify 原路径,Dify 会话照常续上 → 没修好:切换要发版,或 `enabled=0` 不生效。
 
 ## 8. 工作量粗估
 
@@ -708,7 +708,7 @@ Redis(都不含密钥):
    - 推荐 A。理由:现在失败时客户什么都收不到,体验最差;限频防平台故障时刷屏。
 
 9. **灰度与回退**
-   - 选项:A 按智能体切换(智能体表加「接入方式」),Dify 路径保留到全部切完(推荐);B 按项目整体切。
+   - **已拍板(11-17)**:按员工绑定切换 —— 两张绑定表加 `is_expert_work`(默认 0),置 1 即走 Expert Work,按「项目 + 同一 agent_code」查 `t_project_expert_work_config`;置 0 即切回;配置行 `enabled=0` 为项目级总开关。Dify 路径保留到全部切完。
    - 推荐 A。理由:一个开关、随时切回;Dify 会话缓存保留,切回去还能接着聊。
 
 10. **打断后重跑的 input**(依赖 03)
