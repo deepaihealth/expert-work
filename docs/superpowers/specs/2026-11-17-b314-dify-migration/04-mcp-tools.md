@@ -7,10 +7,12 @@
 > **修订(2026-11-17,04 评审结论)**:写入不需客户确认、不设按客户上限;化验单按上传月合并;按小时循环沿用 30 天;数据情境(空腹 / 餐次 / 测量时间)按表单配置、模型先推断再问;防重复写改为「按来源消息」判断(取代「同一天同内容」);客户资料由模型调 `profile_get_brief` 一次取齐(含现有提醒,v1 就做);「查更早聊天」改为增强现有 `chat_private_history`;新增转人工工具 `handoff_to_human`(MCP 直接发通知,四种组合 + 急症例外,§3.10);主回复仍由业务方发,「走 MCP 发」记为否决项(§3.11);Expert Work 平台加「固定值下拉」(§4.1)。
 >
 > **修订(2026-11-17,06 评审结论)**:9.10 各项按本文推荐定稿并写进工具规格 —— 提醒短编号(5.4、5.5)、一次删多条必须带「客户已确认」(5.5)、设提醒返回带星期(5.3)、查表单结束日裁到今天(M4);改档案按字段编码写。
+>
+> **修订(2026-11-17,05 评审结论)**:新增素材清单工具 `material_list`(运动视频等走深护素材库,§5.12);转人工两项定稿 —— 找不到通知对象就不转、照常回复(9.14),健管师默认「本轮不回 + 之后照常」(9.15);pc 转人工明确为照数字人服务的 `enqueueReferral` 往 `t_project_cpwx_pc_send_task` 插 referral 任务(§3.10);更正 §3.11 理由 1:dk 经机器任务服务发出时会写 AI 已发标记,不会被当成真人接管,pad 通道未核实。
 
 ## 0. 一句话结论
 
-迁移后,健管师智能体对深护业务数据的读写全部走深护 MCP:**复用现有 3 个只读工具(查字段结构、查最新值、按时间查提交),增强 1 个(`chat_private_history`,查更早聊天),新增 7 个**(表单写入、提醒增 / 查 / 删、健康方案精简版、客户资料精简版、转人工),加上平台高德的天气工具共放行 12 个(§3.5)。「这是谁的数据」由平台 `arg_bindings` 按本轮 inputs 填进去,模型看不到也改不了。Dify 里靠提示词约束的写入规则(化验单按月合并、最多 70 字段、累积字段追加、不写姓名、不重复写)搬到 MCP 服务端;防重复写看「这条记录是不是由同一批客户消息写过」(§3.4)。转人工由 MCP 直接通知同事,并按智能体配置决定「本轮回不回」「之后还回不回」(§3.10)。主回复仍由业务方取 run 结果后发。天气用平台已有的 `amap-maps` 的 `maps_weather`,快递不做。Expert Work 平台只改一处:MCP 工具参数的「固定值」在工具声明了可选值时改成下拉选择,保存时校验(约 1 人天,§4.1)。
+迁移后,健管师智能体对深护业务数据的读写全部走深护 MCP:**复用现有 3 个只读工具(查字段结构、查最新值、按时间查提交),增强 1 个(`chat_private_history`,查更早聊天),新增 8 个**(表单写入、提醒增 / 查 / 删、健康方案精简版、客户资料精简版、转人工、素材清单),加上平台高德的天气工具共放行 13 个(§3.5)。「这是谁的数据」由平台 `arg_bindings` 按本轮 inputs 填进去,模型看不到也改不了。Dify 里靠提示词约束的写入规则(化验单按月合并、最多 70 字段、累积字段追加、不写姓名、不重复写)搬到 MCP 服务端;防重复写看「这条记录是不是由同一批客户消息写过」(§3.4)。转人工由 MCP 直接通知同事,并按智能体配置决定「本轮回不回」「之后还回不回」(§3.10)。主回复仍由业务方取 run 结果后发。天气用平台已有的 `amap-maps` 的 `maps_weather`,快递不做。Expert Work 平台只改一处:MCP 工具参数的「固定值」在工具声明了可选值时改成下拉选择,保存时校验(约 1 人天,§4.1)。
 
 ### 威胁模型(先看这里)
 
@@ -90,7 +92,7 @@
 - 写库 + 投队列的先例:用药提醒生产者(`medication-reminder-producer.service.ts:1-17`,显式按 `Asia/Shanghai` 算时间)。
 - 通用幂等表 `t_open_api_idempotency` 已有 model,唯一键 `uk_idem`(公司、业务类型、范围、幂等键)(`models/TOpenApiIdempotency.ts`)。
 - 聊天记录工具 `chat_private_history` 只查员工 ↔ 客户的私聊,入参 `project_code`、`employee_code`、`customer_code`,默认近 7 天、每页 50、上限 100(`chat.tool-provider.ts:116-160`;`chat.service.ts:286-380`)。数据来自 `t_project_cpwx_chat_msg`,**pad 和 dk 两条通道都写这张表**:pad 消息同步服务每收一条就 `findOrCreate` 进去,发送方 / 接收方存企微明文 id、群消息存 `roomid` 和 @ 名单(`sync-pad-message.processor.ts:1381-1419、1457-1552、1602-1608`,确认)。
-- 发消息工具 `cpwx_send_*` 只能发文字:pad 走 `message.service.ts:82-230` 直接调 pad 接口,pc 往 `t_machine_task` 插一条发送任务(`message-pc.service.ts:150-215、347-369`)。整个 MCP 仓库搜不到 `AI_SENT` / `markAiSent`(确认),即不写「AI 已发」标记。
+- 发消息工具 `cpwx_send_*` 只能发文字:pad 走 `message.service.ts:82-230` 直接调 pad 接口(再投同步队列),pc 往 `t_machine_task` 插一条发送任务(`message-pc.service.ts:150-215、347-369`)。MCP 仓库自己不写「AI 已发」标记(搜不到 `AI_SENT` / `markAiSent`);但 pc 的 `t_machine_task` 由 PC 机器任务服务领取,领取时对每条任务都写 AI 已发标记(`deep-ai-health-cpwx-pc-machine-task-service` `claim.service.ts:188-192`),而且它的收件人只能是外部联系人(私聊)或群(`recipient.resolver.ts:62-151`),发不了给内部同事的私聊。pad 直发会不会被同步服务当成真人接管,未核实。
 
 ### 1.5 人工接管与转人工现在怎么做(与 §3.10 有关,确认)
 
@@ -161,6 +163,7 @@
 | 提醒列表 | `reminder_list` | **新增** | 按 `customer_pad_userid` 查(与现有数据一致,群里未建档的人也能用) |
 | 历史聊天 | 不再每轮拉;客户问到会话里没有的更早聊天时调 `chat_private_history` | 复用 + **增强** | 范围扩到「该客户私聊 + 该客户在群里发的 + 员工号 @ 该客户的」,加关键词 / 时间段 / 条数(≤ 30),身份由平台绑定(§3.12、5.8) |
 | 天气 | 平台 `amap-maps` 的 `maps_weather` | 平台已有 | 见 3.7 |
+| 运动视频(Dify 整表塞提示词) | `material_list` | **新增** | 返回「健管师可发素材」分类里的全部素材(短 id、名称、类型、标签),不给链接、不搜关键词;分类由配置钉死(5.12,05 §3.3) |
 | 快递 | 不做 | — | 已拍板 |
 
 **写**
@@ -206,7 +209,8 @@
 | `reminder_list` | `project_code`;`customer_pad_userid`;`room_conversation_id` | — |
 | `reminder_delete` | `project_code`;`customer_pad_userid` | — |
 | `chat_private_history`(增强) | `project_code`;`employee_code`;`customer_code` | `scope: customer`(5.8) |
-| `handoff_to_human` | `project_code`;`employee_code`;`employee_pad_userid`;`customer_code`;`customer_pad_userid`;`room_conversation_id`;`input_message_ids` | `this_turn`、`afterwards`(控制台下拉选,§3.10) |
+| `handoff_to_human` | `project_code`;`employee_code`;`employee_pad_userid`;`customer_code`;`customer_pad_userid`;`room_conversation_id`;`input_message_ids` | `this_turn`、`afterwards`(控制台下拉选,§3.10;健管师默认 `silent` + `continue`) |
+| `material_list` | `project_code` | `category_code`(「健管师可发素材」分类的编码) |
 | `amap-maps` / `maps_weather` | 无(不涉及客户身份) | — |
 
 没写箭头的表示工具参数名与变量名相同。表单类工具的参数叫 `owner_code`,要绑到 `customer_code`,这是最容易配错的一处。`handoff_to_human` 绑 `input_message_ids` 是为了两件事:同一批消息重跑时不重复通知同事;pad 私聊照现在的做法把这批客户消息标成「已转人工」(按 `msg_app_info`,§1.5)。
@@ -292,15 +296,16 @@
 | `reminder_create` / `reminder_list` / `reminder_delete` | 写 / 读 / 写 | 提醒 |
 | `chat_private_history`(增强后) | 读 | 「我上周跟你说的那个……」而会话里没有 |
 | `handoff_to_human` | 写 | 转人工 |
+| `material_list` | 读 | 客户明确要运动视频等素材时拿全量清单 |
 | `amap-maps` 的 `maps_weather` | 读 | 天气 |
 
-一共 12 个工具,说明文字都控制在 300 字内。平台规则(`orchestrator/tools/assembly.py:442-470`,确认):MCP 工具 schema 总量小于 min(上下文窗口 × 10%, 2 万 token)时全部直接可见,超过就要模型先用 `find_tools` 搜。12 个工具远小于这个量,不会被藏起来。
+一共 13 个工具,说明文字都控制在 300 字内。平台规则(`orchestrator/tools/assembly.py:442-470`,确认):MCP 工具 schema 总量小于 min(上下文窗口 × 10%, 2 万 token)时全部直接可见,超过就要模型先用 `find_tools` 搜。13 个工具远小于这个量,不会被藏起来。
 
 **禁用(不放行)**
 
 | 工具 | 理由 |
 |---|---|
-| `cpwx_send_text_to_customer` / `cpwx_send_text_to_group` / `cpwx_query_send_status` | 主回复由业务方发,智能体再发会重复;也绕过了数字人服务发送前的人工接管检查;不写 AI 标记,dk 会把它当成真人接管(§3.11) |
+| `cpwx_send_text_to_customer` / `cpwx_send_text_to_group` / `cpwx_query_send_status` | 主回复由业务方发,智能体再发会重复;也绕过了数字人服务发送前的人工接管检查(§3.11) |
 | `medication_create_plan(s_batch)` / `medication_stop_plan(s_batch)` | 会真推送(工具自己标了 dangerous、需确认,`medication.tool-provider.ts:154-160`);「每天提醒吃药」容易被路由到这里 |
 | `medication_query_plans` | 首版用不上;放进来会让「吃药提醒」多一个可能走错的去处 |
 | `customer_*`(5 个) | 能按关键词、标签、编号查任意客户 |
@@ -388,12 +393,18 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 **MCP 做什么(按顺序)**:
 
 1. **校验固定选项**:不是允许值(如手误写成 `slient`)→ 42200,明确说哪个参数、允许哪些值;不悄悄按默认处理。
-2. **通知同事**:按员工绑定判断走 pad 还是 pc(与到点提醒同口径,`send-notify.processor.ts:50-82`),目标取绑定行上的转人工配置,兜底规则与现在一致(§1.5)。用 MCP 现有的 pad / pc 发送能力发出;目标是内部同事 / 内部群,所以**和现在 dk 的转人工一样,不写 AI 标记、不过人工接管检查**。pc 要建成 `t_project_cpwx_pc_send_task` 里 `task_kind=referral` 的任务(跳过接管检查、30 分钟过期);注意 MCP 现有的 pc 发送写的是另一张 `t_machine_task`(§1.4),这里要按 referral 任务的字段另写(照 `pc-send-task.service.ts:206-223`)。转人工状态照现在标:pad 私聊把本批客户消息标 `referral_human_status=1`(从 `input_message_ids` 取 `msg_app_info`);dk 没有状态列,referral 任务本身就是记录。
+2. **通知同事**:按员工绑定判断走 pad 还是 pc(与到点提醒同口径,`send-notify.processor.ts:50-82`),目标取绑定行上的转人工配置,兜底规则与现在一致(§1.5)。目标是内部同事 / 内部群,所以**和现在 dk 的转人工一样,不写 AI 标记、不过人工接管检查**。
+   - **pad**:用 MCP 现有的 pad 文字发送,发给转人工目标(同事 pad id,或内部群)。
+   - **pc(已定 11-17)**:照数字人服务的 `enqueueReferral`(`pc-send-task.service.ts:190-225`)往 `t_project_cpwx_pc_send_task` 插 referral 任务 —— 同样用 `PcReferralResolver.pickTargets(项目, 同事 userid 列表, 群 chat_id)` 的规则选目标(`pc-referral.resolver.ts:43`),字段照搬:`task_id = referral_<uuid>:<sha1(目标)前 16 位>`、`customer_external_userid = ''`、`referral_userid`、`room_chat_id`、`texts`、`task_kind = referral`。领取时的行为(不过接管检查、不写 AI 标记、30 分钟过期、最后发放、领取时再解析同事 / 群名)全部留在数字人服务,MCP 不碰。这是 MCP 与数字人服务之间的跨服务约定,两边要有契约测试。**不走** MCP 现有 pc 发送用的 `t_machine_task`:它的收件人只能是外部联系人或群,发不了给内部同事的私聊,而且领取时会写 AI 已发标记(§1.4)。转人工状态照现在标:pad 私聊把本批客户消息标 `referral_human_status=1`(从 `input_message_ids` 取 `msg_app_info`);dk 没有状态列,referral 任务本身就是记录。
 3. **本轮不回**:`this_turn=silent` 且**不是急症**时,写现有的临时接管标志 `HUMAN_HAS_ANSWERED_{项目}_{员工}[_{群}]_{客户}`(存活 600 秒),写在数字人服务共用的那个 Redis 库(库号待核实,与「提醒队列 14 还是 15」一起核,§9.12)。两通道的发送前检查本来就查这个键(§1.5),这一轮的回复即使生成了也会被拦下。客户再开口时这个键会被自动删掉,下一轮 AI 恢复回复。键里的 id 拼法是跨服务约定,pad 用 pad id、dk 用企微明文 id(§3.3),必须逐字一致。只写客户级的键,不写群级键(群级会挡住群里其他客户)。
 4. **之后不回**:`afterwards=stop` 时,把当前对话的 AI 开关 `is_enabled_agent_reply` 置 0:私聊改 `t_project_customer_cpwx_relation` 那一行,群里改 `t_project_cpwx_group_member` 里**这位客户**那一行。数字人服务调用前本来就查它(`invoke-agent.processor.ts:479-538`),之后这位客户在这个对话里的消息不再调智能体。两张表按企微明文 id 查(员工 `cpwx_userid`、客户 `cpwx_external_userid`、群 `chat_id`);pad 通道绑定的是 pad id,要换算 —— 用 `customer_code` / `employee_code` 反查,或业务方另传企微明文 id,实现时定。
 5. **返回**:告诉模型本轮怎么做 —— `silent`:「本轮不用写回复,输出空」;`reply`:「照常回复,用稳住的话,不要说已转人工」。
 
 **急症例外**:`is_emergency=true` 时,不管 `this_turn` 选的什么,**都不写临时接管标志**,AI 本轮「立即就医 / 拨打 120」的建议必须发出去;`afterwards` 照配置执行。把普通情况误判成急症,最多多发一条回复;提示词仍然要求不回答已经交出去的问题(06)。
+
+**找不到通知对象(已定 11-17)**:绑定行没配转人工目标、调用里也没有 → 不发通知、不写临时标志、不关 AI 开关,工具告诉模型「没有转成」,模型照常回复;服务端记告警日志(5.9、9.14)。
+
+**健管师默认组合(已定 11-17)**:`this_turn = silent`、`afterwards = continue` —— 交出去的那一轮 AI 不说话,由同事回;客户之后再说别的,AI 照常回答;客户追问那道题时,AI 说正在确认、稍后回复(06 R71)。急症例外不变。控制台随时可改成其它组合。
 
 **谁把 AI 重新打开**:业务后台。读代码找到项目服务已有两个接口能改这个开关(§1.5),但员工端有没有入口在用**没核实**;实现前必须确认,没有就补一个(§9.13)。
 
@@ -405,13 +416,13 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 
 考虑过让智能体在一轮里调 MCP 发消息工具发主回复。不做,理由(都读过代码):
 
-1. **会让 AI 一发言就把自己关掉。** MCP 的发消息工具不写「AI 已发」标记(整个 MCP 仓库搜不到 `AI_SENT` / `markAiSent`)。dk 通道上,会话存档服务把员工号发出、又没有这个标记的消息一律当成真人接管,写临时接管标志(`human-answered.service.ts:38、157-185`)→ AI 第一条回复发出去后,自己就被当成「真人接手了」,接下来 10 分钟不回。pad 在消息同步服务里有类似判断(`sync-pad-message.processor.ts:713-765`,没逐行核对是否同样触发)。
+1. **会不会被当成真人接管:pad 未核实,dk 不构成问题(11-17 更正)。** dk 会话存档服务把员工号发出、又没有「AI 已发」标记的消息当成真人接管(`human-answered.service.ts:38、157-185`);但 MCP 的 pc 发送走 `t_machine_task`,PC 机器任务服务领取时会写这个标记(`claim.service.ts:188-192`),所以 dk 上不会误判。pad 通道 MCP 直接调 pad 接口发,同步服务会不会把它当成真人发言(`sync-pad-message.processor.ts:713-765`)没核实。此前写的「AI 一发言就把自己关掉」不成立,作废。下面 2~5 条照样成立,结论不变。
 2. **回复会从平台的各个视图里消失。** 长期记忆提炼只看每一轮的最终回答,工具调用只留下名字(`graph_builder/memory.py:540-546、583-612`,`_turn` 只取最后一条不带工具调用的助手消息);对话页、调试台、评测看的也是最终回答。通过工具发出的回复,这些地方都看不到。
 3. **被打断时收不回。** 新消息到达时数字人服务会取消正在跑的一轮、合并后重跑(`invoke-agent-message.processor.ts:338-371`);一轮中途已经用工具发出去的话撤不回来,重跑又发一次,客户收到前后矛盾的两段。
 4. **没法保证正好发一次。** 模型可能漏调、多调;最终回答有 `output_schema` 校验和重试兜底,工具调用没有。
 5. **只能发文字。** MCP 的发送工具只发文字(pad `message.service.ts`、pc `message-pc.service.ts`);视频、多气泡、发送节奏都在数字人服务。
 
-粗估要多 5 人天,还多两类事故级风险(AI 自我关闭、重复矛盾回复)。等以后做「智能体主动找客户」时再重新评估。
+粗估要多 5 人天,还多一类事故级风险(被打断时重复、矛盾的两段回复),pad 是否误触发真人接管未核实。等以后做「智能体主动找客户」时再重新评估。
 
 ### 3.12 查更早聊天:增强现有 `chat_private_history`(11-17 定,不新建工具)
 
@@ -451,7 +462,8 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | M10 | 契约测试 | 新工具每条返回路径(含空结果、未建档、去重)都过 outputSchema 校验(见 6.8);提醒 job 字段与数字人消费端对齐;转人工写的接管标志键与数字人 / 同步 / 存档三方拼法一致 |
 | M11 | 增强 `chat_private_history` | 5.8;范围、关键词、时间段、条数、说话人标注 |
 | M12 | (可选加固)key 限项目、限工具;客户属于项目核对 | 9.5 |
-| M13 | `handoff_to_human` | 5.9;pad / pc 通知、接管标志、AI 开关、转人工状态、固定选项校验;连数字人共用的 Redis 库 |
+| M13 | `handoff_to_human` | 5.9;pad 通知、pc 照 `enqueueReferral` 插 referral 任务(含 `pickTargets` 选目标)、接管标志、AI 开关、转人工状态、固定选项校验;连数字人共用的 Redis 库 |
+| M14 | `material_list` | 5.12;读深护素材库(素材表 + 分类表 + 分类关系表),只返回绑定分类里的素材 |
 | 配置 | 生产 `AGENT_KEYS` 非空;新增健管师 key;MCP 能连上数字人共用的 Redis 库(写接管标志) | |
 
 ### 4.3 深护数字人 · 项目服务
@@ -467,7 +479,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 ### 4.4 智能体配置
 
 - `system_prompt.jinja: true`,声明 3.3 的 8 个变量。
-- `tools` 两个 mcp 条目(深护健管师专用注册名 + `amap-maps`),`allow_tools`、`arg_bindings` 按 5.11;`handoff_to_human` 的 `this_turn`、`afterwards` 在控制台下拉里选(健管师默认建议见 5.9)。
+- `tools` 两个 mcp 条目(深护健管师专用注册名 + `amap-maps`),`allow_tools`、`arg_bindings` 按 5.11;`handoff_to_human` 的 `this_turn`、`afterwards` 在控制台下拉里选(健管师默认 `silent` + `continue`,11-17 定);`material_list` 的分类编码钉成「健管师可发素材」。
 - 不开 `dynamic_workers`、不配 `subagents`(绑定在子智能体里的行为不在本文核对范围)。
 - `approval_required_tools` 留空(9.1:不确认,已定)。
 - 提示词里写清(全文在 06):只用手上的工具;写入和提醒以工具返回为准;日期参数只传 `YYYY-MM-DD`;`form_list_owner_submissions` 的 `page_size` ≤ 20;客户资料只在话题与健康有关时调、每轮最多一次;情境字段先推断再问;一条消息里重复的量合并或带时间;转人工的时机、急症信号、不说「已转人工」、不回答已交出去的问题。
@@ -675,8 +687,8 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 - **返回**:`status`(`sent` / `duplicate` / `no_target`)、`target`(`user` / `room`,不回显 id)、`this_turn`、`afterwards`、`is_emergency`、`takeover_flag_written`、`ai_switch_off`、`guidance`(本轮怎么做的一句话)、`server_now`、`request_id`。
 - **做法**:见 3.10 的五步。
 - **去重**:同一客户、本次 `input_message_ids` 与之前某次转人工重叠(打断后重跑)→ `duplicate`,不再通知同事,返回上次的结果。不同的消息再转一次照常通知(不按时间窗压)。
-- **找不到通知对象**(绑定行没配、调用也没给)→ `no_target`,**不写接管标志、不关 AI 开关**,`guidance` 让模型照常回复;服务端记告警日志。理由:同事收不到,AI 再闭嘴,客户就没人管了(9.14)。
-- **健管师用哪种组合**:由业务定,控制台随时可改;未定前建议 `reply` + `continue`(9.15)。
+- **找不到通知对象**(绑定行没配、调用也没给)→ `no_target`:不发通知、**不写接管标志、不关 AI 开关**,`guidance` 告诉模型「没有转成,照常回复」;服务端记告警日志。理由:同事收不到,AI 再闭嘴,客户就没人管了(已定 11-17,9.14)。
+- **健管师用哪种组合**:**`silent` + `continue`**(已定 11-17,9.15);控制台随时可改。
 
 ### 5.10 复用工具的改造
 
@@ -719,6 +731,7 @@ spec:
         - reminder_delete
         - chat_private_history
         - handoff_to_human
+        - material_list
       arg_bindings:
         - server: "<健管师 MCP 注册名>"
           tool: profile_get_brief
@@ -764,7 +777,11 @@ spec:
                  employee_pad_userid: employee_pad_userid, customer_code: customer_code,
                  customer_pad_userid: customer_pad_userid, room_conversation_id: room_conversation_id,
                  input_message_ids: input_message_ids}
-          fixed: {this_turn: reply, afterwards: continue}   # 控制台下拉选,组合见 3.10、9.15
+          fixed: {this_turn: silent, afterwards: continue}  # 健管师默认(11-17 定);控制台下拉可改,见 3.10
+        - server: "<健管师 MCP 注册名>"
+          tool: material_list
+          args: {project_code: project_code}
+          fixed: {category_code: "<健管师可发素材 分类编码>"}
     - type: mcp
       servers: ["amap-maps"]
       allow_tools: [maps_weather]
@@ -778,6 +795,16 @@ spec:
 - `tool` 必须在 `allow_tools` 里;
 - `args` 指向的变量必须已声明。
 任何一条不满足,保存时就被拒。
+
+### 5.12 `material_list`(新增,读;05 评审 11-17 定)
+
+- **用途**:客户明确要运动视频(或别的素材)时,让模型看到「健管师可发素材」分类里的全部素材,挑最合适的 ≤ 3 个,把 id 放进输出的 `media`(02)。
+- **说明文字**(给模型):「[列出可以发给客户的素材] 只在客户明确要视频或资料时调用。返回可发素材的完整清单(id、名称、类型、标签),不含链接。按客户情况(年龄、关节、血压、器械条件等)挑最合适的,最多 3 个,把 id 填进回复的 media;清单里没有合适的就只给文字建议。」
+- **入参**:`project_code`(平台绑定);`category_code`(配置钉死,「健管师可发素材」分类);模型不填任何参数。
+- **返回**:`items[]`,每项 `id`(素材表主键,整数)、`name`、`type`(`video` / `image` / `doc` / `pdf` / `audio`)、`tags`(这个素材所属的其它分类名,如「低强度」「坐姿」);外加 `total`、`server_now`。**返回分类里的全部素材**(不分页、不按关键词搜 —— 关键词搜会漏同义词,全量清单不会漏),不返回链接。总长 ≤ 8000 字(41 条约 2 千字以内)。
+- **口径**:素材表(`t_project_material`)× 分类关系表(`t_project_material_category_relation`)× 分类表(`t_project_material_category`,启用中),都按 `project_code` 过滤、排除已删除;按 `sort_no` 排序。
+- **以后**:分类超过约 150 条时再加一个子分类筛选参数,v1 不做。
+- **错误**:分类不存在或停用 → 40400,hint「如实告诉客户暂时没有视频,只给文字建议」。
 
 ## 6. 异常与边界
 
@@ -877,8 +904,9 @@ spec:
 | | M8 客户资料精简版(含提醒段) | 1.5–2 |
 | | M10 契约测试(含接管标志键) | 1 |
 | | M11 增强 `chat_private_history` | 1–1.5 |
-| | M13 转人工(pad / pc 通知、标志、开关、状态、去重) | 2.5–3 |
-| | 小计 | **15.5–18.5** |
+| | M13 转人工(pad 通知、pc 照 `enqueueReferral` 插任务、标志、开关、状态、去重) | 3–3.5 |
+| | M14 素材清单 `material_list` | 0.5 |
+| | 小计 | **16.5–19.5** |
 | | (可选)加固 9.5 | 1.5–2 |
 | 深护数字人·项目服务 | runs 带 inputs(含 `input_message_ids`)、TZ 确认、确认 / 补 AI 开关的重新打开入口、Dify 下线后清接口 | 1–1.5 |
 | 平台配置(我们) | 测试环境注册、开高德、写配置 | 1 |
@@ -886,6 +914,8 @@ spec:
 | | 小计 | **3.5** |
 | Expert Work 平台代码 | 固定值下拉 + 保存时校验(§4.1) | 1 |
 | 否决项对照 | 主回复走 MCP 发(§3.11) | 不做;做的话约 +5 |
+
+素材录入(41 条 + 分类 + 标签)用助手交付的 SQL 脚本,由用户在各环境执行,见 05;业务方按素材 id 查库、按类型发见 02(0.5–1 人日,计入 02)。
 
 ## 9. 待拍板
 
@@ -936,14 +966,9 @@ spec:
 
 **9.13 AI 开关被关掉后,谁、在哪重新打开(实现前必须确认)**:读代码在项目服务找到两个接口(私聊、群成员各一个,§1.5),但员工端有没有入口在用没核实。推荐:深护确认员工后台有按钮;没有就补一个,随 M13 一起上。没有入口时不要启用 `afterwards=stop`。
 
-**9.14 找不到转人工通知对象时怎么办**
-- 选项 A:不写标志、不关开关,模型照常回复,服务端告警(5.9 现写法)。
-- 选项 B:照配置执行(可能本轮不回、之后也不回),只告警。
-- **推荐 A**。理由:同事收不到通知时 AI 再闭嘴,客户就没人管了;A 最坏只是「多回了一句」。
+**9.14 找不到转人工通知对象时怎么办** —— **已定(11-17):按推荐 A**:不发通知、不写标志、不关开关,工具告诉模型「没有转成」,模型照常回复,服务端告警。没选的 B:照配置执行(同事收不到,AI 又闭嘴,客户没人管)。
 
-**9.15 健管师默认用哪种转人工组合**
-- 选项:四种组合之一(3.10)。
-- **推荐先用 `reply` + `continue`**:对客户最接近现在(Dify 不转人工,AI 照常回复;现在只是多了一条给同事的通知);其余组合等业务方定触发条件后在控制台切换,不用改代码。
+**9.15 健管师默认用哪种转人工组合** —— **已定(11-17):`silent` + `continue`**(用户选定,不是当时推荐的 `reply` + `continue`)。交出去那一轮 AI 不回;之后照常;急症例外不变;控制台随时可改。
 
 **9.16 inputs 变量 `input_message_ids` 要不要改名**(与 03 顶层字段同名,6.16)
 - 选项 A:保持同名。03 落地前两处内容相同;落地后重跑时变量多带被取消那一批。
@@ -963,7 +988,7 @@ spec:
 - `src/modules/health-plan/health-plan.tool-provider.ts:15-176`;`src/modules/health-plan/health-plan.service.ts:97-100`。
 - `src/modules/medication/medication.tool-provider.ts:154-160`;`src/modules/medication/medication-reminder-producer.service.ts:1-52`。
 - `src/modules/chat/chat.service.ts:54-55`:读 `t_project_cpwx_chat_msg`;`:286-380` 私聊查询(员工 cpwx_userid ↔ 客户 external_userid);`chat.tool-provider.ts:116-160` 入参与上限。
-- `src/modules/message/message.service.ts:82-230`(pad 只发文字)、`message-pc.service.ts:150-215、347-369`(pc 只发文字,写 `t_machine_task`);全仓库无 `AI_SENT` / `markAiSent`(grep 0 条)。
+- `src/modules/message/message.service.ts:82-230`(pad 只发文字)、`message-pc.service.ts:150-215、347-369`(pc 只发文字,写 `t_machine_task`);MCP 仓库自己无 `AI_SENT` / `markAiSent`(grep 0 条;pc 的标记由机器任务服务领取时写,见下)。
 - `src/ir/confirm-token-store.ts`:未被任何工具使用。
 - `src/models/TOpenApiIdempotency.ts`(`uk_idem`)、`src/models/TProjectAiNotify.ts`、`src/models/TProjectFormSubmission(Detail).ts`、`src/models/TProjectOperationLog.ts`。
 - 工具数 45:各 `*.tool-provider.ts` 的 `name:` 计数。
@@ -1009,6 +1034,12 @@ spec:
 
 **Dify DSL**:节点 id@行号见 1.1、1.2,规则原文见各节点提示词与代码(确认)。
 
+**PC 机器任务服务**(`8527863`,确认)
+- `src/modules/pc-machine-task/claim.service.ts:188-192`(领取时对每条机器任务写 AI 已发标记);`recipient.resolver.ts:57-151`(收件人只能是外部联系人私聊或群)。
+
+**素材库**(深护各服务的 model,确认)
+- `t_project_material`(`project_code`、`material_code`、`material_name`、`material_type`、`material_url`、`sort_no`、软删):如 `deep-ai-health-auto-create-task-msg-service/src/models/TProjectMaterial.ts:4-47`;分类表、分类关系表同目录。项目服务只读接口 `src/modules/material/material.controller.ts:48、63`。
+
 **与共享背景不符或共享背景没写的**
 1. 共享背景说「提醒删除(1768787117123@8448)」:该节点标题在 8713 行,8448 附近是「是否要删除提醒」分支。
 2. `confirmRequired` 确实只是标注,但 MCP 里有一个写好未接入的两段确认存储 `ConfirmTokenStore`。
@@ -1023,3 +1054,4 @@ spec:
 11. 11-17 评审复核:记忆提炼「只看最终回答」的代码在 `memory.py:540-546、583-612`(`_turn`);同文件 368-377 行只是提炼提示词里的示例文字。
 12. 11-17 评审复核:MCP 现有 pc 发送写的是 `t_machine_task`,不是数字人服务的 `t_project_cpwx_pc_send_task`;转人工要建成后者里的 referral 任务,不能直接复用现有 pc 发送(3.10)。
 13. 11-17 评审复核:项目服务已有改 AI 开关的接口(`employee.service.ts:4520`、`:4659`),此前以为「没找到入口」;员工端是否在用仍待确认(9.13)。
+14. 11-17 更正(05 评审轮):§3.11 原理由 1「MCP 发送不写 AI 标记、dk 上 AI 会把自己关掉」不成立 —— pc 的机器任务领取时会写标记(`claim.service.ts:188-192`);pad 未核实。
