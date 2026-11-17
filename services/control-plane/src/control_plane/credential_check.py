@@ -80,6 +80,14 @@ _STATUS_IN_DETAIL = re.compile(r"^\S+ (\d{3}):")
 #: The fixed-key embedder ignores the tenant it is called for.
 _NO_TENANT = UUID(int=0)
 
+
+def _log_safe(value: str) -> str:
+    """``value`` without line breaks. The provider comes from the request path
+    (already matched against the catalog, but CodeQL py/log-injection cannot see
+    that); the ``.replace`` chain is the barrier its taint model recognises."""
+    return value.replace("\r", "").replace("\n", "")
+
+
 CheckInterface = Literal["chat", "embeddings", "rerank"]
 CheckFailure = Literal["unreachable", "auth_rejected", "timeout", "vendor_error"]
 #: Platform features that call a provider's embeddings / rerank interface.
@@ -415,7 +423,7 @@ async def _run_one(
         # tripped over, the address did not answer as this API does.
         logger.warning(
             "credential_check.unexpected_answer provider=%s interface=%s error=%s",
-            provider,
+            _log_safe(provider),
             plan.interface,
             type(exc).__name__,
         )
@@ -445,7 +453,7 @@ async def _record_usage(
         logger.warning(
             "credential_check.usage_write_failed provider=%s model=%s input_tokens=%d "
             "output_tokens=%d",
-            provider,
+            _log_safe(provider),
             model,
             usage.input_tokens,
             usage.output_tokens,

@@ -35,7 +35,6 @@ from tests.auth_fixtures import make_test_jwt
 
 _URL = "https://proxy.example.com/v1"
 _PUBLIC_IP = "93.184.216.34"
-_SLOT = "expert-work/platform/llm/openai"
 _OTHER_REF = "secret://someone/elses-key"
 _OPENAI = "/v1/platform/credentials/providers/openai"
 _CHAT_REPLY = {

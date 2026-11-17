@@ -94,7 +94,7 @@ def _stored_form(hostname: str, port: int | None, path: str) -> str:
         if ipaddress.ip_address(host).version == 6:
             host = f"[{host}]"
     except ValueError:
-        pass
+        pass  # not an IP literal: a host name needs no brackets
     netloc = host if port in (None, _DEFAULT_PORT) else f"{host}:{port}"
     return f"https://{netloc}{path}"
 

@@ -61,7 +61,8 @@ class ProviderKeyNeedsEndpointError(RuntimeError):
 class ProviderKeySource(Protocol):
     """What a caller that sends a provider key somewhere needs from a resolver."""
 
-    async def resolve_provider_key(self, *, tenant_id: UUID, provider: Provider) -> ProviderKey: ...
+    async def resolve_provider_key(self, *, tenant_id: UUID, provider: Provider) -> ProviderKey:
+        """The best key for ``provider`` with the request address saved on it."""
 
 
 class ProviderKeyListSource(Protocol):
@@ -69,7 +70,8 @@ class ProviderKeyListSource(Protocol):
 
     async def resolve_provider_key_list(
         self, *, tenant_id: UUID, provider: Provider
-    ) -> list[ProviderKey]: ...
+    ) -> list[ProviderKey]:
+        """Every key for ``provider``, in the order to try them, each with its address."""
 
 
 class TenantOverlayCredentialsResolver(CredentialsResolver):
