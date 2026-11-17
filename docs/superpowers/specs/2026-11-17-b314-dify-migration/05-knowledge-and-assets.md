@@ -6,6 +6,8 @@
 >
 > **修订(2026-11-17,05 评审结论)**:①交付物是 Word / Excel 等文件,不进 git:知识库文章用 Word,配置书也是 Word(完整提示词 + 控制台步骤,YAML 放附录),放在用户机器上的本地交付文件夹;`docs/agents/health-manager/` 的 git 布局作废(§3.6)。②公司资料内容全部保留(业务方已授权),原先的清理建议作废,只改错别字和格式(§3.2.4、§3.2.5)。③不写「费用与报名」篇。④运动视频改走深护素材库,原「编号表 + 枚举 + 映射」整套作废;素材库没有后台页,助手交 SQL 脚本、用户在各环境执行(§3.3)。⑤每轮探测、重排保持平台默认,我们不跑对比;科普库本期不做;导出导入暂不做。
 >
+> **修订(2026-11-17,素材库补充)**:素材表定为 `t_project_material`(§9 第 14 条已定),给它加一个可空的 `description` 列(动作要领 / 适合人群 / 禁忌),`material_list` 返回名称、类型、标签和说明的前一段,让模型按客户情况挑;说明由深护运动教练写,空着也能上线(§3.3、§5)。
+>
 > 本篇管三件事:Dify 里写死的「知识」迁到哪、运动视频怎么改走深护素材库、测试环境建好的东西怎么原样搬到生产。
 > 输出字段总表、固定话术、提示词正文不在本篇,本篇只给它们需要的片段和约束(见总览里讲输出契约和智能体配置的那几篇)。
 
@@ -189,26 +191,27 @@ spec:
 
 | 表 | 用到的字段 | 说明 |
 |---|---|---|
-| `t_project_material` | `id`(自增主键)、`project_code`、`material_code`(`mat_xxxx`)、`material_name`、`material_type`(video / audio / doc / image / pdf)、`material_url`、`sort_no`、`deleted_at` | 一行一个素材 |
+| `t_project_material` | `id`(自增主键)、`project_code`、`material_code`(`mat_xxxx`)、`material_name`、`material_type`(video / audio / doc / image / pdf)、`material_url`、`sort_no`、`deleted_at`;**新加可空列 `description`**(11-17 定) | 一行一个素材 |
 | `t_project_material_category` | `category_code`、`parent_category_code`、`category_name`、`category_status`、`sort_no` | 分类,可分层 |
 | `t_project_material_category_relation` | `project_code`、`material_code`、`category_code` | 一个素材可以属于多个分类 |
 
-三张表在深护多个服务里都有 model(如 `deep-ai-health-auto-create-task-msg-service/src/models/TProjectMaterial*.ts`);项目服务有两个只读接口(按分类树、按分类查素材,`project-service/src/modules/material/material.controller.ts:48、63`)。**没有后台维护页**,本地各仓库里也搜不到写这三张表的代码(11-17 用户确认:手工 SQL 录入)。
+三张表在深护多个服务里都有 model(如 `deep-ai-health-auto-create-task-msg-service/src/models/TProjectMaterial*.ts`);项目服务有两个只读接口(按分类树、按分类查素材,`project-service/src/modules/material/material.controller.ts:48、63`)。**没有后台维护页**,本地各仓库里也搜不到写这三张表的代码(11-17 用户确认:手工 SQL 录入)。这张表目前没有别的业务在写,加一个可空列不影响那两个只读接口。
 
-与评审时说法的出入(读代码核对):营销用的是另一张 `t_project_marketing_material`(`marketing.service.ts:349-360`);方案生成助手传给 Expert Work 的 `material_codes`(`expert-work-run.service.ts:122`)查的是 `t_project_ai_health_plan_material`(`ai-health-plan.adapter.ts:45-52`),也不是这三张表。两者都不是本方案的先例;要不要换成后者见 §9 第 14 条。
+**用这张表,不用方案生成助手的素材表(11-17 定)**。另注:营销用的是另一张 `t_project_marketing_material`(`marketing.service.ts:349-360`),方案生成助手的 `material_codes`(`expert-work-run.service.ts:122`)查的是 `t_project_ai_health_plan_material`(`ai-health-plan.adapter.ts:45-52`),都不是 `t_project_material`,本方案不以它们为先例。
 
 #### 3.3.2 数据怎么建
 
 - **41 条运动视频**:按 Dify 表里现有的 CDN 链接各建一条素材(`material_type = video`),**不重新上传**。
 - **一个分类「健管师可发素材」**:41 条都挂上。智能体只看得到这个分类(分类编码由配置钉死,04 §5.12)。
 - **可选标签分类**(如「低强度」「坐姿」「器械」「站立」):用分类关系表挂到素材上,模型按客户情况挑时看得到。标签由深护运动教练给;原表没有任何强度信息,41 条里 21 条名字里也看不出要不要器械,补标签模型才有依据。
-- **怎么录**:素材库没有后台页,助手交一份 SQL 脚本(建分类、插 41 条素材、插标签关系),放在交付文件夹里;`project_code`、`created_by` 留占位,`material_code` 的生成格式(`mat_` + 什么)要深护确认后再填。用户在测试、生产各执行一次;执行后核对条数(分类 1 个、素材 41 条、标签关系 N 条)。
+- **说明 `description`(新加可空列,11-17 定)**:每条素材一段说明 —— 动作要领、适合人群、禁忌(如「膝关节不适者慎做」「高血压者避免憋气」)。由深护运动教练写;**空着也能上线**,没有说明的素材模型只按名称和标签挑。
+- **怎么录**:素材库没有后台页,助手交一份 SQL 脚本(给素材表加 `description` 列、建分类、插 41 条素材(含说明)、插标签关系),放在交付文件夹里;`project_code`、`created_by` 留占位,`material_code` 的生成格式(`mat_` + 什么)要深护确认后再填。用户在测试、生产各执行一次;执行后核对条数(分类 1 个、素材 41 条、标签关系 N 条)。
 - 以后加 / 下架素材:同样改 SQL(下架用软删 `deleted_at`,或从「健管师可发素材」分类移出),两个环境各执行一次;**智能体不用重新发布**。
 
 #### 3.3.3 模型怎么用
 
-- 只有客户**明确**要视频 / 素材时,调 `material_list`(04 §5.12)。它返回这个分类里的**全部**素材:短 id(表主键)、名称、类型、标签;**不给链接、不按关键词搜**(关键词搜会漏同义词,全量清单不会漏)。
-- 模型按客户情况(年龄、关节、血压、器械条件)挑最多 3 个,把 id 放进输出的 `media`(02 §5.1);没有合适的就只给文字建议、直说暂时没有。客户没要就不调工具,`media` 为空。
+- 只有客户**明确**要视频 / 素材时,调 `material_list`(04 §5.12)。它返回这个分类里的**全部**素材:短 id(表主键)、名称、类型、标签、说明的前一段;**不给链接、不按关键词搜**(关键词搜会漏同义词,全量清单不会漏)。
+- 模型按客户情况(年龄、关节、血压、器械条件)对照说明里的适合人群和禁忌,挑最多 3 个,把 id 放进输出的 `media`(02 §5.1);没有合适的就只给文字建议、直说暂时没有。客户没要就不调工具,`media` 为空。
 
 #### 3.3.4 业务方怎么接
 
@@ -222,7 +225,7 @@ spec:
 | **能保证**:发出去的素材一定存在、是本项目的、没下架 | 业务方逐个查库 |
 | **能保证**:不会因为关键词没对上而漏掉合适的素材 | 工具返回全量清单 |
 | **能保证**:不会抄错链接 | 模型只写短 id,链接由业务方查 |
-| **不能保证**:挑的是「最合适」的那几个 | 靠标签 + 提示词规则 + 07 用例 + 工程师真实测试;每轮日志记选中的 id 和丢弃个数,定期抽查 |
+| **不能保证**:挑的是「最合适」的那几个 | 靠说明(要领 / 适合人群 / 禁忌)+ 标签 + 提示词规则 + 07 用例 + 工程师真实测试;说明写得越全越准,没写说明的只能按名称和标签挑;每轮日志记选中的 id 和丢弃个数,定期抽查 |
 
 #### 3.3.6 16 个推荐动作怎么办
 
@@ -280,7 +283,7 @@ spec:
       专家团队.docx
   素材/
     健管师素材.sql                     建分类 + 41 条素材 + 标签关系;占位 project_code / created_by(§5.2)
-    健管师素材清单.xlsx                 41 条的名称、链接、标签,给运动教练填标签、给运营核对(SQL 由它生成)
+    健管师素材清单.xlsx                 41 条的名称、链接、标签、说明,给运动教练填标签和说明、给运营核对(SQL 由它生成)
 ```
 
 - 库目录里只放要上传的文件,避免把说明当文档误传;库设置写在配置书里。
@@ -380,30 +383,33 @@ WHERE m.project_code = <绑定的项目> AND c.category_code = <健管师可发�
 ### 5.2 `健管师素材.sql` 骨架(交付文件夹里;值均为占位)
 
 ```sql
+-- 0. 素材表加说明列(可空;已有就跳过)
+ALTER TABLE t_project_material ADD COLUMN description VARCHAR(500) NULL COMMENT '动作要领 / 适合人群 / 禁忌';
 -- 1. 分类(1 个主分类 + 若干标签分类)
 INSERT INTO t_project_material_category (project_code, category_code, category_name, category_status, sort_no, created_by, updated_by, created_at, updated_at)
 VALUES ('<project_code>', '<健管师可发素材 分类编码>', '健管师可发素材', 1, 1, <created_by>, <created_by>, NOW(), NOW()),
        ('<project_code>', '<低强度 分类编码>', '低强度', 1, 10, <created_by>, <created_by>, NOW(), NOW());
 -- 2. 41 条素材,链接用 Dify 表里现有的 CDN 地址(不重新上传)
-INSERT INTO t_project_material (project_code, material_code, material_name, material_type, material_url, sort_no, created_by, updated_by, created_at, updated_at)
-VALUES ('<project_code>', '<mat_ 编码,格式待深护确认>', '深蹲', 'video', 'https://<视频 CDN 主机>/no_logo_sport_video/<文件名>.mp4', 33, <created_by>, <created_by>, NOW(), NOW());
+INSERT INTO t_project_material (project_code, material_code, material_name, material_type, material_url, description, sort_no, created_by, updated_by, created_at, updated_at)
+VALUES ('<project_code>', '<mat_ 编码,格式待深护确认>', '深蹲', 'video', 'https://<视频 CDN 主机>/no_logo_sport_video/<文件名>.mp4',
+        '<运动教练填,如:双脚与肩同宽,膝盖不超过脚尖;膝关节不适者慎做;可为空>', 33, <created_by>, <created_by>, NOW(), NOW());
 -- 3. 分类关系:41 条都挂主分类;按运动教练给的标签挂标签分类
 INSERT INTO t_project_material_category_relation (project_code, material_code, category_code, created_by, updated_by, created_at, updated_at)
 VALUES ('<project_code>', '<mat_ 编码>', '<健管师可发素材 分类编码>', <created_by>, <created_by>, NOW(), NOW());
 ```
 
-执行前要确认的:`material_code` 的格式、`created_by` 填什么、主分类要不要挂在某个父分类下(`parent_category_code`)、分类的 `material_type` 填不填。执行后核对:分类、素材、关系三张表的条数。
+执行前要确认的:`material_code` 的格式、`created_by` 填什么、主分类要不要挂在某个父分类下(`parent_category_code`)、分类的 `material_type` 填不填、`description` 的长度上限(示意 500 字)。执行后核对:分类、素材、关系三张表的条数;`description` 空着不影响上线。
 
 ### 5.3 `material_list` 返回(示例,详见 04 §5.12)
 
 ```json
 {"items": [
-  {"id": 1207, "name": "坐姿抬腿", "type": "video", "tags": ["低强度", "坐姿"]},
-  {"id": 1233, "name": "靠墙静蹲", "type": "video", "tags": ["低强度"]}
+  {"id": 1207, "name": "坐姿抬腿", "type": "video", "tags": ["低强度", "坐姿"], "description": "坐在椅子上慢慢抬腿;适合膝盖不好、体力较弱的人"},
+  {"id": 1233, "name": "靠墙静蹲", "type": "video", "tags": ["低强度"], "description": ""}
  ], "total": 41, "server_now": "2026-11-17T15:02:11+08:00"}
 ```
 
-(动作名、标签为示意。)
+(动作名、标签、说明为示意;说明只返回前 60 字左右,空的返回空串。)
 
 ### 5.4 输出里的 `media`(详见 02 §5.1)
 
@@ -485,7 +491,7 @@ VALUES ('<project_code>', '<mat_ 编码>', '<健管师可发素材 分类编码>
 | 助手 | 配置书(Word:提示词全文、控制台步骤、YAML 附录) | 计入 06 |
 | 助手 | 测试环境建库、执行素材 SQL、检索测试、冒烟 | 0.5–1 天 |
 | 业务方 | 核对整理稿与原文一致 | 日历 1–2 天 |
-| 深护运动教练 | 41 条素材的标签;12 个无视频动作取舍 | 0.5 天 |
+| 深护运动教练 | 41 条素材的标签和说明(说明可后补,不挡上线);12 个无视频动作取舍 | 0.5~1 天 |
 | 深护开发 | `material_list`(04,约 0.5);业务方按 id 查库、按类型发(02,0.5–1) | 计入 04 / 02 |
 | 用户 | 执行生产清单(含素材 SQL、冒烟) | 约 1–2 小时 |
 
@@ -508,11 +514,8 @@ VALUES ('<project_code>', '<mat_ 编码>', '<健管师可发素材 分类编码>
 11. ~~打包导出导入~~ **已定(11-17)**:暂不做,先手工按清单。
 12. ~~源文件目录布局与 `docs/agents/README.md` 约定~~ **作废(11-17)**:交付物改为本地文件夹里的文件,不进 git(§3.6.2)。
 13. ~~知识库内容的审核流程~~ **已定(11-17)**:业务方已授权内容,不设运营 + 法务双签;改动由业务方确认、记在配置书变更记录里。
-14. **素材用哪张表**(11-17 读代码新发现)
-   - A `t_project_material` 三张表(已批准的方案):有分类和多分类关系,能挂标签;没有后台页,靠 SQL 维护。
-   - B `t_project_ai_health_plan_material`(方案生成助手的素材库,`project-service/src/models/TProjectAiHealthPlanMaterial.ts`):有「运动 / 饮食 / 睡眠 / 产品」类型、说明文案(要领 / 组次 / 禁忌)、一个动作可挂多条示范视频,项目服务里已有增删改(`ai-health-plan-material.service.ts:52-114`);没有分类和标签表,和方案生成助手共用。
-   - **推荐 A(按已批准的执行)**;如果深护更想在已有后台里维护,或者希望模型看到「禁忌」说明来挑动作,再考虑 B,`material_list` 和业务方校验改查那张表即可。
-15. **素材 SQL 的几处值要深护确认**(不是取舍):`material_code` 的生成格式、`created_by` 填什么、主分类挂不挂父分类、分类的 `material_type` 填不填。
+14. ~~素材用哪张表~~ **已定(11-17)**:用 `t_project_material` 三张表(有分类和多分类关系,能挂标签;靠 SQL 维护),不用方案生成助手的 `t_project_ai_health_plan_material`;给素材表加可空的 `description` 列补上「要领 / 适合人群 / 禁忌」,这张表没有别的业务在写,加列不影响别处。
+15. **素材 SQL 的几处值要深护确认**(不是取舍):`material_code` 的生成格式、`created_by` 填什么、主分类挂不挂父分类、分类的 `material_type` 填不填、`description` 的长度上限。
 
 ## 10. 出处
 
@@ -591,4 +594,4 @@ VALUES ('<project_code>', '<mat_ 编码>', '<健管师可发素材 分类编码>
 8. 重排是「库级开关默认开 + 平台配了重排模型才生效」,不是单纯可选。
 9. 智能体保存后先是草稿,发布才生效,草稿能在调试台试跑;`docs/agents/ai-health-plan.md` §2 写的「保存即 ACTIVE」已过时。
 10. `docs/agents/README.md` 约定一个智能体一个 md 文件;11-17 起配置书改为交付文件,不再涉及这个约定。
-11. 11-17 核对:评审时提到的两个「素材先例」都不是 `t_project_material`(§3.3.1)。
+11. 11-17 核对:营销和方案生成助手用的都是别的素材表,不是 `t_project_material`(§3.3.1)。
