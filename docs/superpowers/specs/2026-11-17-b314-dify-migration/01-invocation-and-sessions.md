@@ -84,7 +84,7 @@
    - `is_first_contact` 照数字人服务传来的值转给平台(E 与 A 之间从没有过文字消息才是 "1",§3.3.2);A 第一次走本智能体(映射表里原来没有这一格)时,03 落地后按 03 带上「最近的企微消息」做衔接,03 之前不带(已知缺口,§3.11);
    - 发 `POST /v1/agents/{code}/runs`(`mode: stream`、`stream_format: items`),从响应头拿到 run_id,写进轮次状态(供取消用)和 run 台账。
 6. 平台跑这一轮:召回客户 A 的长期记忆(私聊和群里说过的都在),按需调深护 MCP 查档案、写健康数据,最后给出回答。项目服务在流里收到 `item.done`(`type=assistant_message`、`channel=final`),再收到 `end`(`status=success`)。
-7. 项目服务按场景扣康豆(口径见 §3.8),把最终回复按 02 解析(`media` 里的素材 id 查深护素材库、校验、按类型取链接),按 §5.1 返回 `outcome: "reply"` 和 `answer_text[]`、`file_link_list[]` 及各自来源。
+7. 项目服务按场景扣康豆(口径见 §3.8),把最终回复按 02 解析(`media` 里的素材 id 查深护智能体素材表、校验、按类型取链接),按 §5.1 返回 `outcome: "reply"` 和 `answer_text[]`、`file_link_list[]` 及各自来源。
 8. 数字人服务确认这一轮没被标成「取消中」,按通道入发送队列(pad 进 `send-agent-answer-queue`,dk 进 `pcSendTaskService.enqueueAnswer`,防重种子用 run_id)。发送前的真人接管检查照旧。
 9. 发送结果(发出 / 被真人接管拦下 / 发送失败)记到 run 台账;没发出去的,按 03 报「未送达」(03 推荐当场单独调接口报;03 之前没有这个接口,属已知缺口,§3.11)。
 

@@ -8,6 +8,8 @@
 >
 > **修订(2026-11-17,06 评审结论)**:9.10 各项按本文推荐定稿并写进工具规格 —— 提醒短编号(5.4、5.5)、一次删多条必须带「客户已确认」(5.5)、设提醒返回带星期(5.3)、查表单结束日裁到今天(M4);改档案按字段编码写。
 >
+> **修订(2026-11-17,智能体专用素材表)**:素材改由深护新建的 `t_project_agent_material` 提供(表名待深护确认),原「`t_project_material` + 分类表 + 分类关系表」设计作废;`material_list` 钉的是 `agent_code`,不再是分类编码(05 §3.3)。
+>
 > **修订(2026-11-17,03 评审结论)**:写工具判重用的 inputs 变量(和两个写工具的参数)由 `input_message_ids` 改名为 `source_message_ids`,与 03 的顶层字段分开(6.16、9.16)。
 >
 > **修订(2026-11-17,素材库补充与 08 评审)**:`material_list` 多返回素材说明 `description` 的前一段(素材表新加的可空列,05 §3.3);9.5 的「key 限项目、限工具」改为深护安全待办里的可选加固,不卡上线(生产 `AGENT_KEYS` 已确认配置)。
@@ -167,7 +169,7 @@
 | 提醒列表 | `reminder_list` | **新增** | 按 `customer_pad_userid` 查(与现有数据一致,群里未建档的人也能用) |
 | 历史聊天 | 不再每轮拉;客户问到会话里没有的更早聊天时调 `chat_private_history` | 复用 + **增强** | 范围扩到「该客户私聊 + 该客户在群里发的 + 员工号 @ 该客户的」,加关键词 / 时间段 / 条数(≤ 30),身份由平台绑定(§3.12、5.8) |
 | 天气 | 平台 `amap-maps` 的 `maps_weather` | 平台已有 | 见 3.7 |
-| 运动视频(Dify 整表塞提示词) | `material_list` | **新增** | 返回「健管师可发素材」分类里的全部素材(短 id、名称、类型、标签),不给链接、不搜关键词;分类由配置钉死(5.12,05 §3.3) |
+| 运动视频(Dify 整表塞提示词) | `material_list` | **新增** | 读深护新建的 `t_project_agent_material`,返回本智能体可用的全部启用素材(短 id、名称、类型、标签、说明前一段),不给链接、不搜关键词;`agent_code` 由配置钉死(5.12,05 §3.3) |
 | 快递 | 不做 | — | 已拍板 |
 
 **写**
@@ -214,7 +216,7 @@
 | `reminder_delete` | `project_code`;`customer_pad_userid` | — |
 | `chat_private_history`(增强) | `project_code`;`employee_code`;`customer_code` | `scope: customer`(5.8) |
 | `handoff_to_human` | `project_code`;`employee_code`;`employee_pad_userid`;`customer_code`;`customer_pad_userid`;`room_conversation_id`;`source_message_ids` | `this_turn`、`afterwards`(控制台下拉选,§3.10;健管师默认 `silent` + `continue`) |
-| `material_list` | `project_code` | `category_code`(「健管师可发素材」分类的编码) |
+| `material_list` | `project_code` | `agent_code`(健管师的智能体编码) |
 | `amap-maps` / `maps_weather` | 无(不涉及客户身份) | — |
 
 没写箭头的表示工具参数名与变量名相同。表单类工具的参数叫 `owner_code`,要绑到 `customer_code`,这是最容易配错的一处。`handoff_to_human` 绑 `source_message_ids` 是为了两件事:同一批消息重跑时不重复通知同事;pad 私聊照现在的做法把这批客户消息标成「已转人工」(按 `msg_app_info`,§1.5)。
@@ -467,7 +469,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | M11 | 增强 `chat_private_history` | 5.8;范围、关键词、时间段、条数、说话人标注 |
 | M12 | (可选加固)key 限项目、限工具;客户属于项目核对 | 9.5 |
 | M13 | `handoff_to_human` | 5.9;pad 通知、pc 照 `enqueueReferral` 插 referral 任务(含 `pickTargets` 选目标)、接管标志、AI 开关、转人工状态、固定选项校验;连数字人共用的 Redis 库 |
-| M14 | `material_list` | 5.12;读深护素材库(素材表 + 分类表 + 分类关系表),只返回绑定分类里的素材,带说明前一段 |
+| M14 | `material_list` | 5.12;读新表 `t_project_agent_material`(深护建表),只返回本项目、本智能体(或通用)、启用的素材,带说明前一段 |
 | 配置 | 生产 `AGENT_KEYS` 非空;新增健管师 key;MCP 能连上数字人共用的 Redis 库(写接管标志) | |
 
 ### 4.3 深护数字人 · 项目服务
@@ -483,7 +485,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 ### 4.4 智能体配置
 
 - `system_prompt.jinja: true`,声明 3.3 的 8 个变量。
-- `tools` 两个 mcp 条目(深护健管师专用注册名 + `amap-maps`),`allow_tools`、`arg_bindings` 按 5.11;`handoff_to_human` 的 `this_turn`、`afterwards` 在控制台下拉里选(健管师默认 `silent` + `continue`,11-17 定);`material_list` 的分类编码钉成「健管师可发素材」。
+- `tools` 两个 mcp 条目(深护健管师专用注册名 + `amap-maps`),`allow_tools`、`arg_bindings` 按 5.11;`handoff_to_human` 的 `this_turn`、`afterwards` 在控制台下拉里选(健管师默认 `silent` + `continue`,11-17 定);`material_list` 的 `agent_code` 钉成健管师的智能体编码。
 - 不开 `dynamic_workers`、不配 `subagents`(绑定在子智能体里的行为不在本文核对范围)。
 - `approval_required_tools` 留空(9.1:不确认,已定)。
 - 提示词里写清(全文在 06):只用手上的工具;写入和提醒以工具返回为准;日期参数只传 `YYYY-MM-DD`;`form_list_owner_submissions` 的 `page_size` ≤ 20;客户资料只在话题与健康有关时调、每轮最多一次;情境字段先推断再问;一条消息里重复的量合并或带时间;转人工的时机、急症信号、不说「已转人工」、不回答已交出去的问题。
@@ -785,7 +787,7 @@ spec:
         - server: "<健管师 MCP 注册名>"
           tool: material_list
           args: {project_code: project_code}
-          fixed: {category_code: "<健管师可发素材 分类编码>"}
+          fixed: {agent_code: "<健管师智能体编码>"}
     - type: mcp
       servers: ["amap-maps"]
       allow_tools: [maps_weather]
@@ -800,15 +802,16 @@ spec:
 - `args` 指向的变量必须已声明。
 任何一条不满足,保存时就被拒。
 
-### 5.12 `material_list`(新增,读;05 评审 11-17 定)
+### 5.12 `material_list`(新增,读;05 评审 11-17 定,读智能体专用素材表)
 
-- **用途**:客户明确要运动视频(或别的素材)时,让模型看到「健管师可发素材」分类里的全部素材,挑最合适的 ≤ 3 个,把 id 放进输出的 `media`(02)。
+- **用途**:客户明确要运动视频(或别的素材)时,让模型看到本智能体能发的全部素材,挑最合适的 ≤ 3 个,把 id 放进输出的 `media`(02)。
 - **说明文字**(给模型):「[列出可以发给客户的素材] 只在客户明确要视频或资料时调用。返回可发素材的完整清单(id、名称、类型、标签、说明),不含链接。对照说明里的适合人群和禁忌,按客户情况(年龄、关节、血压、器械条件等)挑最合适的,最多 3 个,把 id 填进回复的 media;清单里没有合适的就只给文字建议。」
-- **入参**:`project_code`(平台绑定);`category_code`(配置钉死,「健管师可发素材」分类);模型不填任何参数。
-- **返回**:`items[]`,每项 `id`(素材表主键,整数)、`name`、`type`(`video` / `image` / `doc` / `pdf` / `audio`)、`tags`(这个素材所属的其它分类名,如「低强度」「坐姿」)、`description`(素材说明的前 60 字左右:要领 / 适合人群 / 禁忌;没写说明的返回空串,只按名称和标签挑);外加 `total`、`server_now`。**返回分类里的全部素材**(不分页、不按关键词搜 —— 关键词搜会漏同义词,全量清单不会漏),不返回链接。总长 ≤ 8000 字(41 条带说明约 4 千字)。
-- **口径**:素材表(`t_project_material`,含新加的可空列 `description`)× 分类关系表(`t_project_material_category_relation`)× 分类表(`t_project_material_category`,启用中),都按 `project_code` 过滤、排除已删除;按 `sort_no` 排序。
-- **以后**:分类超过约 150 条时再加一个子分类筛选参数,v1 不做。
-- **错误**:分类不存在或停用 → 40400,hint「如实告诉客户暂时没有视频,只给文字建议」。
+- **入参**:`project_code`(平台从 inputs 绑定);`agent_code`(智能体配置里钉死);模型不填任何参数。
+- **数据源**:深护新建的 `t_project_agent_material`(表名待深护确认,结构见 05 §3.3.1)。
+- **口径**:`project_code` = 本项目,`agent_code` = 本智能体**或为空**(空 = 全项目通用),`status = 1`,未删除;按 `sort` 排。
+- **返回**:`items[]`,每项 `id`(表主键,整数)、`name`、`media_type`(`video` / `image` / `file` / `audio`)、`tags`(JSON 数组,如「低强度」「坐姿」)、`description`(前 60 字左右:要领 / 适合人群 / 禁忌 / 用法;没写返回空串);外加 `total`、`server_now`。**返回全部符合条件的素材**(不分页、不按关键词搜 —— 关键词搜会漏同义词,全量清单不会漏),**永远不返回 `url`**。总长 ≤ 8000 字(41 条带说明约 4 千字)。
+- **以后**:素材超过约 150 条时再加一个按标签筛选的参数,v1 不做。
+- **没有素材**:返回空清单(不报错),模型如实说暂时没有视频、只给文字建议。
 
 ## 6. 异常与边界
 
@@ -919,7 +922,7 @@ spec:
 | Expert Work 平台代码 | 固定值下拉 + 保存时校验(§4.1) | 1 |
 | 否决项对照 | 主回复走 MCP 发(§3.11) | 不做;做的话约 +5 |
 
-素材录入(41 条 + 分类 + 标签)用助手交付的 SQL 脚本,由用户在各环境执行,见 05;业务方按素材 id 查库、按类型发见 02(0.5–1 人日,计入 02)。
+素材表的建表与 41 条初始化用助手交付的 SQL 脚本(`素材库/Agent素材表建表与初始化.sql`),由用户在各环境执行,见 05;业务方按素材 id 查库、按类型发见 02(0.5–1 人日,计入 02)。
 
 ## 9. 待拍板
 
@@ -1038,8 +1041,7 @@ spec:
 **PC 机器任务服务**(`8527863`,确认)
 - `src/modules/pc-machine-task/claim.service.ts:188-192`(领取时对每条机器任务写 AI 已发标记);`recipient.resolver.ts:57-151`(收件人只能是外部联系人私聊或群)。
 
-**素材库**(深护各服务的 model,确认)
-- `t_project_material`(`project_code`、`material_code`、`material_name`、`material_type`、`material_url`、`sort_no`、软删):如 `deep-ai-health-auto-create-task-msg-service/src/models/TProjectMaterial.ts:4-47`;分类表、分类关系表同目录。项目服务只读接口 `src/modules/material/material.controller.ts:48、63`。
+**素材表**:`t_project_agent_material` 是深护为本次新建的表(表名待深护确认),结构见 05 §3.3.1、§5.2;现有代码里没有,不作读代码出处。
 
 **与共享背景不符或共享背景没写的**
 1. 共享背景说「提醒删除(1768787117123@8448)」:该节点标题在 8713 行,8448 附近是「是否要删除提醒」分支。
