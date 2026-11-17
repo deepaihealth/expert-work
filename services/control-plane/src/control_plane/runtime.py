@@ -20,7 +20,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 import httpx
@@ -29,6 +29,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from opentelemetry import trace
 
 from control_plane.credential_value_cache import CredentialValueCache
+from control_plane.knowledge.recognition.clients import RecognitionCredential
 from control_plane.platform_delegation_config import PlatformDelegationConfigService
 from control_plane.platform_dynamic_worker_config import PlatformDynamicWorkerConfigService
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
@@ -41,8 +42,13 @@ from control_plane.settings import Settings
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
 from control_plane.tenant_mcp_pool import TenantMcpPoolProvider
 from control_plane.tenant_scope import bypass_rls_session
+from control_plane.tenant_secret_overlay import (
+    ProviderKeyListSource,
+    ProviderKeySource,
+    TenantOverlayCredentialsResolver,
+)
 from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolProvider
-from expert_work.common.credentials import CredentialsResolver, CredentialsResolverError
+from expert_work.common.credentials import CredentialsResolverError
 from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.skill_run_usage import SkillRunUsageRecorder
 from expert_work.common.uplift_metrics import set_built_agent_cache_entries
@@ -105,7 +111,6 @@ from orchestrator.errors import AgentFactoryError, PlatformNotConfiguredError
 from orchestrator.llm import (
     DEFAULT_MAX_INPUT_BYTES,
     Embedder,
-    HTTPEmbeddingClient,
     OpenAICompatibleEmbedder,
     RateLimiterFactory,
     RerankGuards,
@@ -113,9 +118,11 @@ from orchestrator.llm import (
 from orchestrator.llm.embedder import (
     EmbeddingSide,
     catalog_batch_size,
+    embedding_client_for,
     embedding_marker,
     marked_model_key,
 )
+from orchestrator.llm.endpoints import ProviderKey, fixed_provider_key_resolver
 from orchestrator.multimodal import (
     CachingImageResolver,
     DispatchingImageResolver,
@@ -748,40 +755,28 @@ class AgentRuntime:
             hook(tenant_id, user_id)
 
 
-@runtime_checkable
-class _ProviderKeysCapable(Protocol):
-    """A resolver that can return the ordered key list for a provider (Y-MK)."""
-
-    async def resolve_provider_keys(self, *, tenant_id: UUID, provider: Provider) -> list[str]: ...
-
-
 def make_provider_key_resolver(
-    *, resolver: CredentialsResolver, tenant_id: UUID
+    *, resolver: ProviderKeyListSource, tenant_id: UUID
 ) -> ProviderKeyResolver:
-    """Bind a :class:`CredentialsResolver` + tenant to a provider→secret_ref
-    *list* getter for the agent build (Stream Q, Mini-ADR Q-5; Stream Y-MK).
+    """Bind a credentials resolver + tenant to a provider → key *list* getter
+    for the agent build (Stream Q, Mini-ADR Q-5; Stream Y-MK).
 
     Y-MK: returns the ordered list of keys to try for a provider (per-provider
-    multi-key failover). An overlay resolver that exposes ``resolve_provider_keys``
-    returns the full list; a base resolver falls back to its single
-    ``resolve_provider`` wrapped as a 1-key list — preserving single-key builds.
+    multi-key failover). B-308: each is a :class:`ProviderKey` — the secret ref
+    with the request address saved on that credential — so every router built
+    from this resolver (main model, vision, escalation, per-step, sub-agents,
+    memory write-back) sends each key to its own address.
 
     Translates :class:`CredentialsResolverError` into
     :class:`AgentFactoryError` here (control-plane) so the orchestrator's
     ``build_llm_router`` stays free of any ``expert-work-common.credentials`` import.
     """
 
-    async def _resolve(provider: str) -> list[str]:
+    async def _resolve(provider: str) -> list[ProviderKey]:
         try:
-            if isinstance(resolver, _ProviderKeysCapable):
-                return await resolver.resolve_provider_keys(
-                    tenant_id=tenant_id, provider=cast(Provider, provider)
-                )
-            return [
-                await resolver.resolve_provider(
-                    tenant_id=tenant_id, provider=cast(Provider, provider)
-                )
-            ]
+            return await resolver.resolve_provider_key_list(
+                tenant_id=tenant_id, provider=cast(Provider, provider)
+            )
         except CredentialsResolverError as exc:
             msg = f"no platform credential is configured for provider {provider!r}"
             raise PlatformNotConfiguredError(msg) from exc
@@ -887,7 +882,7 @@ async def _build_judge_caller(
     spec: AgentSpec,
     *,
     tenant_id: UUID,
-    credentials_resolver: CredentialsResolver,
+    credentials_resolver: TenantOverlayCredentialsResolver,
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None,
     http_client: httpx.AsyncClient | None = None,
@@ -913,11 +908,15 @@ async def _build_judge_caller(
         configured = await judge_config_service.effective_judge_config()
         if configured is not None:
             provider, name = cast(Provider, configured[0]), configured[1]
-    secret_ref = await credentials_resolver.resolve_provider(tenant_id=tenant_id, provider=provider)
-    judge_spec = ModelSpec(provider=provider, name=name, api_key_ref=secret_ref)
+    # B-308 — the key with its request address, pinned for this one router.
+    judge_key = await credentials_resolver.resolve_provider_key(
+        tenant_id=tenant_id, provider=provider
+    )
+    judge_spec = ModelSpec(provider=provider, name=name)
     router = await build_llm_router(
         judge_spec,
         secret_store=secret_store,
+        provider_key_resolver=fixed_provider_key_resolver(provider, judge_key),
         http_client=http_client,
         # 波 2 线 A — the judge's provider handle draws from the same global bucket.
         rate_limiter_factory=rate_limiter_factory,
@@ -940,7 +939,7 @@ async def _make_output_judge(
     spec: AgentSpec,
     *,
     tenant_id: UUID,
-    credentials_resolver: CredentialsResolver,
+    credentials_resolver: TenantOverlayCredentialsResolver,
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None = None,
     http_client: httpx.AsyncClient | None = None,
@@ -971,7 +970,7 @@ async def _make_action_judge(
     spec: AgentSpec,
     *,
     tenant_id: UUID,
-    credentials_resolver: CredentialsResolver,
+    credentials_resolver: TenantOverlayCredentialsResolver,
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None = None,
     http_client: httpx.AsyncClient | None = None,
@@ -1011,7 +1010,7 @@ async def resolve_defenses(
     spec: AgentSpec,
     *,
     tenant_id: UUID | None,
-    credentials_resolver: CredentialsResolver | None,
+    credentials_resolver: TenantOverlayCredentialsResolver | None,
     secret_store: SecretStore,
     platform_judge_config_service: PlatformJudgeConfigService | None = None,
     platform_tool_budget_config_service: PlatformToolBudgetConfigService | None = None,
@@ -1120,7 +1119,7 @@ def make_agent_builder(
     tenant_mcp_pool_provider: TenantMcpPoolProvider | None = None,
     platform_mcp_pool_provider: PlatformMcpPoolProvider | None = None,
     user_mcp_oauth_pool_provider: UserMcpOAuthPoolProvider | None = None,
-    credentials_resolver: CredentialsResolver | None = None,
+    credentials_resolver: TenantOverlayCredentialsResolver | None = None,
     platform_embedding_config_service: PlatformEmbeddingConfigService | None = None,
     platform_judge_config_service: PlatformJudgeConfigService | None = None,
     # Phase 3 — platform tool-output-budget master switch (DB-wins over env).
@@ -1339,13 +1338,20 @@ async def _cached_secret(
     cache: CredentialValueCache | None,
     secret_store: SecretStore,
     tenant_id: UUID,
-    secret_ref: str,
+    key: ProviderKey,
 ) -> str:
-    """Resolve ``secret_ref``'s value through the process-level cache.
+    """Resolve ``key``'s value through the process-level cache.
 
     ``cache=None``(测试 / 未接线)= 现状行为:每次直读 vault。命中时不打
     vault——调用方既有的 ``secret_ms`` span attribute 自然趋 0,即收益读数。
+
+    B-308 §4.3 — a key with a request address is never cached: a changed key
+    overwrites its slot in place, so on a replica that missed the
+    invalidation broadcast the cached old key could meet the new address.
     """
+    secret_ref = key.secret_ref
+    if key.base_url is not None:
+        return await secret_store.get(parse_secret_ref(secret_ref))
     if cache is not None:
         hit = cache.get(tenant_id, secret_ref)
         if hit is not None:
@@ -1360,7 +1366,7 @@ async def _cached_secret(
 class ResolvingEmbedder:
     """Per-tenant credential-resolving :class:`Embedder` (Mini-ADR O-9)."""
 
-    resolver: CredentialsResolver
+    resolver: ProviderKeySource
     secret_store: SecretStore
     provider: Provider
     model: str
@@ -1381,17 +1387,18 @@ class ResolvingEmbedder:
         # 同一次调用的内部构成,单列会让瀑布图多两行毫秒级噪音。二期 PR2 T3
         # 起 vault 读走 ``_cached_secret``——命中时 ``secret_ms`` 趋 0,即收益。
         t0 = time.monotonic()
-        secret_ref = await self.resolver.resolve_provider(
-            tenant_id=tenant_id, provider=self.provider
-        )
+        key = await self.resolver.resolve_provider_key(tenant_id=tenant_id, provider=self.provider)
         t1 = time.monotonic()
-        api_key = await _cached_secret(self.secret_cache, self.secret_store, tenant_id, secret_ref)
+        api_key = await _cached_secret(self.secret_cache, self.secret_store, tenant_id, key)
         t2 = time.monotonic()
         span = trace.get_current_span()
         span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
         span.set_attribute("secret_ms", round((t2 - t1) * 1000))
+        _mark_custom_endpoint(span, key)
         delegate = OpenAICompatibleEmbedder(
-            client=HTTPEmbeddingClient(api_key=api_key, http=self.http),
+            client=embedding_client_for(
+                self.provider, api_key=api_key, base_url=key.base_url, http=self.http
+            ),
             model=self.model,
             max_input_bytes=self.max_input_bytes,
         )
@@ -1403,15 +1410,24 @@ class ResolvingProviderKeys:
     """B-209 —— 知识库扫描页识别调用的厂商密钥:与嵌入同一套解析(按上传文档的租户解析凭据
     引用,再读密钥值,走进程内缓存)。没有凭据时抛错 —— 识别器把这一页记「待识别」。"""
 
-    resolver: CredentialsResolver
+    resolver: ProviderKeySource
     secret_store: SecretStore
     secret_cache: CredentialValueCache | None = None
 
-    async def __call__(self, *, tenant_id: UUID, provider: str) -> str:
-        secret_ref = await self.resolver.resolve_provider(
+    async def __call__(self, *, tenant_id: UUID, provider: str) -> RecognitionCredential:
+        key = await self.resolver.resolve_provider_key(
             tenant_id=tenant_id, provider=cast(Provider, provider)
         )
-        return await _cached_secret(self.secret_cache, self.secret_store, tenant_id, secret_ref)
+        api_key = await _cached_secret(self.secret_cache, self.secret_store, tenant_id, key)
+        # B-308 — the key value together with the request address of its row.
+        return RecognitionCredential(api_key=api_key, base_url=key.base_url)
+
+
+def _mark_custom_endpoint(span: trace.Span, key: ProviderKey) -> None:
+    """B-308 §4.7 — tag an embedding / rerank span whose call goes to a custom
+    request address (the address itself is never recorded)."""
+    if key.base_url is not None:
+        span.set_attribute("endpoint", "custom")
 
 
 def _unranked(documents: Sequence[str], top_k: int, outcome: RerankOutcome) -> RerankRanking:
@@ -1437,7 +1453,7 @@ class ResolvingReranker:
     for the rerank provider, degrade to the RRF-fused order rather than
     failing (Mini-ADR O-12)."""
 
-    resolver: CredentialsResolver
+    resolver: ProviderKeySource
     secret_store: SecretStore
     provider: Provider
     model: str
@@ -1481,7 +1497,7 @@ class ResolvingReranker:
         # 调用(LLM 分支走 build_llm_router),所以两条子路径各自打点。
         t0 = time.monotonic()
         try:
-            secret_ref = await self.resolver.resolve_provider(
+            key = await self.resolver.resolve_provider_key(
                 tenant_id=tenant_id, provider=self.provider
             )
         except CredentialsResolverError:
@@ -1494,17 +1510,16 @@ class ResolvingReranker:
         t1 = time.monotonic()
         span = trace.get_current_span()
         span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
+        _mark_custom_endpoint(span, key)
         if api != "llm":
-            api_key = await _cached_secret(
-                self.secret_cache, self.secret_store, tenant_id, secret_ref
-            )
+            api_key = await _cached_secret(self.secret_cache, self.secret_store, tenant_id, key)
             span.set_attribute("secret_ms", round((time.monotonic() - t1) * 1000))
             reranker = vendor_reranker(
                 api,
                 provider=self.provider,
                 model=self.model,
                 api_key=api_key,
-                secret_ref=secret_ref,
+                provider_key=key,
                 http=self.http,
                 guards=self.rerank_guards,
             )
@@ -1515,14 +1530,14 @@ class ResolvingReranker:
                 tenant_id=tenant_id,
                 **instruction_kwargs(instruction),
             )
-        model_spec = ModelSpec.model_validate(
-            {"provider": self.provider, "name": self.model, "api_key_ref": secret_ref}
-        )
+        model_spec = ModelSpec.model_validate({"provider": self.provider, "name": self.model})
         # 刻意不传 cache——plan 拍定不穿透 build_llm_router 的 vault 读
         # (rerank-LLM 分支少见配置,见 plan Global Constraints)。
         router = await build_llm_router(
             model_spec,
             secret_store=self.secret_store,
+            # B-308 —— 这一把密钥连同它的请求地址交给路由。
+            provider_key_resolver=fixed_provider_key_resolver(self.provider, key),
             http_client=self.http,
             rate_limiter_factory=self.rate_limiter_factory,
         )
@@ -1539,7 +1554,7 @@ class DynamicResolvingEmbedder:
     admin's change takes effect without restart (Stream T, Mini-ADR T-3)."""
 
     config_service: PlatformEmbeddingConfigService
-    resolver: CredentialsResolver
+    resolver: ProviderKeySource
     secret_store: SecretStore
     #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
     #: yet wired) falls back to the embedding client's own per-call default.
@@ -1600,15 +1615,18 @@ class DynamicResolvingEmbedder:
                 "platform embedding is not configured — configure it in platform settings"
             )
         provider, model = cfg
-        secret_ref = await self.resolver.resolve_provider(tenant_id=tenant_id, provider=provider)
+        key = await self.resolver.resolve_provider_key(tenant_id=tenant_id, provider=provider)
         t2 = time.monotonic()
-        api_key = await _cached_secret(self.secret_cache, self.secret_store, tenant_id, secret_ref)
+        api_key = await _cached_secret(self.secret_cache, self.secret_store, tenant_id, key)
         t3 = time.monotonic()
         span = trace.get_current_span()
         span.set_attribute("config_ms", round((t1 - t0) * 1000))
         span.set_attribute("resolve_ms", round((t2 - t1) * 1000))
         span.set_attribute("secret_ms", round((t3 - t2) * 1000))
-        client = HTTPEmbeddingClient(api_key=api_key, http=self.http)
+        _mark_custom_endpoint(span, key)
+        client = embedding_client_for(
+            provider, api_key=api_key, base_url=key.base_url, http=self.http
+        )
         if side is None:
             # Unsided callers (long-term memory …): the request they always sent.
             delegate = OpenAICompatibleEmbedder(
@@ -1637,7 +1655,7 @@ class DynamicResolvingReranker:
     identity order when rerank is unconfigured (Stream T, Mini-ADR T-3)."""
 
     config_service: PlatformEmbeddingConfigService
-    resolver: CredentialsResolver
+    resolver: ProviderKeySource
     secret_store: SecretStore
     #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
     #: yet wired) falls back to each client's own per-call default.
@@ -1685,9 +1703,7 @@ class DynamicResolvingReranker:
         if api is None:
             return _unranked(documents, top_k, "model_unsupported")
         try:
-            secret_ref = await self.resolver.resolve_provider(
-                tenant_id=tenant_id, provider=provider
-            )
+            key = await self.resolver.resolve_provider_key(tenant_id=tenant_id, provider=provider)
         except CredentialsResolverError:
             logger.info(
                 "knowledge.rerank_skipped — no credential for provider=%s tenant=%s",
@@ -1699,17 +1715,16 @@ class DynamicResolvingReranker:
         span = trace.get_current_span()
         span.set_attribute("config_ms", round((t1 - t0) * 1000))
         span.set_attribute("resolve_ms", round((t2 - t1) * 1000))
+        _mark_custom_endpoint(span, key)
         if api != "llm":
-            api_key = await _cached_secret(
-                self.secret_cache, self.secret_store, tenant_id, secret_ref
-            )
+            api_key = await _cached_secret(self.secret_cache, self.secret_store, tenant_id, key)
             span.set_attribute("secret_ms", round((time.monotonic() - t2) * 1000))
             reranker = vendor_reranker(
                 api,
                 provider=provider,
                 model=model,
                 api_key=api_key,
-                secret_ref=secret_ref,
+                provider_key=key,
                 http=self.http,
                 guards=self.rerank_guards,
             )
@@ -1720,14 +1735,14 @@ class DynamicResolvingReranker:
                 tenant_id=tenant_id,
                 **instruction_kwargs(instruction),
             )
-        model_spec = ModelSpec.model_validate(
-            {"provider": provider, "name": model, "api_key_ref": secret_ref}
-        )
+        model_spec = ModelSpec.model_validate({"provider": provider, "name": model})
         # 刻意不传 cache——plan 拍定不穿透 build_llm_router 的 vault 读
         # (rerank-LLM 分支少见配置,见 plan Global Constraints)。
         router = await build_llm_router(
             model_spec,
             secret_store=self.secret_store,
+            # B-308 —— 这一把密钥连同它的请求地址交给路由。
+            provider_key_resolver=fixed_provider_key_resolver(provider, key),
             http_client=self.http,
             rate_limiter_factory=self.rate_limiter_factory,
         )
@@ -1740,7 +1755,7 @@ class DynamicResolvingReranker:
 
 async def resolve_embedder(
     *,
-    resolver: CredentialsResolver,
+    resolver: TenantOverlayCredentialsResolver,
     secret_store: SecretStore,
     provider: Provider,
     model: str,
@@ -1765,7 +1780,7 @@ async def resolve_embedder(
 
 async def resolve_reranker(
     *,
-    resolver: CredentialsResolver,
+    resolver: TenantOverlayCredentialsResolver,
     secret_store: SecretStore,
     provider: Provider,
     model: str,

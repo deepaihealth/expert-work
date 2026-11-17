@@ -34,6 +34,7 @@ from expert_work.persistence import InMemorySkillStore
 from expert_work.protocol import AgentSpec, SkillStatus
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.secret_store import LocalDevSecretStore
+from orchestrator.llm.endpoints import ProviderKey
 
 _EVAL_DIR = _Path(__file__).resolve().parent
 if str(_EVAL_DIR) not in _sys.path:
@@ -114,12 +115,12 @@ class SkillCase:
 _ANTHROPIC_KEY_NAME = "anthropic-test"
 
 
-async def _platform_resolver(provider: str) -> list[str]:
+async def _platform_resolver(provider: str) -> list[ProviderKey]:
     # Stream Y-2 — agent builds resolve the LLM key via the platform resolver
     # (manifest ``api_key_ref`` is ignored). Stream Y-MK — returns the ordered
     # key list (one key here). These cases are all anthropic.
     del provider
-    return [f"secret://{_ANTHROPIC_KEY_NAME}"]
+    return [ProviderKey(f"secret://{_ANTHROPIC_KEY_NAME}")]
 
 
 def _spec_with_skills(skills: tuple[str, ...], model_name: str) -> AgentSpec:

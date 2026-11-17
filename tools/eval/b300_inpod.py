@@ -570,6 +570,23 @@ def assert_no_background_tasks(*, baseline: Background | set[Any]) -> None:
         )
 
 
+def platform_credentials_resolver(secrets: Any, settings: Any, tenant_config: Any) -> Any:
+    """与 ``create_app`` 同样接法的凭据解析器。B-308:两条厂商视图给的都是「密钥引用 + 这把
+    密钥的请求地址」,所以经它建出来的嵌入、辅助模型调用都发到平台凭证上配的地址。"""
+    from control_plane.tenant_secret_overlay import TenantOverlayCredentialsResolver
+
+    return TenantOverlayCredentialsResolver(
+        tenant_provider_key_view=secrets.effective_best_provider_keys_for,
+        tenant_tool_view=secrets.effective_tool_credentials_for,
+        tenant_provider_key_list_view=secrets.effective_provider_keys_for,
+        platform_provider_credentials=settings.effective_platform_provider_credentials,
+        platform_tool_credentials=settings.effective_platform_tool_credentials,
+        tenant_config_getter=tenant_config,
+        platform_provider_getter=secrets.effective_provider_credentials,
+        platform_tool_getter=secrets.effective_tool_credentials,
+    )
+
+
 @contextlib.asynccontextmanager
 async def bootstrap() -> AsyncIterator[Deps]:
     """控制面进程里的最小装配(审查 H1):**不建 app、不进 lifespan**,所以不会起排队运行 worker、
@@ -589,7 +606,6 @@ async def bootstrap() -> AsyncIterator[Deps]:
     from control_plane.runtime import DynamicResolvingEmbedder
     from control_plane.settings import Settings
     from control_plane.tenancy import TenantConfigService
-    from control_plane.tenant_secret_overlay import TenantOverlayCredentialsResolver
 
     baseline = background_now()
     settings = Settings()
@@ -601,16 +617,7 @@ async def bootstrap() -> AsyncIterator[Deps]:
     tenant_config = TenantConfigService(store=stores.tenant_config, audit_logger=audit, ttl_s=ttl)
     pii.bind(tenant_config)
     secrets = PlatformSecretsService(store=stores.platform_secret, settings=settings, ttl_s=ttl)
-    resolver = TenantOverlayCredentialsResolver(
-        tenant_provider_view=secrets.effective_provider_credentials_for,
-        tenant_tool_view=secrets.effective_tool_credentials_for,
-        tenant_provider_keys_view=secrets.effective_provider_secret_refs_for,
-        platform_provider_credentials=settings.effective_platform_provider_credentials,
-        platform_tool_credentials=settings.effective_platform_tool_credentials,
-        tenant_config_getter=tenant_config,
-        platform_provider_getter=secrets.effective_provider_credentials,
-        platform_tool_getter=secrets.effective_tool_credentials,
-    )
+    resolver = platform_credentials_resolver(secrets, settings, tenant_config)
     cache = CredentialValueCache()
     http = httpx.AsyncClient()
     embedder = DynamicResolvingEmbedder(

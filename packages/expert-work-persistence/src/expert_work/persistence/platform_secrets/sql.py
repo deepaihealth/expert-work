@@ -38,6 +38,8 @@ def _provider_record(row: PlatformProviderSecretRow) -> PlatformProviderSecretRe
         secret_ref=row.secret_ref,
         enabled=row.enabled,
         priority=row.priority,
+        base_url=row.base_url,
+        base_url_unverified=row.base_url_unverified,
         created_at=row.created_at,
         updated_at=row.updated_at,
         updated_by=row.updated_by,
@@ -61,6 +63,8 @@ def _tenant_provider_record(row: TenantProviderSecretRow) -> TenantProviderSecre
         provider=cast(Provider, row.provider),
         secret_ref=row.secret_ref,
         enabled=row.enabled,
+        base_url=row.base_url,
+        base_url_unverified=row.base_url_unverified,
         created_at=row.created_at,
         updated_at=row.updated_at,
         updated_by=row.updated_by,
@@ -106,6 +110,8 @@ class SqlPlatformSecretStore(PlatformSecretStore):
         enabled: bool,
         priority: int = 100,
         actor_id: str,
+        base_url: str | None = None,
+        base_url_unverified: bool = False,
     ) -> PlatformProviderSecretRecord:
         now = _utc_now()
         async with self._sf() as session:
@@ -117,6 +123,8 @@ class SqlPlatformSecretStore(PlatformSecretStore):
                     secret_ref=secret_ref,
                     enabled=enabled,
                     priority=priority,
+                    base_url=base_url,
+                    base_url_unverified=base_url_unverified,
                     created_at=now,
                     updated_at=now,
                     updated_by=actor_id,
@@ -127,6 +135,8 @@ class SqlPlatformSecretStore(PlatformSecretStore):
                         "secret_ref": secret_ref,
                         "enabled": enabled,
                         "priority": priority,
+                        "base_url": base_url,
+                        "base_url_unverified": base_url_unverified,
                         "updated_at": now,
                         "updated_by": actor_id,
                     },
@@ -223,6 +233,8 @@ class SqlPlatformSecretStore(PlatformSecretStore):
         secret_ref: str,
         enabled: bool,
         actor_id: str,
+        base_url: str | None = None,
+        base_url_unverified: bool = False,
     ) -> TenantProviderSecretRecord:
         now = _utc_now()
         async with self._sf() as session:
@@ -233,6 +245,8 @@ class SqlPlatformSecretStore(PlatformSecretStore):
                     provider=provider,
                     secret_ref=secret_ref,
                     enabled=enabled,
+                    base_url=base_url,
+                    base_url_unverified=base_url_unverified,
                     created_at=now,
                     updated_at=now,
                     updated_by=actor_id,
@@ -242,6 +256,8 @@ class SqlPlatformSecretStore(PlatformSecretStore):
                     set_={
                         "secret_ref": secret_ref,
                         "enabled": enabled,
+                        "base_url": base_url,
+                        "base_url_unverified": base_url_unverified,
                         "updated_at": now,
                         "updated_by": actor_id,
                     },

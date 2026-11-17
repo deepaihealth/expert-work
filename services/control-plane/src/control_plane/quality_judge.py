@@ -3,9 +3,9 @@
 LLM-as-judge scoring for sampled production runs. Uses the RT-1 structured
 output path directly (``build_llm_router`` + ``output_schema``): the verdict
 is a schema-validated JSON object, never a regex-scraped integer. Credentials
-are platform-exclusive (BYOK was removed in Stream Y-1), resolved through
-``CredentialsResolver.resolve_provider`` and pinned into the ``ModelSpec`` —
-the same path the eval agent / embedder / defense judge use.
+are platform-exclusive (BYOK was removed in Stream Y-1), resolved as a
+``ProviderKey`` (the key with its request address, B-308) and pinned for the
+one router this judge builds — the same path the embedder / defense judge use.
 
 Deliberately self-contained (surgical): it builds its own thin caller from
 the shared router primitives rather than importing the ``Consolidator*``-named
@@ -27,7 +27,7 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from control_plane.credential_value_cache import CachingSecretStore, CredentialValueCache
-from expert_work.common.credentials import CredentialsResolver
+from control_plane.tenant_secret_overlay import ProviderKeySource
 from expert_work.protocol import ModelSpec, Provider, StructuredOutputSpec
 
 if TYPE_CHECKING:
@@ -90,7 +90,7 @@ class QualityJudge:
     def __init__(
         self,
         *,
-        resolver: CredentialsResolver,
+        resolver: ProviderKeySource,
         secret_store: SecretStore,
         secret_cache: CredentialValueCache | None = None,
         rate_limiter_factory: RateLimiterFactory | None = None,
@@ -120,25 +120,29 @@ class QualityJudge:
         # Lazy import — mirrors the aux adapter: importing ``build_llm_router``
         # at module load risks an orchestrator<->control-plane import cycle.
         from orchestrator import build_llm_router
+        from orchestrator.llm.endpoints import fixed_provider_key_resolver
 
         try:
             provider_typed = cast(Provider, provider)
-            secret_ref = await self._resolver.resolve_provider(
+            # B-308 — the key with its request address, pinned for this router.
+            key = await self._resolver.resolve_provider_key(
                 tenant_id=tenant_id, provider=provider_typed
             )
-            spec = ModelSpec(
-                provider=provider_typed, name=model, api_key_ref=secret_ref, fallback=[]
-            )
+            spec = ModelSpec(provider=provider_typed, name=model, fallback=[])
             # 二期 PR2 T3 — hand the router a tenant-scoped caching store so
             # its internal vault read (agent_factory.py:1956) becomes a
             # cache hit.
             store: SecretStore = self._secret_store
-            if self._secret_cache is not None:
+            # B-308 §4.3 — never cache a key that has a request address.
+            if self._secret_cache is not None and key.base_url is None:
                 store = CachingSecretStore(
                     inner=self._secret_store, cache=self._secret_cache, tenant_id=tenant_id
                 )
             router = await build_llm_router(
-                spec, secret_store=store, rate_limiter_factory=self._rate_limiter_factory
+                spec,
+                secret_store=store,
+                provider_key_resolver=fixed_provider_key_resolver(provider_typed, key),
+                rate_limiter_factory=self._rate_limiter_factory,
             )
             content = f"{_RUBRIC}\n\nUSER REQUEST:\n{prompt}\n\nAGENT REPLY:\n{reply}"
             response = await router(

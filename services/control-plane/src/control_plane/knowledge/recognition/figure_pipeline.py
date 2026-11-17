@@ -38,11 +38,12 @@ from control_plane.knowledge.recognition.cleaning import (
     reading_too_large,
 )
 from control_plane.knowledge.recognition.clients import (
-    CHAT_COMPLETIONS_URLS,
     ChatVlmClient,
     Reading,
     RecognitionCallError,
     RecognitionClient,
+    RecognitionCredential,
+    chat_vlm_endpoint,
     read_with_retry,
 )
 from control_plane.knowledge.recognition.figure_describe import (
@@ -99,22 +100,31 @@ FigureStatus = Literal["described", "failed", "pending"]
 
 #: Builds a vision-chat client for one fixed prompt: (model, API key, system
 #: prompt, user text, output cap). Tests inject fakes.
-FigureClientFactory = Callable[[ModelChoice, str, str, str, int], RecognitionClient]
+FigureClientFactory = Callable[
+    [ModelChoice, RecognitionCredential, str, str, int], RecognitionClient
+]
 
 
 def default_figure_client(http: httpx.AsyncClient | None = None) -> FigureClientFactory:
     """The OpenAI-compatible vision chat adapter (thinking off, output cap)."""
 
     def build(
-        choice: ModelChoice, api_key: str, prompt: str, user_text: str, max_tokens: int
+        choice: ModelChoice,
+        credential: RecognitionCredential,
+        prompt: str,
+        user_text: str,
+        max_tokens: int,
     ) -> RecognitionClient:
-        url = CHAT_COMPLETIONS_URLS.get(choice.provider)
-        if url is None:
+        # B-308 — under the credential's own request address when it has one.
+        endpoint = chat_vlm_endpoint(choice.provider, credential.base_url)
+        if endpoint is None:
             msg = f"no chat endpoint for provider {choice.provider!r}"
             raise ValueError(msg)
         return ChatVlmClient(
-            url=url,
-            api_key=api_key,
+            url=endpoint.url,
+            api_key=credential.api_key,
+            custom_endpoint=endpoint.custom,
+            provider=choice.provider,
             model=choice.model,
             request_fields=_request_fields(choice, max_tokens),
             http=http,
@@ -153,7 +163,8 @@ class FigureOutcome:
 @dataclass(frozen=True)
 class _Engine:
     choice: ModelChoice
-    api_key: str | None
+    #: The key with its request address (B-308); ``None`` = not configured.
+    api_key: RecognitionCredential | None
     unavailable: str | None = None
 
 

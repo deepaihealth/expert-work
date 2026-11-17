@@ -46,7 +46,9 @@ from expert_work.common.credentials import CredentialsResolver
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.protocol import Role, TenantConfigRecord, TenantPlan
 from expert_work.runtime.secret_store import parse_secret_ref
+from orchestrator.llm.endpoints import ProviderKey
 from tests.auth_fixtures import make_test_jwt
+from tests.credential_fixtures import static_credentials_resolver
 
 _REF = "secret://platform/qwen"
 
@@ -120,7 +122,7 @@ def _resolver() -> CredentialsResolver:
         updated_at=now,
         updated_by="tester",
     )
-    return CredentialsResolver(
+    return static_credentials_resolver(
         platform_provider_credentials={"qwen": _REF},  # type: ignore[arg-type]
         platform_tool_credentials={},  # type: ignore[arg-type]
         tenant_config_getter=_TenantConfig(record),
@@ -404,7 +406,7 @@ async def test_caching_secret_store_error_does_not_pollute_cache() -> None:
 async def test_cached_secret_error_does_not_pollute_cache() -> None:
     cache = _cache(_Clock())
     with pytest.raises(RuntimeError, match="vault down"):
-        await _cached_secret(cache, _RaisingSecretStore(), uuid4(), _REF)  # type: ignore[arg-type]
+        await _cached_secret(cache, _RaisingSecretStore(), uuid4(), ProviderKey(_REF))  # type: ignore[arg-type]
     assert len(cache) == 0
 
 
@@ -412,8 +414,8 @@ async def test_cached_secret_error_does_not_pollute_cache() -> None:
 
 
 class _FakeAuxResolver:
-    async def resolve_provider(self, *, tenant_id: Any, provider: Any) -> str:
-        return "secret://provider/anthropic"
+    async def resolve_provider_key(self, *, tenant_id: Any, provider: Any) -> ProviderKey:
+        return ProviderKey("secret://provider/anthropic")
 
 
 def _patch_store_reading_router(monkeypatch: pytest.MonkeyPatch, response: AIMessage) -> None:
@@ -424,7 +426,9 @@ def _patch_store_reading_router(monkeypatch: pytest.MonkeyPatch, response: AIMes
         return response
 
     async def _fake_build(spec: Any, *, secret_store: Any, **kwargs: Any) -> Any:
-        await secret_store.get(parse_secret_ref(spec.api_key_ref))
+        # The caller pins the one key it resolved (with its request address).
+        [key] = await kwargs["provider_key_resolver"](spec.provider)
+        await secret_store.get(parse_secret_ref(key.secret_ref))
         return _fake_router
 
     monkeypatch.setattr("orchestrator.build_llm_router", _fake_build, raising=True)
@@ -546,6 +550,92 @@ async def test_platform_put_clears_cache_and_next_read_refetches(
     assert cache.get(tenant, _REF) is None  # 下次 miss
 
     store = _CountingSecretStore(value="new-key")
-    assert await _cached_secret(cache, store, tenant, _REF) == "new-key"  # type: ignore[arg-type]
+    assert await _cached_secret(cache, store, tenant, ProviderKey(_REF)) == "new-key"  # type: ignore[arg-type]
     assert store.gets == [parse_secret_ref(_REF)]  # miss 后重新打 vault 并回填
     assert cache.get(tenant, _REF) == "new-key"
+
+
+# ─── B-308 §4.3 —— 带自定义地址的密钥不进值缓存 ───────────────────────────
+# Changing a key overwrites its slot in place (the ref stays the same). A
+# replica that missed the invalidation broadcast refreshes the row (new
+# address) after 30 s, while its value cache could still hold the old key for
+# up to 300 s — the old key would go to the new address although the admin did
+# everything right. A key with a request address is therefore never cached.
+
+_PROXY = "https://proxy.example.com/v1"
+
+
+@pytest.mark.asyncio
+async def test_cached_secret_never_caches_a_key_with_a_request_address() -> None:
+    cache = _cache(_Clock())
+    tenant = uuid4()
+    cache.put(tenant, _REF, "old-key")  # left over: the broadcast never came
+    store = _CountingSecretStore(value="new-key")
+
+    key = ProviderKey(_REF, _PROXY)
+    assert await _cached_secret(cache, store, tenant, key) == "new-key"  # type: ignore[arg-type]
+    assert await _cached_secret(cache, store, tenant, key) == "new-key"  # type: ignore[arg-type]
+
+    assert store.gets == [parse_secret_ref(_REF)] * 2  # read every time
+    assert cache.get(tenant, _REF) == "old-key"  # and nothing written for it
+
+
+@pytest.mark.asyncio
+async def test_cached_secret_still_caches_a_key_at_the_official_address() -> None:
+    cache = _cache(_Clock())
+    tenant = uuid4()
+    store = _CountingSecretStore(value="k")
+
+    key = ProviderKey(_REF, None)
+    await _cached_secret(cache, store, tenant, key)  # type: ignore[arg-type]
+    await _cached_secret(cache, store, tenant, key)  # type: ignore[arg-type]
+
+    assert store.gets == [parse_secret_ref(_REF)]
+
+
+class _ProxyAuxResolver:
+    async def resolve_provider_key(self, *, tenant_id: Any, provider: Any) -> ProviderKey:
+        return ProviderKey("secret://provider/anthropic", "https://proxy.example.com/v1")
+
+
+@pytest.mark.asyncio
+async def test_aux_adapter_does_not_cache_a_key_with_a_request_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _CountingSecretStore()
+    _patch_store_reading_router(monkeypatch, AIMessage(content="ok"))
+    cache = _cache(_Clock())
+    aux = make_llm_router_aux_model(
+        resolver=_ProxyAuxResolver(),  # type: ignore[arg-type]
+        secret_store=store,  # type: ignore[arg-type]
+        default_provider="anthropic",
+        default_model="m",
+        secret_cache=cache,
+    )
+    tenant = uuid4()
+    await aux(prompt="p", model=None, tenant_id=tenant)
+    await aux(prompt="p", model=None, tenant_id=tenant)
+    assert len(store.gets) == 2
+    assert len(cache) == 0
+
+
+@pytest.mark.asyncio
+async def test_quality_judge_does_not_cache_a_key_with_a_request_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _CountingSecretStore()
+    _patch_store_reading_router(monkeypatch, _VERDICT)
+    cache = _cache(_Clock())
+    judge = QualityJudge(
+        resolver=_ProxyAuxResolver(),  # type: ignore[arg-type]
+        secret_store=store,  # type: ignore[arg-type]
+        secret_cache=cache,
+    )
+    tenant = uuid4()
+    for _ in range(2):
+        verdict = await judge.score(
+            tenant_id=tenant, prompt="q", reply="a", provider="anthropic", model="m"
+        )
+        assert verdict is not None  # score swallows errors — rule out a silent skip
+    assert len(store.gets) == 2
+    assert len(cache) == 0

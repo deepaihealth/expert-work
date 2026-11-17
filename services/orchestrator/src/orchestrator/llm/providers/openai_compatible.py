@@ -60,6 +60,7 @@ from typing import ClassVar
 
 import httpx
 
+from orchestrator.llm.endpoints import Endpoint
 from orchestrator.llm.providers.openai import (
     DEFAULT_CHAT_COMPLETIONS_PATH,
     HTTPOpenAIClient,
@@ -118,6 +119,35 @@ DOUBAO_CHAT_COMPLETIONS_PATH = "/api/v3/chat/completions"
 # ---------------------------------------------------------------------------
 
 
+def _client(
+    provider: str,
+    api_key: str,
+    *,
+    base_url: str,
+    path: str,
+    timeout_s: float,
+    transport: httpx.AsyncBaseTransport | None,
+    http: httpx.AsyncClient | None,
+    endpoint: Endpoint | None,
+) -> HTTPOpenAIClient:
+    """One vendor client. ``endpoint`` (B-308, from the endpoint table) wins
+    over ``base_url`` + ``path`` when given — the agent build always passes it,
+    so a credential's request address reaches the wire; without it the factory
+    behaves exactly as before."""
+    if endpoint is not None:
+        base_url, path = endpoint.root, endpoint.path
+    return HTTPOpenAIClient(
+        api_key=api_key,
+        base_url=base_url,
+        timeout_s=timeout_s,
+        transport=transport,
+        http=http,
+        chat_completions_path=path,
+        custom_endpoint=endpoint is not None and endpoint.custom,
+        endpoint_provider=provider,
+    )
+
+
 def make_kimi_client(
     api_key: str,
     *,
@@ -125,15 +155,18 @@ def make_kimi_client(
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
     http: httpx.AsyncClient | None = None,
+    endpoint: Endpoint | None = None,
 ) -> HTTPOpenAIClient:
     """Moonshot AI / Kimi — OpenAI-compatible at ``api.moonshot.cn/v1``."""
-    return HTTPOpenAIClient(
-        api_key=api_key,
+    return _client(
+        "kimi",
+        api_key,
         base_url=base_url,
+        path=DEFAULT_CHAT_COMPLETIONS_PATH,
         timeout_s=timeout_s,
         transport=transport,
         http=http,
-        chat_completions_path=DEFAULT_CHAT_COMPLETIONS_PATH,
+        endpoint=endpoint,
     )
 
 
@@ -144,19 +177,22 @@ def make_glm_client(
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
     http: httpx.AsyncClient | None = None,
+    endpoint: Endpoint | None = None,
 ) -> HTTPOpenAIClient:
     """Zhipu AI / GLM — OpenAI-compatible at ``open.bigmodel.cn/api/paas/v4``.
 
     Note the non-default ``chat_completions_path`` — Zhipu's gateway does
     not host the endpoint at ``/v1/chat/completions``.
     """
-    return HTTPOpenAIClient(
-        api_key=api_key,
+    return _client(
+        "glm",
+        api_key,
         base_url=base_url,
+        path=GLM_CHAT_COMPLETIONS_PATH,
         timeout_s=timeout_s,
         transport=transport,
         http=http,
-        chat_completions_path=GLM_CHAT_COMPLETIONS_PATH,
+        endpoint=endpoint,
     )
 
 
@@ -167,15 +203,18 @@ def make_deepseek_client(
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
     http: httpx.AsyncClient | None = None,
+    endpoint: Endpoint | None = None,
 ) -> HTTPOpenAIClient:
     """DeepSeek — OpenAI-compatible at ``api.deepseek.com/v1``."""
-    return HTTPOpenAIClient(
-        api_key=api_key,
+    return _client(
+        "deepseek",
+        api_key,
         base_url=base_url,
+        path=DEFAULT_CHAT_COMPLETIONS_PATH,
         timeout_s=timeout_s,
         transport=transport,
         http=http,
-        chat_completions_path=DEFAULT_CHAT_COMPLETIONS_PATH,
+        endpoint=endpoint,
     )
 
 
@@ -186,6 +225,7 @@ def make_qwen_client(
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
     http: httpx.AsyncClient | None = None,
+    endpoint: Endpoint | None = None,
 ) -> HTTPOpenAIClient:
     """Alibaba Qwen via DashScope compatible-mode — OpenAI-format at
     ``dashscope.aliyuncs.com/compatible-mode/v1``.
@@ -194,13 +234,15 @@ def make_qwen_client(
     ``X-DashScope-API-Key`` header; only the compatible-mode path is
     OpenAI-format and is what this factory targets.
     """
-    return HTTPOpenAIClient(
-        api_key=api_key,
+    return _client(
+        "qwen",
+        api_key,
         base_url=base_url,
+        path=DEFAULT_CHAT_COMPLETIONS_PATH,
         timeout_s=timeout_s,
         transport=transport,
         http=http,
-        chat_completions_path=DEFAULT_CHAT_COMPLETIONS_PATH,
+        endpoint=endpoint,
     )
 
 
@@ -211,6 +253,7 @@ def make_doubao_client(
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
     http: httpx.AsyncClient | None = None,
+    endpoint: Endpoint | None = None,
 ) -> HTTPOpenAIClient:
     """ByteDance Doubao via Volcengine ARK — OpenAI-compatible at
     ``ark.cn-beijing.volces.com/api/v3``.
@@ -219,13 +262,15 @@ def make_doubao_client(
     (``ep-2024xxxx-abcde``) rather than a model family name when
     constructing the :class:`OpenAIProvider`.
     """
-    return HTTPOpenAIClient(
-        api_key=api_key,
+    return _client(
+        "doubao",
+        api_key,
         base_url=base_url,
+        path=DOUBAO_CHAT_COMPLETIONS_PATH,
         timeout_s=timeout_s,
         transport=transport,
         http=http,
-        chat_completions_path=DOUBAO_CHAT_COMPLETIONS_PATH,
+        endpoint=endpoint,
     )
 
 

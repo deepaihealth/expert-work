@@ -30,6 +30,7 @@ from orchestrator import (
     pending_request_binding,
 )
 from orchestrator.graph_builder._config import AUDIT_LOGGER_KEY
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.sse import PROMPT_INPUTS_KEY
 
 pytestmark = pytest.mark.asyncio
@@ -518,9 +519,9 @@ def _jinja_spec() -> AgentSpec:
     )
 
 
-async def _key_resolver(provider: str) -> list[str]:
+async def _key_resolver(provider: str) -> list[ProviderKey]:
     del provider
-    return [f"secret://{_KEY_NAME}"]
+    return [ProviderKey(f"secret://{_KEY_NAME}")]
 
 
 async def test_factory_hands_the_graph_only_trusted_variable_names(

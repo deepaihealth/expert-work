@@ -13,9 +13,15 @@ import pytest
 from control_plane.platform_secrets import PlatformSecretsService
 from control_plane.settings import Settings
 from expert_work.persistence.platform_secrets import InMemoryPlatformSecretStore
+from expert_work.protocol import Provider
+from orchestrator.llm.endpoints import ProviderKey
 
 _TENANT_A = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 _TENANT_B = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
+
+def _refs(keys: dict[Provider, list[ProviderKey]]) -> dict[str, list[str]]:
+    return {provider: [key.secret_ref for key in listed] for provider, listed in keys.items()}
 
 
 def _settings(**overrides: object) -> Settings:
@@ -183,7 +189,7 @@ async def test_mk_refs_aggregates_multiple_keys_sorted_by_priority() -> None:
     )
     svc = PlatformSecretsService(store=store, settings=_settings())
 
-    refs = await svc.effective_provider_secret_refs()
+    refs = _refs(await svc.effective_provider_keys())
     assert refs["deepseek"] == ["kms://a", "kms://b"]  # priority 10 before 20
     # Single view = best (first) key, preserved for embed/rerank callers.
     assert (await svc.effective_provider_credentials())["deepseek"] == "kms://a"
@@ -210,7 +216,7 @@ async def test_mk_refs_excludes_disabled_keys() -> None:
     )
     svc = PlatformSecretsService(store=store, settings=_settings())
 
-    refs = await svc.effective_provider_secret_refs()
+    refs = _refs(await svc.effective_provider_keys())
     assert refs["openai"] == ["kms://live"]  # disabled excluded despite lower priority
 
 
@@ -230,7 +236,7 @@ async def test_mk_refs_all_disabled_suppresses_provider() -> None:
     )
     svc = PlatformSecretsService(store=store, settings=settings)
 
-    refs = await svc.effective_provider_secret_refs()
+    refs = _refs(await svc.effective_provider_keys())
     assert "openai" not in refs  # all DB keys disabled → suppressed even with env seed
 
 
@@ -243,7 +249,7 @@ async def test_mk_refs_env_seed_when_no_db_rows() -> None:
     store = InMemoryPlatformSecretStore()
     svc = PlatformSecretsService(store=store, settings=settings)
 
-    refs = await svc.effective_provider_secret_refs()
+    refs = _refs(await svc.effective_provider_keys())
     assert refs["openai"] == ["secret://env-openai"]
 
 
@@ -276,9 +282,130 @@ async def test_mk_refs_for_tenant_override_replaces_list() -> None:
     svc = PlatformSecretsService(store=store, settings=_settings())
 
     # Tenant A: single override replaces the platform key list.
-    assert (await svc.effective_provider_secret_refs_for(_TENANT_A))["openai"] == ["kms://tenant-a"]
+    assert _refs(await svc.effective_provider_keys_for(_TENANT_A))["openai"] == ["kms://tenant-a"]
     # Tenant B: no override → full platform list.
-    assert (await svc.effective_provider_secret_refs_for(_TENANT_B))["openai"] == [
+    assert _refs(await svc.effective_provider_keys_for(_TENANT_B))["openai"] == [
         "kms://plat-a",
         "kms://plat-b",
     ]
+
+
+# ---------------------------------------------------------------------------
+# B-308 — the request address travels with the selected row
+# ---------------------------------------------------------------------------
+
+_CUSTOM = "https://proxy.example.com/v1"
+
+
+async def _two_platform_keys(store: InMemoryPlatformSecretStore) -> None:
+    await store.upsert_provider(
+        provider="openai",
+        key_id="proxy",
+        secret_ref="secret://plat-proxy",
+        enabled=True,
+        priority=10,
+        actor_id="a",
+        base_url=_CUSTOM,
+    )
+    await store.upsert_provider(
+        provider="openai",
+        key_id="direct",
+        secret_ref="secret://plat-direct",
+        enabled=True,
+        priority=20,
+        actor_id="a",
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_platform_key_carries_its_own_address() -> None:
+    store = InMemoryPlatformSecretStore()
+    await _two_platform_keys(store)
+    svc = PlatformSecretsService(store=store, settings=_settings())
+
+    assert (await svc.effective_provider_keys())["openai"] == [
+        ProviderKey("secret://plat-proxy", _CUSTOM),
+        ProviderKey("secret://plat-direct", None),
+    ]
+    best = await svc.effective_best_provider_keys_for(_TENANT_A)
+    assert best["openai"] == ProviderKey("secret://plat-proxy", _CUSTOM)
+    # The ref-only view is unchanged: "is this provider configured".
+    assert (await svc.effective_provider_credentials())["openai"] == "secret://plat-proxy"
+
+
+@pytest.mark.asyncio
+async def test_tenant_override_with_an_address_uses_it() -> None:
+    store = InMemoryPlatformSecretStore()
+    await _two_platform_keys(store)
+    await store.upsert_tenant_provider(
+        tenant_id=_TENANT_A,
+        provider="openai",
+        secret_ref="secret://tenant-a",
+        enabled=True,
+        actor_id="a",
+        base_url="https://tenant-proxy.example.com/v1",
+    )
+    svc = PlatformSecretsService(store=store, settings=_settings())
+
+    override = ProviderKey("secret://tenant-a", "https://tenant-proxy.example.com/v1")
+    assert (await svc.effective_provider_keys_for(_TENANT_A))["openai"] == [override]
+    assert (await svc.effective_best_provider_keys_for(_TENANT_A))["openai"] == override
+
+
+@pytest.mark.asyncio
+async def test_tenant_override_without_an_address_is_official_not_the_platform_keys() -> None:
+    """Decision 6: an override that has no address goes to the official one —
+    it does not inherit the address of the platform key it replaces."""
+    store = InMemoryPlatformSecretStore()
+    await _two_platform_keys(store)
+    await store.upsert_tenant_provider(
+        tenant_id=_TENANT_A,
+        provider="openai",
+        secret_ref="secret://tenant-a",
+        enabled=True,
+        actor_id="a",
+    )
+    svc = PlatformSecretsService(store=store, settings=_settings())
+
+    assert (await svc.effective_provider_keys_for(_TENANT_A))["openai"] == [
+        ProviderKey("secret://tenant-a", None)
+    ]
+    # Another tenant still sees the platform keys with their addresses.
+    assert (await svc.effective_provider_keys_for(_TENANT_B))["openai"][0].base_url == _CUSTOM
+
+
+@pytest.mark.asyncio
+async def test_disabled_override_with_the_platform_ref_still_suppresses() -> None:
+    """A disabled override that reuses the platform key's ref (how an admin
+    turns a provider off for one tenant) keeps suppressing it."""
+    store = InMemoryPlatformSecretStore()
+    await _two_platform_keys(store)
+    await store.upsert_tenant_provider(
+        tenant_id=_TENANT_A,
+        provider="openai",
+        secret_ref="secret://plat-proxy",
+        enabled=False,
+        actor_id="a",
+    )
+    svc = PlatformSecretsService(store=store, settings=_settings())
+
+    assert "openai" not in await svc.effective_provider_keys_for(_TENANT_A)
+    assert "openai" not in await svc.effective_best_provider_keys_for(_TENANT_A)
+    assert "openai" not in await svc.effective_provider_credentials_for(_TENANT_A)
+    assert "openai" in await svc.effective_provider_keys_for(_TENANT_B)
+
+
+@pytest.mark.asyncio
+async def test_env_seeded_key_has_no_address() -> None:
+    settings = _settings(
+        supported_providers=["openai"],
+        platform_provider_credentials={"openai": "secret://env-openai"},
+    )
+    svc = PlatformSecretsService(store=InMemoryPlatformSecretStore(), settings=settings)
+    assert (await svc.effective_provider_keys())["openai"] == [ProviderKey("secret://env-openai")]
+
+
+def test_old_ref_list_methods_are_gone() -> None:
+    # Renamed, not aliased (B-308 §4.3): an unconverted caller fails at once.
+    assert not hasattr(PlatformSecretsService, "effective_provider_secret_refs")
+    assert not hasattr(PlatformSecretsService, "effective_provider_secret_refs_for")

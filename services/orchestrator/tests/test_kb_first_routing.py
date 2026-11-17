@@ -20,6 +20,7 @@ from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import BuiltAgent, ToolEnv, build_agent
 from orchestrator.llm import FakeEmbedder
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools.assembly import build_tool_registry
 from orchestrator.tools.knowledge import KNOWLEDGE_ANSWERABILITY_RULE, KNOWLEDGE_SEARCH_GUIDANCE
@@ -170,9 +171,9 @@ def _spec(refs: list[str] | None) -> AgentSpec:
     return AgentSpec.model_validate(doc)
 
 
-async def _key_resolver(provider: str) -> list[str]:
+async def _key_resolver(provider: str) -> list[ProviderKey]:
     del provider
-    return [f"secret://{_KEY_NAME}"]
+    return [ProviderKey(f"secret://{_KEY_NAME}")]
 
 
 async def _build(

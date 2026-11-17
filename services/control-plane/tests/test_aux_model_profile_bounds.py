@@ -12,11 +12,12 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from control_plane.aux_model_adapter import LLMRouterAuxModelAdapter
+from orchestrator.llm.endpoints import ProviderKey
 
 
 class _Resolver:
-    async def resolve_provider(self, *, tenant_id: Any, provider: Any) -> str:
-        return f"secret://{provider}"
+    async def resolve_provider_key(self, *, tenant_id: Any, provider: Any) -> ProviderKey:
+        return ProviderKey(f"secret://{provider}")
 
 
 async def _spec_sent(

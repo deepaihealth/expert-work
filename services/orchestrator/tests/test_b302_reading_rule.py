@@ -18,6 +18,7 @@ from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import BuiltAgent, ToolEnv, build_agent
 from orchestrator import agent_factory as factory_module
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.tools.figure_reads import READING_RULE
 
 _KEY_NAME = "anthropic-key"
@@ -47,9 +48,9 @@ def _spec(*, vision: bool, **policies: Any) -> AgentSpec:
     return AgentSpec.model_validate(doc)
 
 
-async def _key_resolver(provider: str) -> list[str]:
+async def _key_resolver(provider: str) -> list[ProviderKey]:
     del provider
-    return [f"secret://{_KEY_NAME}"]
+    return [ProviderKey(f"secret://{_KEY_NAME}")]
 
 
 async def _build(spec: AgentSpec, env: ToolEnv) -> BuiltAgent:

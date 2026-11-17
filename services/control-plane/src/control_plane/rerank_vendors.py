@@ -27,7 +27,9 @@ from typing import Any, Literal, assert_never
 import httpx
 
 from expert_work.protocol.model_catalog import RerankApi, catalog_entry
-from orchestrator.llm import DashScopeReranker, HTTPDashScopeRerankClient, RerankGuards
+from orchestrator.llm import DashScopeReranker, RerankGuards
+from orchestrator.llm.endpoints import ProviderKey
+from orchestrator.llm.rerank import dashscope_rerank_client
 from orchestrator.llm.rerank_batches import CohereStyleReranker
 from orchestrator.llm.rerank_cohere import RERANK_SHAPE_BY_PROVIDER, cohere_style_client
 
@@ -108,22 +110,30 @@ def vendor_reranker(
     provider: str,
     model: str,
     api_key: str,
-    secret_ref: str,
+    provider_key: ProviderKey,
     http: httpx.AsyncClient | None,
     guards: RerankGuards,
 ) -> DashScopeReranker | CohereStyleReranker:
     """The reranker calling ``provider/model``'s own rerank endpoint (see
-    :func:`callable_rerank_api`), its client behind ``guards``."""
+    :func:`callable_rerank_api`), its client behind ``guards``.
+
+    ``provider_key`` (B-308) is the credential ``api_key`` was read from: its
+    request address decides where the rerank request goes (the endpoint table
+    derives each vendor's rerank address from it); the guards stay keyed by its
+    secret ref."""
+    secret_ref = provider_key.secret_ref
     if api == "dashscope":
         if provider != _DASHSCOPE_PROVIDER:
             msg = f"DashScope's rerank endpoint is not served for provider {provider!r}"
             raise ValueError(msg)
-        native = HTTPDashScopeRerankClient(api_key=api_key, http=http)
+        native = dashscope_rerank_client(api_key=api_key, base_url=provider_key.base_url, http=http)
         client = guards.wrap(native, provider=provider, model=model, secret_ref=secret_ref)
         return DashScopeReranker(client=client, model=model)
     if api != "cohere_style":
         assert_never(api)
-    cohere = cohere_style_client(provider, api_key=api_key, http=http)
+    cohere = cohere_style_client(
+        provider, api_key=api_key, base_url=provider_key.base_url, http=http
+    )
     entry = catalog_entry(provider, model)
     return CohereStyleReranker(
         client=guards.wrap(cohere, provider=provider, model=model, secret_ref=secret_ref),

@@ -24,33 +24,46 @@ from typing import Any, Literal, Protocol
 import httpx
 
 from control_plane.knowledge.recognition.cleaning import NO_TEXT_SENTENCE, layout_text_chars
-from orchestrator.llm import (
-    DEEPSEEK_BASE_URL,
-    DEFAULT_CHAT_COMPLETIONS_PATH,
-    DOUBAO_BASE_URL,
-    DOUBAO_CHAT_COMPLETIONS_PATH,
-    GLM_BASE_URL,
-    GLM_CHAT_COMPLETIONS_PATH,
-    KIMI_BASE_URL,
-    QWEN_BASE_URL,
+from orchestrator.llm.endpoints import (
+    Endpoint,
+    EndpointNotSupportedError,
+    endpoint_for,
+    redact_endpoint,
 )
+from orchestrator.llm.providers._http import client_for
 from orchestrator.llm.providers.openai_compatible import GLM_ACCOUNT_429_CODES
 
-#: Layout-parsing endpoints by provider (only Zhipu offers one today).
-LAYOUT_PARSING_URLS: Mapping[str, str] = {
-    "glm": f"{GLM_BASE_URL}/api/paas/v4/layout_parsing",
-}
+#: Providers whose chat endpoint speaks the OpenAI-compatible vision format the
+#: recognition adapters send — the same hosts and paths the agent runtime calls.
+_CHAT_VLM_PROVIDERS = frozenset({"openai", "glm", "qwen", "deepseek", "kimi", "doubao"})
 
-#: OpenAI-compatible chat-completions endpoints by provider — the same hosts
-#: and paths the agent runtime calls.
-CHAT_COMPLETIONS_URLS: Mapping[str, str] = {
-    "openai": f"https://api.openai.com{DEFAULT_CHAT_COMPLETIONS_PATH}",
-    "glm": f"{GLM_BASE_URL}{GLM_CHAT_COMPLETIONS_PATH}",
-    "qwen": f"{QWEN_BASE_URL}{DEFAULT_CHAT_COMPLETIONS_PATH}",
-    "deepseek": f"{DEEPSEEK_BASE_URL}{DEFAULT_CHAT_COMPLETIONS_PATH}",
-    "kimi": f"{KIMI_BASE_URL}{DEFAULT_CHAT_COMPLETIONS_PATH}",
-    "doubao": f"{DOUBAO_BASE_URL}{DOUBAO_CHAT_COMPLETIONS_PATH}",
-}
+
+@dataclass(frozen=True)
+class RecognitionCredential:
+    """One provider credential as a recognition call needs it (B-308): the key
+    value and the request address saved with that key (``None`` = official)."""
+
+    api_key: str = field(repr=False)
+    base_url: str | None = None
+
+
+def layout_parsing_endpoint(provider: str, base_url: str | None = None) -> Endpoint | None:
+    """Where ``provider``'s layout-parsing API is — under the credential's
+    request address when it has one; ``None`` when the provider offers none
+    (only one does today)."""
+    try:
+        return endpoint_for(provider, "layout_parsing", base_url)
+    except EndpointNotSupportedError:
+        return None
+
+
+def chat_vlm_endpoint(provider: str, base_url: str | None = None) -> Endpoint | None:
+    """Where ``provider``'s OpenAI-compatible chat API is (the address the
+    agent runtime calls for that key); ``None`` when it has none."""
+    if provider not in _CHAT_VLM_PROVIDERS:
+        return None
+    return endpoint_for(provider, "chat", base_url)
+
 
 #: Bumped whenever :data:`OCR_PROMPT` changes — part of the cache key, so a
 #: new prompt re-reads pages instead of serving the old prompt's text.
@@ -172,21 +185,34 @@ def _data_uri(image: bytes) -> str:
 
 
 async def _post(
-    http: httpx.AsyncClient | None, url: str, api_key: str, body: dict[str, Any]
+    http: httpx.AsyncClient | None,
+    url: str,
+    api_key: str,
+    body: dict[str, Any],
+    *,
+    custom_endpoint: bool = False,
+    provider: str | None = None,
 ) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {api_key}"}
     try:
-        if http is not None:
-            response = await http.post(url, json=body, headers=headers, timeout=_TIMEOUT_S)
-        else:
-            async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
-                response = await client.post(url, json=body, headers=headers)
+        # B-308 — the one place that picks the HTTP client: a custom request
+        # address always goes through the address-checking client.
+        async with client_for(
+            http,
+            timeout=_TIMEOUT_S,
+            transport=None,
+            custom_endpoint=custom_endpoint,
+            provider=provider,
+        ) as client:
+            response = await client.post(url, json=body, headers=headers, timeout=_TIMEOUT_S)
     except httpx.HTTPError as exc:  # timeouts + transport errors
         cause: CallErrorCause = (
             "timeout" if isinstance(exc, httpx.TimeoutException) else "transport"
         )
+        # A custom request address may carry a token in its path: origin only.
+        detail = redact_endpoint(str(exc), Endpoint(root=url, path="", custom=custom_endpoint))
         raise RecognitionCallError(
-            f"{type(exc).__name__}: {exc}", kind="busy", cause=cause
+            f"{type(exc).__name__}: {detail}", kind="busy", cause=cause
         ) from exc
     if response.is_error:
         raise _status_error(response)
@@ -264,10 +290,20 @@ class LayoutParsingClient:
     api_key: str = field(repr=False)
     model: str
     http: httpx.AsyncClient | None = None
+    #: B-308 — ``url`` is under a credential's custom request address: the
+    #: request goes through the address-checking client.
+    custom_endpoint: bool = False
+    #: Label for a custom-address connection's log line / counter.
+    provider: str | None = None
 
     async def read(self, image: bytes) -> Reading:
         data = await _post(
-            self.http, self.url, self.api_key, {"model": self.model, "file": _data_uri(image)}
+            self.http,
+            self.url,
+            self.api_key,
+            {"model": self.model, "file": _data_uri(image)},
+            custom_endpoint=self.custom_endpoint,
+            provider=self.provider,
         )
         usage = _usage(data)  # before any shape check: a malformed answer is billed too
         markdown = data.get("md_results")
@@ -335,6 +371,11 @@ class ChatVlmClient:
     system_prompt: str = OCR_PROMPT
     user_text: str = _OCR_USER_TEXT
     temperature: float = OCR_TEMPERATURE
+    #: B-308 — ``url`` is under a credential's custom request address: the
+    #: request goes through the address-checking client.
+    custom_endpoint: bool = False
+    #: Label for a custom-address connection's log line / counter.
+    provider: str | None = None
 
     async def read(self, image: bytes) -> Reading:
         body: dict[str, Any] = {
@@ -352,7 +393,14 @@ class ChatVlmClient:
             "temperature": self.temperature,
             **self.request_fields,
         }
-        data = await _post(self.http, self.url, self.api_key, body)
+        data = await _post(
+            self.http,
+            self.url,
+            self.api_key,
+            body,
+            custom_endpoint=self.custom_endpoint,
+            provider=self.provider,
+        )
         usage = _usage(data)  # before any shape check: a malformed answer is billed too
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):

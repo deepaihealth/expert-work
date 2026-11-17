@@ -14,17 +14,18 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from control_plane.quality_judge import QualityJudge
+from orchestrator.llm.endpoints import ProviderKey
 
 
 class _FakeResolver:
     def __init__(self, *, raises: bool = False) -> None:
         self._raises = raises
 
-    async def resolve_provider(self, *, tenant_id: Any, provider: Any) -> str:
+    async def resolve_provider_key(self, *, tenant_id: Any, provider: Any) -> ProviderKey:
         if self._raises:
             msg = "no platform credential"
             raise RuntimeError(msg)
-        return "secret://provider/anthropic"
+        return ProviderKey("secret://provider/anthropic")
 
 
 def _patch_router(monkeypatch: pytest.MonkeyPatch, response: AIMessage) -> None:

@@ -37,6 +37,7 @@ from orchestrator.graph_builder.outgoing_reference import (
     sends_arguments_out,
 )
 from orchestrator.llm import FakeEmbedder
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools.knowledge import KnowledgeSearchTool
 from orchestrator.tools.web_search import WebSearchTool
@@ -118,9 +119,9 @@ _MANIFEST: dict[str, Any] = {
 }
 
 
-async def _key_resolver(provider: str) -> list[str]:
+async def _key_resolver(provider: str) -> list[ProviderKey]:
     del provider
-    return [f"secret://{_KEY_NAME}"]
+    return [ProviderKey(f"secret://{_KEY_NAME}")]
 
 
 async def _build(knowledge: bool) -> BuiltAgent:

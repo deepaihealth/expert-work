@@ -16,8 +16,6 @@ import pytest
 
 from control_plane.knowledge.recognition.cleaning import NO_TEXT_SENTENCE
 from control_plane.knowledge.recognition.clients import (
-    CHAT_COMPLETIONS_URLS,
-    LAYOUT_PARSING_URLS,
     OCR_PROMPT,
     ChatVlmClient,
     LayoutParsingClient,
@@ -89,7 +87,10 @@ async def test_layout_parsing_request_and_reply() -> None:
 
     async with _http(handler) as http:
         client = LayoutParsingClient(
-            url=LAYOUT_PARSING_URLS["glm"], api_key="k-glm", model="glm-ocr", http=http
+            url="https://open.bigmodel.cn/api/paas/v4/layout_parsing",
+            api_key="k-glm",
+            model="glm-ocr",
+            http=http,
         )
         reading = await client.read(_IMAGE)
 
@@ -132,7 +133,7 @@ async def test_chat_vlm_request_carries_the_fixed_prompt_and_thinking_off() -> N
     fields = thinking_off_request_fields("qwen", "qwen3.7-flash", max_tokens=8192)
     async with _http(handler) as http:
         client = ChatVlmClient(
-            url=CHAT_COMPLETIONS_URLS["qwen"],
+            url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
             api_key="k-qwen",
             model="qwen3.7-flash",
             request_fields=fields,

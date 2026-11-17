@@ -38,10 +38,8 @@ from control_plane.memory_consolidator import (
     ConsolidatorAuxModel,
     ConsolidatorLLMReply,
 )
-from expert_work.common.credentials import (
-    CredentialsResolver,
-    CredentialsResolverError,
-)
+from control_plane.tenant_secret_overlay import ProviderKeySource
+from expert_work.common.credentials import CredentialsResolverError
 from expert_work.common.uplift_metrics import record_credentials_resolve
 from expert_work.protocol import ModelSpec, Provider, StructuredOutputSpec
 
@@ -72,7 +70,7 @@ class LLMRouterAuxModelAdapter:
     def __init__(
         self,
         *,
-        resolver: CredentialsResolver,
+        resolver: ProviderKeySource,
         secret_store: SecretStore,
         default_provider: Provider,
         default_model: str,
@@ -106,13 +104,13 @@ class LLMRouterAuxModelAdapter:
         # ``build_llm_router`` at module import would risk an import
         # cycle. Done at call time keeps the dependency graph honest.
         from orchestrator import build_llm_router
+        from orchestrator.llm.endpoints import fixed_provider_key_resolver
 
         provider = self._default_provider
         model_name = model or self._default_model
         try:
-            secret_ref = await self._resolver.resolve_provider(
-                tenant_id=tenant_id, provider=provider
-            )
+            # B-308 — the key with its request address, pinned for this router.
+            key = await self._resolver.resolve_provider_key(tenant_id=tenant_id, provider=provider)
             record_credentials_resolve(
                 mode="platform",  # mode logged by resolver decision
                 role="provider",
@@ -130,7 +128,6 @@ class LLMRouterAuxModelAdapter:
         spec = ModelSpec(
             provider=provider,
             name=model_name,
-            api_key_ref=secret_ref,
             # Consolidator does not declare its own fallback chain; the
             # default model is what the manifest opted into.
             fallback=[],
@@ -146,12 +143,16 @@ class LLMRouterAuxModelAdapter:
         # 二期 PR2 T3 — hand the router a tenant-scoped caching store so its
         # internal vault read (agent_factory.py:1956) becomes a cache hit.
         store: SecretStore = self._secret_store
-        if self._secret_cache is not None:
+        # B-308 §4.3 — never cache a key that has a request address.
+        if self._secret_cache is not None and key.base_url is None:
             store = CachingSecretStore(
                 inner=self._secret_store, cache=self._secret_cache, tenant_id=tenant_id
             )
         router = await build_llm_router(
-            spec, secret_store=store, rate_limiter_factory=self._rate_limiter_factory
+            spec,
+            secret_store=store,
+            provider_key_resolver=fixed_provider_key_resolver(provider, key),
+            rate_limiter_factory=self._rate_limiter_factory,
         )
         message = HumanMessage(content=prompt)
         # RT-1 — ``output_schema`` threads straight through to the router's
@@ -204,7 +205,7 @@ def _coerce_text(content: object) -> str:
 
 def make_llm_router_aux_model(
     *,
-    resolver: CredentialsResolver,
+    resolver: ProviderKeySource,
     secret_store: SecretStore,
     default_provider: Provider,
     default_model: str,

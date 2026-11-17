@@ -87,7 +87,7 @@ if TYPE_CHECKING:
     import httpx
     from langgraph.checkpoint.base import BaseCheckpointSaver
 
-    from expert_work.common.credentials import CredentialsResolver
+    from control_plane.tenant_secret_overlay import TenantOverlayCredentialsResolver
     from expert_work.runtime.secret_store import SecretStore
     from orchestrator.llm import RateLimiterFactory
     from orchestrator.tools.registry import ToolSpec
@@ -433,7 +433,7 @@ class MemoryWritebackProcessor:
 def make_router_caller_factory(
     *,
     secret_store: SecretStore,
-    credentials_resolver: CredentialsResolver | None,
+    credentials_resolver: TenantOverlayCredentialsResolver | None,
     middleware_env: MiddlewareEnv | None,
     http_client: httpx.AsyncClient | None,
     rate_limiter_factory: RateLimiterFactory | None,

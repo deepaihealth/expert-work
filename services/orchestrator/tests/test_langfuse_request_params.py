@@ -33,6 +33,7 @@ from expert_work.runtime.middleware import (
 )
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator.agent_factory import _escalated_model, build_llm_router
+from orchestrator.llm.endpoints import ProviderKey
 from orchestrator.llm.router import LLMRouter, ProviderHandle
 from orchestrator.tools.registry import ToolSpec
 
@@ -151,9 +152,9 @@ class _Wire:
         return _openai_reply(body)
 
 
-async def _any_key(provider: str) -> list[str]:
+async def _any_key(provider: str) -> list[ProviderKey]:
     del provider
-    return [f"secret://{_KEY}"]
+    return [ProviderKey(f"secret://{_KEY}")]
 
 
 async def _call(

@@ -39,6 +39,7 @@ from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator.agent_factory import build_agent
+from orchestrator.llm.endpoints import ProviderKey
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -121,8 +122,8 @@ _PROVIDER_KEY_NAMES = {
 }
 
 
-async def _platform_resolver(provider: str) -> list[str]:
-    return [f"secret://{_PROVIDER_KEY_NAMES[provider]}"]
+async def _platform_resolver(provider: str) -> list[ProviderKey]:
+    return [ProviderKey(f"secret://{_PROVIDER_KEY_NAMES[provider]}")]
 
 
 @pytest.fixture

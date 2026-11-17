@@ -30,6 +30,7 @@ from typing import Any
 
 import httpx
 
+from orchestrator.llm.endpoints import endpoint_for
 from orchestrator.llm.providers._http import client_for
 from orchestrator.llm.providers.openai_compatible import GLM_ACCOUNT_429_CODES, GLM_BASE_URL
 from orchestrator.llm.rerank_guard import (
@@ -153,6 +154,11 @@ class HTTPCohereStyleRerankClient:
     timeout_s: float = _DEFAULT_TIMEOUT_S
     transport: httpx.AsyncBaseTransport | None = None
     http: httpx.AsyncClient | None = None
+    #: B-308 — ``url`` is under a credential's custom request address: requests
+    #: go through the address-checking client.
+    custom_endpoint: bool = False
+    #: Label for the custom-address connection log line / counter.
+    endpoint_provider: str | None = None
 
     async def rerank(
         self,
@@ -172,7 +178,11 @@ class HTTPCohereStyleRerankClient:
             instruction=instruction,
         )
         async with client_for(
-            self.http, timeout=self.timeout_s, transport=self.transport
+            self.http,
+            timeout=self.timeout_s,
+            transport=self.transport,
+            custom_endpoint=self.custom_endpoint,
+            provider=self.endpoint_provider,
         ) as client:
             try:
                 response = await client.post(
@@ -207,23 +217,34 @@ def cohere_style_client(
     provider: str,
     *,
     api_key: str,
+    base_url: str | None = None,
     http: httpx.AsyncClient | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> HTTPCohereStyleRerankClient:
     """The client for platform provider ``provider``'s Cohere-style rerank
     endpoint; :class:`ValueError` when the platform knows none for it (see
-    :data:`RERANK_SHAPE_BY_PROVIDER`)."""
+    :data:`RERANK_SHAPE_BY_PROVIDER`).
+
+    ``base_url`` (B-308) is the credential's request address; the rerank path
+    from the endpoint table is appended to it instead of the official root."""
     family = RERANK_SHAPE_BY_PROVIDER.get(provider)
     shape = COHERE_STYLE_SHAPES[family] if family is not None else None
     if shape is None or shape.host is None:
         msg = f"no Cohere-style rerank endpoint is known for provider {provider!r}"
         raise ValueError(msg)
+    if base_url is None:
+        url, custom = f"{shape.host}{shape.path}", False
+    else:
+        endpoint = endpoint_for(provider, "rerank", base_url)
+        url, custom = endpoint.url, endpoint.custom
     return HTTPCohereStyleRerankClient(
         api_key=api_key,
-        url=f"{shape.host}{shape.path}",
+        url=url,
         shape=shape,
         http=http,
         transport=transport,
+        custom_endpoint=custom,
+        endpoint_provider=provider,
     )
 
 

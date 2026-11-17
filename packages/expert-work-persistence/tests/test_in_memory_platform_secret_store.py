@@ -199,3 +199,64 @@ async def test_provider_upsert_same_key_updates_in_place() -> None:
     assert rows[0].secret_ref == "kms://new"
     assert rows[0].enabled is False
     assert rows[0].priority == 5
+
+
+@pytest.mark.asyncio
+async def test_provider_base_url_is_stored_and_overwritten_as_written() -> None:
+    """B-308 §4.1 — the two address columns default to official / verified and
+    every upsert overwrites them with what it was given (whole-row write)."""
+    store = InMemoryPlatformSecretStore()
+    plain = await store.upsert_provider(
+        provider="glm", secret_ref="secret://glm", enabled=True, actor_id="admin"
+    )
+    assert plain.base_url is None
+    assert plain.base_url_unverified is False
+
+    custom = await store.upsert_provider(
+        provider="glm",
+        secret_ref="secret://glm",
+        enabled=True,
+        actor_id="admin",
+        base_url="https://proxy.example.com/api/paas/v4",
+        base_url_unverified=True,
+    )
+    assert custom.base_url == "https://proxy.example.com/api/paas/v4"
+    assert custom.base_url_unverified is True
+    fetched = await store.get_provider("glm")
+    assert fetched == custom
+
+    cleared = await store.upsert_provider(
+        provider="glm", secret_ref="secret://glm", enabled=True, actor_id="admin"
+    )
+    assert cleared.base_url is None
+    assert cleared.base_url_unverified is False
+
+
+@pytest.mark.asyncio
+async def test_tenant_provider_base_url_is_stored_and_overwritten_as_written() -> None:
+    from uuid import uuid4
+
+    store = InMemoryPlatformSecretStore()
+    tenant_id = uuid4()
+    custom = await store.upsert_tenant_provider(
+        tenant_id=tenant_id,
+        provider="glm",
+        secret_ref="secret://t/glm",
+        enabled=True,
+        actor_id="admin",
+        base_url="https://proxy.example.com/api/paas/v4",
+        base_url_unverified=True,
+    )
+    assert custom.base_url == "https://proxy.example.com/api/paas/v4"
+    assert custom.base_url_unverified is True
+    assert await store.list_tenant_providers(tenant_id) == [custom]
+
+    cleared = await store.upsert_tenant_provider(
+        tenant_id=tenant_id,
+        provider="glm",
+        secret_ref="secret://t/glm",
+        enabled=True,
+        actor_id="admin",
+    )
+    assert cleared.base_url is None
+    assert cleared.base_url_unverified is False
