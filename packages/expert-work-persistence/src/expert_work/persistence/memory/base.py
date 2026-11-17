@@ -55,11 +55,16 @@ CONFIRMED_RETIRES_STATED = False
 
 #: 一条旧记忆没被退的原因(存储在行锁里重判时给的;写回的预判用同一个 :func:`may_retire`):
 #: ``gone`` 不存在 / 已删 / 已作废 / 已不是当前有效;``summary`` 是汇总行;``corrected`` 控制台
-#: 更正过;``assistant`` 助手一方的候选对用户一方的记忆;``confirmed_vs_stated`` 见上。
-RetireRefusal = Literal["gone", "summary", "corrected", "assistant", "confirmed_vs_stated"]
+#: 更正过;``assistant`` 助手一方的候选对用户一方的记忆;``confirmed_vs_stated`` 见上;
+#: ``not_correction`` 第一次提炼的候选不带更正标记对用户一方的记忆(第 10 版,§7.1 第 19 行)。
+RetireRefusal = Literal[
+    "gone", "summary", "corrected", "assistant", "confirmed_vs_stated", "not_correction"
+]
 
 _CORRECTED_TIER = _ORIGIN_TIERS["user_corrected"]
 _STATED_TIER = _ORIGIN_TIERS["user_stated"]
+#: 第 10 版(§7.1 第 19 行)—— 不带更正标记的第一次候选退不掉的层级:用户说的、用户确认。
+_CORRECTION_ONLY_TIERS = frozenset({_STATED_TIER, _ORIGIN_TIERS["user_confirmed"]})
 
 
 def tier_of(origin: EffectiveOrigin) -> int:
@@ -73,6 +78,7 @@ def may_retire(
     *,
     target_is_summary: bool,
     identical: bool = False,
+    needs_correction: bool = False,
 ) -> RetireRefusal | None:
     """B-300 重做 §7.8 —— 来源为 ``candidate`` 的候选能不能退一条层级为 ``target_tier`` 的旧记忆
     (汇总行的层级按成员算,:func:`origin_standing`);``None`` = 能。只看来源,不看置信度。
@@ -82,6 +88,8 @@ def may_retire(
     * 控制台更正过的 → 谁也不能;
     * 助手一方(来自助手 / 未记录)的候选对用户一方的记忆 → 不能;
     * 用户确认的候选对用户说的记忆 → 默认不能(:data:`CONFIRMED_RETIRES_STATED`);
+    * ``needs_correction``(第 10 版,§7.1 第 19 行;写回按候选一侧定:第一次提炼的候选、不带更正
+      标记、模型把这一条列成不再成立)→ 用户说的、用户确认的不能;
     * 其余 → 能。先后、事件日期、同一条消息这三项只在写回里查。"""
     own = _ORIGIN_TIERS[candidate]
     if target_is_summary and not (identical and target_tier < own):
@@ -96,6 +104,8 @@ def may_retire(
         and not CONFIRMED_RETIRES_STATED
     ):
         return "confirmed_vs_stated"
+    if needs_correction and target_tier in _CORRECTION_ONLY_TIERS:
+        return "not_correction"
     return None
 
 
@@ -487,6 +497,7 @@ class MemoryStore(abc.ABC):
         identical_ids: Sequence[UUID] = (),
         flag_summary_ids: Sequence[UUID] = (),
         link_id: UUID | None = None,
+        needs_correction_ids: Sequence[UUID] = (),
     ) -> SupersedeResult:
         """P5b / B-300 redesign §7.8 — write ``new_item`` and, in the same transaction,
         retire zero or more older rows (``invalid_at=now``, ``superseded_by`` = the new
@@ -498,7 +509,13 @@ class MemoryStore(abc.ABC):
         deleted / already superseded / no longer current (folded into a summary, expired,
         archived) → skipped, ``gone``; otherwise :func:`may_retire` with the new row's
         effective origin and the target's tier by members (``summary`` / ``corrected`` /
-        ``assistant`` / ``confirmed_vs_stated``). ``identical_ids`` (a subset of
+        ``assistant`` / ``confirmed_vs_stated``). ``needs_correction_ids`` (rev 10, §7.1
+        row 19; targets and summaries to flag) are the ones the caller holds to the
+        correction rule — a first-pass candidate without a correction mark that the model
+        said replaces them: each is re-judged with ``needs_correction`` on its tier **now**,
+        so a row that turned user-side meanwhile (the owner edited it in the console) is
+        refused ``not_correction`` and a summary whose members did is not flagged.
+        ``identical_ids`` (a subset of
         ``old_ids``) are rows whose content is the same as the new one: for them the
         summary rule has its one exception (same sentence, weaker source).
 
@@ -524,10 +541,10 @@ class MemoryStore(abc.ABC):
         The new row's ``supersedes``: the first flagged summary (the rewrite finds the
         user's statement through this link; what the row retired is still found through
         the retired rows' ``superseded_by``); else the first retired row; else the first
-        target refused as ``confirmed_vs_stated``; else ``link_id`` (when that row exists
-        for this user). Except for a retired row, what it points at is still valid — the
-        link only says "about the same thing"; whether a row was replaced is read from
-        that row's ``invalid_at``.
+        target refused as ``confirmed_vs_stated`` or ``not_correction``; else ``link_id``
+        (when that row exists for this user). Except for a retired row, what it points at
+        is still valid — the link only says "about the same thing"; whether a row was
+        replaced is read from that row's ``invalid_at``.
 
         B-300 D2 — ``new_item`` goes through the strict scan; when blocked,
         :class:`MemoryInjectionBlockedError` is raised before anything changes.
@@ -542,10 +559,12 @@ class MemoryStore(abc.ABC):
         old_ids: Sequence[UUID],
         anchor_id: UUID,
         candidate_origin: EffectiveOrigin,
+        needs_correction_ids: Sequence[UUID] = (),
     ) -> RetireResult:
         """B-300 redesign §7.8 — retire without writing: the candidate repeats the live
         row ``anchor_id``, and ``old_ids`` are no longer needed. Same locks and the same
-        re-judgement as :meth:`supersede`; retired rows get ``superseded_by=anchor_id``.
+        re-judgement as :meth:`supersede` (``needs_correction_ids`` included); retired rows
+        get ``superseded_by=anchor_id``.
         The anchor must be this user's currently valid row whose tier (by members) is not
         lower than the candidate's — otherwise nothing changes (``anchor_live=False``)."""
 
@@ -564,14 +583,21 @@ class MemoryStore(abc.ABC):
 
     @abc.abstractmethod
     async def flag_summary(
-        self, *, tenant_id: UUID, user_id: UUID, summary_id: UUID, statement_id: UUID
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        summary_id: UUID,
+        statement_id: UUID,
+        needs_correction: bool = False,
     ) -> UUID | None:
         """B-300 redesign §7.12 step 1, for a candidate that is **not written** because it
         repeats ``statement_id``: the user denied something the summary says, so the
         summary is flagged all the same, with the row the candidate repeats as the
         statement to rewrite by. That row must be this user's currently valid user-side
         row; the summary is judged as in :meth:`supersede` (members without a console
-        correction; one step along ``superseded_by`` when it was rewritten meanwhile).
+        correction; one step along ``superseded_by`` when it was rewritten meanwhile;
+        ``needs_correction`` as for ``needs_correction_ids``).
         The basis is recorded on the **summary** (its ``supersedes`` = ``statement_id``);
         the statement row itself is not changed. Returns the flagged summary's id, or
         ``None`` when nothing was flagged."""

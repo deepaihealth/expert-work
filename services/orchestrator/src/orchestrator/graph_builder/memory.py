@@ -198,6 +198,11 @@ _CONVERSATION_EXTRACTION = "conversation"
 # ``turn`` 与 ``event_date`` 两条(``_SCORING_TAIL`` 只有第一次用)。「方案三:折中」(用户
 # 2026-11-16):写进内容的日期不是事件日期;事件日期一条加一对对照例子。复审(11-16):当前状态写
 # 「(as of <date>)」,读数 / 计数写测得那天,编号不带日期(去重合并按内容里的日期分开读数)。
+# 第 10 版(用户 2026-11-17,测试 118.5 T39,附录 C):只有一个值或名字的行,上面看得出指什么也跳过
+# (唯一例外:接着用户自己没说完的半句);被考 / 被要求复述时的回答、「是 Z 吧?」式的回忆不算陈述;
+# ``is_correction`` 改成「同一条消息自己说出以前的某件事变了、错了或已经没有了,给不给新值都算」。
+# 对照例子用借书证(前面没用过的领域)。第一次的候选退用户一方要带更正标记
+# (:func:`_needs_correction`)。
 _USER_TEXT_EXTRACTION_HEADER = """You are a memory extraction module. The input is messages one user typed in a
 conversation, one per line, oldest first, each starting with its number in brackets.
 The other side of the conversation is not shown. Lines above the line "=== new ===" were
@@ -218,16 +223,27 @@ Only extract what these messages state on their own.
   that line was sent, so turn "this morning", "yesterday" and the like in that line into a
   date counted from it; in a line without a date, leave such words as they are. A date
   written in the content is not by itself an "event_date" (see below).
-- A message that only agrees with, answers or refers to something that is not shown here
-  (a bare "yes", "ok, do that", or a value or name with nothing saying what it is) states
-  nothing by itself: skip it, and do not guess what it was about.
+- A message that only agrees with, answers or refers to something (a bare "yes", "ok, do
+  that", or a value or name with nothing in the same message saying what it is) states
+  nothing by itself: skip it, and do not guess what it was about. Skip it even when a line
+  above shows what it refers to; the only exception is a line that finishes a sentence the
+  user left unfinished on the line just before it.
 - A value or name on its own, with nothing in the same message saying what it is, is never
   a correction and never an update of an earlier memory, even when it differs from
-  something said before.
-- A question, a hypothetical, a guess about something that is not the user's own, or a
-  repeat of what someone else said is not a statement by the user: skip it.
+  something said before. A line that finishes a sentence the user left unfinished on the
+  line just before it is not on its own: read the two lines as one message.
+- A question, a hypothetical, a guess about something that is not the user's own, a repeat
+  of what someone else said, an answer given while the user is being quizzed or tested on
+  what they remember, or a recollection put as a question ("it's Z, right?") is not a
+  statement by the user: skip it. Something the user says again of their own accord is
+  still a statement.
 - When the user states something about themselves or their own things with doubt
-  ("I think", "maybe", "not sure"), record it and keep the doubt in the content."""  # noqa: E501
+  ("I think", "maybe", "not sure"), record it and keep the doubt in the content.
+For example:
+  "[1] 考考我,看我还记不记得自己的借书证号" above "=== new ===", then "[2] L-3028 吧?" — an
+  answer while being quizzed: record nothing.
+  "[1] 我的借书证号是" above "=== new ===", then "[2] L-3082" — line 2 finishes the user's
+  own sentence: record "用户的借书证号是 L-3082" with "turn": 2."""  # noqa: E501
 
 _SCORING_TAIL = (
     "For each memory also rate two scores in [0, 1]: "
@@ -240,9 +256,17 @@ _SCORING_TAIL = (
     "~7, seasonal/plans ~90, yearly ~365, stable preferences ~1095, "
     "near-permanent identity facts ~3650. Omit or null if you cannot "
     "estimate.\n"
-    '- "is_correction": true ONLY when the same message itself says what is '
-    "being corrected and gives the new value (e.g. the user says they moved, "
-    "changed jobs, renamed a thing); otherwise false.\n"
+    '- "is_correction": true when the same message itself says that something said '
+    "earlier has changed, was wrong or no longer exists, whether or not it gives the new "
+    "value (e.g. the user says they moved, changed jobs, renamed a thing, or no longer has "
+    "it); otherwise false. A line that finishes a sentence the user left unfinished on the "
+    "line just before it is read together with that line; apart from that, a value or name "
+    "on its own never is. For example:\n"
+    '  "借书证号我之前说错了,是 L-3082" — the earlier one was wrong: true.\n'
+    '  "那张旧借书证已经注销了" — it no longer exists: true.\n'
+    '  "我的借书证号是 L-3082" — it does not say that anything changed: false.\n'
+    '  "[1] 借书证号改成了" then "[2] L-3082" — line 2 finishes a sentence that says it '
+    "changed: true.\n"
     '- "turn": the number of the line that states it.\n'
     '- "event_date": only for a value that happened or was observed on one day (a '
     "reading, a count, a payment made), that day as YYYY-MM-DD; null for anything else, "
@@ -268,7 +292,9 @@ _USER_TEXT_EXTRACTION_SYSTEM = _USER_TEXT_EXTRACTION_HEADER + "\n" + _SCORING_TA
 # 输入行(挂不上就降为「来自助手」,``memory_lines``)。回归闸门里空列表若回升,先怀疑例子 9
 # (验证码 → 空列表,设计 §11.1)。「方案三:折中」(用户 2026-11-16):事件日期那段加「写进内容的
 # 日期不是事件日期」与一对对照例子。例子 7 的读数仍是「事实」:经历只在本智能体召回,读数要各
-# 智能体共享(「去掉自检,读数共享」,用户 2026-11-16)。
+# 智能体共享(「去掉自检,读数共享」,用户 2026-11-16)。第 10 版第三轮审查 MEDIUM-A(用户 11-17
+# 「收尾,不再加程序规则」):第 2 点末加一句,与第一次同一条规矩 —— 被考、被测记不记得时的回答与
+# 「是 Z 吧?」式的回忆不记。第二次的用户确认退用户确认过的 Y 没有程序兜底,只靠这一句和 K-n。
 _CONVERSATION_EXTRACTION_SYSTEM = """You are a memory extraction module. The input is part of a conversation, one message per
 line. Each line starts with its number in brackets and a tag:
 - [user] — text the user typed, followed by the date it was sent.
@@ -295,6 +321,9 @@ Record two sorts of durable, reusable memories:
    state it, keeping any doubt the user expressed. A line that answers two questions gives
    two memories. When the user agrees to one proposal in a reply that also states other
    findings, only that proposal is the user's agreement; the findings stay the assistant's.
+   An answer given while the user is being quizzed or tested on what they remember, or a
+   recollection put as a question ("it's Z, right?"), settles nothing: record nothing for
+   it.
 When a reply changes or rejects something said earlier, set "is_correction" to true and
 write both what it was and what it is now.
 A value that happened or was observed on one day — a reading, a count, a payment made —
@@ -1533,6 +1562,9 @@ class _Decision:
     restates: tuple[str, ...] = ()
     #: 模型仍回了旧的 ``UPDATE`` / ``DELETE``(已按 ``ADD`` + 清单改写)。
     legacy: bool = False
+    #: ``restates`` 里退用户一方时仍照 ``replaces`` 查更正标记的编号(旧的 ``UPDATE``、两张都列的;
+    #: 第 10 版审查 M-1)。
+    strict: tuple[str, ...] = ()
 
 
 _NO_DECISION = _Decision()
@@ -1581,22 +1613,27 @@ def _decision(row: Mapping[str, Any]) -> _Decision | None:
     target = str(raw) if raw is not None else None
     replaces, restates = _id_list(row.get("replaces")), _id_list(row.get("restates"))
     legacy = op in ("UPDATE", "DELETE")
+    strict: tuple[str, ...] = ()
     if legacy:
-        # 旧习惯:「更新」多半是「说得更全」→ restates(保守:不触发历史行,也不触发汇总行重写);
+        # 旧习惯:「更新」多半是「说得更全」→ restates(不触发历史行,也不触发汇总行重写);
         # 「删除」→ replaces。两种都写下候选。
         if target is not None and op == "UPDATE":
-            restates = (*restates, target)
+            restates, strict = (*restates, target), (target,)
         elif target is not None:
             replaces = (*replaces, target)
         op, target = "ADD", None
     restates = tuple(dict.fromkeys(restates))
-    # 同一个编号两张里都有 → 算 restates;等于 ``target_id`` 的 → 忽略。
+    # 同一个编号两张里都有 → 算 restates;等于 ``target_id`` 的 → 忽略。旧的「更新」与两张都列的
+    # 只在历史行、汇总行打标上按 restates 算(第 9 版的保守);第 10 版起退用户一方时照 replaces 查
+    # 更正标记(``strict``,审查 M-1)—— 否则这两种回法是第一次提炼的候选绕开那条规则最宽的路。
+    strict = tuple(dict.fromkeys((*strict, *(r for r in replaces if r in restates))))
     return _Decision(
         op=op,
         target=target,
         replaces=tuple(r for r in dict.fromkeys(replaces) if r not in restates and r != target),
         restates=tuple(r for r in restates if r != target),
         legacy=legacy,
+        strict=tuple(r for r in strict if r != target),
     )
 
 
@@ -1871,6 +1908,9 @@ class _ReconcileDeps:
     before_store: BeforeStore | None
     #: 本对话里各消息的发送时间(消息 id → UTC),比先后用(:func:`_said_at`)。
     message_times: Mapping[str, datetime] = field(default_factory=dict)
+    #: 本任务的每条候选(写下时行 id 就是候选的 id)→ 它的更正标记。库里的行不存这个标记,本任务
+    #: 先写下的那几条程序还记得(历史行倒过来查用,:func:`_is_history_of`)。
+    task_corrections: Mapping[UUID, bool] = field(default_factory=dict)
 
 
 async def _refresh_if_restated(
@@ -1957,6 +1997,7 @@ async def _reconcile_and_apply(
     log_label: str,
     before_store: BeforeStore | None = None,
     message_times: Mapping[str, datetime] | None = None,
+    task_corrections: Mapping[UUID, bool] | None = None,
 ) -> _Reconciled:
     """Stream CM-7 Mem0-style extract→reconcile, B-300 redesign §7 (rev 9: the write and
     the retirements are decided separately, §7.3).
@@ -1980,7 +2021,9 @@ async def _reconcile_and_apply(
     B-300 D2 —— 新内容被写入扫描拦下的候选:不落库、什么旧记忆都不退,也**不**退回直接写入;
     交回 ``blocked`` 由调用方发审计(``positions`` = 候选在本次提炼结果里的序号)。
     """
-    deps = _ReconcileDeps(memory_store, token, log_label, before_store, message_times or {})
+    deps = _ReconcileDeps(
+        memory_store, token, log_label, before_store, message_times or {}, task_corrections or {}
+    )
     progress = _Progress()
     try:
         await _reconcile_into(progress, candidates, agent_name, positions, llm_caller, deps)
@@ -2102,10 +2145,12 @@ def _would_write(entry: _Pending, decision: _Decision, by_short_id: Mapping[str,
 
 class _Listed(NamedTuple):
     """要退的清单里的一条。``kind``:``replaces`` / ``restates`` = 模型列的;``merged`` = 模型判
-    候选与它重复、它层级更低(§7.1 第 16 行);``forced`` = 内容相同、层级更低(第 17 行)。"""
+    候选与它重复、它层级更低(§7.1 第 16 行);``forced`` = 内容相同、层级更低(第 17 行)。
+    ``strict``:``restates`` 里来自旧的 ``UPDATE`` 或两张都列的(:attr:`_Decision.strict`)。"""
 
     target: MemoryItem
     kind: str
+    strict: bool = False
 
 
 def _listed(
@@ -2130,7 +2175,7 @@ def _listed(
             if named is None:
                 unknown += 1
             elif plan.duplicate is None or named.id != plan.duplicate.id:
-                out.setdefault(named.id, _Listed(named, kind))
+                out.setdefault(named.id, _Listed(named, kind, short in decision.strict))
     return list(out.values()), unknown
 
 
@@ -2139,6 +2184,7 @@ def _retire_refusal(
     listed: _Listed,
     duplicate: MemoryItem | None,
     message_times: Mapping[str, datetime],
+    held: bool,
 ) -> str | None:
     """§7.3 第二步第 3~8 项对清单里的一条(汇总行与行锁里的重判另算);``None`` = 过。
     程序并入的(``merged`` / ``forced``)不查名次与先后:同一句话换成来源更强的那条,没有东西会丢。"""
@@ -2165,26 +2211,66 @@ def _retire_refusal(
         said = _said_at(target, item, message_times)
         if said is not None and as_utc(candidate.line_at) < said:
             return "older_line"
-    reason = may_retire(effective_origin(item), entry.tiers[target.id], target_is_summary=False)
+    # ``held``(:func:`_needs_correction`)= 第 10 版那一项管不管这一条;层级由 ``may_retire`` 看,
+    # 存储在行锁里按此刻的层级再看一次(审查 LOW-1)。
+    reason = may_retire(
+        effective_origin(item),
+        entry.tiers[target.id],
+        target_is_summary=False,
+        needs_correction=held,
+    )
     if reason is not None:
         return reason
     return "same_evidence" if _second_pass_over_first(item, target) else None
 
 
+def _needs_correction(entry: _Pending, listed: _Listed) -> bool:
+    """设计第 10 版(用户 2026-11-17,测试 118.5 T39)—— 第一次提炼的候选(只看用户的字,来源一律
+    「用户说的」)用模型列的 ``replaces`` 退用户一方(用户说的 / 用户确认,汇总行按成员算)的旧行,
+    要带更正标记(``is_correction``);否则不退、新行连着它。被考时答的一个值、回忆「是 Z 吧?」被
+    第一次读成了用户说的,一旦模型把旧值列进清单就会把用户自己说过的退掉 —— 这条路上原来没有
+    程序兜底(§6.5 第 3 点)。不受限:``restates``(说全了;旧的 ``UPDATE`` 与两张都列的除外,审查
+    M-1);程序并入的(``merged`` / ``forced``);候选与一条有效的用户一方行内容完全相同(用户把
+    记着的一句原样再说一遍,场景 e1、e2)。
+
+    这里只定这条候选对这一条**受不受管**(候选一侧与模型怎么列的);目标是不是用户一方由
+    :func:`may_retire` 看(``needs_correction``,汇总行按成员算),存储在行锁里按此刻的层级再看
+    一次 —— 目标的层级在这几秒里会变:用户在控制台改了一条来自助手的行,它就成了用户说的
+    (审查 LOW-1)。"""
+    item = entry.candidate.item
+    if (listed.kind != "replaces" and not listed.strict) or entry.candidate.is_correction:
+        return False
+    if effective_origin(item) != "user_stated":
+        return False
+    same_text = _identical_neighbors(item, entry.neighbors)
+    return not any(entry.tiers[n.id] > 0 for n in same_text)
+
+
 def _is_history_of(
-    entry: _Pending, target: MemoryItem, message_times: Mapping[str, datetime]
+    entry: _Pending,
+    target: MemoryItem,
+    message_times: Mapping[str, datetime],
+    task_corrections: Mapping[UUID, bool],
 ) -> bool:
     """§7.1 第 11 行(用户 2026-11-16「记成历史」,按审查 N-1 收窄)—— 候选更早、模型说目标让它
     「不再成立」(调用方已核:在 ``replaces`` 里、先后那一项才没过)时,候选能不能写成连到目标的
     历史行:候选是用户一方;候选那一行与目标的证据消息在同一个对话里,比的都是消息的真实发送时间、
     候选严格更早;候选不带事件日期;倒过来「目标退候选」过得了来源那一项(库里的行没有更正标记;
-    候选不带事件日期时,倒过来的事件日期那一项本来就不拒绝)。加锁时目标是否仍有效由存储查。"""
+    候选不带事件日期时,倒过来的事件日期那一项本来就不拒绝)。加锁时目标是否仍有效由存储查。
+
+    第 10 版:倒过来退的一方若是用户说的(第一次的产出),它退用户一方要带更正标记(
+    :func:`_needs_correction`)。库里的行不存这个标记;第 10 版审查 MEDIUM-2(用户 11-17 选 (b)):
+    **本任务**先写下的行程序还记得它当时带没带(``task_corrections``)—— 带了算过(场景 j:「算了,
+    还是叫松风」是更正,早说的「南枝」写成历史);没带、或不是本任务写的 → 算不过,两条并存、连线
+    (倒过来的 T39:被考时答的值先写下,早说的用户确认不会因此变成历史)。"""
     candidate = entry.candidate
     item = candidate.item
     if effective_origin(item) not in USER_SIDE_ORIGINS or item.occurred_on is not None:
         return False
     evidence = _evidence_at(target, item, message_times)
     if evidence is None or candidate.line_at is None or as_utc(candidate.line_at) >= evidence:
+        return False
+    if effective_origin(target) == "user_stated" and task_corrections.get(target.id) is not True:
         return False
     reversed_refusal = may_retire(
         effective_origin(target), origin_tier(item), target_is_summary=False
@@ -2206,6 +2292,9 @@ class _Verdict:
     one_sided: set[UUID] = field(default_factory=set)
     #: 那条内容相同、带事件日期的更弱行的日期(候选不带时带到新行上,§7.1 第 17 行)。
     carried_event_date: date | None = None
+    #: 要退 / 要打标的里受第 10 版那一项管的(:func:`_needs_correction`):存储在行锁里按此刻的
+    #: 层级重判(审查 LOW-1)。
+    needs_correction: list[UUID] = field(default_factory=list)
 
 
 def _judge_listed(
@@ -2219,7 +2308,8 @@ def _judge_listed(
         target = one.target
         if one.kind in ("replaces", "restates"):
             _record_target(one.kind, entry, target)
-        refusal = _retire_refusal(entry, one, plan.duplicate, deps.message_times)
+        held = _needs_correction(entry, one)
+        refusal = _retire_refusal(entry, one, plan.duplicate, deps.message_times, held)
         same_sentence = one.kind == "forced"
         summary_rule = may_retire(
             origin, entry.tiers[target.id], target_is_summary=True, identical=same_sentence
@@ -2236,6 +2326,8 @@ def _judge_listed(
             )
             if basis and one.kind == "replaces" and origin in USER_SIDE_ORIGINS and refusal is None:
                 verdict.flag.append(target.id)
+                if held:
+                    verdict.needs_correction.append(target.id)
             continue
         if refusal is not None:
             logger.info("%s_reconcile_not_retired reason=%s", deps.log_label, refusal)
@@ -2244,17 +2336,19 @@ def _judge_listed(
                 if (
                     one.kind == "replaces"
                     and verdict.history is None
-                    and _is_history_of(entry, target, deps.message_times)
+                    and _is_history_of(entry, target, deps.message_times, deps.task_corrections)
                 ):
                     verdict.history = target.id
                 else:
                     record_memory_reconcile(op="older_coexists")
                     verdict.link = verdict.link or target.id
-            elif refusal == "confirmed_vs_stated" and plan.write:
-                # 默认规则(§6.5):两条都有效,新行连着旧行。
+            elif refusal in ("confirmed_vs_stated", "not_correction") and plan.write:
+                # 默认规则(§6.5)与第一次的候选不带更正(第 10 版):两条都有效,新行连着旧行。
                 verdict.link = verdict.link or target.id
             continue
         verdict.retire.append(target.id)
+        if held:
+            verdict.needs_correction.append(target.id)
         if same_sentence:
             verdict.identical.append(target.id)
             if item.occurred_on is None and target.occurred_on is not None:
@@ -2328,6 +2422,7 @@ async def _store(
                 identical_ids=verdict.identical,
                 flag_summary_ids=verdict.flag,
                 link_id=verdict.link,
+                needs_correction_ids=verdict.needs_correction,
             )
         )
     except MemoryInjectionBlockedError as exc:
@@ -2426,6 +2521,7 @@ async def _settle_duplicate(
                 old_ids=verdict.retire,
                 anchor_id=duplicate.id,
                 candidate_origin=effective_origin(item),
+                needs_correction_ids=verdict.needs_correction,
             )
         )
         if not result.anchor_live:
@@ -2449,6 +2545,7 @@ async def _settle_duplicate(
                 user_id=item.user_id,
                 summary_id=summary_id,
                 statement_id=duplicate.id,
+                needs_correction=summary_id in verdict.needs_correction,
             )
         )
         if flagged is not None:
@@ -2958,6 +3055,9 @@ async def flush_messages_with_outcome(
             else [candidates]
         )
         message_times = _message_times(messages, user_text_messages or ()) if reconcile else {}
+        # 第 10 版审查 MEDIUM-2(用户 11-17 选 (b)):第二段查历史行时要知道第一段写下的行带没带
+        # 更正标记 —— 库里不存,这里按候选记下(写下时行 id 就是候选的 id)。
+        task_corrections = {c.item.id: c.is_correction for c in candidates}
         for number, stage in enumerate(stages):
             later = [(str(c.item.kind), c.item.content) for s in stages[number + 1 :] for c in s]
             retry_pairs = [(str(c.item.kind), c.item.content) for c in stage] + later
@@ -2974,6 +3074,7 @@ async def flush_messages_with_outcome(
                         log_label=log_label,
                         before_store=before_store,
                         message_times=message_times,
+                        task_corrections=task_corrections,
                     )
                 except ReconcileFailedError as exc:
                     # 重做 §7.6(PR S)—— 不再直接写入:抛给任务重试(重试会完整地再做一遍拦截与

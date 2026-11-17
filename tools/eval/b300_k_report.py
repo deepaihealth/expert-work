@@ -153,6 +153,17 @@ _NOTES: tuple[str, ...] = (
     "K-bp = K-b′、K-cp = K-c′。",  # noqa: RUF001
     "K-c′、K-n1 / K-n2、K-e2 / K-w、K-late、K-s 分开报的半边 / 形状在 counts 里(x_retired_<变体>、"  # noqa: RUF001
     "units_<变体> 等);K-n 的四种形状按场景序号轮换,10 个场景里是 3 / 3 / 2 / 2,不是各 7.5 个单元。",
+    "K-n1 / K-n2 按「候选出自哪一次提炼、带不带更正标记」分开报数(§11.2a,第 10 版):"
+    "x_retired_by_<pass1|pass2>_<correction|no_correction|unknown> 是退掉 X 的那条候选(取材料里"
+    "候选的来源与 is_correction;第一次的产出一律是用户说的),x_listed_by_<同上> 是把 X 列进清单的"
+    "候选,z_extracted_<同上> 是两次提炼原样的回复里含 Z 的记忆。读法:*_no_correction 退了 X 是"
+    "代码错,pass1_correction 退了 X 是指令没挡住(没有程序兜底);线照旧是 x_retired 0 / 30。"
+    "例外只对第一次的候选(pass1)成立,另报两种、互斥:x_retired_restates_only_by_pass1_<…> 是"
+    "候选只把 X 列在 restates 里(不是两张都列,也不是旧的 UPDATE;按设计不查更正标记);"
+    "x_retired_same_text_by_pass1_<…> 是候选旁边有一条内容相同、同类型、事件日期不冲突的用户一方"
+    "行(§7.1 第 19 行例外 ③,例如同一个错值原样答了第二次;用户 11-17 接受为已知限制;材料里没有"
+    "智能体名,是近似)。pass1_no_correction 减去这两项才是代码错;第二次的候选(pass2_*)退了 X "
+    "一律是代码错,不分这两种。",
     "近邻:除 K-late(设计写明不种)外每个单元两条,共 17 x 30 x 2 = 1,020 条;设计 §11.3 写的"
     "「900 条」是加 K-n2、K-late、K-s 之前的数。「模型列了、被程序挡下」按「回复里列了、那一行"
     "写回后仍有效」数(counts 的 listed_blocked / listed_blocked_on_neighbour),不读进程级计数。",

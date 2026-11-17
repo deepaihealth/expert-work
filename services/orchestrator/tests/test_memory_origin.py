@@ -337,14 +337,29 @@ async def test_a_denial_is_itself_stored_and_the_old_memory_links_to_it() -> Non
     assert (old.expired_at, old.superseded_by) == (None, rows["cand"].id)
 
 
-async def test_user_stated_candidate_retires_a_user_memory() -> None:
+@pytest.mark.parametrize("is_correction", [True, False], ids=["correction", "plain"])
+async def test_user_stated_candidate_retires_a_user_memory(is_correction: bool) -> None:
     store = InMemoryMemoryStore()
     target = await _seed(store, "old words", origin="user_stated", confidence=0.95)
-    llm = _LLM(user_reply=_user_candidate("new words"), ops_reply=_replaces(target.id))
+    user_reply = _reply(
+        {
+            "kind": "fact",
+            "content": "new words",
+            "confidence": 0.8,
+            "turn": 1,
+            "is_correction": is_correction,
+        }
+    )
+    llm = _LLM(user_reply=user_reply, ops_reply=_replaces(target.id))
     await _flush(llm, store, _ReportingEmbedder({"new words": _NEAR_EAST}), reconcile=True)
     rows = await _live(store)
-    # 置信度(0.8 对 0.95)不参与:同是用户说的,按先后。
-    assert set(rows) == {"new words"}
+    # 置信度(0.8 对 0.95)不参与:同是用户说的,按先后。第 10 版(用户 2026-11-17,测试 118.5
+    # T39):第一次的候选拿 replaces 退用户一方要带更正标记,不带的两条并存、新行连着旧行。
+    if is_correction:
+        assert set(rows) == {"new words"}
+    else:
+        assert set(rows) == {"old words", "new words"}
+        assert rows["new words"].supersedes == target.id
     assert rows["new words"].origin == "user_stated"
 
 

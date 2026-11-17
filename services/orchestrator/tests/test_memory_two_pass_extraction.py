@@ -279,11 +279,15 @@ async def test_prompts_carry_the_design_text() -> None:
         "conversation, one per line, oldest first, each starting with its number in brackets.\n"
         "The other side of the conversation is not shown."
     )
-    assert "a guess about something that is not the user's own, or a" in first
+    # 第 10 版(附录 C):不是陈述的清单加了被考时的回答与回忆(逐字由 test_memory_extraction_redesign
+    # 钉住)。
+    assert "a guess about something that is not the user's own, a repeat" in first
     assert "record it and keep the doubt in the content." in first
-    # 打分、有效天数、JSON 格式沿用现有文字;is_correction 一句用户 11-14 改过(设计 §4.2)。
+    # 打分、有效天数、JSON 格式沿用现有文字;is_correction 一句用户 11-14 改过(设计 §4.2),
+    # 第 10 版(用户 11-17)再改成「说出以前的某件事变了、错了或已经没有了,给不给新值都算」。
     assert '"expected_valid_days"' in first
-    assert '"is_correction": true ONLY when the same message itself says' in first
+    assert '"is_correction": true when the same message itself says that something' in first
+    assert '"is_correction": true ONLY when' not in first
     second = llm.system_of("conversation")
     # B-300 重做:第二次整段换成附录 A(逐字由 test_memory_extraction_redesign 钉住)。
     assert second.startswith(
@@ -366,11 +370,16 @@ async def test_language_is_named_from_user_text_only() -> None:
     )
     for which in ("user", "conversation"):
         system = llm.system_of(which)
+        # 末句是第 10 版(用户 11-17)加的:只有 content 按这个语言写,键名与取值照格式用英文
+        # (审查 LOW-3:只举两次都有的取值,不点第一次没有的 basis)。
         assert system.endswith(
             "## Output language\n"
             'Write the "content" of every memory in Chinese, in the same script the user '
             "writes in.\n"
-            "Keep names, codes, units and quoted terms exactly as they appear. Do not translate."
+            "Keep names, codes, units and quoted terms exactly as they appear. Do not translate.\n"
+            'Only the "content" is written in this language: write every key, and every value the\n'
+            'format above lists (such as "fact" or "episodic"), in English exactly as it shows '
+            "them."
         )
 
 

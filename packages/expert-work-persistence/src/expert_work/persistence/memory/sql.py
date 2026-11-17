@@ -229,9 +229,11 @@ async def _judge_retirements(
     old_ids: Sequence[UUID],
     candidate: EffectiveOrigin,
     identical: frozenset[UUID],
+    needs_correction: frozenset[UUID] = frozenset(),
 ) -> tuple[list[MemoryItemRow], dict[UUID, RetireRefusal]]:
     """B-300 redesign §7.8 — each target re-judged on its locked row (members are read,
-    not locked): which may be retired, and why the others may not."""
+    not locked): which may be retired, and why the others may not. ``needs_correction``:
+    targets held to the rev-10 correction rule (§7.1 row 19), judged on the tier now."""
     passed: list[MemoryItemRow] = []
     refused: dict[UUID, RetireRefusal] = {}
     for old_id in sorted(dict.fromkeys(old_ids)):
@@ -247,6 +249,7 @@ async def _judge_retirements(
             tier,
             target_is_summary=bool(row.consolidated_from),
             identical=old_id in identical,
+            needs_correction=old_id in needs_correction,
         )
         if reason is None:
             passed.append(row)
@@ -472,6 +475,7 @@ async def _flag_summaries(
     candidate: EffectiveOrigin,
     now: datetime,
     basis_id: UUID,
+    needs_correction: frozenset[UUID] = frozenset(),
 ) -> list[UUID]:
     """B-300 redesign §7.12 step 1 — mark each summary "to rewrite" and record on it the
     row to rewrite by (its own ``supersedes``); one already rewritten
@@ -489,7 +493,8 @@ async def _flag_summaries(
         if row is None or row.status != "consolidated" or not row.consolidated_from:
             continue
         tier = await origin_standing(_row_to_item(row), _member_loader(session, tenant_id, user_id))
-        if may_retire(candidate, tier, target_is_summary=False) is not None:
+        held = summary_id in needs_correction
+        if may_retire(candidate, tier, target_is_summary=False, needs_correction=held) is not None:
             continue
         row.review_flagged_at = now
         row.supersedes = basis_id
@@ -928,12 +933,14 @@ class SqlMemoryStore(MemoryStore):
         identical_ids: Sequence[UUID] = (),
         flag_summary_ids: Sequence[UUID] = (),
         link_id: UUID | None = None,
+        needs_correction_ids: Sequence[UUID] = (),
     ) -> SupersedeResult:
         hit = scan_memory_content(new_item.id, new_item.content)
         if hit is not None:
             raise MemoryInjectionBlockedError([hit])
         now = datetime.now(UTC)
         candidate = effective_origin(new_item)
+        held = frozenset(needs_correction_ids)
         content_hash = new_item.content_hash or hash_content(new_item.content)
         async with self._sf() as session:
             # One id-ordered lock over everything this call may change: the targets,
@@ -949,7 +956,7 @@ class SqlMemoryStore(MemoryStore):
             locked = await _lock_rows(session, tenant_id, user_id, sorted(wanted))
             current = await _current_ids(session, tenant_id, user_id, sorted(wanted))
             passed, refused = await _judge_retirements(
-                session, locked, current, old_ids, candidate, frozenset(identical_ids)
+                session, locked, current, old_ids, candidate, frozenset(identical_ids), held
             )
             retired = [row.id for row in passed]
             clash = await _lock_dedup_clash(
@@ -1005,8 +1012,12 @@ class SqlMemoryStore(MemoryStore):
                 candidate,
                 now,
                 new_item.id,
+                held,
             )
-            coexisting = next((i for i, r in refused.items() if r == "confirmed_vs_stated"), None)
+            coexisting = next(
+                (i for i, r in refused.items() if r in ("confirmed_vs_stated", "not_correction")),
+                None,
+            )
             linked: UUID | None = None
             if link_id is not None:
                 linked = (
@@ -1039,6 +1050,7 @@ class SqlMemoryStore(MemoryStore):
         old_ids: Sequence[UUID],
         anchor_id: UUID,
         candidate_origin: EffectiveOrigin,
+        needs_correction_ids: Sequence[UUID] = (),
     ) -> RetireResult:
         now = datetime.now(UTC)
         targets = [i for i in old_ids if i != anchor_id]
@@ -1055,7 +1067,13 @@ class SqlMemoryStore(MemoryStore):
             if tier < tier_of(candidate_origin):
                 return RetireResult(anchor_live=False)
             passed, refused = await _judge_retirements(
-                session, locked, current, targets, candidate_origin, frozenset()
+                session,
+                locked,
+                current,
+                targets,
+                candidate_origin,
+                frozenset(),
+                frozenset(needs_correction_ids),
             )
             for row in passed:
                 row.invalid_at = now
@@ -1110,7 +1128,13 @@ class SqlMemoryStore(MemoryStore):
             return _row_to_item(new_row)
 
     async def flag_summary(
-        self, *, tenant_id: UUID, user_id: UUID, summary_id: UUID, statement_id: UUID
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        summary_id: UUID,
+        statement_id: UUID,
+        needs_correction: bool = False,
     ) -> UUID | None:
         now = datetime.now(UTC)
         async with self._sf() as session:
@@ -1132,6 +1156,7 @@ class SqlMemoryStore(MemoryStore):
                 origin,
                 now,
                 statement_id,
+                frozenset({summary_id}) if needs_correction else frozenset(),
             )
             if not flagged:
                 return None

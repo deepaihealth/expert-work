@@ -145,24 +145,33 @@ def detect_user_language(texts: Iterable[str]) -> str | None:
     return None
 
 
+# B-300 重做第 10 版(用户 2026-11-17):三档末尾加一句 —— 只有 content 按这个语言写,键名与格式里
+# 列出的取值照上面的格式原样用英文(不做中文键名兼容)。两次提炼共用这一节,只点两次都有的
+# "fact" / "episodic":第一次的格式里没有 basis(审查 LOW-3)。
 _NAMED = (
     "## Output language\n"
     'Write the "content" of every memory in {language}, in the same script the user writes in.\n'
-    "Keep names, codes, units and quoted terms exactly as they appear. Do not translate."
+    "Keep names, codes, units and quoted terms exactly as they appear. Do not translate.\n"
+    'Only the "content" is written in this language: write every key, and every value the\n'
+    'format above lists (such as "fact" or "episodic"), in English exactly as it shows them.'
 )
 
 _UNNAMED = (
     "## Output language\n"
     'Write the "content" of every memory in the language the user writes in. If no user text\n'
     "is shown, use the language of the conversation. Keep names, codes, units and quoted terms\n"
-    "exactly as they appear. Do not translate."
+    "exactly as they appear. Do not translate.\n"
+    'Only the "content" is written in this language: write every key, and every value the\n'
+    'format above lists (such as "fact" or "episodic"), in English exactly as it shows them.'
 )
 
 _LATIN = (
     "## Output language\n"
     'Write the "content" of every memory in exactly the language of the user\'s own messages\n'
     "in the input — a language written in Latin letters, not Chinese, Japanese or Korean.\n"
-    "Keep names, codes, units and quoted terms exactly as they appear. Do not translate."
+    "Keep names, codes, units and quoted terms exactly as they appear. Do not translate.\n"
+    'Only the "content" is written in this language: write every key, and every value the\n'
+    'format above lists (such as "fact" or "episodic"), in English exactly as it shows them.'
 )
 
 _SUMMARY_NAMED = (

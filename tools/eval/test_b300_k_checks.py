@@ -202,6 +202,228 @@ def test_k_n_never_retires_x_and_reports_each_shape(cls: str) -> None:
         assert fine["x_retired"] is False and fine["counts"]["user_side_stored"] == 0
 
 
+_STATED, _CONFIRMED = "stated in user messages", "confirmed by the user"
+
+
+def _x(s: sc.Scenario) -> str:
+    return next(seed.content for seed in s.seeds if seed.key == "x")
+
+
+@pytest.mark.parametrize("cls", ["K-n1", "K-n2"])
+@pytest.mark.parametrize(
+    ("source", "correction", "tag"),
+    [
+        (_STATED, False, "pass1_no_correction"),  # 代码错(§7.1 第 19 行该挡)
+        (_STATED, True, "pass1_correction"),  # 指令没挡住(C1~C3)
+        (_CONFIRMED, False, "pass2_no_correction"),  # 代码错(默认规则该挡)
+        (_STATED, None, "pass1_unknown"),
+    ],
+)
+def test_k_n_reports_who_retired_x_by_pass_and_correction_mark(
+    cls: str, source: str, correction: bool | None, tag: str
+) -> None:
+    """§11.2a K-n1(第 10 版):X 被退时,按退它的候选出自哪一次提炼、带不带更正标记分开报数;
+    模型列了 X(不论退没退)另报。"""
+    s = _s(cls)
+    z = _z(s)
+    call = _reconcile(
+        0, z, [_x(s)], {"op": "ADD", "replaces": ["e0"]}, source=source, is_correction=correction
+    )
+    new = [_row("n1", z, origin=LABELS[source])]
+    retired = _check(s, new, retire={"x": "n1"}, calls=[call])["counts"]
+    assert retired[f"x_retired_by_{tag}"] == 1 and retired[f"x_listed_by_{tag}"] == 1
+    assert sum(v for k, v in retired.items() if k.startswith("x_retired_by_")) == 1
+    kept = _check(s, new, calls=[call])["counts"]
+    assert kept[f"x_listed_by_{tag}"] == 1
+    assert not any(k.startswith("x_retired_by_") for k in kept)
+
+
+def test_k_n_credits_x_to_the_candidate_it_was_retired_into() -> None:
+    """两条候选都列了 X:算给 X 的 ``superseded_by`` 指向的那一条(写下的,或它判重复的那一条);
+    谁都没列 X 却被退了 → ``unknown``。"""
+    s = _s("K-n1")
+    z, x = _z(s), _x(s)
+    first = _reconcile(
+        0, f"{z} (first)", [x], {"op": "ADD", "replaces": ["e0"]}, is_correction=False
+    )
+    second = _reconcile(
+        0, z, [x], {"op": "ADD", "restates": ["e0"]}, source=_CONFIRMED, is_correction=False
+    )
+    new = [_row("n1", z, origin="user_confirmed")]
+    got = _check(s, new, retire={"x": "n1"}, calls=[first, second])["counts"]
+    assert got["x_retired_by_pass2_no_correction"] == 1
+    assert got["x_retired_by_pass1_no_correction"] == 0
+    assert (got["x_listed_by_pass1_no_correction"], got["x_listed_by_pass2_no_correction"]) == (
+        1,
+        1,
+    )
+    anchor = _row("n2", "the row it repeats", origin="user_stated")
+    repeat = _reconcile(
+        0, z, [x, anchor["content"]], {"op": "NOOP", "target_id": "e1", "replaces": ["e0"]},
+        is_correction=True,
+    )  # fmt: skip
+    got = _check(s, [anchor], retire={"x": "n2"}, calls=[first, repeat])["counts"]
+    assert got["x_retired_by_pass1_correction"] == 1
+    assert got["x_retired_by_pass1_no_correction"] == 0
+    nobody = _check(s, new, retire={"x": "n1"})["counts"]
+    assert nobody["x_retired_by_unknown"] == 1
+
+
+def test_k_n_credits_x_to_the_first_lister_when_no_candidate_matches_the_successor() -> None:
+    """退了 X 的那一行与哪条候选都对不上(正文、判重复的那一条都不是):算给第一条列了 X 的。"""
+    s = _s("K-n1")
+    x = _x(s)
+    first = _reconcile(
+        0, "first wording", [x], {"op": "ADD", "replaces": ["e0"]}, is_correction=False
+    )
+    second = _reconcile(
+        0, "second wording", [x], {"op": "ADD", "restates": ["e0"]}, source=_CONFIRMED,
+        is_correction=False,
+    )  # fmt: skip
+    new = [_row("n1", "a row neither candidate wrote")]
+    got = _check(s, new, retire={"x": "n1"}, calls=[first, second])["counts"]
+    assert got["x_retired_by_pass1_no_correction"] == 1
+    assert (got["x_retired_by_pass2_no_correction"], got["x_retired_by_unknown"]) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("same_as", "via_exception"),
+    [
+        (_STATED, 1),  # 与一条有效的用户说的行相同(例如上一次被考时答的同一个值)
+        (_CONFIRMED, 1),  # 与一条用户确认的行相同
+        ("from the assistant", 0),  # 与助手一方的行相同:程序不放行,不在例外里
+        (None, 0),  # 没有内容相同的邻居
+    ],
+)
+def test_k_n_reports_retirements_through_the_identical_text_exception_apart(
+    same_as: str | None, via_exception: int
+) -> None:
+    """§7.1 第 19 行例外 ③(第三轮审查 MEDIUM-B,用户 11-17 接受为已知限制):第一次的候选与一条
+    有效的用户一方行内容完全相同时不查更正标记 —— 同一个错值原样再答一次就能退 X。这样退的另报
+    ``x_retired_same_text_by_<次>_<标记>``(``x_retired_by_…`` 里照样算一次),不算代码错。"""
+    s = _s("K-n1")
+    z, x = _z(s), _x(s)
+    existing = [x] if same_as is None else [x, z]
+    # X 自己也是用户说的(真实材料就是这样):只有内容相同的那条才算(审查 LOW-1)。
+    fields = {x: {"source": _STATED}, **({} if same_as is None else {z: {"source": same_as}})}
+    call = _reconcile(
+        0, z, existing, {"op": "ADD", "replaces": ["e0"]}, is_correction=False,
+        existing_fields=fields,
+    )  # fmt: skip
+    got = _check(s, [_row("n1", z)], retire={"x": "n1"}, calls=[call])["counts"]
+    assert got["x_retired_by_pass1_no_correction"] == 1
+    assert got["x_retired_same_text_by_pass1_no_correction"] == via_exception
+    kept = _check(s, [_row("n1", z)], calls=[call])["counts"]
+    assert not any(k.startswith("x_retired_same_text_by_") for k in kept)
+
+
+@pytest.mark.parametrize(
+    ("neighbour", "via_exception"),
+    [
+        ({"kind": "fact", "event_date": "2026-03-02"}, 1),  # 同类型、同一天
+        ({"kind": "fact", "event_date": None}, 1),  # 只有一边有日期:不冲突
+        ({"kind": "episodic", "event_date": "2026-03-02"}, 0),  # 不同类型 = 不同格
+        ({"kind": "fact", "event_date": "2026-03-01"}, 0),  # 两边日期不同 = 不同的两次
+    ],
+)
+def test_the_identical_text_exception_compares_kind_and_event_date(
+    neighbour: dict[str, Any], via_exception: int
+) -> None:
+    """与平台 ``_identical_neighbors`` 同一口径:同类型、两边事件日期不冲突(审查 LOW-2;材料里没有
+    智能体名,同格只比到类型 —— 近似)。"""
+    s = _s("K-n1")
+    z, x = _z(s), _x(s)
+    fields = {x: {"source": _STATED, "kind": "fact"}, z: {"source": _STATED, **neighbour}}
+    call = _reconcile(
+        0, z, [x, z], {"op": "ADD", "replaces": ["e0"]}, is_correction=False,
+        existing_fields=fields, candidate_fields={"kind": "fact", "event_date": "2026-03-02"},
+    )  # fmt: skip
+    got = _check(s, [_row("n1", z)], retire={"x": "n1"}, calls=[call])["counts"]
+    assert got["x_retired_same_text_by_pass1_no_correction"] == via_exception
+
+
+@pytest.mark.parametrize(
+    ("decision", "restates_only"),
+    [
+        ({"op": "ADD", "restates": ["e0"]}, 1),
+        ({"op": "ADD", "replaces": ["e0"]}, 0),
+        ({"op": "ADD", "replaces": ["e0"], "restates": ["e0"]}, 0),  # 两张都列:照查更正标记
+        ({"op": "UPDATE", "target_id": "e0"}, 0),  # 旧的 UPDATE:照查更正标记
+        ({"op": "DELETE", "target_id": "e0"}, 0),
+    ],
+    ids=["restates", "replaces", "both_lists", "legacy_update", "legacy_delete"],
+)
+def test_k_n_reports_retirements_by_a_restates_only_listing_apart(
+    decision: dict[str, Any], restates_only: int
+) -> None:
+    """§7.1 第 19 行:只列在 ``restates`` 里(不是两张都列,也不是旧的 ``UPDATE``)不查更正标记 ——
+    按设计,不算代码错,另报 ``x_retired_restates_only_by_…``(聚焦审查 MEDIUM)。旧操作的目标也算
+    「列了 X」。"""
+    s = _s("K-n1")
+    z, x = _z(s), _x(s)
+    call = _reconcile(
+        0, z, [x], decision, is_correction=False, existing_fields={x: {"source": _STATED}}
+    )
+    got = _check(s, [_row("n1", z)], retire={"x": "n1"}, calls=[call])["counts"]
+    assert (got["x_listed_by_pass1_no_correction"], got["x_retired_by_pass1_no_correction"]) == (
+        1,
+        1,
+    )
+    assert got["x_retired_restates_only_by_pass1_no_correction"] == restates_only
+
+
+def test_the_two_exemptions_apply_to_the_first_pass_only_and_never_twice() -> None:
+    """两种不算代码错的退法只对第一次的候选成立:第二次的用户确认退了 X(用户说的),不论只列在
+    ``restates``、还是与一条用户一方行内容相同,都是代码错(默认规则该挡,审查 LOW-3)。同一次退法
+    两种都占时只算一次(只列在 ``restates`` 的先算),``pass1_no_correction`` 减去两者才不会减多。"""
+    s = _s("K-n1")
+    z, x = _z(s), _x(s)
+    fields = {x: {"source": _STATED}, z: {"source": _STATED}}
+    second = _reconcile(
+        0, z, [x, z], {"op": "ADD", "restates": ["e0"]}, source=_CONFIRMED, is_correction=False,
+        existing_fields=fields,
+    )  # fmt: skip
+    got = _check(s, [_row("n1", z)], retire={"x": "n1"}, calls=[second])["counts"]
+    assert got["x_retired_by_pass2_no_correction"] == 1
+    assert not any(
+        k.startswith(("x_retired_same_text_by_", "x_retired_restates_only_by_")) for k in got
+    )
+    first = _reconcile(
+        0, z, [x, z], {"op": "ADD", "restates": ["e0"]}, is_correction=False,
+        existing_fields=fields,
+    )  # fmt: skip
+    got = _check(s, [_row("n1", z)], retire={"x": "n1"}, calls=[first])["counts"]
+    assert got["x_retired_restates_only_by_pass1_no_correction"] == 1
+    assert got["x_retired_same_text_by_pass1_no_correction"] == 0
+
+
+@pytest.mark.parametrize("cls", ["K-n1", "K-n2"])
+def test_k_n_reports_how_each_pass_extracted_the_non_statement(cls: str) -> None:
+    """两次提炼原样的回复里含 Z 的记忆,按哪一次、带不带更正标记分开报数(只报数)。"""
+    s = _s(cls)
+    z = _z(s)
+
+    def extraction(kind: str, *memories: dict[str, Any]) -> dict[str, Any]:
+        return {"kind": kind, "reply": json.dumps({"memories": list(memories)})}
+
+    calls = [
+        extraction("pass1", {"kind": "fact", "content": z, "is_correction": False, "turn": 2}),
+        extraction(
+            "pass2",
+            {"kind": "fact", "content": z, "is_correction": True, "turn": 2},
+            {"kind": "fact", "content": "something else entirely", "turn": 1},
+        ),
+        extraction("pass1", {"kind": "fact", "content": z, "turn": 2}),
+    ]
+    got = _check(s, [], calls=calls)["counts"]
+    assert got["z_extracted_pass1_no_correction"] == 1
+    assert got["z_extracted_pass2_correction"] == 1
+    assert got["z_extracted_pass1_unknown"] == 1
+    assert sum(v for k, v in got.items() if k.startswith("z_extracted_")) == 3
+    other = _check(_s("K-a"), [], calls=calls)["counts"]
+    assert not any(k.startswith(("z_extracted_", "x_listed_by_")) for k in other)
+
+
 def test_k_e1_retires_x_onto_the_seeded_y_without_a_new_row() -> None:
     s = _s("K-e1")
     good = _check(s, [], retire={"x": "seed-y"})
@@ -398,15 +620,32 @@ def test_k_s_restatement_must_not_mark_or_change_the_summary() -> None:
 
 
 def _reconcile(
-    index: int, content: str, existing: list[str], decision: dict[str, Any]
+    index: int,
+    content: str,
+    existing: list[str],
+    decision: dict[str, Any],
+    *,
+    source: str = "stated in user messages",
+    is_correction: bool | None = None,
+    existing_fields: dict[str, dict[str, Any]] | None = None,
+    candidate_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """``existing_fields``:邻居正文 → 它在材料里另带的字段(``source`` / ``kind`` /
+    ``event_date``);``candidate_fields``:候选另带的字段。"""
+    flag = {} if is_correction is None else {"is_correction": is_correction}
+    extra = existing_fields or {}
     material = {
         "candidates": [
             {
                 "index": index,
                 "content": content,
-                "source": "stated in user messages",
-                "existing": [{"id": f"e{n}", "content": text} for n, text in enumerate(existing)],
+                "source": source,
+                **flag,
+                **(candidate_fields or {}),
+                "existing": [
+                    {"id": f"e{n}", "content": text, **extra.get(text, {})}
+                    for n, text in enumerate(existing)
+                ],
             }
         ]
     }

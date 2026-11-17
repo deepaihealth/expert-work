@@ -79,6 +79,9 @@ Record two sorts of durable, reusable memories:
    state it, keeping any doubt the user expressed. A line that answers two questions gives
    two memories. When the user agrees to one proposal in a reply that also states other
    findings, only that proposal is the user's agreement; the findings stay the assistant's.
+   An answer given while the user is being quizzed or tested on what they remember, or a
+   recollection put as a question ("it's Z, right?"), settles nothing: record nothing for
+   it.
 When a reply changes or rejects something said earlier, set "is_correction" to true and
 write both what it was and what it is now.
 A value that happened or was observed on one day — a reading, a count, a payment made —
@@ -258,6 +261,23 @@ def test_conversation_prompt_is_appendix_a_verbatim() -> None:
     assert _CONVERSATION_EXTRACTION_SYSTEM == _APPENDIX_A
 
 
+def test_the_second_pass_records_nothing_for_a_quiz_answer() -> None:
+    """第 10 版第三轮审查 MEDIUM-A(用户 11-17「收尾,不再加程序规则」):被考时答的值换由第二次记成
+    用户确认时,程序不挡它退用户确认过的 Y —— 只靠指令。第二次与第一次同一条规矩:被考、被测记不记得
+    时的回答,和「是 Z 吧?」式的回忆,不记。"""
+    system = _flat(_CONVERSATION_EXTRACTION_SYSTEM)
+    assert (
+        "the findings stay the assistant's. An answer given while the user is being quizzed or "
+        'tested on what they remember, or a recollection put as a question ("it\'s Z, right?"), '
+        "settles nothing: record nothing for it. When a reply changes" in system
+    )
+    first = _flat(_USER_TEXT_EXTRACTION_SYSTEM)
+    assert (
+        "an answer given while the user is being quizzed or tested on what they remember, or a "
+        'recollection put as a question ("it\'s Z, right?")' in first
+    )
+
+
 def test_conversation_prompt_keeps_the_secret_rule_and_drops_the_negative_rules() -> None:
     system = _flat(_CONVERSATION_EXTRACTION_SYSTEM)
     assert (
@@ -307,10 +327,20 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
     # 复审 MEDIUM(11-16):「(as of <date>)」只给当前状态;读数写测得那天;编号不带日期。
     assert 'such as "(as of <date>)", so it is not later taken' not in system
     assert "Write it with the date or time it refers to, so it is not later taken" not in system
+    # 第 10 版(用户 2026-11-17,测试 118.5 T39):给不给新值都算;只有一个值或名字的永远不是;
+    # 一组借书证的对照例子。
+    assert '"is_correction": true ONLY when' not in system
     assert (
-        '- "is_correction": true ONLY when the same message itself says what is being corrected '
-        "and gives the new value (e.g. the user says they moved, changed jobs, renamed a thing); "
-        'otherwise false. - "turn": the number of the line that states it. - "event_date": only '
+        '- "is_correction": true when the same message itself says that something said earlier '
+        "has changed, was wrong or no longer exists, whether or not it gives the new value (e.g. "
+        "the user says they moved, changed jobs, renamed a thing, or no longer has it); otherwise "
+        "false. A line that finishes a sentence the user left unfinished on the line just before "
+        "it is read together with that line; apart from that, a value or name on its own never "
+        'is. For example: "借书证号我之前说错了,是 L-3082" — the earlier one was wrong: true. '
+        '"那张旧借书证已经注销了" — it no longer exists: true. "我的借书证号是 L-3082" — it does '
+        'not say that anything changed: false. "[1] 借书证号改成了" then "[2] L-3082" — line 2 '
+        "finishes a sentence that says it changed: true. "
+        '- "turn": the number of the line that states it. - "event_date": only '
         "for a value that happened or was observed on one day (a reading, a count, a payment "
         "made), that day as YYYY-MM-DD; null for anything else, including an id, a number that "
         "names something, or a current status, even when its date is written in the content. "
@@ -330,12 +360,39 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
         "which are never recorded." in system
     )
     # 第 9 版(附录 C):猜测别人的事照旧跳过;关于用户自己的事、带着犹豫说的,记下并把犹豫写进内容。
+    # 第 10 版(附录 C):被考 / 被要求复述时的回答、「是 Z 吧?」式的回忆也不算陈述;只有一个值或名字
+    # 的行,上面看得出指什么也跳过,唯一例外是接着用户自己没说完的半句;一对借书证的对照例子。
     assert (
-        "- A question, a hypothetical, a guess about something that is not the user's own, or a "
-        "repeat of what someone else said is not a statement by the user: skip it. "
-        "- When the user states something about themselves or their own things with doubt "
-        '("I think", "maybe", "not sure"), record it and keep the doubt in the content.' in system
+        '- A message that only agrees with, answers or refers to something (a bare "yes", '
+        '"ok, do that", or a value or name with nothing in the same message saying what it is) '
+        "states nothing by itself: skip it, and do not guess what it was about. Skip it even "
+        "when a line above shows what it refers to; the only exception is a line that finishes a "
+        "sentence the user left unfinished on the line just before it. - A value or name on its "
+        "own, with nothing in the same message saying what it is, is never a correction and never "
+        "an update of an earlier memory, even when it differs from something said before. A line "
+        "that finishes a sentence the user left unfinished on the line just before it is not on "
+        "its own: read the two lines as one message. - A question" in system
     )
+    assert "refers to something that is not shown here" not in system
+    assert (
+        "- A question, a hypothetical, a guess about something that is not the user's own, a "
+        "repeat of what someone else said, an answer given while the user is being quizzed or "
+        'tested on what they remember, or a recollection put as a question ("it\'s Z, right?") '
+        "is not a statement by the user: skip it. Something the user says again of their own "
+        "accord is still a statement. "
+        "- When the user states something about themselves or their own things with doubt "
+        '("I think", "maybe", "not sure"), record it and keep the doubt in the content. '
+        'For example: "[1] 考考我,看我还记不记得自己的借书证号" above "=== new ===", then "[2] '
+        'L-3028 吧?" — an answer while being quizzed: record nothing. "[1] 我的借书证号是" above '
+        '"=== new ===", then "[2] L-3082" — line 2 finishes the user\'s own sentence: record '
+        '"用户的借书证号是 L-3082" with "turn": 2.' in system
+    )
+
+
+@pytest.mark.parametrize("language", ["Chinese", "English", None])
+def test_the_first_pass_is_never_told_about_basis(language: str | None) -> None:
+    """审查 LOW-3:第一次的格式里没有 ``basis``;两次共用的语言节也不点它的名。"""
+    assert "basis" not in memory_module._extract_system("user", language)
 
 
 @pytest.mark.parametrize("which", ["user", "conversation"])

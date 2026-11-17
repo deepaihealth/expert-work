@@ -550,6 +550,10 @@ def record_memory_reconcile(*, op: str) -> None:
     user-side memory), ``retire_refused_corrected`` (the memory was corrected in the
     console), ``retire_refused_confirmed_vs_stated`` (a user-confirmed candidate against
     a user-stated memory — the default rule; the new row links to the old one),
+    ``retire_refused_not_correction`` (redesign rev 10: a first-pass — user-stated —
+    candidate listed a user-stated or user-confirmed memory in ``replaces`` without
+    ``is_correction``; the new row links to the old one; ``restates``, rows the program
+    folds in and a candidate whose text equals a live user-side memory are not held to it),
     ``retire_refused_summary`` (a summary row), ``retire_target_gone`` (deleted, retired
     or folded meanwhile). ``retire_unknown_id`` = an id in the model's lists that is not
     one of this candidate's neighbours.
