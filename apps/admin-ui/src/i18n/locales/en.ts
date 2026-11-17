@@ -2710,6 +2710,36 @@ export interface TranslationKeys {
     override_btn: string;
     delete_override_confirm: string;
     edit_override_modal_title: string;
+    col_base_url: string;
+    base_url_official: string;
+    base_url_unverified: string;
+    base_url_label: string;
+    base_url_hint: string;
+    base_url_key_hint_new: string;
+    base_url_needs_new_key: string;
+    base_url_err_BASE_URL_INVALID: string;
+    base_url_err_BASE_URL_BLOCKED_HOST: string;
+    base_url_err_BASE_URL_UNRESOLVABLE: string;
+    base_url_err_BASE_URL_NOT_SUPPORTED: string;
+    base_url_err_BASE_URL_NEEDS_NEW_KEY: string;
+    base_url_err_SECRET_NOT_FOUND: string;
+    base_url_err_BASE_URL_CHECK_UNAVAILABLE: string;
+    base_url_err_FORMAT_includes_api_path: string;
+    base_url_err_FORMAT_version_segment: string;
+    base_url_err_FORMAT_version_segment_required: string;
+    check_failed: string;
+    check_failed_interface: string;
+    check_reason_unreachable: string;
+    check_reason_auth_rejected: string;
+    check_reason_timeout: string;
+    check_reason_vendor_error: string;
+    check_reason_with_status: string;
+    check_interface_chat: string;
+    check_interface_embedding: string;
+    check_interface_rerank: string;
+    sentence_separator: string;
+    force_save_label: string;
+    force_save_hint: string;
     embedding_heading: string;
     embedding_current: string;
     embedding_unconfigured: string;
@@ -6782,6 +6812,37 @@ const en: TranslationKeys = {
     delete_override_confirm:
       "Remove this override? The tenant falls back to the platform credential.",
     edit_override_modal_title: "Edit tenant override for {{key}}",
+    // B-308 — optional request address on a provider credential.
+    col_base_url: "Request address",
+    base_url_official: "Official",
+    base_url_unverified: "Check failed",
+    base_url_label: "Request address (optional)",
+    base_url_hint: "Leave empty to use the official address. Enter the address up to the version number only, e.g. https://your-host/v1 — the platform appends the API path. Public https addresses only; do not put a key in the address. Every call made with this key (chat, images, embeddings, rerank, document recognition, etc.) goes here. When you change the address, also enter this service's key. Saving makes one real call with this key to test it. If this address is unreachable, times out or errors, the platform does not switch to another key of the same provider; it switches to the agent's fallback model. If the address returns an error such as 400 / 404, or an answer breaks off midway, that turn fails without switching.",
+    base_url_key_hint_new: "Enter this service's key.",
+    base_url_needs_new_key: "To change the address, also enter this service's key.",
+    base_url_err_BASE_URL_INVALID: "The address is not valid. Check it — for example: it must start with https; no spaces or backslashes; no user name or password, ? or #; no full-width or invisible characters in the host name; not too long.",
+    base_url_err_BASE_URL_BLOCKED_HOST: "This address is not allowed: only public https addresses are supported — not internal, local, cloud metadata or in-cluster addresses.",
+    base_url_err_BASE_URL_UNRESOLVABLE: "The address's host name could not be found. Check the spelling.",
+    base_url_err_BASE_URL_NOT_SUPPORTED: "This provider does not take a request address.",
+    base_url_err_BASE_URL_NEEDS_NEW_KEY: "To change the address, also enter this service's key.",
+    base_url_err_SECRET_NOT_FOUND: "This reference was not found in the secret store. Check it, or paste the key.",
+    base_url_err_BASE_URL_CHECK_UNAVAILABLE: "The address cannot be tested: this provider has no available chat model in the model catalog. Enable one there, then save again.",
+    base_url_err_FORMAT_includes_api_path: "Enter the address up to the version number only, without the API path (such as /chat/completions) — the platform appends it. For example {{example}}",
+    base_url_err_FORMAT_version_segment: "This provider's address must end with {{suffix}}, for example {{example}}",
+    base_url_err_FORMAT_version_segment_required: "This provider's address must end with {{suffix}} (the vendor's documentation may leave it out; include it here), for example {{example}}",
+    check_failed: "The connectivity check failed: {{reason}}",
+    check_failed_interface: "tested the {{interface}} interface",
+    check_reason_unreachable: "unreachable",
+    check_reason_auth_rejected: "key rejected",
+    check_reason_timeout: "timed out",
+    check_reason_vendor_error: "provider error",
+    check_reason_with_status: "{{reason}} ({{status}})",
+    check_interface_chat: "chat",
+    check_interface_embedding: "embeddings",
+    check_interface_rerank: "rerank",
+    sentence_separator: "; ",
+    force_save_label: "Save anyway",
+    force_save_hint: "Tick, then click Save: the row is saved although the check failed and is marked \"Check failed\" until a later check passes.",
     embedding_heading: "Embedding & Rerank",
     embedding_current: "Current",
     embedding_unconfigured:

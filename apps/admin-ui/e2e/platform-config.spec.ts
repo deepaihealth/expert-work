@@ -163,6 +163,124 @@ test("system_admin adds a key — PUT to the key endpoint carries value + priori
   expect(body.secret_ref).toBeUndefined();
 });
 
+// B-308 —— 请求地址:列表只显示主机、编辑弹窗带地址、连通测试失败给「仍然保存」。
+const B308_VIEW = {
+  success: true,
+  data: {
+    providers: [
+      {
+        provider: "openai",
+        source: "db",
+        secret_ref: "secret://expert-work/platform/llm/openai",
+        enabled: true,
+        official_base_url: "https://api.openai.com/v1",
+        keys: [
+          {
+            key_id: "default",
+            secret_ref: "secret://expert-work/platform/llm/openai",
+            enabled: true,
+            priority: 100,
+            base_url: null,
+            base_url_unverified: false,
+          },
+          {
+            key_id: "relay",
+            secret_ref: "secret://expert-work/platform/llm/openai/relay",
+            enabled: true,
+            priority: 200,
+            base_url: "https://relay.example.com/team-token/v1",
+            base_url_unverified: true,
+          },
+        ],
+        used_by_agents: 1,
+        tenant_override_count: 0,
+      },
+    ],
+    tools: [],
+  },
+  error: null,
+};
+
+test("system_admin sets a request address — check fails, then 'save anyway' resends with force_save (B-308)", async ({
+  page,
+}) => {
+  await page.route("**/v1/me", async (route) => {
+    await route.fulfill({ json: SYS_ADMIN_ME });
+  });
+  await page.route("**/v1/platform/credentials", async (route) => {
+    await route.fulfill({ json: B308_VIEW });
+  });
+  const bodies: Record<string, unknown>[] = [];
+  await page.route(
+    "**/v1/platform/credentials/providers/openai/keys/default",
+    async (route) => {
+      bodies.push(route.request().postDataJSON());
+      if (bodies.length === 1) {
+        await route.fulfill({
+          status: 422,
+          json: {
+            detail: {
+              code: "BASE_URL_CHECK_FAILED",
+              message: "the connectivity check of the request address failed",
+              reason: "vendor_error",
+              status: 502,
+              interface: "chat",
+            },
+          },
+        });
+        return;
+      }
+      await route.fulfill({
+        json: {
+          success: true,
+          data: {
+            ...B308_VIEW.data.providers[0].keys[0],
+            base_url: "https://relay.example.com/v1",
+            base_url_unverified: true,
+          },
+          error: null,
+        },
+      });
+    },
+  );
+  await login(page);
+  await page.goto("/settings/platform");
+
+  await page.getByRole("button", { name: "Expand row" }).click();
+  // The list shows the host and the "check failed" marker, never the path.
+  const relayCell = page.getByTestId("pc-key-base-url-openai-relay");
+  await expect(relayCell).toContainText("relay.example.com");
+  await expect(relayCell).toContainText("Check failed");
+  await expect(relayCell).not.toContainText("team-token");
+  await expect(page.getByTestId("pc-key-base-url-openai-default")).toContainText(
+    "Official",
+  );
+
+  await page.getByTestId("pc-key-edit-openai-default").click();
+  const address = page.getByTestId("pc-edit-base-url");
+  await expect(address).toBeVisible();
+  await expect(address).toHaveAttribute("placeholder", "https://api.openai.com/v1");
+  await address.fill("https://relay.example.com/v1");
+  await expect(page.getByTestId("pc-edit-key-hint")).toContainText(
+    "also enter this service's key",
+  );
+  await page.getByTestId("pc-edit-value").fill("sk-relay-KEY");
+  await page.getByRole("button", { name: "Save" }).click();
+
+  const failed = page.getByTestId("pc-edit-check-failed");
+  await expect(failed).toContainText("provider error (502)");
+  await expect(failed).toContainText("chat");
+  await expectNoA11yViolations(page, "/settings/platform (check failed)");
+  expect(bodies[0].base_url).toBe("https://relay.example.com/v1");
+  expect(bodies[0].force_save).toBeUndefined();
+
+  await page.getByTestId("pc-edit-force-save").check();
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect.poll(() => bodies.length).toBe(2);
+  expect(bodies[1].force_save).toBe(true);
+  expect(bodies[1].value).toBe("sk-relay-KEY");
+});
+
 test("non-admin sees system-admin-only notice + passes axe", async ({
   page,
 }) => {

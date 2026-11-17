@@ -18,6 +18,10 @@ export interface PlatformProviderKey {
   secret_ref: string;
   enabled: boolean;
   priority: number;
+  /** B-308 — this key's request address (normalised); ``null`` = official. */
+  base_url?: string | null;
+  /** B-308 — saved with "save anyway" after a failed connectivity check. */
+  base_url_unverified?: boolean;
 }
 
 /**
@@ -51,6 +55,9 @@ export interface PlatformProviderRow {
   /** B-51 — platform-side dependencies. Absent on the write endpoints' rows. */
   platform_uses?: PlatformProviderUse[];
   tenant_override_count: number;
+  /** B-308 — the provider's official root address (the address field's
+   *  placeholder); ``null`` when the provider takes no request address. */
+  official_base_url?: string | null;
 }
 
 export interface PlatformToolRow {
@@ -79,6 +86,14 @@ export interface PlatformSecretUpsertBody {
   enabled: boolean;
   /** Stream Y-MK — failover order within a provider (lower tried first). */
   priority?: number;
+  /**
+   * B-308 — provider writes only. Left out = keep the row's address (an
+   * enable toggle must leave it out); ``null`` = back to the official
+   * address; a non-empty value is validated and tested on every save.
+   */
+  base_url?: string | null;
+  /** B-308 — "save anyway" after a failed connectivity check. */
+  force_save?: boolean;
 }
 
 export async function getPlatformCredentials(): Promise<PlatformCredentialsView> {
@@ -163,6 +178,10 @@ export interface TenantOverrideRow {
   created_at: string;
   updated_at: string;
   updated_by: string;
+  /** B-308 — provider overrides only; ``null`` = official (never inherits a
+   *  platform key's address). */
+  base_url?: string | null;
+  base_url_unverified?: boolean;
 }
 
 export interface TenantProviderEntry {
@@ -170,6 +189,8 @@ export interface TenantProviderEntry {
   override: (TenantOverrideRow & { provider: string }) | null;
   effective_source: TenantEffectiveSource;
   effective_ref: string | null;
+  /** B-308 — see ``PlatformProviderRow.official_base_url``. */
+  official_base_url?: string | null;
 }
 
 export interface TenantToolEntry {
