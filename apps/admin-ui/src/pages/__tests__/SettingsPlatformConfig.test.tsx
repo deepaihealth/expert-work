@@ -22,7 +22,7 @@ import type {
   TenantCredentialsView,
 } from "../../api/platform_config";
 import { AuthProvider } from "../../auth/AuthContext";
-import { setStoredToken } from "../../api/client";
+import { ApiError, setStoredToken } from "../../api/client";
 
 const TENANT = "00000000-0000-0000-0000-00000000acce";
 
@@ -389,6 +389,465 @@ describe("SettingsPlatformConfig — platform credential visibility (B-51)", () 
     );
     expect(screen.getByTestId("pc-platform-uses-anthropic")).toHaveTextContent(
       "2 platform features",
+    );
+  });
+});
+
+// ─── B-308 请求地址 ─────────────────────────────────────────────────────
+
+const PROXY = "https://relay.example.com:8443/team-token/v1";
+
+function b308View(): PlatformCredentialsView {
+  return {
+    providers: [
+      providerRow({
+        provider: "openai",
+        source: "db",
+        secret_ref: "secret://expert-work/platform/llm/openai",
+        enabled: true,
+        official_base_url: "https://api.openai.com/v1",
+        keys: [
+          {
+            key_id: "default",
+            secret_ref: "secret://expert-work/platform/llm/openai",
+            enabled: true,
+            priority: 100,
+            base_url: PROXY,
+            base_url_unverified: true,
+          },
+          {
+            key_id: "acct-b",
+            secret_ref: "kms://platform/openai-b",
+            enabled: true,
+            priority: 200,
+            base_url: null,
+            base_url_unverified: false,
+          },
+        ],
+      }),
+      providerRow({
+        provider: "qwen",
+        source: "db",
+        secret_ref: "kms://platform/qwen",
+        enabled: true,
+        official_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        keys: [
+          {
+            key_id: "default",
+            secret_ref: "kms://platform/qwen",
+            enabled: true,
+            priority: 100,
+            base_url: null,
+            base_url_unverified: false,
+          },
+        ],
+      }),
+      providerRow({
+        provider: "azure",
+        source: "db",
+        secret_ref: "kms://platform/azure",
+        enabled: true,
+        official_base_url: null,
+        keys: [
+          {
+            key_id: "default",
+            secret_ref: "kms://platform/azure",
+            enabled: true,
+            priority: 100,
+            base_url: null,
+            base_url_unverified: false,
+          },
+        ],
+      }),
+    ],
+    tools: [],
+  };
+}
+
+const SAVED_KEY = {
+  key_id: "default",
+  secret_ref: "secret://x",
+  enabled: true,
+  priority: 100,
+};
+
+async function expandProvider(
+  user: ReturnType<typeof userEvent.setup>,
+  provider: string,
+) {
+  const table = await screen.findByTestId("pc-providers-table");
+  const row = within(table)
+    .getAllByRole("row")
+    .find((r) => within(r).queryByText(provider, { exact: true }) !== null);
+  await user.click(
+    within(row!).getByRole("button", { name: /expand|展开/i }),
+  );
+  return screen.findByTestId(`pc-keys-table-${provider}`);
+}
+
+async function openKeyEdit(
+  user: ReturnType<typeof userEvent.setup>,
+  provider: string,
+  keyId: string,
+) {
+  await expandProvider(user, provider);
+  await user.click(screen.getByTestId(`pc-key-edit-${provider}-${keyId}`));
+  await screen.findByTestId("pc-edit-modal");
+}
+
+describe("SettingsPlatformConfig — request address (B-308)", () => {
+  it("shows 'Official' or only the host, with the check-failed marker", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(b308View().providers);
+    await expandProvider(user, "openai");
+    const custom = screen.getByTestId("pc-key-base-url-openai-default");
+    expect(custom).toHaveTextContent("relay.example.com:8443");
+    expect(custom).toHaveTextContent("Check failed");
+    // The path may carry a token: the list never shows it.
+    expect(custom).not.toHaveTextContent("team-token");
+    const official = screen.getByTestId("pc-key-base-url-openai-acct-b");
+    expect(official).toHaveTextContent("Official");
+    expect(official).not.toHaveTextContent("Check failed");
+  });
+
+  it("the enable toggle leaves the address out of the request", async () => {
+    const user = userEvent.setup();
+    const upsertKey = vi
+      .spyOn(sdk, "upsertPlatformProviderKey")
+      .mockResolvedValue(SAVED_KEY);
+    renderWithProviders(b308View().providers);
+    await expandProvider(user, "openai");
+    await user.click(screen.getByTestId("pc-key-toggle-openai-default"));
+    await waitFor(() => expect(upsertKey).toHaveBeenCalledTimes(1));
+    const body = upsertKey.mock.calls[0][2];
+    expect(body).toEqual({
+      secret_ref: "secret://expert-work/platform/llm/openai",
+      enabled: false,
+      priority: 100,
+    });
+    expect("base_url" in body).toBe(false);
+  });
+
+  it("prefills the address and leaves it out when unchanged", async () => {
+    const user = userEvent.setup();
+    const upsertKey = vi
+      .spyOn(sdk, "upsertPlatformProviderKey")
+      .mockResolvedValue(SAVED_KEY);
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "openai", "default");
+    expect(screen.getByTestId("pc-edit-base-url")).toHaveValue(PROXY);
+    await user.type(screen.getByTestId("pc-edit-value"), "sk-relay");
+    await user.click(screen.getByText("Save"));
+    await waitFor(() => expect(upsertKey).toHaveBeenCalledTimes(1));
+    const body = upsertKey.mock.calls[0][2];
+    expect(body.value).toBe("sk-relay");
+    expect("base_url" in body).toBe(false);
+    expect("force_save" in body).toBe(false);
+  });
+
+  it("uses the provider's official root as the placeholder (qwen keeps /compatible-mode/v1)", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "qwen", "default");
+    expect(screen.getByTestId("pc-edit-base-url")).toHaveAttribute(
+      "placeholder",
+      "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    );
+  });
+
+  it("hides the address for a provider that takes none", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "azure", "default");
+    expect(screen.queryByTestId("pc-edit-base-url")).toBeNull();
+    // The list shows a dash instead of "Official" for such a provider.
+    expect(screen.queryByTestId("pc-key-base-url-azure-default")).toBeNull();
+  });
+
+  it("a changed address with the same reference is stopped before sending", async () => {
+    const user = userEvent.setup();
+    const upsertKey = vi.spyOn(sdk, "upsertPlatformProviderKey");
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "openai", "acct-b");
+    await user.click(screen.getByText("Reference (URI)"));
+    const address = screen.getByTestId("pc-edit-base-url");
+    await user.type(address, "https://relay.example.com/v1");
+    expect(await screen.findByTestId("pc-edit-key-hint")).toHaveTextContent(
+      "To change the address, also enter this service's key.",
+    );
+    await user.click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(
+          "To change the address, also enter this service's key.",
+        ).length,
+      ).toBeGreaterThan(1),
+    );
+    expect(upsertKey).not.toHaveBeenCalled();
+  });
+
+  it("a changed address with an empty key box says to enter the key", async () => {
+    const user = userEvent.setup();
+    const upsertKey = vi.spyOn(sdk, "upsertPlatformProviderKey");
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "openai", "acct-b");
+    await user.type(
+      screen.getByTestId("pc-edit-base-url"),
+      "https://relay.example.com/v1",
+    );
+    await user.click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(
+          "To change the address, also enter this service's key.",
+        ).length,
+      ).toBeGreaterThan(1),
+    );
+    expect(upsertKey).not.toHaveBeenCalled();
+  });
+
+  it("sends a changed address with the pasted key, and null when cleared", async () => {
+    const user = userEvent.setup();
+    const upsertKey = vi
+      .spyOn(sdk, "upsertPlatformProviderKey")
+      .mockResolvedValue(SAVED_KEY);
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "openai", "acct-b");
+    await user.type(
+      screen.getByTestId("pc-edit-base-url"),
+      "  https://relay.example.com/v1  ",
+    );
+    await user.type(screen.getByTestId("pc-edit-value"), "sk-relay");
+    await user.click(screen.getByText("Save"));
+    await waitFor(() => expect(upsertKey).toHaveBeenCalledTimes(1));
+    expect(upsertKey.mock.calls[0][2]).toEqual(
+      expect.objectContaining({
+        value: "sk-relay",
+        base_url: "https://relay.example.com/v1",
+      }),
+    );
+
+    // Clearing back to official needs no new key — sent as null. (The row
+    // is still expanded.)
+    await user.click(screen.getByTestId("pc-key-edit-openai-default"));
+    await screen.findByTestId("pc-edit-modal");
+    await user.clear(screen.getByTestId("pc-edit-base-url"));
+    await user.click(screen.getByText("Reference (URI)"));
+    await user.click(screen.getByText("Save"));
+    await waitFor(() => expect(upsertKey).toHaveBeenCalledTimes(2));
+    expect(upsertKey.mock.calls[1][2]).toEqual(
+      expect.objectContaining({
+        secret_ref: "secret://expert-work/platform/llm/openai",
+        base_url: null,
+      }),
+    );
+  });
+
+  it("a failed check explains why and offers 'save anyway' (resent with force_save)", async () => {
+    const user = userEvent.setup();
+    const upsertKey = vi
+      .spyOn(sdk, "upsertPlatformProviderKey")
+      .mockRejectedValueOnce(
+        new ApiError("check failed", "BASE_URL_CHECK_FAILED", 422, {
+          code: "BASE_URL_CHECK_FAILED",
+          reason: "vendor_error",
+          status: 502,
+          interface: "chat",
+        }),
+      )
+      .mockResolvedValueOnce(SAVED_KEY);
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "openai", "acct-b");
+    await user.type(
+      screen.getByTestId("pc-edit-base-url"),
+      "https://relay.example.com/v1",
+    );
+    await user.type(screen.getByTestId("pc-edit-value"), "sk-relay");
+    await user.click(screen.getByText("Save"));
+    const failed = await screen.findByTestId("pc-edit-check-failed");
+    expect(failed).toHaveTextContent("provider error (502)");
+    expect(failed).toHaveTextContent("chat");
+    expect("force_save" in upsertKey.mock.calls[0][2]).toBe(false);
+
+    await user.click(screen.getByTestId("pc-edit-force-save"));
+    await user.click(screen.getByText("Save"));
+    await waitFor(() => expect(upsertKey).toHaveBeenCalledTimes(2));
+    expect(upsertKey.mock.calls[1][2]).toEqual(
+      expect.objectContaining({
+        force_save: true,
+        base_url: "https://relay.example.com/v1",
+      }),
+    );
+  });
+
+  it.each([
+    [
+      "BASE_URL_FORMAT",
+      {
+        hint: "version_segment",
+        expected_suffix: "/compatible-mode/v1",
+        example: "https://your-host/compatible-mode/v1",
+      },
+      "must end with /compatible-mode/v1, for example https://your-host/compatible-mode/v1",
+    ],
+    [
+      "BASE_URL_FORMAT",
+      {
+        hint: "includes_api_path",
+        expected_suffix: "/v1",
+        example: "https://your-host/v1",
+      },
+      "without the API path",
+    ],
+    ["BASE_URL_BLOCKED_HOST", {}, "only public https addresses"],
+    ["BASE_URL_INVALID", {}, "must start with https"],
+    ["BASE_URL_UNRESOLVABLE", {}, "could not be found"],
+    ["BASE_URL_NEEDS_NEW_KEY", {}, "also enter this service's key"],
+    ["SECRET_NOT_FOUND", {}, "not found in the secret store"],
+    ["BASE_URL_CHECK_UNAVAILABLE", {}, "no available chat model"],
+  ])(
+    "%s is explained in plain words, without 'save anyway'",
+    async (code, extra, text) => {
+      const user = userEvent.setup();
+      const upsertKey = vi
+        .spyOn(sdk, "upsertPlatformProviderKey")
+        .mockRejectedValue(
+          new ApiError("refused", code, 422, { code, ...extra }),
+        );
+      renderWithProviders(b308View().providers);
+      await openKeyEdit(user, "openai", "acct-b");
+      await user.type(
+        screen.getByTestId("pc-edit-base-url"),
+        "https://relay.example.com/v1",
+      );
+      await user.type(screen.getByTestId("pc-edit-value"), "sk-relay");
+      await user.click(screen.getByText("Save"));
+      await waitFor(() => expect(upsertKey).toHaveBeenCalled());
+      expect(await screen.findByTestId("pc-edit-error")).toHaveTextContent(
+        text,
+      );
+      expect(screen.queryByTestId("pc-edit-force-save")).toBeNull();
+    },
+  );
+
+  it("a new key with an address asks for this service's key", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(b308View().providers);
+    await screen.findByTestId("pc-providers-table");
+    await user.click(screen.getByTestId("pc-add-key-openai"));
+    await screen.findByTestId("pc-edit-modal");
+    expect(screen.queryByTestId("pc-edit-key-hint")).toBeNull();
+    await user.type(
+      screen.getByTestId("pc-edit-base-url"),
+      "https://relay.example.com/v1",
+    );
+    expect(await screen.findByTestId("pc-edit-key-hint")).toHaveTextContent(
+      "Enter this service's key.",
+    );
+  });
+});
+
+describe("SettingsPlatformConfig — tenant override request address (B-308)", () => {
+  function renderTenant(view: TenantCredentialsView) {
+    setStoredToken(
+      makeJwt({ sub: "u1", tenant_id: TENANT, roles: ["system_admin"] }),
+    );
+    vi.spyOn(sdk, "getPlatformCredentials").mockResolvedValue(b308View());
+    vi.spyOn(tenantsSdk, "listTenants").mockResolvedValue([
+      {
+        tenant_id: TENANT,
+        display_name: "Acme",
+        plan: "pro",
+        created_at: "2026-06-01T00:00:00Z",
+        status: "active",
+      },
+    ] as Awaited<ReturnType<typeof tenantsSdk.listTenants>>);
+    vi.spyOn(sdk, "getTenantCredentials").mockResolvedValue(view);
+    return render(
+      <MemoryRouter>
+        <AuthProvider>
+          <App>
+            <SettingsPlatformConfig />
+          </App>
+        </AuthProvider>
+      </MemoryRouter>,
+    );
+  }
+
+  const OVERRIDE = {
+    tenant_id: TENANT,
+    provider: "openai",
+    secret_ref: "kms://tenant/openai",
+    enabled: true,
+    created_at: "2026-11-01T00:00:00Z",
+    updated_at: "2026-11-01T00:00:00Z",
+    updated_by: "admin",
+    base_url: "https://relay.example.com/secret-path/v1",
+    base_url_unverified: false,
+  };
+
+  it("shows the override's host in its own column", async () => {
+    const user = userEvent.setup();
+    renderTenant({
+      tenant_id: TENANT,
+      providers: [
+        {
+          provider: "openai",
+          override: OVERRIDE,
+          effective_source: "tenant",
+          effective_ref: "kms://tenant/openai",
+          official_base_url: "https://api.openai.com/v1",
+        },
+      ],
+      tools: [],
+    });
+    await screen.findByTestId("pc-providers-table");
+    await openDrawerAndPickTenant(user);
+    const cell = await screen.findByTestId("pc-tenant-base-url-openai");
+    expect(cell).toHaveTextContent("relay.example.com");
+    expect(cell).not.toHaveTextContent("secret-path");
+  });
+
+  it("a new override with an address hints for the key and sends the address", async () => {
+    const user = userEvent.setup();
+    const upsert = vi
+      .spyOn(sdk, "upsertTenantProviderOverride")
+      .mockResolvedValue(OVERRIDE);
+    renderTenant({
+      tenant_id: TENANT,
+      providers: [
+        {
+          provider: "openai",
+          override: null,
+          effective_source: "db",
+          effective_ref: "secret://expert-work/platform/llm/openai",
+          official_base_url: "https://api.openai.com/v1",
+        },
+      ],
+      tools: [],
+    });
+    await screen.findByTestId("pc-providers-table");
+    await openDrawerAndPickTenant(user);
+    await user.click(await screen.findByTestId("pc-tenant-edit-openai"));
+    await screen.findByTestId("pc-edit-modal");
+    await user.type(
+      screen.getByTestId("pc-edit-base-url"),
+      "https://relay.example.com/v1",
+    );
+    expect(await screen.findByTestId("pc-edit-key-hint")).toHaveTextContent(
+      "Enter this service's key.",
+    );
+    await user.type(screen.getByTestId("pc-edit-value"), "sk-tenant-relay");
+    await user.click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(upsert).toHaveBeenCalledWith(
+        TENANT,
+        "openai",
+        expect.objectContaining({
+          value: "sk-tenant-relay",
+          base_url: "https://relay.example.com/v1",
+        }),
+      ),
     );
   });
 });

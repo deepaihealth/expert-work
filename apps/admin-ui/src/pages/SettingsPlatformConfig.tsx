@@ -15,6 +15,7 @@ import {
   App,
   Button,
   Card,
+  Checkbox,
   Drawer,
   Form,
   Input,
@@ -69,6 +70,14 @@ import { PlatformJudgeSection } from "./settings_platform/PlatformJudgeSection";
 import { PlatformQualitySection } from "./settings_platform/PlatformQualitySection";
 import { PlatformRecognitionSection } from "./settings_platform/PlatformRecognitionSection";
 import { PlatformToolBudgetSection } from "./settings_platform/PlatformToolBudgetSection";
+import {
+  BaseUrlCell,
+  baseUrlErrorText,
+  checkFailureOf,
+  checkFailureText,
+  comparableAddress,
+  type CheckFailure,
+} from "./settings_platform/credentialBaseUrl";
 
 const { Text } = Typography;
 
@@ -86,6 +95,12 @@ interface EditTarget {
   priority?: number;
   /** Stream Y-MK — true when adding a brand-new key (key_id is editable). */
   isNewKey?: boolean;
+  /** B-308 — the row's request address when the dialog opened (``null`` = official). */
+  baseUrl?: string | null;
+  /** B-308 — the provider's official root; absent / ``null`` hides the address field. */
+  officialBaseUrl?: string | null;
+  /** B-308 — no row exists yet (new key / new tenant override). */
+  isNewRow?: boolean;
 }
 
 // Key-format placeholder per credential row — the old hardcoded "sk-ant-…"
@@ -167,9 +182,49 @@ export function SettingsPlatformConfig() {
     enabled: boolean;
     key_id?: string;
     priority?: number;
+    base_url?: string;
   }>();
   const [editMode, setEditMode] = useState<"value" | "ref">("value");
   const [saving, setSaving] = useState(false);
+  // B-308 — a failed connectivity check ("save anyway" offered), the admin's
+  // "save anyway" tick, and any other refusal of the request address.
+  const [checkFailure, setCheckFailure] = useState<CheckFailure | null>(null);
+  const [forceSave, setForceSave] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const watchedBaseUrl = Form.useWatch("base_url", editForm);
+  const showBaseUrl =
+    edit?.kind === "provider" && Boolean(edit.officialBaseUrl);
+  // B-308 — "the address changed" = differs from what the dialog opened with
+  // and is not a clear back to official. Such a save needs this service's key.
+  const addressChanged = useCallback(
+    (raw: string | undefined): boolean => {
+      if (edit === null || !showBaseUrl) {
+        return false;
+      }
+      const next = comparableAddress(raw, edit.officialBaseUrl);
+      return (
+        next !== "" && next !== comparableAddress(edit.baseUrl, edit.officialBaseUrl)
+      );
+    },
+    [edit, showBaseUrl],
+  );
+  const keyHint = addressChanged(watchedBaseUrl)
+    ? edit?.isNewRow
+      ? t("settings_platform.base_url_key_hint_new")
+      : t("settings_platform.base_url_needs_new_key")
+    : null;
+  const keyExtra = (hint: string) =>
+    keyHint === null ? (
+      hint
+    ) : (
+      <>
+        {hint}
+        <br />
+        <Text type="warning" data-testid="pc-edit-key-hint">
+          {keyHint}
+        </Text>
+      </>
+    );
 
   // Per-tenant override drawer (Stream HX-8).
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -312,7 +367,14 @@ export function SettingsPlatformConfig() {
     if (edit === null) {
       return;
     }
-    const values = await editForm.validateFields();
+    let values: Awaited<ReturnType<typeof editForm.validateFields>>;
+    try {
+      values = await editForm.validateFields();
+    } catch {
+      // The form shows what is missing (B-308: also "a changed address needs
+      // this service's key"); nothing is sent.
+      return;
+    }
     const body: PlatformSecretUpsertBody =
       editMode === "value"
         ? { value: values.value, enabled: values.enabled }
@@ -321,7 +383,19 @@ export function SettingsPlatformConfig() {
     if (edit.kind === "provider" && edit.tenantId === undefined) {
       body.priority = values.priority ?? 100;
     }
+    // B-308 — send the address only when it changed (an unchanged non-empty
+    // address would be re-tested on every save); empty = back to official.
+    if (showBaseUrl) {
+      const next = comparableAddress(values.base_url, edit.officialBaseUrl);
+      if (next !== comparableAddress(edit.baseUrl, edit.officialBaseUrl)) {
+        body.base_url = next === "" ? null : (values.base_url ?? "").trim();
+      }
+    }
+    if (forceSave) {
+      body.force_save = true;
+    }
     setSaving(true);
+    setSaveError(null);
     try {
       if (
         edit.kind === "provider" &&
@@ -341,7 +415,17 @@ export function SettingsPlatformConfig() {
         refreshTenantView(editedTenant);
       }
     } catch (err) {
-      message.error(errText(err));
+      const failure = checkFailureOf(err);
+      const text = failure === null ? baseUrlErrorText(err, t) : null;
+      if (failure !== null) {
+        setCheckFailure(failure);
+        setForceSave(false);
+      } else if (text !== null) {
+        setCheckFailure(null);
+        setSaveError(text);
+      } else {
+        message.error(errText(err));
+      }
     } finally {
       setSaving(false);
     }
@@ -351,15 +435,20 @@ export function SettingsPlatformConfig() {
     editForm,
     doUpsert,
     errText,
+    forceSave,
     message,
     refresh,
     refreshTenantView,
+    showBaseUrl,
     t,
   ]);
 
   // Stream Y-MK — nested per-key table shown when a provider row is expanded.
   const keyColumns = useCallback(
-    (provider: string): TableColumnsType<PlatformProviderKey> => [
+    (
+      provider: string,
+      officialBaseUrl: string | null | undefined,
+    ): TableColumnsType<PlatformProviderKey> => [
       {
         title: t("settings_platform.col_key_id"),
         dataIndex: "key_id",
@@ -386,6 +475,19 @@ export function SettingsPlatformConfig() {
               {ref}
             </Text>
           </Tooltip>
+        ),
+      },
+      {
+        title: t("settings_platform.col_base_url"),
+        key: "base_url",
+        width: 200,
+        render: (_v, k) => (
+          <BaseUrlCell
+            baseUrl={k.base_url}
+            unverified={k.base_url_unverified}
+            officialBaseUrl={officialBaseUrl}
+            testId={`pc-key-base-url-${provider}-${k.key_id}`}
+          />
         ),
       },
       {
@@ -418,6 +520,8 @@ export function SettingsPlatformConfig() {
                   secret_ref: k.secret_ref,
                   keyId: k.key_id,
                   priority: k.priority,
+                  baseUrl: k.base_url ?? null,
+                  officialBaseUrl,
                 })
               }
               data-testid={`pc-key-edit-${provider}-${k.key_id}`}
@@ -573,6 +677,8 @@ export function SettingsPlatformConfig() {
                 keyId: "",
                 priority: 100,
                 isNewKey: true,
+                officialBaseUrl: row.official_base_url,
+                isNewRow: true,
               })
             }
             data-testid={`pc-add-key-${row.provider}`}
@@ -629,6 +735,28 @@ export function SettingsPlatformConfig() {
         width: 120,
         render: (_v, row) => effectiveSourceTag(row.effective_source),
       },
+      ...(kind === "provider"
+        ? [
+            {
+              title: t("settings_platform.col_base_url"),
+              key: "base_url",
+              width: 180,
+              render: (_v: unknown, row: TenantProviderEntry | TenantToolEntry) => {
+                const entry = row as TenantProviderEntry;
+                return entry.override === null ? (
+                  <Text type="secondary">—</Text>
+                ) : (
+                  <BaseUrlCell
+                    baseUrl={entry.override.base_url}
+                    unverified={entry.override.base_url_unverified}
+                    officialBaseUrl={entry.official_base_url}
+                    testId={`pc-tenant-base-url-${entry.provider}`}
+                  />
+                );
+              },
+            },
+          ]
+        : []),
       {
         title: t("settings_platform.col_secret_ref"),
         key: "ref",
@@ -662,6 +790,10 @@ export function SettingsPlatformConfig() {
                     key,
                     secret_ref: row.override?.secret_ref ?? "",
                     tenantId: tenantId ?? undefined,
+                    baseUrl: row.override?.base_url ?? null,
+                    officialBaseUrl:
+                      "provider" in row ? row.official_base_url : null,
+                    isNewRow: row.override === null,
                   })
                 }
                 data-testid={`pc-tenant-edit-${key}`}
@@ -710,7 +842,11 @@ export function SettingsPlatformConfig() {
         enabled: true,
         key_id: edit.isNewKey ? "" : edit.keyId,
         priority: edit.priority ?? 100,
+        base_url: edit.baseUrl ?? "",
       });
+      setCheckFailure(null);
+      setForceSave(false);
+      setSaveError(null);
     }
   }, [edit, editForm]);
 
@@ -817,7 +953,7 @@ export function SettingsPlatformConfig() {
                           rowExpandable: (r) => r.keys.length > 0,
                           expandedRowRender: (r) => (
                             <Table<PlatformProviderKey>
-                              columns={keyColumns(r.provider)}
+                              columns={keyColumns(r.provider, r.official_base_url)}
                               dataSource={r.keys}
                               rowKey={(k) => k.key_id}
                               pagination={false}
@@ -984,7 +1120,17 @@ export function SettingsPlatformConfig() {
         cancelText={t("common.cancel")}
         data-testid="pc-edit-modal"
       >
-        <Form form={editForm} layout="vertical">
+        <Form
+          form={editForm}
+          layout="vertical"
+          onValuesChange={() => {
+            // B-308 — an edit after a refusal starts over: the old check
+            // result and "save anyway" no longer apply.
+            setCheckFailure(null);
+            setForceSave(false);
+            setSaveError(null);
+          }}
+        >
           <Form.Item label={t("settings_platform.mode_label")}>
             <Segmented
               value={editMode}
@@ -1001,14 +1147,19 @@ export function SettingsPlatformConfig() {
             <Form.Item
               name="value"
               label={t("settings_platform.value_label")}
-              extra={t("settings_platform.value_hint")}
+              extra={keyExtra(t("settings_platform.value_hint"))}
               rules={[
                 {
                   validator: (_r, value: string) =>
                     typeof value === "string" && value.length > 0
                       ? Promise.resolve()
                       : Promise.reject(
-                          new Error(t("settings_platform.value_required")),
+                          new Error(
+                            addressChanged(editForm.getFieldValue("base_url")) &&
+                            !edit?.isNewRow
+                              ? t("settings_platform.base_url_needs_new_key")
+                              : t("settings_platform.value_required"),
+                          ),
                         ),
                 },
               ]}
@@ -1023,16 +1174,31 @@ export function SettingsPlatformConfig() {
             <Form.Item
               name="secret_ref"
               label={t("settings_platform.secret_ref_label")}
-              extra={t("settings_platform.secret_ref_hint")}
+              extra={keyExtra(t("settings_platform.secret_ref_hint"))}
               rules={[
                 {
-                  validator: (_r, value: string) =>
-                    typeof value === "string" &&
-                    /^(secret|kms):\/\//.test(value)
-                      ? Promise.resolve()
-                      : Promise.reject(
-                          new Error(t("settings_platform.secret_ref_hint")),
-                        ),
+                  validator: (_r, value: string) => {
+                    if (
+                      typeof value !== "string" ||
+                      !/^(secret|kms):\/\//.test(value)
+                    ) {
+                      return Promise.reject(
+                        new Error(t("settings_platform.secret_ref_hint")),
+                      );
+                    }
+                    // B-308 — a changed address with the same reference would
+                    // send the old key to the new address: stop before sending.
+                    if (
+                      addressChanged(editForm.getFieldValue("base_url")) &&
+                      !edit?.isNewRow &&
+                      value.trim() === edit?.secret_ref
+                    ) {
+                      return Promise.reject(
+                        new Error(t("settings_platform.base_url_needs_new_key")),
+                      );
+                    }
+                    return Promise.resolve();
+                  },
                 },
               ]}
             >
@@ -1082,6 +1248,19 @@ export function SettingsPlatformConfig() {
                 </Form.Item>
               </>
             )}
+          {showBaseUrl && (
+            <Form.Item
+              name="base_url"
+              label={t("settings_platform.base_url_label")}
+              extra={t("settings_platform.base_url_hint")}
+            >
+              <Input
+                placeholder={edit?.officialBaseUrl ?? undefined}
+                autoComplete="off"
+                data-testid="pc-edit-base-url"
+              />
+            </Form.Item>
+          )}
           <Form.Item
             name="enabled"
             label={t("settings_platform.enabled_label")}
@@ -1093,6 +1272,36 @@ export function SettingsPlatformConfig() {
             />
           </Form.Item>
         </Form>
+        {saveError !== null && (
+          <Alert
+            type="error"
+            showIcon
+            message={saveError}
+            data-testid="pc-edit-error"
+          />
+        )}
+        {checkFailure !== null && (
+          <Alert
+            type="error"
+            showIcon
+            message={checkFailureText(checkFailure, t)}
+            description={
+              <Space direction="vertical" size={2}>
+                <Checkbox
+                  checked={forceSave}
+                  onChange={(e) => setForceSave(e.target.checked)}
+                  data-testid="pc-edit-force-save"
+                >
+                  {t("settings_platform.force_save_label")}
+                </Checkbox>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {t("settings_platform.force_save_hint")}
+                </Text>
+              </Space>
+            }
+            data-testid="pc-edit-check-failed"
+          />
+        )}
       </Modal>
     </div>
   );
