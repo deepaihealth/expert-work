@@ -19,11 +19,18 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from expert_work.protocol import ModelSpec
-from expert_work.runtime.middleware import LLMError
+from expert_work.runtime.middleware import (
+    BreakerRegistry,
+    CircuitOpenError,
+    LLMError,
+    LLMErrorHandlingMiddleware,
+    MiddlewareChain,
+)
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import build_llm_router
 from orchestrator.agent_factory import _build_provider
 from orchestrator.errors import AgentFactoryError
+from orchestrator.llm import AllProvidersExhaustedError
 from orchestrator.llm.embedder import embedding_client_for
 from orchestrator.llm.endpoints import (
     OFFICIAL_BASE_URLS,
@@ -490,6 +497,134 @@ async def test_provider_level_failure_moves_to_the_fallback_model() -> None:
         ("checked", "https://p.example.com/v1/chat/completions"),
         ("sk-backup", _LEGACY_CHAT_URLS["deepseek"]),
     ]
+
+
+# --- 9b. the breaker those failures open does not hand the turn to the backup key
+# (test-env acceptance 120.10, 5908fe554: three 503s opened the proxy key's
+# breaker, the retried turn met CircuitOpenError and was served by the
+# official-address backup key) ---------------------------------------------------
+
+_CUSTOM_CHAT = "https://p.example.com/v1/chat/completions"
+
+
+async def _no_wait(_delay: float) -> None:
+    return None
+
+
+async def _breaker_router(
+    primary_ref_url: str | None,
+    primary_reply: httpx.Response | Exception,
+    seen: list[tuple[str, str]],
+    registry: BreakerRegistry,
+    *,
+    fallback: bool = False,
+) -> tuple[Any, httpx.AsyncClient, httpx.AsyncClient]:
+    """Primary key (at ``primary_ref_url``) + an official-address backup key,
+    under the real E.4 retry + breaker. Every request is recorded as
+    ``(key, url)``; the primary key gets ``primary_reply``, any other key 200."""
+
+    def _answer(request: httpx.Request) -> httpx.Response:
+        key = request.headers["authorization"].removeprefix("Bearer ")
+        seen.append((key, str(request.url)))
+        if key != "sk-primary":
+            return httpx.Response(200, json=_OPENAI_REPLY)
+        if isinstance(primary_reply, Exception):
+            raise primary_reply
+        return primary_reply
+
+    async def _resolve(provider: str) -> list[ProviderKey]:
+        if provider == "openai":
+            return [ProviderKey(_PRIMARY_REF, primary_ref_url), ProviderKey(_BACKUP_REF, None)]
+        return [ProviderKey(_BACKUP_REF, None)]
+
+    checked = httpx.AsyncClient(transport=httpx.MockTransport(_answer))
+    shared = httpx.AsyncClient(transport=httpx.MockTransport(_answer))
+    _http.register_checked_client(checked)
+    router = await build_llm_router(
+        ModelSpec(
+            provider="openai",
+            name="gpt-4o",
+            fallback=[ModelSpec(provider="deepseek", name="deepseek-chat")] if fallback else [],
+        ),
+        secret_store=_store(),
+        provider_key_resolver=_resolve,
+        http_client=shared,
+        around_llm_chain=MiddlewareChain.from_middlewares(
+            "around_llm_call",
+            [LLMErrorHandlingMiddleware(breaker_registry=registry, sleeper=_no_wait)],
+        ),
+    )
+    return router, checked, shared
+
+
+async def _force_open(registry: BreakerRegistry, breaker_key: str) -> None:
+    breaker = await registry.get(breaker_key)
+    for _ in range(3):
+        await breaker.acquire()
+        await breaker.record_failure()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "primary",
+    [
+        httpx.Response(503, text="upstream down"),
+        httpx.ConnectError("connection refused"),
+        httpx.ConnectError("name or service not known"),
+        httpx.ReadTimeout("timed out"),
+    ],
+    ids=["503", "refused", "dns", "timeout"],
+)
+async def test_open_breaker_on_the_custom_address_does_not_try_the_backup_key(
+    primary: httpx.Response | Exception,
+) -> None:
+    """Turn 1: the proxy fails three times, the key's breaker opens, the turn
+    errors (no fallback model). Turn 2: the open breaker must skip the
+    official-address backup key exactly as the errors that opened it did."""
+    seen: list[tuple[str, str]] = []
+    router, checked, shared = await _breaker_router(_CUSTOM, primary, seen, BreakerRegistry())
+    try:
+        with pytest.raises(LLMError):
+            await router(messages=[HumanMessage(content="hi")], tools=[])
+        with pytest.raises(AllProvidersExhaustedError) as turn_two:
+            await router(messages=[HumanMessage(content="hi")], tools=[])
+    finally:
+        await _close(checked, shared)
+
+    assert isinstance(turn_two.value.last_exc, CircuitOpenError)  # met the open breaker
+    assert seen == [("sk-primary", _CUSTOM_CHAT)] * 3  # turn 2 sent nothing
+
+
+@pytest.mark.asyncio
+async def test_open_breaker_on_the_custom_address_moves_to_the_fallback_model() -> None:
+    seen: list[tuple[str, str]] = []
+    registry = BreakerRegistry()
+    router, checked, shared = await _breaker_router(
+        _CUSTOM, httpx.Response(503), seen, registry, fallback=True
+    )
+    try:
+        await _force_open(registry, router.providers[0].breaker_key)
+        await router(messages=[HumanMessage(content="hi")], tools=[])
+    finally:
+        await _close(checked, shared)
+
+    assert seen == [("sk-backup", _LEGACY_CHAT_URLS["deepseek"])]
+
+
+@pytest.mark.asyncio
+async def test_open_breaker_on_an_official_key_still_tries_the_sibling_key() -> None:
+    """Unchanged for keys without a request address: an open breaker is
+    key-level (Stream Y-MK) and the next key of the same model serves."""
+    seen: list[tuple[str, str]] = []
+    registry = BreakerRegistry()
+    router, checked, shared = await _breaker_router(None, httpx.Response(503), seen, registry)
+    try:
+        await _force_open(registry, router.providers[0].breaker_key)
+        await router(messages=[HumanMessage(content="hi")], tools=[])
+    finally:
+        await _close(checked, shared)
+
+    assert seen == [("sk-backup", _LEGACY_CHAT_URLS["openai"])]
 
 
 # --- 8 (orchestrator half) — every router build_agent builds gets the address ---

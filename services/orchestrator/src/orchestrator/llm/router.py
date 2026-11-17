@@ -198,6 +198,9 @@ class ProviderHandle:
     #: fingerprint, :func:`~orchestrator.llm.failover.breaker_key_for`); empty
     #: → the breaker keys by ``key``. Metrics keep using ``key``.
     breaker_key: str = ""
+    #: B-308 — this key sends to a credential's custom request address. An open
+    #: breaker on it then skips the sibling keys (see ``_dispatch``).
+    custom_endpoint: bool = False
 
 
 # Stream Y-MK — key/account-level failures. The router advances to the next
@@ -206,7 +209,8 @@ class ProviderHandle:
 # non-OAuth revoked static key (``_call_one``'s OAuth refresh path has already
 # run for OAuth providers), so a revoked key tries a sibling too.
 # ``CircuitOpenError`` is per-key (E.4 breaker), so an open breaker on one key
-# should try a sibling, not abandon the whole provider.
+# should try a sibling, not abandon the whole provider — except on a key with
+# a custom request address (B-308, ``_dispatch``).
 _KEY_LEVEL_ERRORS: tuple[type[LLMError], ...] = (
     LLMRateLimitError,
     LLMKeyUnavailableError,
@@ -555,7 +559,15 @@ class LLMRouter:
                     handle.key,
                     type(exc).__name__,
                 )
-                pos += 1
+                # B-308 §4.3 — a key with its own request address whose breaker
+                # is open skips its siblings, like the 5xx / network / timeout
+                # failures that open it: the turn must not move to another key
+                # of the same provider (official address included). The breaker
+                # does not say why it opened, so one opened by 429s skips too.
+                if handle.custom_endpoint and isinstance(exc, CircuitOpenError):
+                    pos = plan.next_group(pos)
+                else:
+                    pos += 1
             except LLMClientError:
                 logger.warning(
                     "llm_router.client_error_no_fallback idx=%d key=%s",
