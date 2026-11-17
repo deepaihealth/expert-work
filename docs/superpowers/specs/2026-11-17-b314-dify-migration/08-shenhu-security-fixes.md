@@ -238,7 +238,7 @@
 - **A(切换前必做;挡在服务层,不是只挡一条路由)**:项目服务里凡是按会话 / run 的 id、或按 agent_code 碰到 expert-work 会话的服务入口,都先查这个会话(或请求里的 agent_code)在 `t_project_expert_work_config` 里 (project_code, agent_code) 那一行的 `adapter_type`,是 `wecom_chat` 就拒绝;只有企微聊天模块自己的调用放行。要改的入口:
   - `findOwnedSession`(改名、归档共用,`expert-work-session.service.ts:153`)、读会话消息(`:286`)、`listSessions`(`:215`:请求的 agent_code 是企微聊天智能体就拒绝;不带 agent_code 时结果里排除这类会话);
   - 读条目时按 id 查会话(`expert-work-items.service.ts:101`);
-  - `prepareRun`(`expert-work-run.service.ts:240`,按请求的 agent_code 判,`:272`;续聊带会话 id 的分支 `:305` 按查到的会话行同样判)、`prepareReconnect`(`:514`)、`cancelRun`(`:605`);
+  - `prepareRun`(`expert-work-run.service.ts:240`,按请求的 agent_code 判,`:272`;续聊带会话 id 的分支 `:305` 按查到的会话行同样判,而且要在调 `upsertSession` **之前**判 —— 它会改写已有行的 `customer_code`、`last_run_at`,`expert-work-session.service.ts:139-146`)、`prepareReconnect`(`:514`)、`cancelRun`(`:605`);
   - 附件下载按会话 id 查行的三处(`agent-chat.controller.ts:254`、`ai-health-plan-upload.controller.ts:200`、`ai-health-report-upload.controller.ts:153`)。
 
   这样 `/expert-work/:agent_code/*`、`/ai-health-plan/*`、`/ai-health-report/*`,以及其它复用这些服务的入口(工作台专家对话、ai-strategy)一起挡住。企微聊天模块自己读写会话前核对「项目 + agent_code + `ew_user_id`」—— 不用 `customer_code`:群里没建档的发言人 `customer_code` 是空串。不改前端;现有智能体的 `adapter_type` 为空,不受影响。**约 1.5~2 人天**(原估 0.5~1 只算了通用路由一处;现在是 7 个服务入口 + 3 处下载,每处都要补测试)。归属:**迁移需要,切换前必做**(07 §3.8 前置条件第 12 条)。
@@ -368,7 +368,7 @@
 
 | 归属 | 内容 | 粗估 |
 |---|---|---|
-| **迁移需要** | 确认生产 `AGENT_KEYS`(已确认);新代码日志与密钥检查(含在 01 / 02 / 04);S7 顺手做(可选);S13 修法 A 1.5~2(项目服务) | **约 2~3 人天** |
+| **迁移需要** | 确认生产 `AGENT_KEYS`(已确认);新代码日志与密钥检查(含在 01 / 02 / 04);S7 顺手做(可选);S13 修法 A 1.5~2(项目服务,已计入 01 §8 项目服务那一行,汇总时别重复加) | **约 2~3 人天** |
 | 随 Dify 下线 | 作废两把第三方密钥、清 Dify 会话键与日志表列 | 0.5~1 人天 |
 | 深护安全待办 | S1 网关止血(建议尽快)0.5~1;服务密钥 6~10;删旧判断 1;S2 1;S3 0.5~1.5;S4 5~8;S5 3.5~4.5;S10 0.5;S11 0.5~1;MCP 密钥范围与拒启动 1.5~2.5 | 约 20~30 人天(深护另行排期) |
 

@@ -114,7 +114,7 @@ Dify 里没有知识库(资料写在环境变量里),也没有用 Dify 自己的
 | 身份校验 | 平台绑定身份参数为必须;深护服务端核归属、按密钥限项目 / 工具为可选加固(进深护安全待办);生产 MCP key 白名单不能为空 —— 已确认已配置 | 11-17 |
 | 先交测试的 v0 | 智能体本身 + 只读工具 + 天气 + 知识库草稿;写工具与企微端到端随后 | 11-17 |
 | 主回复由谁发 | 项目服务取回 run 结果、交数字人服务发,不走 MCP 发消息;智能体主动找客户说话这次不做,后面再加(到点提醒照旧)。走 MCP 发的否决理由已核实:记忆与对话页看不到、被打断收不回、不保证只发一次、只能发文字(04 §3.11;「dk 会把 AI 回复当真人接管」一条经复核不成立,pad 未核实) | 11-17 |
-| 每轮时限 | `run_deadline_s: 300`;项目服务等 360 秒、数字人服务调项目服务 HTTP 超时 300 → 390 秒,同客户锁 600 秒不变。11-17 补:项目服务等满 360 秒**必须调取消**,让这一轮以 `interrupted` 结束、不扣;只是不等了而不取消,这一轮会跑完并扣费(01 §3.7) | 11-17 |
+| 每轮时限 | `run_deadline_s: 300`;项目服务等 360 秒、数字人服务调项目服务 HTTP 超时 300 → 390 秒,同客户锁 600 秒不变。11-17 补:项目服务等满 360 秒**必须调取消**:先把 run 行 `settle_skip_charge` 写成 1、再调 `:cancel`(同 §3.6),这一轮不扣;只是不等了而不取消,这一轮会跑完并扣费(01 §3.7) | 11-17 |
 | 康豆 | 沿用场景固定价;智能体这一轮正常跑完就扣,包括不发消息的轮次(转人工选了「本轮不回」、群里不是对 AI 说的话);出错、超时、发兜底话术、被取消不扣;`incomplete`(被最大步数 / token 预算截断)只有拿到可用回答才扣,否则发兜底不扣(11-17);按场景固定价要在项目服务计费里加按 `adapter_type` 的钩子(01 §3.8)(`silent` 也扣是用户选定,与原推荐相反;群里没 @ 员工的消息多数在数字人服务就被挡掉、不调智能体也不扣) | 11-17 |
 | 会话第一轮 | 关掉 `working_memory.keep_first_turn`:会话不换,第一轮会被带几个月、可能被当成现状引用 | 11-17 |
 | 数字人服务连不上项目服务 | 不发兜底,记日志并告警(与现在 Dify 链路一致) | 11-17 |
@@ -122,7 +122,7 @@ Dify 里没有知识库(资料写在环境变量里),也没有用 Dify 自己的
 | 失败兜底 | 失败 / 超时发兜底话术,同一聊天窗口 10 分钟最多一次(私聊和各群分开计);兜底原文由项目服务拼,**文案写死在代码里**(沿用 Dify 原文,11-17 改定,不存库) | 11-17 |
 | 切换方式 | 两张员工绑定表加 `is_expert_work`,置 1 走 Expert Work、置 0 切回;配置行 `enabled=0` 为项目级总开关 | 11-17 |
 | 智能体编码 | Expert Work 上的健管师智能体编码 = 深护员工绑定上现有的 `agent_code`(切换规则要求两边同一个编码);素材 SQL 的 `@agent_code`、`material_list` 钉的 `agent_code`、MCP 的 `x-agent-id` 都用这个值 | 11-17 |
-| 会话与 run 台账 | 复用现有 `t_project_expert_work_session` / `t_project_expert_work_run`,不新建 `t_project_dh_ew_*`:客户会话 `employee_code` 为空串、填 `customer_code` 和 `ew_user_id = wx:…`,加索引(项目, 智能体, user_id, 状态);一个客户一个活跃会话由代码在同客户锁里保证;续会话前核对会话行「项目 + agent_code + `ew_user_id`」与本轮一致;run 表只加 `invoke_token`、`source_msg_keys`(我方取消用现有 `settle_skip_charge`,代次由 `invoke_token` 推出,用量成本和送达结果 v1 只打日志);客户删除会级联删会话行(预期) | 11-17 |
+| 会话与 run 台账 | 复用现有 `t_project_expert_work_session` / `t_project_expert_work_run`,不新建 `t_project_dh_ew_*`:客户会话 `employee_code` 为空串、填 `customer_code` 和 `ew_user_id = wx:…`,加索引(项目, 智能体, user_id, 状态);一个客户一个活跃会话由代码在同客户锁里保证;续会话前核对会话行「项目 + agent_code + `ew_user_id`」与本轮一致;run 表只加 `invoke_token`、`source_msg_keys`(我方取消用现有 `settle_skip_charge`,代次按幂等键逐代查出,用量成本和送达结果 v1 只打日志);客户删除会级联删会话行(预期) | 11-17 |
 | 通用而不是只给健管师 | 配置行加可空的 `adapter_type`(如 `wecom_chat`),为空 = 照现在按 agent_code 精确注册,现有智能体不动;项目服务做一个通用的企微聊天适配器(组 inputs、解析 `messages` + `media`、计费);以后再接企微聊天智能体只加配置。需求一样的项目共用一个智能体编码,需求不同才新建定制智能体;不加 `ew_agent_code` 列 | 11-17 |
 | 会话越权(08 S13) | A **切换前必做**:挡在会话服务层,不是只挡一条路由 —— 项目服务各 expert-work 服务入口(按会话 / run id 或按 agent_code 查会话的地方:改名 / 归档、读会话消息、会话列表、读条目、发起、重连、取消、附件下载)遇到 `adapter_type = wecom_chat` 智能体的会话一律拒绝,只放行企微聊天模块自己的调用;企微聊天模块核对「项目 + agent_code + `ew_user_id`」(健管师和以后的企微聊天智能体都在内);约 1.5~2 人天,项目服务,不改前端,现有智能体不受影响。B 进深护安全待办:所有通用路由核对 agent_code、限制不带员工编码的 `sessions/list`(要前端确认用法,主要保护 ai-strategy H5 客户会话) | 11-17 |
 | 调用细节(01 其余技术项,按推荐定) | 取最终回复 = 流里 `channel=final`,续流没收到再按 run_id 查条目;返回契约 = 01 新入口 + `outcome`(`reply` / `silent` / `fallback` / `cancelled` / `busy` / `offline`)+ 02 的来源数组;本轮时间 = input 首行(06 不另传 `current_time`、不加【】前缀);inputs 身份变量必填、空串,不传 `source`、`customer_display_name`,加 `is_first_contact`、`attachment_urls`(04 评审后再加 `source_message_ids`);打断后重跑 03 前合并整批进 input | 11-17 |
