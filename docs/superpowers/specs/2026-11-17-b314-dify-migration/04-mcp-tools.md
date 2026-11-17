@@ -247,7 +247,7 @@
 | 工具 | 读 / 写 | 为什么要 |
 |---|---|---|
 | `profile_get_brief` | 读 | 替代 Dify 每轮 4~5 路预取 |
-| `health_plan_get_brief` | 读 | 方案问答 |
+| `health_plan_get_brief` | 读 | 方案问答;推广话术前判断客户有没有方案(02 §3.6,已拍板 11-17) |
 | `form_get_field_detail` | 读 | 写表单前拿字段编码与选项 |
 | `form_get_latest_field_values` | 读 | 「我最近一次糖化多少」 |
 | `form_list_owner_submissions` | 读 | 「上周血糖怎么样」 |
@@ -354,7 +354,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 
 ### 4.3 深护数字人 · 项目服务
 
-- 业务方调 runs 时带上 3.3 的 inputs(属于「发起一轮」改造,和补消息一起做)。项目服务客户端 `EwRunRequest.inputs` 现在是 `Record<string, string>`(`expert-work.types.ts:46`);`attachment_urls` 是列表,要么放宽类型,要么约定传 JSON 字符串、MCP 两种都收。
+- 业务方调 runs 时带上 3.3 的 inputs(属于「发起一轮」改造,和补消息一起做)。项目服务客户端 `EwRunRequest.inputs` 现在是 `Record<string, string>`(`expert-work.types.ts:46`);`attachment_urls` 按 01 §3.3.2 传 JSON 数组(数组里的链接平台不预下载,06 §5.1),客户端类型要放宽;MCP 仍两种都收。
 - 部署确认数字人服务进程时区为东八区:循环提醒续期按进程时区算(`send-notify.processor.ts:200-202`),仓库里的 `dockerfile`、`pm2.json` 没设 TZ(推断:若生产不是东八区,续期会偏)。
 - Dify 下线后:3.8 表里「挪到 MCP / 不再需要」的接口删除,或去掉调试请求头放行。
 - 控制台确认员工能撤销 AI 写入的表单字段和提醒(3.4 末)。
@@ -781,9 +781,8 @@ spec:
 - ⑥ **设提醒返回带星期**:06 §4.2 要求返回首次时间带星期;本文 `first_send_at` 只有 ISO。推荐加一个 `first_send_weekday`(或可读串),模型回复写「12 月 1 日 周一」客户能当场核对。
 - ⑦ **方案精简摘要给业务方用**:06 要业务方把方案摘要带进本轮资料;本文 `health_plan_get_brief` 是给模型调的工具。取决于 9.4。
 
-**9.11 身份变量必填还是可选**(交叉核对发现,与 06 §5.1 / §5.5 不同)
-- 本文(与 01 一致):声明变量全部 `required: true`(`attachment_urls` 除外),没建档 / 私聊传空串;漏传当场 422(§7 用例 5)。06:`customer_code`、`employee_code`、`room_conversation_id` 可选,没建档 / 私聊不传。
-- 推荐本文做法,理由与汇总见 01 待拍板 12。
+**9.11 身份变量必填还是可选** —— **按推荐定(11-17,01 待拍板 12)**
+- 本文做法:声明变量全部 `required: true`(`attachment_urls` 除外),没建档 / 私聊传空串;漏传当场 422(§7 用例 5)。06 §5.1 / §5.5 已改成同一口径。
 
 ## 10. 出处
 
