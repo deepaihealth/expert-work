@@ -208,6 +208,18 @@ export function SettingsPlatformConfig() {
     },
     [edit, showBaseUrl],
   );
+  // B-308 — clearing a custom address back to official needs no new key
+  // (design §4.2): an empty key box then keeps the row's current key.
+  const clearingAddress = useCallback(
+    (raw: string | undefined): boolean =>
+      edit !== null &&
+      showBaseUrl &&
+      !edit.isNewRow &&
+      edit.secret_ref !== "" &&
+      comparableAddress(edit.baseUrl, edit.officialBaseUrl) !== "" &&
+      comparableAddress(raw, edit.officialBaseUrl) === "",
+    [edit, showBaseUrl],
+  );
   const keyHint = addressChanged(watchedBaseUrl)
     ? edit?.isNewRow
       ? t("settings_platform.base_url_key_hint_new")
@@ -375,10 +387,17 @@ export function SettingsPlatformConfig() {
       // this service's key"); nothing is sent.
       return;
     }
+    // B-308 — clearing the address with an empty key box: the write takes
+    // exactly one of value / secret_ref, and the row's own ref keeps its key.
+    const keepKey =
+      editMode === "value" && !values.value && clearingAddress(values.base_url);
     const body: PlatformSecretUpsertBody =
-      editMode === "value"
+      editMode === "value" && !keepKey
         ? { value: values.value, enabled: values.enabled }
-        : { secret_ref: values.secret_ref, enabled: values.enabled };
+        : {
+            secret_ref: keepKey ? edit.secret_ref : values.secret_ref,
+            enabled: values.enabled,
+          };
     // Stream Y-MK — provider key edits carry priority + a key_id route.
     if (edit.kind === "provider" && edit.tenantId === undefined) {
       body.priority = values.priority ?? 100;
@@ -433,6 +452,7 @@ export function SettingsPlatformConfig() {
     edit,
     editMode,
     editForm,
+    clearingAddress,
     doUpsert,
     errText,
     forceSave,
@@ -1151,7 +1171,8 @@ export function SettingsPlatformConfig() {
               rules={[
                 {
                   validator: (_r, value: string) =>
-                    typeof value === "string" && value.length > 0
+                    (typeof value === "string" && value.length > 0) ||
+                    clearingAddress(editForm.getFieldValue("base_url"))
                       ? Promise.resolve()
                       : Promise.reject(
                           new Error(

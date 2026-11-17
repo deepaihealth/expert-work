@@ -643,6 +643,42 @@ describe("SettingsPlatformConfig — request address (B-308)", () => {
     );
   });
 
+  it("clearing the address with an empty key box keeps the current key (no switch to Reference)", async () => {
+    const user = userEvent.setup();
+    const upsertKey = vi
+      .spyOn(sdk, "upsertPlatformProviderKey")
+      .mockResolvedValue(SAVED_KEY);
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "openai", "default");
+    // Default "Paste a key" mode, key box left empty.
+    await user.clear(screen.getByTestId("pc-edit-base-url"));
+    await user.click(screen.getByText("Save"));
+    await waitFor(() => expect(upsertKey).toHaveBeenCalledTimes(1));
+    const body = upsertKey.mock.calls[0][2];
+    // The contract takes exactly one of value / secret_ref: the row's own ref
+    // means "keep the current key".
+    expect(body).toEqual({
+      secret_ref: "secret://expert-work/platform/llm/openai",
+      enabled: true,
+      priority: 100,
+      base_url: null,
+    });
+    expect("value" in body).toBe(false);
+  });
+
+  it("any other save with an empty key box still asks for a key", async () => {
+    const user = userEvent.setup();
+    const upsertKey = vi.spyOn(sdk, "upsertPlatformProviderKey");
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "openai", "default");
+    // Address untouched, key box empty.
+    await user.click(screen.getByText("Save"));
+    expect(
+      await screen.findByText("Paste a key, or switch to Reference."),
+    ).toBeInTheDocument();
+    expect(upsertKey).not.toHaveBeenCalled();
+  });
+
   it("a failed check explains why and offers 'save anyway' (resent with force_save)", async () => {
     const user = userEvent.setup();
     const upsertKey = vi
