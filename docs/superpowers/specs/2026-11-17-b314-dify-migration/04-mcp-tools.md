@@ -5,6 +5,8 @@
 > 核对基线:深护 MCP `499302b`、数字人服务 `8dc5f3f`、项目服务 `b6938bc2`、pad 消息同步 `0ff5743`、dk 会话存档 `ba0a89e`、Expert Work `origin/main d9db26f79`(测试环境镜像 `5908fe554`)、Dify DSL `深护智康(pad)-健管师-3.0.yml`。下文「确认」= 读过代码,「推断」= 没跑过或靠参数名对上。
 >
 > **修订(2026-11-17,04 评审结论)**:写入不需客户确认、不设按客户上限;化验单按上传月合并;按小时循环沿用 30 天;数据情境(空腹 / 餐次 / 测量时间)按表单配置、模型先推断再问;防重复写改为「按来源消息」判断(取代「同一天同内容」);客户资料由模型调 `profile_get_brief` 一次取齐(含现有提醒,v1 就做);「查更早聊天」改为增强现有 `chat_private_history`;新增转人工工具 `handoff_to_human`(MCP 直接发通知,四种组合 + 急症例外,§3.10);主回复仍由业务方发,「走 MCP 发」记为否决项(§3.11);Expert Work 平台加「固定值下拉」(§4.1)。
+>
+> **修订(2026-11-17,06 评审结论)**:9.10 各项按本文推荐定稿并写进工具规格 —— 提醒短编号(5.4、5.5)、一次删多条必须带「客户已确认」(5.5)、设提醒返回带星期(5.3)、查表单结束日裁到今天(M4);改档案按字段编码写。
 
 ## 0. 一句话结论
 
@@ -440,7 +442,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | M1 | 会话找不到改回 404 | 带了 `mcp-session-id` 但找不到 → 404 + JSON-RPC 错误;没带且不是 initialize → 仍 400。POST / GET / DELETE / 旧 SSE `/messages` 一起改(`mcp.controller.ts:58-64、99-101、110-112`,`/messages` 约 :161) |
 | M2 | 未预料异常不回原文 | `mcp-error.ts:32-44` 改成固定文案 + `request_id`;详情只进服务端日志,日志里不打客户姓名、聊天正文 |
 | M3 | 按 `inputSchema` 校验入参 | 在 `mcp-server.service.ts:102` 前统一用 ajv 校验(含 `required`、类型、`format`),不合格回 42200。新工具必须有;旧工具建议一起上(对 Dify 有行为变化,并行期可先只对新工具开) |
-| M4 | 日期参数容错 + 改说明 | `form_get_latest_field_values` / `form_list_owner_submissions`:`start/end_submit_time` 接受 `YYYY-MM-DD`,也接受带时分秒或 ISO(只取北京日期),其它格式回 42200;说明里「服务器本地时区」改成「北京时间」 |
+| M4 | 日期参数容错 + 改说明 | `form_get_latest_field_values` / `form_list_owner_submissions`:`start/end_submit_time` 接受 `YYYY-MM-DD`,也接受带时分秒或 ISO(只取北京日期),其它格式回 42200;结束日晚于今天时裁到今天(9.10 ⑤);说明里「服务器本地时区」改成「北京时间」 |
 | M5 | `form_save_customer_values` | 5.2;含三种模式、规则、情境字段配置、按来源消息去重(存来源消息 id)、改口、操作日志 |
 | M6 | `reminder_create` / `reminder_list` / `reminder_delete` | 5.3–5.5;注册 `send-notify-queue`(显式库号) |
 | M7 | `health_plan_get_brief` | 5.6;移植 `queryCustomerHealthPlanMd` 为纯文本 |
@@ -582,7 +584,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 - 循环提醒的 `end_time` 默认且最长为首次发送 + 30 天。
 - 写 `t_project_ai_notify`(`trigger_time` / `end_time` 存北京墙钟)→ 投 `send-notify-queue`(延迟按东八区算)→ 回写 `job_id`。投递失败就删掉刚写的表行,该条返回 `rejected: queue_unavailable`。
 
-**返回**:`results[]`,每项含 `index`、`status`(`created` / `duplicate` / `rejected`)、`notify_code`、`content`、`first_send_at`、`repeat`、`repeat_interval`、`repeat_until`、`reason`、`advance_adjusted`;外加 `server_now`、`request_id`。全部 `rejected` 时 `isError=true`、42200,`context` 里带每条的原因。
+**返回**:`results[]`,每项含 `index`、`status`(`created` / `duplicate` / `rejected`)、`notify_code`、`short_code`(如 `R3`,5.4)、`content`、`first_send_at`、`first_send_weekday`(如「周三」,模型回复写「11 月 18 日 周三」客户能当场核对,9.10 ⑥)、`repeat`、`repeat_interval`、`repeat_until`、`reason`、`advance_adjusted`;外加 `server_now`、`request_id`。全部 `rejected` 时 `isError=true`、42200,`context` 里带每条的原因。
 
 - 幂等:同一 `customer_pad_userid` + 同一 `room_conversation_id` + 同一首次发送时间 + 同循环方式 + 规范化后的同内容,且该提醒仍生效 → `duplicate`,返回已有编号(同一时刻的同一句提醒设两条没有意义,所以这里不需要来源消息)。
 - 不设按客户的条数上限(11-17 定);一次调用最多 5 条(参数上限)。按小时循环同样最长 30 天(沿用 Dify,11-17 定)。
@@ -602,15 +604,17 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 
 ### 5.4 `reminder_list`(新增,读)
 
-- **说明文字**:「[查看客户的提醒] 列出当前客户还会发出的提醒,包括编号 notify_code、下次发送时间、循环方式。客户问『我设了哪些提醒』,或要取消提醒前,先调本工具拿编号。只能看到当前客户自己的提醒。」
+- **说明文字**:「[查看客户的提醒] 列出当前客户还会发出的提醒,包括短编号(如 R1)、提醒语、事件原时间、下次发送时间、循环方式。客户问『我设了哪些提醒』,或要取消提醒前,先调本工具拿短编号。列表里的发送时间已经减去提前量,客户说的通常是事件时间。只能看到当前客户自己的提醒。」
 - **入参**:绑定 `project_code`、`customer_pad_userid`、`room_conversation_id`;模型可选 `scope`(`all` / `this_chat`,默认 `all`)。
-- **返回**:`reminders[]`,每项含 `notify_code`、`content`、`next_send_at`、`repeat`、`repeat_interval`、`repeat_until`、`chat`(`private` / `this_group` / `other_group`);另有 `total`、`server_now`。最多 50 条,按下次发送时间升序。
+- **返回**:`reminders[]`,每项含 `short_code`、`notify_code`、`content`、`event_time`(事件原时间)、`next_send_at`、`repeat`、`repeat_interval`、`repeat_until`、`chat`(`private` / `this_group` / `other_group`);另有 `total`、`server_now`。最多 50 条,按下次发送时间升序。
+- **短编号**(9.10 ①,已定):服务端按客户分配(`R1`、`R2`…),存在提醒表新加的一列,删掉后不复用;Dify 时期的旧提醒第一次被列出时补发。原始 `notify_code` 是 `notify_` + uuid(`agent-callback.service.ts:189`),模型手抄必错,所以模型只用短编号。
 - **过滤口径**与现有接口一致:未删除、未结束、下次发送时间未过(`ai-notify.service.ts:38-64`)。Dify 时期建的提醒同样能查到,因为键都是 `customer_pad_userid`。
 
 ### 5.5 `reminder_delete`(新增,写)
 
-- **说明文字**:「[取消客户的提醒] 按 reminder_list 返回的 notify_code 取消当前客户的提醒,循环提醒整条取消。编号不是当前客户的会出现在 not_found 里。只有出现在 deleted 里的才算取消成功。」
-- **入参**:绑定 `project_code`、`customer_pad_userid`;模型填 `notify_codes`(1..20)。
+- **说明文字**:「[取消客户的提醒] 按 reminder_list 返回的短编号取消当前客户的提醒,循环提醒整条取消。一次取消多条时,必须先把要删的清单列给客户看,客户在下一轮明确确认后,才带 confirmed_by_customer=true 调用。编号不是当前客户的会出现在 not_found 里。只有出现在 deleted 里的才算取消成功。」
+- **入参**:绑定 `project_code`、`customer_pad_userid`;模型填 `codes`(1..20,收短编号,也收原始 `notify_code`)、`confirmed_by_customer`(boolean,可选)。
+- **一次删多条**(9.10 ②,已定):`codes` 多于 1 条且没带 `confirmed_by_customer=true` → 42200,hint「先列出清单请客户确认,下一轮再删」;不做服务端两段式(06 §9 第 8 条)。
 - **返回**:`deleted[]`、`not_found[]`、`server_now`、`request_id`。
 - **做法**:只处理 `project_code + customer_pad_userid` 匹配的行 → 软删 + 删掉还没触发的 job(照抄 `removePendingJob`)。
 - **幂等**:同一客户已删过的编号再删,仍算 `deleted`(查询时连软删的行一起看);别人的编号一律 `not_found`,不暴露它存不存在。
@@ -635,7 +639,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | `basic_info` | `{text, updated_at}`;`form_customer_basic_info` 各字段最新值,「字段名:值 单位」一行一个,空值省略 |
 | `health_plan` | `{found, text, truncated}`;同 5.6,但 ≤ 3000 字 |
 | `today_food_log` | `{text, count}`;今天(北京)`form_food_log` 的记录 |
-| `reminders` | `{items, total}`;同 5.4 的口径和字段(编号、提醒语、下次发送时间、循环、截止),最多 20 条,多了注明总数 |
+| `reminders` | `{items, total}`;同 5.4 的口径和字段(短编号、提醒语、事件原时间、下次发送时间、循环、截止),最多 20 条,多了注明总数 |
 | `writable_forms` | `{form_code, form_name, description, context_fields}[]`;可写表单清单;`context_fields` 是这张表的情境字段和推断说明(3.4「情境字段」) |
 | `server_now` | |
 
@@ -839,7 +843,7 @@ spec:
 | 9 | 同月先后发两张化验单;下月再发一张;一张超过 70 项的 | 返回 `status`、`dropped_over_limit`;化验单提交表 | 前两张合成 1 条(`merged`),附件两张都在且不重复;下月新建;超出的列在 `dropped_over_limit` | 同月多条、附件丢失,或写入失败 |
 | 10 | 「明天早上 8 点提醒我测血糖」;「每天提醒我吃药」 | 返回;提醒表;Redis delayed 队列;到点时客户企微 | 返回 `created` + `notify_code` + `first_send_at=07:50+08:00`;表里有行、队列里有 job、到点真发出;吃药提醒走的是 `reminder_create` 而不是用药工具 | 回复说设好了但到点没发(库号不对 / 时区偏) |
 | 11 | 「昨天 8 点提醒我」(过去时间) | 返回 | `rejected: time_out_of_range`,回复如实说没设上 | 模型照样说「设好了」 |
-| 12 | `reminder_list` → 删其中一条 → 等到点 | 返回;提醒表软删;到点客户企微 | `deleted` 含该编号;到点不发 | 删了还发 |
+| 12 | `reminder_list` → 用短编号删其中一条 → 等到点;再不带 `confirmed_by_customer` 一次删两条 | 返回;提醒表软删;到点客户企微 | `deleted` 含该编号;到点不发;一次删两条没带确认 → 42200、两条都还在 | 删了还发;或一句话清空全部 |
 | 13 | 测试环境 MCP 空闲 31 分钟或重启后,让健管师调一次工具 | 平台日志 `mcp.session_terminated_resend`;run 结果 | 调用成功,模型无感 | 这次工具调用报错 |
 | 14 | 构造一个会让数据库报错的调用(测试环境临时断开 MCP 数据库连接) | 模型看到的工具结果 | 只有固定文案 + `request_id`,没有 SQL / 表名 | 报错原文进入模型上下文 |
 | 15 | 选一位健康方案最大的客户,调 `profile_get_brief`、`health_plan_get_brief` | 返回长度;trace 里有没有 `chars truncated` | ≤ 8000 字,没有平台截断标记 | JSON 被中间截断,模型读到坏数据 |
@@ -916,7 +920,7 @@ spec:
 
 **9.9 「查更早聊天」「转人工」什么时候做** —— **已定(11-17):v1 都做**。查更早聊天增强现有 `chat_private_history`(3.12),不新建工具;转人工新建 `handoff_to_human`(3.10)。
 
-**9.10 06 §4.2 列出的服务端要求,与本文设计不一致的几处**(交叉核对发现;06 声明「以 04 为准」,但这些是它依赖的规矩,需要逐条定)
+**9.10 06 §4.2 列出的服务端要求** —— **已定(11-17,06 评审):按下面各条的推荐**;① ② ⑤ ⑥ 已写进 5.3~5.5、M4,④ 按本文做法(按编码写),③ ⑦ 见各条。
 - ① **提醒短编号**:06(R41、§5.4)要求列表给短编号(如 R1),模型只抄短编号;本文 `reminder_list` / `reminder_delete` 用原始 `notify_code`(`notify_` + uuid,`agent-callback.service.ts:189`)。推荐加短编号:由服务端按客户分配、存一列,`reminder_delete` 两种都收。理由:长串手抄必错,抄错一位就是删不掉(安全上不越权,但客户体验差)。
 - ② **批量删除要带「客户已确认」**:06(R40、待拍板 8)要求一次删多条必须带这个参数;本文 `reminder_delete` 没有。推荐加一个可选参数 `confirmed_by_customer`(模型填,不绑定),多于 1 条且没带时服务端拒绝并提示先列出确认。
 - ③ ~~血糖必须带测量时段、服务端硬拒~~ **已定(11-17)**:改为所有表单通用的「情境字段」规则 —— 按表单配置、模型先按消息时间和上下文推断、推不出才问,服务端不因缺情境拒收(3.4)。

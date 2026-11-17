@@ -4,6 +4,8 @@
 >
 > **修订(2026-11-17,04 评审结论)**:inputs 加 `input_message_ids`(本批消息 id,写工具判重用);客户资料不走变量,由智能体调深护 MCP 一次取齐,业务方不每轮预取;转人工由深护 MCP 直接通知同事、写现有接管标志 / AI 开关,不经数字人服务回调(§3.2);主回复不走 MCP 发的理由已核实(§9 第 1 条)。
 >
+> **修订(2026-11-17,06 评审结论)**:inputs 加 `self_introduction`(自我介绍),与 `self_appellation` 一起由项目服务原样转给 Expert Work(数字人服务已在传)。
+>
 > 读者:深护项目服务 / 数字人服务的开发,以及 Expert Work 这边配置智能体的人。
 > 本文只管「一轮怎么调、会话怎么分、出错怎么收」;提示词与回复格式见 02,补消息与未送达回报见 03,工具与身份绑定见 04。
 
@@ -155,7 +157,8 @@
 | `attachment_urls` | 本轮客户发来的图片 / 文件原始链接,JSON 数组(数组里的链接平台不预下载,06 §5.1) | 是 | 否(没附件不传) | 工具参数绑定(表单写入的附件,04) | 否(`render: raw`) |
 | `input_message_ids` | 本轮要处理的客户消息的企微消息 id,JSON 数组,带通道前缀:pad `"pad:" + msg_app_info`、dk `"dk:" + msgid`(取自 §5.1 `messages[].msg_key`,与 03 同一规则);打断后合并重跑时放合并后的整批 | 是 | 是 | 写工具判重(同表 + 同内容 + 来源消息重叠才算重复)、转人工去重(04 §3.4、§3.10) | 否 |
 | `is_first_contact` | `"1"` / `"0"`;沿用 Dify 口径:这名员工与这个客户之间从没有过文字消息才是 `"1"`(数字人服务查消息表算出、随 §5.1 传来,项目服务原样转;不用「Expert Work 上第一轮」,否则从 Dify 切过来的老客户都会被重问,已拍板 11-17) | 是 | 否 | 首轮补问(02 待拍板 6、06 节 N) | 是(分支) |
-| `self_appellation` | 健管师自称 | 是 | 否 | 人设(06 §5.1) | 是 |
+| `self_appellation` | 健管师自称,≤ 100 字;数字人服务已在传,按员工绑定行 → 智能体行 → 员工名取(`invoke-agent.processor.ts:861`) | 是 | 否 | 人设名(06 §5.1、节 A) | 是 |
+| `self_introduction` | 自我介绍,≤ 2048 字,可空;取法同上(`:862`)。运营在深护后台配,不是客户输入 | 是 | 否 | 有就按它介绍自己,没有用默认人设(06 节 A) | 是(分支) |
 
 身份变量一律必填、没有就传空串:业务方漏传会当场 422,而不是悄悄少一个参数(04 §7 第 5 条)。`source` 不传(04 没有工具绑定它);客户备注名 / 群昵称(原 `customer_display_name`)不传,称呼取档案里的称呼字段(06 R19)。
 
@@ -256,7 +259,7 @@ Dify 的 `agent_call_back_url`、`agent_api_url`、`project_service_api_url` 不
 
 读法:
 
-- 按原假设,会话超过约 20 轮后每轮输入成本稳定在约 0.65 元,**门槛封顶约 ¥0.9 / 轮**(一轮里全不命中缓存约 2.2 元),不再随会话变长而涨。主模型若用 06 推荐的 qwen4-max(10 / 0.5),同样输入量约便宜 1/4。
+- 按原假设,会话超过约 20 轮后每轮输入成本稳定在约 0.65 元,**门槛封顶约 ¥0.9 / 轮**(一轮里全不命中缓存约 2.2 元),不再随会话变长而涨。主模型用 06 定的 qwen4-max(10 / 0.5),同样输入量约便宜 1/4。
 - **这些数都待实测**:上线前用测试环境实测 S、g、k 替换(§8「先数」第 2 条);上线后看真实费用,贵了再考虑加回「空闲换会话」(后续可选)。
 - 代价:① 到门槛后模型只看得到第一轮 + 最近 20 轮,中间的靠长期记忆;摘要触发时多一次辅助模型调用。② 平台默认一直保留会话第一轮(`working_memory.keep_first_turn`),会话不换,这一轮会是几周、几个月前的内容(§9 第 14 条)。③ 会话越长,平台读历史的接口越慢(query.md §5.3「会话越长,单次请求的开销越大」)。
 - 输出(含思考)另算,不随会话长度变。
@@ -523,7 +526,7 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 | `room_conversation_id` | string | 私聊为空串 |
 | `group_partner_code` | string,可缺 | 同现有语义:键存在即按群归属扣费 |
 | `invoke_token` | string | 轮次令牌,同现有 |
-| `persona` | object | `self_appellation`(私聊 / 群聊由 `room_conversation_id` 是否为空判断;客户备注名不再需要) |
+| `persona` | object | `self_appellation`、`self_introduction`(取法同现有 Dify 调用,`invoke-agent.processor.ts:861-862`;私聊 / 群聊由 `room_conversation_id` 是否为空判断;客户备注名不再需要) |
 | `is_first_contact` | `"1"` / `"0"` | 数字人服务查消息表算出:这名员工与这个客户之间从没有过文字消息为 `"1"`(§3.3.2) |
 | `messages` | array | 本批客户消息,按发送时间排序,见下表 |
 | 03 的字段 | — | 补消息(`backfill`、`backfill_omitted_before`、`input_message_ids`),见 03;03 之前不传 |
@@ -593,7 +596,8 @@ Idempotency-Key: dh1:<64 位十六进制>
     "attachment_urls": ["https://<深护 OSS>/demo/breakfast.jpg"],
     "input_message_ids": ["pad:APPINFO_0101", "pad:APPINFO_0102", "pad:APPINFO_0103"],
     "is_first_contact": "0",
-    "self_appellation": "小丘"
+    "self_appellation": "王老师",
+    "self_introduction": "国家二级健康管理师,做慢病管理 8 年"
   },
   "files": [{ "upload_id": "upl_3f2c9a1e-…" }]
 }
