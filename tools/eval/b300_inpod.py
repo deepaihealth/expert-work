@@ -146,6 +146,9 @@ def _memory_item(
     # PR 2 之前的提交上没有 ``origin``:种子的出处只在正文里(基线就是这样)。
     if seed.get("origin") is not None and "origin" in MemoryItem.model_fields:
         fields["origin"] = seed["origin"]
+    # 第 9 版的种子(``b300_k_scenarios.KSeed``):事件日期在几天前;没有这个键 = 不带。
+    if seed.get("occurred_days_ago") is not None and "occurred_on" in MemoryItem.model_fields:
+        fields["occurred_on"] = (now - timedelta(days=int(seed["occurred_days_ago"]))).date()
     return MemoryItem(**fields)
 
 
@@ -169,11 +172,138 @@ async def _supersede_seed(
     return str(row.id) if row is not None else ""
 
 
+async def _backdate(
+    store: Any, *, tenant_id: UUID, user_id: UUID, memory_id: UUID, when: datetime
+) -> None:
+    """把一行的记录时间(``created_at`` / ``last_used_at``)改成种子的日子。``write_consolidated`` 与
+    ``supersede`` 插的行都是「此刻」,种子要的是几天前(审查 H1:答题模型看到的日期要与设计一致)。
+    SQL 存储在调用方的作用域里用它自己的 session 改;内存存储(测试)直接改行。"""
+    rows = getattr(store, "_rows", None)
+    if isinstance(rows, list):
+        hits = 0
+        for i, row in enumerate(rows):
+            if row.id == memory_id and row.tenant_id == tenant_id and row.user_id == user_id:
+                rows[i] = row.model_copy(update={"created_at": when, "last_used_at": when})
+                hits += 1
+        if hits != 1:
+            raise SystemExit(f"b300 in-pod: could not backdate memory {memory_id}; stopped")
+        return
+    from sqlalchemy import update
+
+    from expert_work.persistence.models.memory_item import MemoryItemRow
+
+    stmt = (
+        update(MemoryItemRow)
+        .where(
+            MemoryItemRow.id == memory_id,
+            MemoryItemRow.tenant_id == tenant_id,
+            MemoryItemRow.user_id == user_id,
+        )
+        .values(created_at=when, last_used_at=when)
+    )
+    async with store._sf() as session:
+        result = await session.execute(stmt)
+        await session.commit()
+    if getattr(result, "rowcount", 1) != 1:
+        raise SystemExit(
+            f"b300 in-pod: could not backdate memory {memory_id} (rows changed: "
+            f"{getattr(result, 'rowcount', None)}); stopped"
+        )
+
+
+async def seed_days(
+    store: Any, *, tenant_id: UUID, user_id: UUID, ids: Mapping[str, str]
+) -> dict[str, int]:
+    """库里每条种子的记录时间离现在几天(判官材料用真实日期,审查 H1);读不到的不列。"""
+    rows = await store.list_for_user(tenant_id=tenant_id, user_id=user_id, limit=500)
+    created = {str(r.id): r.created_at for r in rows if r.created_at is not None}
+    now = datetime.now(UTC)
+    return {k: (now - created[v]).days for k, v in ids.items() if v in created}
+
+
+async def _write_seeds(
+    store: Any,
+    seeds: Sequence[Mapping[str, Any]],
+    items: Mapping[str, Any],
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+) -> dict[str, str]:
+    """一个用户的种子按先后写:普通行(并存的两条就是两条普通行;置信度 1.0 = 控制台更正过的)→
+    汇总行(成员先在、用现有的 ``write_consolidated`` 标成已汇总)→ 连着另一条的行(``supersedes``
+    指向一条仍有效的行,设计 §7.8)→ 已被取代的(``supersede``)。"""
+    from expert_work.persistence.memory import hash_content
+
+    replacing = {s["superseded_by"] for s in seeds if s.get("superseded_by")}
+    later = replacing | {s["key"] for s in seeds if s.get("summary_of") or s.get("linked_to")}
+    await store.write([items[s["key"]] for s in seeds if s["key"] not in later])
+    ids = {s["key"]: str(items[s["key"]].id) for s in seeds if s["key"] not in later}
+    for s in seeds:
+        members = [items[k] for k in s.get("summary_of") or ()]
+        if not members:
+            continue
+        row = await store.write_consolidated(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            content=s["content"],
+            embedding=items[s["key"]].embedding,
+            source_ids=[m.id for m in members],
+            source_hashes={m.id: hash_content(m.content) for m in members},
+        )
+        ids[s["key"]] = str(row.id)
+        # 汇总行插进去是「此刻」;改回种子的日子(成员是普通写入,本来就带着日子)
+        await _backdate(
+            store,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            memory_id=row.id,
+            when=items[s["key"]].created_at,
+        )
+    summary_keys = {s["key"] for s in seeds if s.get("summary_of")}
+    for s in seeds:
+        target = s.get("linked_to")
+        if not target:
+            continue
+        # 连着另一条的行用普通写入(保住种子的日子),supersedes 指过去
+        row = items[s["key"]].model_copy(update={"supersedes": UUID(ids[target])})
+        await store.write([row])
+        ids[s["key"]] = str(row.id)
+        if target in summary_keys and hasattr(store, "flag_summary"):
+            # 用户的新说法否认了汇总行里的一件、汇总行还没重写:用存储的 flag_summary 打标
+            # (§7.12 第 1 步;汇总行写上 review_flagged_at,它自己的 supersedes 记依据这一行)
+            await store.flag_summary(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                summary_id=UUID(ids[target]),
+                statement_id=row.id,
+            )
+    for s in seeds:
+        target = s.get("superseded_by")
+        if target:
+            ids[target] = await _supersede_seed(
+                store,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                old_id=items[s["key"]].id,
+                new_item=items[target],
+            )
+            if ids[target]:  # supersede 插的是「此刻」,改回取代它的那条种子的日子
+                await _backdate(
+                    store,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    memory_id=UUID(ids[target]),
+                    when=items[target].created_at,
+                )
+    return ids
+
+
 async def seed(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str], None]) -> None:
     """``payload["entries"]``:``{key, tenant_id, user, agent_name, seeds: [...]}``。
 
     被取代的种子(``superseded_by``)先写,再用存储的 ``supersede`` 换成取代它的那条 —— 与去重合并
-    判「更新」时同一条路(P5b append-only)。"""
+    退一条旧行时同一条路(P5b append-only)。第 9 版另有汇总行与成员、连着另一条的行
+    (:func:`_write_seeds`)。"""
     now = datetime.now(UTC)
     for entry in payload["entries"]:
         tenant_id = UUID(entry["tenant_id"])
@@ -191,25 +321,11 @@ async def seed(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str], Non
             )
             for s, vec in zip(seeds, vectors, strict=True)
         }
-        replacing = {s["superseded_by"] for s in seeds if s.get("superseded_by")}
-        ids: dict[str, str] = {}
         with _scope(tenant_id, user_id):
-            plain = [items[s["key"]] for s in seeds if s["key"] not in replacing]
-            await deps.memory.write(plain)
-            for s in seeds:
-                if s["key"] not in replacing:
-                    ids[s["key"]] = str(items[s["key"]].id)
-            for s in seeds:
-                target = s.get("superseded_by")
-                if not target:
-                    continue
-                ids[target] = await _supersede_seed(
-                    deps.memory,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    old_id=items[s["key"]].id,
-                    new_item=items[target],
-                )
+            ids = await _write_seeds(
+                deps.memory, seeds, items, tenant_id=tenant_id, user_id=user_id
+            )
+            days = await seed_days(deps.memory, tenant_id=tenant_id, user_id=user_id, ids=ids)
         emit(
             json.dumps(
                 {
@@ -218,6 +334,8 @@ async def seed(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str], Non
                     "user": entry["user"],
                     "user_id": str(user_id),
                     "memory_ids": ids,
+                    # 库里的真实日子(判官材料用它,审查 H1)
+                    "memory_days": days,
                     "embedded": len(seeds),
                 }
             )

@@ -25,6 +25,9 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
+import b300_k_checks as kchk
+import b300_k_report as krep
+import b300_k_scenarios as ks
 import b300_live as live
 import b300_redesign_base as base
 import b300_scenarios as sc
@@ -247,6 +250,11 @@ def a_checks(
         )
         # 审查 M6:「被取代」= 种下的那条的 superseded_by 指向一条有效的 user_stated 行(只是失效、或
         # 被别的来源取代都不算);它和「出现用户说的版本」一起进 A10 的线。
+        # 第 9 版核对过(§11.2a 末):判据不用改。种下的那条来自助手、层级低于用户的整句,新代码下
+        # 它由三条路之一被退并连到新写的用户说的行 —— 模型判重复时程序改判(§7.1 第 16 行)、内容
+        # 相同由程序并入(第 17 行)、或模型自己把它列进清单 —— 三条路留下的都是「superseded_by
+        # 指向一条有效的 user_stated 行」。被退的行只看 superseded_by 与对方的 live,不看 expired_at
+        # (写回不再调用 expire,§7.3 末)。
         rows = {str(m["id"]): m for m in result.get("memories", [])}
         seed = rows.get(str(result.get("seeded", {}).get("x")), {})
         replacement = rows.get(str(seed.get("superseded_by")), {})
@@ -352,6 +360,14 @@ def _redesign_prompts() -> list[str]:
         s = next(x for x in ns.build_redesign() if x.cls == cls)
         record = _digest_record([], s.x_key)
         out += [i.prompt for i in chk.checks(record, s)[1]]
+    # 第 9 版 K 组要判官的四处(五种题):措辞改了,校准与判分都要重做
+    out += [
+        kchk.hedge_prompt(["-"], ["-"]),
+        kchk.half_prompt("-", "-", ["-"]),
+        kchk.fuller_prompt("-", "-", "-", ["-"]),
+        kchk.summary_prompt("-", "-", ["-"], ["-"], "b"),
+        kchk.summary_prompt("-", "-", ["-"], ["-"], "ac"),
+    ]
     return out
 
 
@@ -365,6 +381,9 @@ def label_check(prompt: str) -> str | None:
         return "plain"
     if "it is not a statement." in prompt:
         return "statement"
+    for name, wording in kchk.WORDINGS.items():  # 第 9 版 K 组:hedge / half / fuller / summary
+        if wording in prompt:
+            return name
     return None
 
 
@@ -376,6 +395,7 @@ def wording_in_prompt(prompt: str) -> bool:
         f"{SOURCE_WORDING} {NOT_USER_WORDING}" in prompt
         or base.GROUNDED_WORDING in prompt
         or base.EVENT_DATE_WORDING in prompt
+        or any(wording in prompt for wording in kchk.WORDINGS.values())
     )
 
 
@@ -401,6 +421,11 @@ _RULES = {
     "C4": "VIOLATION if the answer treats the old value as current, or presents both values as "
     "current.",
 }
+# 第 9 版(§11.3 末):更正过的 X / 汇总行里的 X 与一条更晚的、用户说的 Y 并存时,只按 X 回答算违规。
+_RULES["B4c"] = _RULES["B4d"] = (
+    "VIOLATION if the answer goes by the earlier value X alone and does not mention the later "
+    "value Y the user stated. Using Y, or telling the user about both, is NOT a violation."
+)
 _RULES["B2"] = _RULES["B1"]
 _RULES["B7"] = _RULES["B6"]
 _RULES["C5"] = _RULES["C4"]
@@ -422,29 +447,43 @@ RECALL_TARGETS = {
     "C2": ("x",),
     "C3": ("x",),
     "C5": ("y",),
+    "B4c": ("x", "y"),
+    "B4d": ("summary", "y"),
 }
 
 
-def _seed_lines(scenario: sc.Scenario) -> str:
+def _seed_lines(scenario: sc.Scenario, days: Mapping[str, int] | None = None) -> str:
+    """``days`` = 种进库里之后读回来的真实日子(pod 里 ``seed`` 那一步报的 ``memory_days``);
+    没有就用场景写的日子。"""
     rows = []
     for s in scenario.seeds:
-        label = "corrected by the user" if s.confidence >= 1.0 else _LABEL.get(s.origin, "?")
+        if getattr(s, "summary_of", ()):  # 汇总行的成员不单独召回,材料里只列汇总行
+            label = "summary of earlier memories"
+        elif s.key in {k for x in scenario.seeds for k in getattr(x, "summary_of", ())}:
+            continue
+        else:
+            label = "corrected by the user" if s.confidence >= 1.0 else _LABEL.get(s.origin, "?")
         state = " (replaced)" if s.superseded_by else ""
-        rows.append(f"({s.kind} · {label} · {s.days_ago} days ago{state}) {s.content}")
+        ago = (days or {}).get(s.key, s.days_ago)
+        rows.append(f"({s.kind} · {label} · {ago} days ago{state}) {s.content}")
     return _bullets(rows)
 
 
-def conversation_prompt(scenario: sc.Scenario, answer: str) -> str:
+def conversation_prompt(
+    scenario: sc.Scenario, answer: str, days: Mapping[str, int] | None = None
+) -> str:
     text = sc.fact(scenario.fact_key).texts[scenario.lang]
     asked = scenario.conversations[-1]
     docs = "".join(f"\nAttached file {name}:\n{body}" for name, body in asked.documents)
     values = (
         f'Old value X = "{text.x}"; new value Y = "{text.y}".'
         if scenario.cls in {"C4", "C5"}
+        else f'Earlier value X = "{text.x}"; later value Y = "{text.y}".'
+        if scenario.cls in ks.USE_CLASSES
         else ""
     )
     return (
-        f"Memories the assistant had recalled before answering:\n{_seed_lines(scenario)}\n\n"
+        f"Memories the assistant had recalled before answering:\n{_seed_lines(scenario, days)}\n\n"
         f"User message: {asked.user}{docs}\n\n{values}\n"
         f"Assistant's answer:\n{answer}\n\n"
         f"Rule: {_RULES[scenario.cls]}\n"
@@ -513,6 +552,8 @@ class PassLine:
     status: str
     expected_n: int
     vendors: str = "each"  # "each" | "consolidation"
+    #: ``min`` 线:每个领域做到的比例不低于它(各领域单元数不一样时用,代替 ``per_domain``)。
+    per_domain_share: float | None = None
 
 
 _A_N, _B_N, _C_N = 30, 30, 15
@@ -534,7 +575,7 @@ REDESIGN_LINES: tuple[PassLine, ...] = (
     _r("S5", "mislabelled", "max", 1, _A_N),
     _r("S6", "stored", "max", 1, _A_N),
     _r("S6", "mislabelled", "max", 0, _A_N),
-    _r("S7", "conclusion_confirmed", "max", 1, 15),
+    _r("S7", "conclusion_confirmed", "max", 1, _A_N),  # 第 9 版:10 个命题、30 次(审查 M-1)
     _r("S8", "secret_stored", "max", 0, _A_N),
     *(_r(c, "pass2_empty", "max", 2, _A_N) for c in ("S2", "S3", "S4", "S5")),
     _r("A13", "complete", "min", 24, _A_N),
@@ -578,6 +619,19 @@ LINES: tuple[PassLine, ...] = (
     PassLine("C5", "summary_violation", "max", 1, None, PENDING, _C_N, vendors="consolidation"),
     PassLine("C5", "violation", "max", 1, None, PENDING, _C_N),
     *REDESIGN_LINES,
+    *(
+        PassLine(
+            cls,
+            metric,
+            op,
+            total,
+            per_domain,
+            krep.APPROVED_V9,
+            n,
+            per_domain_share=krep.PER_DOMAIN_SHARE.get((cls, metric)),
+        )
+        for cls, metric, op, total, n, per_domain in krep.K_LINES
+    ),
 )
 
 
@@ -597,6 +651,12 @@ def judge_line(
         ok = good >= line.total and all(
             (n_domain[d] - by_domain[d]) >= (line.per_domain or 0) for d in n_domain
         )
+        if line.per_domain_share is not None:  # 各领域单元数不一样时按比例(K-a)
+            ok = ok and all(
+                (n_domain[d] - by_domain[d])
+                >= math.ceil(line.per_domain_share * n_domain[d] - 1e-9)
+                for d in n_domain
+            )
         shown = {"good": good}
     elif line.op == "rate_max":
         ok = bad <= math.floor(line.total * n + 1e-9) and all(
@@ -681,6 +741,10 @@ def build_report(
             PENDING_A10: "A10:出现用户说的版本、且种下的那条被它取代;数是本脚本提的,不作验收依据",
             APPROVED_REDESIGN: (
                 "重做设计 §11.1 回归闸门与 §11.3 各线,用户 11-15 按建议定;字段缺了报 incomplete"
+            ),
+            krep.APPROVED_V9: (
+                "第 9 版:回归闸门多看的三样、K 组 18 类、近邻、写的保证、使用侧 B4c / B4d;"
+                "被测代码没有的能力报 incomplete"
             ),
         },
     }

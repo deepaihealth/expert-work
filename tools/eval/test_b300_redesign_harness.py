@@ -76,9 +76,10 @@ def test_gate_units_are_the_11_15_p6_p7_units_unchanged(tmp_path: Path) -> None:
     assert all(a[u["scenario_id"]] == u["scenario_digest"] for u in gate)
 
 
-def test_s_phase_has_225_units(tmp_path: Path) -> None:
+def test_s_phase_has_240_units(tmp_path: Path) -> None:
+    """第 9 版(审查 M-1):S7 加到 10 个命题,S 组 240 个单元。"""
     q = _quote(tmp_path, *GLM, "--phases", "a", "--stop-line", "100")
-    assert len(phases.build_units(phases.PHASES["s"], q)) == 225
+    assert len(phases.build_units(phases.PHASES["s"], q)) == 240
     assert len(phases.build_units(phases.PHASES["shape"], q)) == 60
 
 
@@ -186,7 +187,7 @@ def test_gate_quote_prices_only_the_gate_with_a_judge_sub_budget(tmp_path: Path)
     q = _quote(tmp_path, *GLM, "--phases", "g", "--stop-line", "20")
     assert q["phases"] == ["G"]
     groups = q["planned"]["groups"]
-    assert set(groups) == {"gate", "calibration-g"}
+    assert set(groups) == {"gate", "gate-k", "calibration-g"}  # 第 9 版:闸门多一段 K 四类
     kinds = groups["gate"]["by_vendor"]["glm"]["calls_by_kind"]
     assert kinds["extract@glm-5.3-flash"] == [120.0, 120.0]  # 60 次写回 x 两次提炼
     assert kinds["reconcile@glm-5.3-flash"] == [0.0, 120.0]  # 两段合并,每段 0~1 次
@@ -205,7 +206,7 @@ def test_redesign_unit_shapes_are_priced_in_the_a_budget(tmp_path: Path) -> None
     q = _quote(tmp_path, *GLM, "--phases", "a", "--stop-line", "100", "--no-compare")
     kinds = q["planned"]["groups"]["S"]["by_vendor"]["glm"]["calls_by_kind"]
     writebacks = sum(len(s.writebacks) for s in ns.build_redesign()) * plan.REPEATS
-    assert writebacks == 942
+    assert writebacks == 972  # 第 9 版:S7 多 5 个场景 x 2 轮 x 3 次
     assert kinds["extract@glm-5.3-flash"] == [writebacks * 2.0] * 2
     assert plan.budget_of_group("S") == "A" and set(q["phase_budgets"]) == {"A", "A-judge"}
 
@@ -395,7 +396,22 @@ _PROBES: dict[str, Callable[[], bool]] = {
     "event_date": lambda: _field_kept("occurred_on", date(2026, 11, 15)),
     "confirmed_at": lambda: _field_kept("confirmed_at", datetime(2026, 11, 15, tzinfo=UTC)),
     "slicing": _takes_slice_start,
+    # 第 9 版(``b300_k_platform`` 的 A1 / A8):存储的 ``supersede`` 收清单;整理器有当场重写的入口
+    "retire_split": lambda: "old_ids" in inspect.signature(_store_supersede()).parameters,
+    "summary_rewrite": lambda: hasattr(_rewriter(), "rewrite_for_user"),
 }
+
+
+def _store_supersede() -> Any:
+    from expert_work.persistence import InMemoryMemoryStore
+
+    return InMemoryMemoryStore.supersede
+
+
+def _rewriter() -> Any:
+    from control_plane import memory_consolidator
+
+    return getattr(memory_consolidator, "SummaryRewriter", None)
 
 
 @pytest.mark.parametrize("name", base.CAPABILITIES)

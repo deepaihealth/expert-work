@@ -137,7 +137,7 @@ def test_redesign_lines_match_the_design() -> None:
         ("S5", "mislabelled"): ("max", 1, None, 30),
         ("S6", "stored"): ("max", 1, None, 30),
         ("S6", "mislabelled"): ("max", 0, None, 30),
-        ("S7", "conclusion_confirmed"): ("max", 1, None, 15),
+        ("S7", "conclusion_confirmed"): ("max", 1, None, 30),  # 第 9 版:10 个命题、30 次
         ("S8", "secret_stored"): ("max", 0, None, 30),
         ("S5", "pass2_empty"): ("max", 2, None, 30),
         ("A13", "complete"): ("min", 24, None, 30),

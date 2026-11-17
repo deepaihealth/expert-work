@@ -37,6 +37,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import b300_k_platform as kp  # noqa: E402
 import b300_scenarios as sc  # noqa: E402
 from b300_spend import Guard, SpendStopError, call_cap_yuan, usage_cost  # noqa: E402
 from b301_plan import Price  # noqa: E402
@@ -283,7 +284,8 @@ class GuardedCaller:
                 "reply": text,
                 "input_tokens": int(usage.get("prompt_tokens") or 0),
                 "output_tokens": int(usage.get("completion_tokens") or 0),
-                **({"input": rest} if kind in {"pass1", "pass2"} else {}),
+                # 第 9 版:去重合并的材料也记下(模型列了哪些旧记忆、写的保证,都要按它对回去)。
+                **({"input": rest} if kind in {"pass1", "pass2", "reconcile"} else {}),
             }
         )
         return AIMessage(
@@ -323,7 +325,15 @@ def turn_messages(turn: sc.Turn, index: int) -> list[Any]:
 
 
 def _live(item: Any) -> bool:
-    return item.deleted_at is None and item.invalid_at is None and item.superseded_by is None
+    """有效 = 没删、没作废、没被取代,且不是已并入汇总的成员(成员召回不到,平台也不当它「已经
+    在了」,审查 M3;汇总行自己算)。"""
+    folded = item.status != "consolidated" and getattr(item, "consolidated_into", None) is not None
+    return (
+        item.deleted_at is None
+        and item.invalid_at is None
+        and item.superseded_by is None
+        and not folded
+    )
 
 
 def platform_capabilities() -> dict[str, bool]:
@@ -335,12 +345,16 @@ def platform_capabilities() -> dict[str, bool]:
     fields = MemoryItem.model_fields
     origins: frozenset[str] = getattr(protocol_item, "MEMORY_ORIGINS", frozenset())
     entry = inspect.signature(memory_module.flush_messages_with_outcome).parameters
+    from expert_work.persistence import InMemoryMemoryStore
+
     return {
         "user_confirmed": "user_confirmed" in origins,
         "evidence_pointer": "evidence_message_id" in fields,
         "event_date": "occurred_on" in fields,
         "confirmed_at": "confirmed_at" in fields,
         "slicing": SLICE_START_PARAM in entry,
+        # 第 9 版:``supersede`` 收清单、有当场重写汇总行的入口(假设都在 ``b300_k_platform``)
+        **kp.capabilities(InMemoryMemoryStore),
     }
 
 
@@ -380,6 +394,8 @@ def _dump(m: Any) -> dict[str, Any]:
         "evidence_message_index": _text(getattr(m, "evidence_message_index", None)),
         "occurred_on": _text(getattr(m, "occurred_on", None)),
         "confirmed_at": _text(getattr(m, "confirmed_at", None)),
+        # 第 9 版的读库断言(§11.2a):连线、作废时间、汇总行与成员、重写标记。
+        **kp.dump_row(m),
     }
 
 
@@ -390,6 +406,10 @@ async def _seed_store(
 
     if not scenario.seeds:
         return {}
+    if scenario.group == "K":  # 带日子、并存连线、置信度 1.0、汇总行与成员(§11.2a)
+        return await kp.seed_store(
+            store, embedder, scenario.seeds, tenant_id=A_TENANT, user_id=user_id
+        )
     vectors = await embedder.embed([s.content for s in scenario.seeds], tenant_id=A_TENANT)
     ids: dict[str, str] = {}
     items = []
@@ -445,29 +465,50 @@ async def run_extraction(
             continue
         caller = GuardedCaller(transport, f"{item}|wb{index}", phase)
         slice_arg: dict[str, Any] = slice_start(start) if caps["slicing"] else {}
-        outcome = await memory_module.flush_messages_with_outcome(
-            list(messages),
-            memory_store=store,
-            embedder=embedder,
-            llm_caller=caller,
-            tenant_id=A_TENANT,
-            user_id=user_id,
-            thread_id=thread,
-            token=CancellationToken(),
-            reconcile=True,
-            agent_name=A_AGENT,
-            **slice_arg,
-        )
+        with kp.writeback_errors() as swallowed:  # 写回入口吞掉的错,只记异常名(§11.1 第 2 步 ③)
+            outcome = await memory_module.flush_messages_with_outcome(
+                list(messages),
+                memory_store=store,
+                embedder=embedder,
+                llm_caller=caller,
+                tenant_id=A_TENANT,
+                user_id=user_id,
+                thread_id=thread,
+                token=CancellationToken(),
+                reconcile=True,
+                agent_name=A_AGENT,
+                **slice_arg,
+            )
         if caller.failures or transport.guard.blocked:
             if transport.guard.blocked:
                 raise SpendStopError(transport.guard.blocked)
             raise RuntimeError(f"model call failed inside the writeback: {caller.failures}")
+        rewrite: dict[str, Any] | None = None
+        if scenario.cls == "K-s":  # §7.12 第 2 步:写回任务收尾时当场重写打了标的汇总行
+            aux = kp.GuardedAux(transport, f"{item}|wb{index}", phase)
+            rewrite = await kp.rewrite_flagged(
+                store,
+                embedder,
+                aux,
+                tenant_id=A_TENANT,
+                user_id=user_id,
+                model=transport.model,
+                summary_id=seeded.get("summary"),
+            )
+            rewrite["calls"] = aux.calls
+            if transport.guard.blocked:  # 重写器把模型调用的错吞成 failed:止损了照样停
+                raise SpendStopError(transport.guard.blocked)
+            if aux.failures:  # 评测这边的调用出错(限流用完重试等):这条记录要补跑
+                raise RuntimeError(f"summary rewrite model call failed: {aux.failures}")
         now = await store.list_for_user(tenant_id=A_TENANT, user_id=user_id, limit=500)
         rounds.append(
             {
+                **({"rewrite": rewrite} if rewrite is not None else {}),
                 "after_turn": index,
                 "written": outcome.written,
                 "failed": outcome.failed,
+                "errors": list(swallowed),
+                "scan_blocked": kp.scan_blocked(caller.calls),
                 "calls": caller.calls,
                 "message_count": len(messages),
                 "sliced": bool(slice_arg),
@@ -481,6 +522,7 @@ async def run_extraction(
         "rounds": rounds,
         "memories": [_dump(m) for m in everything],
         "capabilities": caps,
+        "origin_labels": kp.origin_labels(),
         "user_message_ids": user_ids,
     }
 

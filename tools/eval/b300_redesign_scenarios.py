@@ -3,8 +3,9 @@
 本机写回的路子跑),每个场景另有一份 :class:`Spec`(哪一轮是用户的回答、哪一次写回的新段里有可记
 的内容、还要查哪些关键串)。
 
-* **S 组**(§11.2,AuthMem 的成对设计):S1~S6 是同 10 个命题、只换「它怎么进到对话里」;S7 5 句
-  「几个结论 + 一个提议,用户回『好』」;S8 10 个秘密值。共 75 个场景,每个 3 次 = 225 个单元。
+* **S 组**(§11.2,AuthMem 的成对设计):S1~S6 是同 10 个命题、只换「它怎么进到对话里」;S7 10 句
+  「几个结论 + 一个提议,用户回『好』」(第 9 版从 5 句加到 10 句);S8 10 个秘密值。共 80 个场景,
+  每个 3 次 = 240 个单元。K 组(第 9 版,18 类)在 ``b300_k_scenarios``。
   每个 S 场景种一条同领域、无关的「用户说的」旁观记忆,量「误伤」(§11.3)。
 * **形状留出集**(§11.2,只报数):H1 一行答两个问题、H2 隔一轮才回答、H3 多个结论 + 「好」(同
   S7、换领域)、H4 秘密值夹在一句正常回答里;每种 5 个,用另外 5 个领域。
@@ -345,7 +346,7 @@ def build_x() -> list[Scenario]:
         out.append(
             _scenario("A14", "X", ex.key, ex.domain, "long", ex.lang, turns, Spec(), x_key="")
         )
-    for item in rf.S7_ITEMS:
+    for item in rf.A15_ITEMS:
         out.append(_a15(item))
     for reading in rfx.READINGS:
         out += _same_day(reading)
@@ -438,7 +439,7 @@ def scenario_digest_all() -> str:
 
 _SIZE = {
     **dict.fromkeys(("S1", "S2", "S3", "S4", "S5", "S6", "S8", "A13", *SD_CLASSES), 10),
-    "S7": 5,
+    "S7": 10,  # 第 9 版(审查 M-1):10 个命题、30 次
     "A15": 5,
     "A14": 2,
     **dict.fromkeys(SHAPE_CLASSES, 5),

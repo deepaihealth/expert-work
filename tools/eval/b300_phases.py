@@ -18,6 +18,8 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import b300_k_items as ki  # noqa: E402
+import b300_k_scenarios as ks  # noqa: E402
 import b300_live as live  # noqa: E402
 import b300_plan as plan  # noqa: E402
 import b300_redesign_scenarios as ns  # noqa: E402
@@ -41,6 +43,8 @@ class Phase:
     baseline: bool
     #: 只跑一家:``cut2`` / ``cut3`` 在对应删减生效时只跑一家;``always`` 总是一家(基线证明会红)。
     single: str = ""
+    #: 每个场景跑几次;0 = 照 ``b300_plan.REPEATS``(回归闸门的 K 段每个场景只跑 1 次)。
+    repeats: int = 0
 
 
 PHASES: dict[str, Phase] = {
@@ -66,6 +70,11 @@ PHASES: dict[str, Phase] = {
         Phase("a14", ("A14",), "extraction", False),
         Phase("a15", ("A15",), "extraction", False),
         Phase("sd", ns.SD_CLASSES, "extraction", False),
+        # 第 9 版(§11.1 第 2 步 ①、§11.2a、§11.3 末):回归闸门先跑的 K-a / K-b / K-n2 / K-cp 各 10 个
+        # 单元;正式一轮的 K 组 18 类;使用侧 B4c / B4d。
+        Phase("gate-k", ks.GATE_K_CLASSES, "extraction", False, repeats=1),
+        Phase("k", ks.K_CLASSES, "extraction", False),
+        Phase("b4x", ks.USE_CLASSES, "conversation", False),
     )
 }
 
@@ -88,7 +97,12 @@ PHASE_BUDGET = {
     **dict.fromkeys(("s", "shape", "a13", "a14", "a15", "sd"), "A"),
     "gate": "G",
     "calibration-g": "G",
+    "gate-k": "G",
+    "k": "A",
+    "b4x": "B",
 }
+#: 回归闸门的两段(原样的 P6 / P7、第 9 版加的 K 四类):线带 ``G-`` 前缀,与正式一轮分开。
+GATE_PHASES = ("gate", "gate-k")
 #: 判官的记账段名后缀(§11.8 ③:判官单独一段子预算);校准只有判官调用。
 JUDGE_SUFFIX = "-judge"
 
@@ -112,11 +126,15 @@ def parent_budget(budget: str) -> str:
 def scenarios_for(phase: Phase) -> list[sc.Scenario]:
     if phase.classes == ("D",):
         return sc.build_compare()
-    return [s for s in [*sc.build_all(), *ns.build_redesign()] if s.cls in phase.classes]
+    return [s for s in _every_scenario() if s.cls in phase.classes]
+
+
+def _every_scenario() -> list[sc.Scenario]:
+    return [*sc.build_all(), *ns.build_redesign(), *ks.build_k(), *ks.build_use()]
 
 
 def all_scenarios() -> dict[str, sc.Scenario]:
-    return sc.by_id([*sc.build_all(), *sc.build_compare(), *ns.build_redesign()])
+    return sc.by_id([*_every_scenario(), *sc.build_compare()])
 
 
 def phase_vendors(phase: Phase, q: Mapping[str, Any]) -> list[str]:
@@ -164,7 +182,7 @@ def build_units(phase: Phase, q: Mapping[str, Any]) -> list[dict[str, Any]]:
     pilot = bool(q.get("pilot"))
     models = {v["provider"]: {"main": v["main"], "memory": v["memory"]} for v in q["vendors"]}
     for s in pilot_scenarios(phase) if pilot else scenarios_for(phase):
-        for repeat in range(1 if pilot else plan.REPEATS):
+        for repeat in range(1 if pilot else (phase.repeats or plan.REPEATS)):
             vendors = [q["single_vendor"]] if pilot else vendors_for_class(phase, s.cls, q)
             for vendor in vendors:
                 shared = phase.kind == "c5"
@@ -598,13 +616,20 @@ def record_approval(out: Path, *, cmd: str, quote_id: str, user_said: str | None
 
 
 def check_labels(labels: Sequence[Mapping[str, Any]]) -> None:
-    """§8.3:20 条人工标注,5 个领域各 4 条,是 / 否各半。标注由人给,脚本不造。"""
+    """§8.3:20 条人工标注,至少 5 个领域、每个领域至多 4 条(用户 11-16 放宽),是 / 否各半。
+    领域要是 A 组或 K 组认识的。标注由人给,脚本不造。"""
     if len(labels) != plan.CALIBRATION_ITEMS:
         raise EvalError(f"calibration wants {plan.CALIBRATION_ITEMS} labels, got {len(labels)}")
     per_domain = defaultdict(int)
     for row in labels:
         per_domain[row["domain"]] += 1
-    if sorted(per_domain) != sorted(sc.DOMAINS) or set(per_domain.values()) != {4}:
-        raise EvalError(f"calibration labels must be 4 per domain: {dict(per_domain)}")
+    # 第 9 版:K 组的判官题来自另外 5 个领域,一批标注里可以是 A 组的领域,也可以掺 K 组的 ——
+    # 领域要认识、至少 5 个、每个至多 4 条(只用 A 组的领域时就是原来的「5 个领域各 4 条」)。
+    known = {*sc.DOMAINS, *ki.K_DOMAINS}
+    if set(per_domain) - known or len(per_domain) < len(sc.DOMAINS) or max(per_domain.values()) > 4:
+        raise EvalError(
+            "calibration labels need at least 5 known domains and at most 4 per domain: "
+            f"{dict(per_domain)}"
+        )
     if sum(bool(r["label"]) for r in labels) * 2 != len(labels):
         raise EvalError("calibration labels must be half yes, half no")

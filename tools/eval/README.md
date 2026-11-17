@@ -566,7 +566,7 @@ B-206 K-2 起默认同时给模型 `knowledge_read`(与生产一致:绑了知识
 
 1. `manifests --out agents/` → 控制台导入(每家 `eval-b300-<家>` 不写回、`eval-b300-<家>-wb` 写回)。先人工跑一段确认智能体读得到上传的文件。
 2. `prepare --phase b --out OUT --tenant-id T --approved-quote Q` → `OUT/b/units.json` 与 `bundle-seed.py`;pod 里跑它 → `ingest --op seed`。每次运行一个新的评测用户,种子互不串。
-3. `calibrate --labels labels.jsonl ...`(只做一次):20 条**人工**标注(每行 `domain` / `label` / `prompt`,5 个领域各 4 条、是否各半),判官一致 ≥ 18 才让 `judge` 开跑。A 组另有一套(`calibrate --set a --labels a-labels.jsonl`,按报价的 A 组票数,默认 1 票);1 票没过就 `quote --a-judge-votes 3` 重新报价、批、再校。
+3. `calibrate --labels labels.jsonl ...`(只做一次):20 条**人工**标注(每行 `domain` / `label` / `prompt`,至少 5 个领域、每个至多 4 条、是否各半;用户 11-16 放宽,原为 5 个领域各 4 条),判官一致 ≥ 18 才让 `judge` 开跑。A 组另有一套(`calibrate --set a --labels a-labels.jsonl`,按报价的 A 组票数,默认 1 票);1 票没过就 `quote --a-judge-votes 3` 重新报价、批、再校。
 4. `run --phase b --release-tag ... --approved-quote Q --stop-line S` → `bundle --op recalled` → pod → `ingest --op recalled`(召回帧对外已剔除,只能在库里读)→ `judge --phase b`。
 5. 种下的那条没被召回的、前提不成立的不计入:`prepare --phase b --reruns` 加一次尝试(补跑合计超过两成就停下问)→ 重复 2、4。出错的那几条不另开尝试,同样的参数再 `run` 就在原地续跑。
 6. `report --out OUT --quote-file quote.json`。
@@ -579,7 +579,7 @@ C4 分三步:`run --step 1`(写回智能体)→ 等写回 → `bundle --op state
 
 | 文件 | 做什么 |
 |---|---|
-| `b300_redesign_facts.py` / `b300_redesign_facts_x.py` / `b300_redesign_heldout.py` / `b300_redesign_scenarios.py` | S 组(S1~S6 同 10 个命题只换来源条件、S7 结论 + 提议、S8 秘密值,共 75 个场景 x 3 = 225 单元,每个 S 场景种一条同领域无关的旁观记忆量「误伤」);形状留出集 H1~H4(20 个,另 5 个领域,**由没看过提示词例子的人写**,脚本只转了结构、给期望值补了几种写法、把一个卡号首位改成 0);A13 / A14 / A15、同一天读数 SD1~SD3(读数都避开 1~31 和年份)。每一轮之后写回一次。卡号类秘密值都是 0 开头、不过 Luhn 的假号 |
+| `b300_redesign_facts.py` / `b300_redesign_facts_x.py` / `b300_redesign_heldout.py` / `b300_redesign_scenarios.py` | S 组(S1~S6 同 10 个命题只换来源条件、S7 结论 + 提议(第 9 版从 5 句加到 10 句)、S8 秘密值,共 80 个场景 x 3 = 240 单元,每个 S 场景种一条同领域无关的旁观记忆量「误伤」);形状留出集 H1~H4(20 个,另 5 个领域,**由没看过提示词例子的人写**,脚本只转了结构、给期望值补了几种写法、把一个卡号首位改成 0);A13 / A14 / A15、同一天读数 SD1~SD3(读数都避开 1~31 和年份)。每一轮之后写回一次。卡号类秘密值都是 0 开头、不过 Luhn 的假号 |
 | `b300_redesign_base.py` / `b300_redesign_checks.py` | 判法:关键串(`\|` 分开几种写法;千分位不算;数字按边界、先去掉日期片段)、秘密值只去掉数字之间的空格和横线、纯数字按数字边界比(`~` 开头的写法按整词比)、来源读字段、空列表、带编号的输入、判官的「有据程度」(≥ 4 算对)与「事件日期误标」;平台没有 `user_confirmed` / 证据指针 / 事件日期 / 切片起点时,依赖它的线报 `incomplete` 并写明缺哪个字段(A13、A14 没有切片起点都报 incomplete;A14 量的是提炼输入里分隔行 `=== new ===` 以下的新段,不含固定指令、也不含上下文行(与设计 §11.3「前 3 轮」口径不同:上下文从 0 行热身,连它一起量切片正确也会到 1.5 上下),上下文另由 `A14.context_over_cap` 查不超过第一次 2 条、第二次 4 行;形状留出集 H2 按 §5.4 预期被降成来自助手,`user_confirmed_other_origin` 不算漏记;连续 4 次限流只让那一项失败、按 0 结) |
 
 A10 的线(本脚本提 ≥ 24 / 30,待用户确认):出现用户说的版本,且种下的那条的 `superseded_by` 指向这条有效的 `user_stated`。
@@ -603,5 +603,20 @@ python tools/eval/b300_eval.py report --out GATE --quote-file quote.json    # �
 ```
 
 空列表若回升,先拿掉第二次指令的例子 9 重跑闸门(§11.1)。正式一轮:`quote --phases a`(A 组 + 上面六段)另报价、另批。
+
+#### 第 9 版:K 组(新说法与旧记忆冲突,§11.2a / §11.3)、闸门的 K 段、使用侧 B4c / B4d
+
+| 文件 | 做什么 |
+|---|---|
+| `b300_k_items.py` / `b300_k_scenarios.py` | K 组 18 类 x 10 个场景(5 个领域各 2 个、中英各 5,同 10 组内容只换新说法的来路)= 540 单元;除 K-late 外每个场景种两条**近邻**(同一话题、另一个人 / 另一样东西 / 另一个场合)。种子(`KSeed`)带日子、来源、置信度(1.0 = 控制台更正过的)、并存连线、汇总行与成员、事件日期。类名只用 ASCII:`K-ap` / `K-bp` / `K-cp` = 设计里带撇号的三类。场景写的时候没有读附录 A / B / C / E 给模型的指令与例子。使用侧 `B4c`(更正过的 X + 更晚的用户说的 Y)、`B4d`(含 X 的汇总行 + 更晚的 Y)各 10 个 |
+| `b300_k_checks.py` | 每类的**读库断言**(新值有没有有效行、旧值的 `superseded_by` 指向谁、旧值是否仍有效、近邻是否被动过)、「写的保证」(§7.3 的定义)、四处判官题(犹豫是否留着 / 没被否认的半句 / 说得更全的部分 / 汇总行两问,各一票) |
+| `b300_k_report.py` | 第 9 版的线(`K_LINES`)、统计力表(报告的 `statistical_power`)、照实说明 |
+| `b300_k_platform.py` | **对代码侧新接口的全部假设集中在这里**(`ASSUMPTIONS`,报告的 `disclosures` 原样带上):`supersede` 收 `old_ids`、当场重写汇总行的入口、去重合并材料与回复的形状、被吞掉的错怎么数。接口合进来之后对不上的只改这里(和 `b300_inpod.py` 里标了「接口假设」的 `_supersede_seed`) |
+
+段:`gate-k`(闸门多看的 K-a / K-b / K-n2 / K-cp 各 10 个单元 = 40,G 段,不送 K 组的判官题;线 `G-K-*`、`G-ALL.write_guarantee_broken`、`G-ALL.reconcile_reply_error`)、`k`(540 单元,A 段)、`b4x`(B4c / B4d,B 段,与 `b` 同样的 `prepare` → `bundle --op seed` → `ingest` → `run` → 召回 → `judge`)。闸门:`--phases g` 的报价同时覆盖 `gate` 与 `gate-k`,两段各 `prepare` / `run` / `judge` 一遍、同一个 `--out`。K-s 在每次写回之后调一次当场重写(入口还没有时不调模型,要重写才量得到的两条线报 `incomplete`)。被测代码的 `supersede` 还不收 `old_ids`(第 9 版代码没合)时「写的保证」报 `incomplete`,其余读库的线照量。**校准**:正式一轮的判官题多了 `hedge` / `half` / `fuller` / `summary` 四种,判官措辞摘要随之变了 —— 之前的 A 组校准与判分都要重做;标注可以掺 K 组的 5 个领域(领域要认识、至少 5 个、每个至多 4 条)。
+
+用户 11-16 定的几处:**K-a** 里带事件日期的 2 个场景(6 个单元)不进线、只在 `counts` 报数(`K-a.dated_*`),线是 ≥ 19 / 24、漏记 ≤ 2 / 24,逐领域做到的不少于三分之二(闸门里 8 个单元、≥ 6);**K-s** 场景不改、照实量,否认那一半每个单元走到哪一步分开报(`K-s.deny_not_listed` / `deny_listed_blocked` / `deny_marked_not_rewritten` / `deny_rewritten`),不达标的次数再按原因分(`K-s.<指标>_bad_<原因>`:`listed_blocked` = 汇总行没进同格前 2 名等被程序挡下,`rewritten` = 重写本身错)。
+
+**待标清单(不花钱、不调模型)**:写回跑完、判官还没跑时,`python tools/eval/b300_eval.py labels-todo --out OUT --phase k [--phase a --phase s ...] --write todo.jsonl`。每行 `key` / `check`(题型)/ `domain` / `prompt` / `label`(空,人填 `true` / `false`)/ `suggested`(建议先标的 20 条:题型轮着取、每个领域至多 4 条);命令另印出各题型有几道、还有哪些题型一道都没有(`checks_without_items`)。人标完,挑定 20 条(是 / 否各半、至少 5 个领域、每个至多 4 条、这一段**真有待判项**的每种题型都有)另存成 `a-labels.jsonl`,再 `calibrate --set a --labels a-labels.jsonl`。校准在写回跑完之后做:它只要求本段真有待判项的题型都有标注(段里还没有记录时按全部题型要求);没有待判项的题型记进 `calibration-a.json` 的 `checks_without_items`,报告里注明「本轮无待判项、未校准」。之后若又跑出校准时没有的题型,`judge` 会拒,要补标、重校准。
 
 **LoCoMo / LongMemEval**:`longmem/endtoend.py` 经提炼入口的显式参数 `user_text_messages` 声明「语料是用户文字」(设计 §4.1);入口还没有这个参数时什么都不传,行为与改前一致;**B-300 的那次 LoCoMo 检查(PR 1 之后的代码)要加 `run_longmem.py --expect-user-text`**,入口没有这个参数就报错,不悄悄跳过。`run_longmem.py` 的端到端档**必须二选一** `--expect-user-text` / `--pre-b300`(都不给、都给都退出);`run_baseline_full.sh` 用 `USER_TEXT_FLAG`(默认 `--pre-b300`,PR 1 合并后改成 `--expect-user-text`)。参数名以 PR 1 为准,改名要同步改 `USER_TEXT_PARAM`。**PR 1 起输入形状变了**:每段会话按角色拆开(用户每轮一条用户消息,经 `user_text_messages` 声明;助手每轮一条助手消息;日期抬头单独一条用户消息),一整段语料一条都没写进去时抛 `NothingIngestedError`。所以 B-300 之前的基线要用新形状重跑、不能沿用旧数;LoCoMo 两个说话人都按用户文字处理,与产品形状不同,分数不能直接和更早的基线比;日期抬头走第一次提炼、可能被丢,时间类题目掉分先查这里(设计 §8.5)。A 组若在被测代码上没看到两次提炼,第一条就停下(不空转花钱)。

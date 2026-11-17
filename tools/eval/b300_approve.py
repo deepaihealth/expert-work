@@ -19,6 +19,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import b300_k_scenarios as ks  # noqa: E402
 import b300_plan as plan  # noqa: E402
 import b300_redesign_scenarios as ns  # noqa: E402
 import b300_scenarios as sc  # noqa: E402
@@ -58,7 +59,7 @@ def make_quote(args: argparse.Namespace, *, exclude: str | None = None) -> dict[
         stop_line=args.stop_line,
         scenario_digest=(
             f"{sc.scenario_digest([*sc.build_all(), *sc.build_compare()])}"
-            f"+{ns.scenario_digest_all()}"
+            f"+{ns.scenario_digest_all()}+{ks.scenario_digest_k()}"
         ),
         include_compare=not args.no_compare,
         tokens=token_table(args.tokens),

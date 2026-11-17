@@ -15,11 +15,12 @@ def _rows(cls: str) -> list[sc.Scenario]:
     return [s for s in ns.build_redesign() if s.cls == cls]
 
 
-def test_s_group_size_is_225_units() -> None:
-    """§11.2:S1~S6 各 10 个命题、S7 5 个、S8 10 个,每个 3 次,共 225 个单元。"""
+def test_s_group_size_is_240_units() -> None:
+    """§11.2:S1~S6 各 10 个命题、S7 10 个(第 9 版从 5 个加到 10 个)、S8 10 个,每个 3 次,共 240 个
+    单元。"""
     sizes = {cls: len(_rows(cls)) for cls in ns.S_CLASSES}
-    assert sizes == {**{f"S{i}": 10 for i in range(1, 7)}, "S7": 5, "S8": 10}
-    assert sum(sizes.values()) * 3 == 225
+    assert sizes == dict.fromkeys(ns.S_CLASSES, 10)
+    assert sum(sizes.values()) * 3 == 240
 
 
 def test_other_sets_have_the_designed_size() -> None:

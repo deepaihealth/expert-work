@@ -40,7 +40,17 @@ class JudgeItem:
 USER_SIDE = frozenset({"user_stated", "user_confirmed", "user_corrected"})
 
 #: 重做加的平台字段(设计 §9.1 / §8)→ 记录里 ``capabilities`` 的键。
-CAPABILITIES = ("user_confirmed", "evidence_pointer", "event_date", "confirmed_at", "slicing")
+#: 第 9 版另加两样(``b300_k_platform.capabilities``):``supersede`` 收清单(写和退分开)、有当场
+#: 重写汇总行的入口。
+CAPABILITIES = (
+    "user_confirmed",
+    "evidence_pointer",
+    "event_date",
+    "confirmed_at",
+    "slicing",
+    "retire_split",
+    "summary_rewrite",
+)
 
 _NUMERIC = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 #: 关键串里分开几种写法的符号。

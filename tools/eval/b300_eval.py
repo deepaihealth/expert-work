@@ -53,12 +53,14 @@ import b300_scenarios as sc  # noqa: E402
 import b300_spend as spend  # noqa: E402
 import b300_steps as steps  # noqa: E402
 from b300_approve import approved, make_quote, spending, vendors_of  # noqa: E402
-from b300_outcomes import judge_items, report  # noqa: E402
+from b300_outcomes import judge_items, latest_records, report  # noqa: E402
 from b300_phases import (  # noqa: E402
+    GATE_PHASES,
     INPOD_SOURCE,
     PHASES,
     EvalError,
     agent_code,
+    budget_of,
     build_units,
     bundle_source,
     calibration_ok,
@@ -218,6 +220,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--set", dest="which", choices=("a", "b"), default="b")
     _quote_args(p, stop_required=True)
     p.add_argument("--approved-quote", required=True)
+    p = sub.add_parser("labels-todo")  # 不花钱:把已经跑出来的记录变成待人工标注的清单
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--phase", action="append", required=True, choices=sorted(PHASES))
+    p.add_argument("--write", type=Path, required=True)
+    p.add_argument("--pick", type=int, default=plan.CALIBRATION_ITEMS)
     p = sub.add_parser("progress")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--write", type=Path, required=True)
@@ -340,7 +347,7 @@ def a_votes_ready(out: Path, q: Mapping[str, Any], phase_name: str = "") -> int:
     judge = q["judge"]
     votes = int(
         judge.get("gate_votes", judge["a_group_votes"])
-        if phase_name == "gate"
+        if phase_name in GATE_PHASES
         else judge["a_group_votes"]
     )
     path = calibration_path(out, "a")
@@ -378,6 +385,8 @@ def _judge(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
         load_units(args.out, phase.name, q["quote_id"])
         votes = judge_votes(args.out, q, phase.kind, phase.name)
         items, _facts = judge_items(args.out, phase)
+        if phase.kind == "extraction" and not q["pilot"]:
+            uncalibrated_items(args.out, items)
         # 审查 M3:A 组每条判分记判官措辞;措辞对不上的旧判分重判,报告不认
         stamp = (
             {"wording_digest": rep.a_judge_wording_digest()} if phase.kind == "extraction" else {}
@@ -399,8 +408,45 @@ def _judge(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
 #: 每套 A 组校准要覆盖的判官题(审查 M5):闸门只判有据程度与事件日期;正式一轮另有 P2~P5 / P8。
 CALIBRATION_CHECKS = {
     "calibration-g": frozenset({"grounded", "event_date"}),
-    "calibration-a": frozenset({"plain", "statement", "grounded", "event_date"}),
+    # 第 9 版:正式一轮多了 K 组的四种判官题(闸门的 K 段不送判官)
+    "calibration-a": frozenset(
+        {"plain", "statement", "grounded", "event_date", "hedge", "half", "fuller", "summary"}
+    ),
 }
+
+
+def checks_to_calibrate(out: Path, calibration: str) -> frozenset[str]:
+    """这套校准要覆盖的题型(审查 M4):它管的那几段(A 或 G)里**真的有待判项**的题型;这几段在
+    ``out`` 里还一条记录都没有(先校准、后跑)时按全部题型要求。"""
+    everything = CALIBRATION_CHECKS[calibration]
+    budget = "G" if calibration == "calibration-g" else "A"
+    names = [
+        n
+        for n, p in PHASES.items()
+        if p.kind == "extraction"
+        and budget_of(n) == budget
+        and (out / n / "records.jsonl").exists()
+    ]
+    if not names:
+        return everything
+    pending = {rep.label_check(i.prompt) for n in names for i in judge_items(out, PHASES[n])[0]}
+    return everything & frozenset(k for k in pending if k)
+
+
+def uncalibrated_items(out: Path, items: Sequence[rep.JudgeItem]) -> None:
+    """要判的题里有校准时没覆盖的题型(校准之后又跑出了新题型)→ 拒,先补标、重校准。"""
+    path = calibration_path(out, "a")
+    if not path.exists():
+        return
+    checks = json.loads(path.read_text(encoding="utf-8")).get("checks")
+    if checks is None:  # 老格式的校准:按当时的规矩覆盖了全部题型
+        return
+    missing = sorted({k for i in items if (k := rep.label_check(i.prompt))} - set(checks))
+    if missing:
+        raise EvalError(
+            f"items of kind {missing} were not covered by the calibration (it had no such items "
+            "when it ran); label a new batch with them and `calibrate --set a` again"
+        )
 
 
 def calibration_phase(which: str, phases_arg: str | None) -> str:
@@ -423,7 +469,7 @@ def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
                 "rebuild their prompts with the current code"
             )
         phase_name = calibration_phase(args.which, args.phases)
-        needed = CALIBRATION_CHECKS[phase_name]
+        needed = checks_to_calibrate(args.out, phase_name)
         have = {rep.label_check(r["prompt"]) for r in labels}
         if needed - have:
             raise EvalError(
@@ -471,11 +517,66 @@ def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
         "of": len(labels),
     }
     result.update(stamp)  # 审查 LOW-2:校准绑定判官措辞(A 组)与标注文件
+    if args.which == "a":  # 审查 M4:这次校准覆盖了哪些题型;本轮无待判项的题型没校准,报告注明
+        covered = checks_to_calibrate(args.out, calibration_phase(args.which, args.phases))
+        everything = CALIBRATION_CHECKS[calibration_phase(args.which, args.phases)]
+        result["checks"] = sorted(covered)
+        result["checks_without_items"] = sorted(everything - covered)
     calibration_path(args.out, args.which).write_text(json.dumps(result), encoding="utf-8")
     emit(
         f"judge ({args.which}, {votes} vote(s)) agrees on {agree} / {len(labels)} "
         f"(need ≥ {plan.CALIBRATION_MIN_AGREE})"
     )
+
+
+# --------------------------------------------------------------------------- 待标清单
+
+
+def labels_todo(out: Path, names: Sequence[str], write: Path, pick: int) -> dict[str, Any]:
+    """校准要的人工标注从哪来(不调模型、不花钱):把 ``out`` 里这几段**已经跑出来**的记录变成判官
+    题,写成待标清单 —— 每行 ``key`` / ``check``(题型)/ ``domain`` / ``prompt`` / ``label``(空着,
+    人填 true / false)/ ``suggested``(建议先标的那 ``pick`` 条:题型轮着取、每个领域至多 4 条)。
+    人标完,把选定的 20 条(是 / 否各半、至少 5 个领域、每个至多 4 条、每种题型都有)另存一份交给
+    ``calibrate --set a --labels``。"""
+    rows: list[dict[str, Any]] = []
+    for name in names:
+        items, _facts = judge_items(out, PHASES[name])
+        domains = {key: r["domain"] for key, r in latest_records(out, name).items()}
+        for item in items:
+            domain = next((d for k, d in domains.items() if item.key.startswith(f"{k}|")), None)
+            kind = rep.label_check(item.prompt)
+            if domain is None or kind is None:
+                continue
+            row = {"key": item.key, "check": kind, "domain": domain, "prompt": item.prompt}
+            rows.append({**row, "label": None, "suggested": False})
+    per_domain: dict[str, int] = {}
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_kind.setdefault(row["check"], []).append(row)
+    picked = 0
+    while picked < pick and any(by_kind.values()):
+        for kind in sorted(by_kind):
+            queue = by_kind[kind]
+            while queue and per_domain.get(queue[0]["domain"], 0) >= 4:
+                queue.pop(0)
+            if queue and picked < pick:
+                row = queue.pop(0)
+                row["suggested"] = True
+                per_domain[row["domain"]] = per_domain.get(row["domain"], 0) + 1
+                picked += 1
+    write.write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8"
+    )
+    kinds = {k: sum(r["check"] == k for r in rows) for k in sorted({r["check"] for r in rows})}
+    needed = sorted(set().union(*CALIBRATION_CHECKS.values()) - set(kinds))
+    return {
+        "items": len(rows),
+        "by_check": kinds,
+        "suggested": picked,
+        "suggested_by_domain": dict(sorted(per_domain.items())),
+        "checks_without_items": needed,
+        "wording_digest": rep.a_judge_wording_digest(),
+    }
 
 
 # --------------------------------------------------------------------------- 入口
@@ -509,6 +610,9 @@ def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = pri
         if args.cmd == "manifests":
             for path in write_manifests(args.out, vendors_of(args.vendor)):
                 emit(str(path))
+            return 0
+        if args.cmd == "labels-todo":
+            emit(json.dumps(labels_todo(args.out, args.phase, args.write, args.pick)))
             return 0
         if args.cmd == "progress":
             body = progress(args.out)
