@@ -6,6 +6,8 @@
 >
 > **修订(2026-11-17,05 评审结论)**:节 I 去掉视频目录,改为「客户明确要视频时调 `material_list` 拿全量清单、挑 ≤3 个填进 `media`」(R20);新增 R79「不替客户约专家、不承诺某位专家亲自服务」、R80「问服务价格不报数字、转人工」;转人工默认配置定为「本轮不回 + 之后照常」,交出去那一轮输出空、不说稳住的话(节 R);配置书改为 Word 交付文件,不进 git(§3.11)。
 >
+> **修订(2026-11-17,最后几项)**:`working_memory` 加 `keep_first_turn: false`(01 §9 第 14 条);康豆按 01 新口径,`silent` 轮也扣。
+>
 > **修订(2026-11-17,智能体专用素材表)**:素材改由深护新建的 `t_project_agent_material` 提供(表名待深护确认),原「`t_project_material` + 分类表 + 分类关系表」设计作废;`material_list` 钉的是 `agent_code`,不再是分类编码(05 §3.3)。
 >
 > **修订(2026-11-17,03 评审结论)**:变量 `input_message_ids` 改名为 `source_message_ids`(§5.1、§5.5、§5.6;含义见 01 §3.3.2)。
@@ -360,7 +362,7 @@ Dify 每轮把档案、方案、表单、今日饮食、聊天记录全部预取
 | `stream_deadline_s` | **不配**(用默认 180,已定) | 原想填 60(首字超时即切备用模型),但平台对这个值有下限 180 秒,低于 180 一律按 180(`agent_factory.py:227-236`),填 60 等于默认;要更早切备用只能改平台(§9 第 11 条) |
 | `workflow.max_iterations` | 12 | 最重的一轮(化验单 + 档案 + 回复)约 4~5 步;防兜圈 |
 | `policies.tool_result_prune` | `absolute_cap_tokens: 40000`(已拍板 11-17) | 先把旧的大块工具结果收成一行引用 |
-| `policies.working_memory` | `absolute_cap_tokens: 40000`、`max_recent_turns: 20`(已拍板 11-17) | 平台默认 min(窗口×0.7, 20 万) 才开始裁,对 1M 窗口模型就是 20 万 token,一次调用约 2 元;会话已拍板不按空闲换新(01 §3.4.3),有长期记忆 + 客户资料工具兜着,只留最近 20 轮 |
+| `policies.working_memory` | `absolute_cap_tokens: 40000`、`max_recent_turns: 20`、`keep_first_turn: false`(已拍板 11-17;第一轮不常驻,免得几个月前的数据被当成现状,01 §9 第 14 条) | 平台默认 min(窗口×0.7, 20 万) 才开始裁,对 1M 窗口模型就是 20 万 token,一次调用约 2 元;会话已拍板不按空闲换新(01 §3.4.3),有长期记忆 + 客户资料工具兜着,只留最近 20 轮 |
 | `policies.context_compression` | `absolute_cap_tokens: 60000`(已拍板 11-17) | 裁完仍超时才摘要;按 01 的原假设单轮封顶约 0.9 元,数值待实测(01 §3.4.4) |
 | `cache.enabled` | **false** | 平台说明里写明时间敏感的智能体要关(`agent_spec.py:793-818`) |
 | `dynamic_context.inject_current_date` | **false** | 平台这一行只有日期,还叫模型「精确时间去调代码工具」(`agent_factory.py:1888-1908`),会把模型引去起沙箱;时间由业务方写在 input 首行(01 §3.3.1) |
@@ -553,7 +555,7 @@ spec:
   policies:
     run_deadline_s: 300           # 已拍板 11-17
     tool_result_prune: { absolute_cap_tokens: 40000 }                         # 已拍板 11-17
-    working_memory: { max_recent_turns: 20, absolute_cap_tokens: 40000 }     # 已拍板 11-17
+    working_memory: { max_recent_turns: 20, absolute_cap_tokens: 40000, keep_first_turn: false }  # 已拍板 11-17
     context_compression: { absolute_cap_tokens: 60000 }                      # 已拍板 11-17
   # defenses: 保留默认(spotlight + output_screen 开;judge / action_screen / dlp 关)
 
