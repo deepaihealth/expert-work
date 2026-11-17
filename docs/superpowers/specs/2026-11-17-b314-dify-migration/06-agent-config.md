@@ -6,6 +6,8 @@
 >
 > **修订(2026-11-17,05 评审结论)**:节 I 去掉视频目录,改为「客户明确要视频时调 `material_list` 拿全量清单、挑 ≤3 个填进 `media`」(R20);新增 R79「不替客户约专家、不承诺某位专家亲自服务」、R80「问服务价格不报数字、转人工」;转人工默认配置定为「本轮不回 + 之后照常」,交出去那一轮输出空、不说稳住的话(节 R);配置书改为 Word 交付文件,不进 git(§3.11)。
 >
+> **修订(2026-11-17,控制台)**:§3.10 末尾加「只能在配置文件里改的项」:三个上下文绝对上限控制台表单没有,要在 YAML 视图里改;固定值下拉上线前,`this_turn` / `afterwards` / `agent_code` 的固定值要手填。
+>
 > **修订(2026-11-17,最后几项)**:`working_memory` 加 `keep_first_turn: false`(01 §9 第 14 条);康豆按 01 新口径,`silent` 轮也扣。
 >
 > **修订(2026-11-17,智能体专用素材表)**:素材改由深护新建的 `t_project_agent_material` 提供(表名待深护确认),原「`t_project_material` + 分类表 + 分类关系表」设计作废;`material_list` 钉的是 `agent_code`,不再是分类编码(05 §3.3)。
@@ -372,6 +374,12 @@ Dify 每轮把档案、方案、表单、今日饮食、聊天记录全部预取
 | `knowledge.knowledge_base_refs` | 「公司与服务」(名字以 05 为准),每轮探测按默认开 | 05 |
 
 **平台的基础能力关不掉**:代码执行、文件读写、产物登记、`read_document`、`read_page` 对每个智能体都装(`assembly.py:811-870`),配置里没有开关。提示词写明不跑代码、不出文件(节 P);若 07 发现模型仍会调用,再考虑平台加开关(§4.1)。
+
+**只能在配置文件里改的项(控制台表单没有)**:
+
+- `policies.tool_result_prune.absolute_cap_tokens`(40000)、`policies.working_memory.absolute_cap_tokens`(40000)、`policies.context_compression.absolute_cap_tokens`(60000)。控制台的上下文门槛表单只显示百分比门槛,以及「最近 N 轮」「保留第一轮」两项(`apps/admin-ui/src/components/manifest-editor/groups/ContextGatesSection.tsx`,读代码确认),没有这三个绝对上限。建智能体时在控制台的 YAML 视图里改,保存后再切到 YAML 视图核对一遍。
+- 本智能体用到的其它设置在表单里都有对应控件(模型与备用、思考、温度、`max_tokens`、输出格式、日期注入、动态子智能体、知识库、MCP 工具与参数绑定含固定值、提示词变量与 `trusted`、长期记忆、守卫、沙箱出网、缓存、每轮时限、最大步数、`keep_first_turn`、`max_recent_turns`;除上下文门槛外按评审时的说法记录,未逐项核对)。
+- 固定值下拉(04 §4.1)上线前,`handoff_to_human` 的 `this_turn` / `afterwards`、`material_list` 的 `agent_code` 这几个固定值要手填,注意拼写(`silent`、`continue`),填错要到调用时才报错。
 
 ### 3.11 配置书放哪
 
