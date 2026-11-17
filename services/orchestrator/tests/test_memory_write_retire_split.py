@@ -189,9 +189,9 @@ def _said(
     return _Candidate(item, is_correction=correction, line_at=at, in_new_segment=True)
 
 
-def _now_said(item: MemoryItem) -> _Candidate:
+def _now_said(item: MemoryItem, *, correction: bool = False) -> _Candidate:
     """此刻说的一句(晚于刚用 ``write_consolidated`` 写下的汇总行)。"""
-    return _said(item, at=datetime.now(UTC) + timedelta(hours=1))
+    return _said(item, at=datetime.now(UTC) + timedelta(hours=1), correction=correction)
 
 
 async def _reconcile(
@@ -381,7 +381,9 @@ async def test_a_legacy_op_writes_the_candidate_and_retires_its_target(
     cand = c.mem("no longer has a cat")
     counts = _Counts("legacy_op", "retired")
     reply = json.dumps({"ops": [{"index": 0, "op": op, "target_id": "e0"}]})
-    assert await _reconcile(store, _LLM([reply]), _said(cand)) == 1
+    # 第 10 版:「不再……」是更正(说出以前的事已经没有了);``DELETE`` 读成 ``replaces``,第一次的
+    # 候选退用户说的要带更正标记。
+    assert await _reconcile(store, _LLM([reply]), _said(cand, correction=True)) == 1
     # 「删除」的那句话本身写下;旧行连到它(不是 expired_at)。
     assert _stored(store, cand) and _retired_into(store, old, cand)
     assert _row(store, old.id).expired_at is None
@@ -395,14 +397,16 @@ async def test_a_legacy_op_writes_the_candidate_and_retires_its_target(
 async def test_a_later_user_statement_retires_the_earlier_one_whatever_the_confidence(
     confidence: float,
 ) -> None:
-    """「松风 0.95 / 南枝 0.8」:同是用户说的,按先后,置信度不参与。"""
+    """「松风 0.95 / 南枝 0.8」:同是用户说的,按先后,置信度不参与。用户整句说「改叫南枝」是更正
+    (第 10 版:第一次的候选退用户说的要带更正标记)。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     old = c.mem("the cat is called Songfeng", _at(0.9), confidence=0.95)
     await store.write([old])
     cand = c.mem("the cat is called Nanzhi", confidence=confidence)
     counts = _Counts("add", "retired")
-    assert await _reconcile(store, _LLM([_ops(_add(replaces=["e0"]))]), _said(cand)) == 1
+    reply = _ops(_add(replaces=["e0"]))
+    assert await _reconcile(store, _LLM([reply]), _said(cand, correction=True)) == 1
     assert _stored(store, cand) and _retired_into(store, old, cand)
     assert _row(store, cand.id).supersedes == old.id
     assert counts.delta() == {"add": 1, "retired": 1}
@@ -416,7 +420,8 @@ async def test_one_candidate_retires_two_and_both_link_to_it() -> None:
     await store.write([first, second])
     cand = c.mem("moved to Chengdu and works at a design institute")
     reply = _ops(_add(replaces=["e0"], restates=["e1"]))
-    assert await _reconcile(store, _LLM([reply]), _said(cand)) == 1
+    # 「搬到成都了」是更正(第 10 版:第一次的候选拿 replaces 退用户说的要带更正标记)。
+    assert await _reconcile(store, _LLM([reply]), _said(cand, correction=True)) == 1
     assert _retired_into(store, first, cand) and _retired_into(store, second, cand)
     assert _row(store, cand.id).supersedes in {first.id, second.id}
     assert [r.id for r in _live(store)] == [cand.id]
@@ -431,7 +436,9 @@ async def test_two_candidates_in_one_batch_listing_the_same_old_row() -> None:
     second = c.mem("deliveries go to the office", _at(0.99))
     counts = _Counts("retired", "retire_target_gone")
     reply = _ops(_add(0, replaces=["e0"]), _add(1, replaces=["e0"]))
-    assert await _reconcile(store, _LLM([reply]), _said(first), _said(second)) == 2
+    # 两句都在说「改寄公司」(更正;第 10 版起第一次的候选要带更正标记才退用户说的)。
+    said = (_said(first, correction=True), _said(second, correction=True))
+    assert await _reconcile(store, _LLM([reply]), *said) == 2
     # 先到的退掉它,后到的看到「已作废」、自己照写。
     assert _retired_into(store, old, first)
     assert _stored(store, first) and _stored(store, second)
@@ -449,9 +456,10 @@ async def test_cross_cell_and_rank_refusals_do_not_stop_the_write_or_each_other(
     await store.write([near, mid, far, event])
     cand = c.mem("the new fact")
     counts = _Counts("retire_refused_cross_cell", "retire_refused_rank", "retired")
-    # 邻居按余弦:event(e0)、near(e1)、mid(e2)、far(e3)。
+    # 邻居按余弦:event(e0)、near(e1)、mid(e2)、far(e3)。候选带更正标记:这里只看格与名次
+    # (第 10 版起第一次的候选不带更正退不掉用户说的,见本文件末节)。
     reply = _ops(_add(replaces=["e0", "e3", "e1"]))
-    assert await _reconcile(store, _LLM([reply]), _said(cand)) == 1
+    assert await _reconcile(store, _LLM([reply]), _said(cand, correction=True)) == 1
     assert _stored(store, cand)
     assert _untouched(store, event) and _untouched(store, far) and _untouched(store, mid)
     assert _retired_into(store, near, cand)  # 清单里一条不过不影响另一条
@@ -494,9 +502,10 @@ async def test_a_source_refusal_keeps_the_old_row_and_still_writes_the_candidate
 
 @pytest.mark.parametrize(
     ("candidate", "target"),
+    # 第 10 版:用户说的(第一次的产出)→ 用户说的 / 用户确认,只有带更正标记才按先后退 ——
+    # 两种都移到本文件末节:
+    # ``test_a_first_pass_candidate_retires_a_user_side_row_only_as_a_correction``。
     [
-        ("user_stated", "user_stated"),
-        ("user_stated", "user_confirmed"),
         ("user_confirmed", "user_confirmed"),
         ("user_stated", "assistant_derived"),
         ("user_confirmed", None),
@@ -568,7 +577,8 @@ async def test_a_target_corrected_while_deciding_is_rejudged_under_the_lock() ->
 
     counts = _Counts("retire_refused_corrected", "retired")
     llm = _CorrectingLLM([_ops(_add(replaces=["e0"]))])
-    assert await _reconcile(store, llm, _said(cand)) == 1
+    # 「不再过敏」是更正:预判要过(第 10 版起第一次的候选不带更正过不了),才轮到锁里重判。
+    assert await _reconcile(store, llm, _said(cand, correction=True)) == 1
     assert _stored(store, cand) and _untouched(store, old)
     assert counts.delta() == {"retire_refused_corrected": 1, "retired": 0}
 
@@ -586,7 +596,9 @@ async def test_a_target_that_disappears_while_deciding_is_skipped() -> None:
             return await super().__call__(**kwargs)
 
     counts = _Counts("retire_target_gone")
-    assert await _reconcile(store, _DeletingLLM([_ops(_add(replaces=["e0"]))]), _said(cand)) == 1
+    # 带更正标记:预判要过(第 10 版),才轮到锁里发现它没了。
+    llm = _DeletingLLM([_ops(_add(replaces=["e0"]))])
+    assert await _reconcile(store, llm, _said(cand, correction=True)) == 1
     assert _stored(store, cand) and _row(store, old.id).invalid_at is None
     assert counts.delta() == {"retire_target_gone": 1}
 
@@ -598,7 +610,8 @@ async def test_a_blocked_candidate_retires_nothing() -> None:
     await store.write([old])
     cand = c.mem(_INJECTION)
     result = await _reconcile_and_apply(
-        [_said(cand)],
+        # 带更正标记:旧行过了预判、进了要退的清单(第 10 版),审计里才带着它的 id。
+        [_said(cand, correction=True)],
         agent_name=_AGENT,
         positions={cand.id: 4},
         memory_store=store,
@@ -630,8 +643,11 @@ _D1, _D2 = date(2026, 11, 1), date(2026, 11, 2)
         (_D1, _D1, True, None),  # 同一次的更正
         (None, _D1, False, "retire_refused_undated_vs_dated"),  # 「拦住,两条并存」
         (None, _D1, True, None),
-        (_D1, None, False, None),  # 候选带、目标不带 → 不按日期拒绝
-        (None, None, False, None),
+        (_D1, None, True, None),  # 候选带、目标不带 → 不按日期拒绝
+        (None, None, True, None),
+        # 第 10 版:日期这一项不拒绝,但候选是第一次的产出、目标是用户说的 → 要带更正标记。
+        (_D1, None, False, "retire_refused_not_correction"),
+        (None, None, False, "retire_refused_not_correction"),
     ],
 )
 async def test_event_dates_decide_whether_the_old_row_is_retired(
@@ -668,7 +684,8 @@ async def test_a_noop_across_different_event_dates_is_written() -> None:
 
 
 async def test_a_noop_of_a_weaker_row_is_written_and_retires_it() -> None:
-    """场景 w:用户的话不被助手的行吞掉。"""
+    """场景 w:用户的话不被助手的行吞掉。「周会改到周四了」是更正 —— 周二那条按先后被退(第 10 版
+    起第一次的候选要带更正标记;不带时只退助手那条,见本文件末节)。"""
     c = _Ctx()
     store = InMemoryMemoryStore()
     assistant = c.mem("the weekly sync moved to Thursday", _at(0.95), origin="assistant_derived")
@@ -677,7 +694,7 @@ async def test_a_noop_of_a_weaker_row_is_written_and_retires_it() -> None:
     cand = c.mem("weekly sync is on Thursday now", origin="user_stated")
     counts = _Counts("noop_weaker_target_written", "retired", "noop")
     reply = _ops(_noop("e0", replaces=["e1"]))
-    assert await _reconcile(store, _LLM([reply]), _said(cand)) == 1
+    assert await _reconcile(store, _LLM([reply]), _said(cand, correction=True)) == 1
     assert _stored(store, cand)
     assert _retired_into(store, assistant, cand) and _retired_into(store, tuesday, cand)
     assert counts.delta() == {"noop_weaker_target_written": 1, "retired": 2, "noop": 0}
@@ -769,7 +786,8 @@ async def test_a_noop_with_a_list_retires_into_the_row_it_repeats() -> None:
     cand = c.mem("the governing law is Singapore's")
     counts = _Counts("retired", "noop_refreshed")
     reply = _ops(_noop("e0", replaces=["e1"]))
-    assert await _reconcile(store, _LLM([reply]), _said(cand)) == 0
+    # 带更正标记(第 10 版:换了说法的重复不算「内容完全相同」的例外;不带的见本文件末节)。
+    assert await _reconcile(store, _LLM([reply]), _said(cand, correction=True)) == 0
     assert not _stored(store, cand)
     assert _retired_into(store, old, current) and _valid(_row(store, current.id))
     assert _row(store, current.id).confirmed_at == _LATER
@@ -788,7 +806,8 @@ async def test_the_row_a_candidate_repeats_does_not_take_a_rank() -> None:
     cand = c.mem("the governing law is Singapore's")
     counts = _Counts("retire_refused_rank")
     reply = _ops(_noop("e0", replaces=["e2", "e3"]))
-    assert await _reconcile(store, _LLM([reply]), _said(cand)) == 0
+    # 只看名次:候选带更正标记(第 10 版起不带的退不掉用户说的)。
+    assert await _reconcile(store, _LLM([reply]), _said(cand, correction=True)) == 0
     assert _retired_into(store, old, current) and _untouched(store, beyond)
     assert counts.delta() == {"retire_refused_rank": 1}
 
@@ -878,9 +897,11 @@ async def test_an_unknown_line_time_retires_nothing() -> None:
 
 
 def _two_turns(
-    c: _Ctx, *, later_origin: str = "user_stated", earlier_origin: str = "user_confirmed"
+    c: _Ctx, *, later_origin: str = "user_confirmed", earlier_origin: str = "user_confirmed"
 ) -> tuple[MemoryItem, MemoryItem, dict[str, datetime]]:
-    """场景 j:晚说的(t2)先写、早说的(t1)后到,同一个对话。"""
+    """场景 j:晚说的(t2)先写、早说的(t1)后到,同一个对话。默认两条都是用户确认(两轮里用户各
+    同意了一个名字):第 10 版起晚说的若是用户说的(第一次的产出),倒过来「它退早说的」要带更正
+    标记,库里的行没有 → 算不过,两条并存(见 ``first_pass_later``)。"""
     later = c.mem(
         "the cat is called Songfeng",
         _at(0.9),
@@ -921,17 +942,27 @@ async def test_an_earlier_denied_statement_is_written_as_a_history_row() -> None
 
 @pytest.mark.parametrize(
     "missing",
-    ["restates", "other_thread", "record_time_only", "event_date", "reverse_refused", "assistant"],
+    [
+        "restates",
+        "other_thread",
+        "record_time_only",
+        "event_date",
+        "reverse_refused",
+        "assistant",
+        "first_pass_later",
+    ],
 )
 async def test_without_any_one_of_the_five_the_earlier_candidate_coexists_and_links(
     missing: str,
 ) -> None:
     c = _Ctx()
     store = InMemoryMemoryStore()
+    # 倒过来「目标退候选」查不过:目标是助手的(退不掉用户一方)、「确认对说的」,或(第 10 版)
+    # 目标是用户说的 —— 第一次的产出退用户一方要带更正标记,库里的行没有这个标记。
+    later_origin = {"assistant": "assistant_derived", "first_pass_later": "user_stated"}
     later, earlier, times = _two_turns(
         c,
-        # 倒过来「目标退候选」查不过:目标是助手的(退不掉用户一方),或「确认对说的」。
-        later_origin="assistant_derived" if missing == "assistant" else "user_stated",
+        later_origin=later_origin.get(missing, "user_confirmed"),
         earlier_origin="user_confirmed",
     )
     if missing == "reverse_refused":
@@ -1002,7 +1033,9 @@ async def test_a_summary_the_model_lists_as_replaced_is_flagged_not_retired() ->
     )
     cand = c.mem("now drives to work")
     counts = _Counts("retire_refused_summary", "summary_rewrite_marked", "retired")
-    assert await _reconcile(store, _LLM([_ops(_add(replaces=["e0"]))]), _now_said(cand)) == 1
+    # 「不坐地铁了,改开车」是更正(第 10 版:打标同样要第一次的候选带更正标记,见本文件末节)。
+    reply = _ops(_add(replaces=["e0"]))
+    assert await _reconcile(store, _LLM([reply]), _now_said(cand, correction=True)) == 1
     row = _row(store, summary.id)
     assert _valid(row) and row.review_flagged_at is not None
     assert _row(store, cand.id).supersedes == summary.id
@@ -1187,9 +1220,9 @@ async def test_a_duplicate_that_denies_part_of_a_summary_flags_it_by_the_row_it_
     await store.write([said])
     cand = c.mem("drives to work these days")
     counts = _Counts("retire_refused_summary", "summary_rewrite_marked")
-    # 邻居按余弦:said(e0)、summary(e1)。
+    # 邻居按余弦:said(e0)、summary(e1)。候选带更正标记(第 10 版:换了说法的重复不算例外)。
     reply = _ops(_noop("e0", replaces=["e1"]))
-    assert await _reconcile(store, _LLM([reply]), _now_said(cand)) == 0
+    assert await _reconcile(store, _LLM([reply]), _now_said(cand, correction=True)) == 0
     assert not _stored(store, cand)
     flagged = _row(store, summary.id)
     assert flagged.review_flagged_at is not None and flagged.supersedes == said.id
@@ -1230,7 +1263,8 @@ async def test_every_summary_a_candidate_denies_is_flagged() -> None:
     cand = c.mem("now drives to work")
     counts = _Counts("retire_refused_summary", "summary_rewrite_marked")
     reply = _ops(_add(replaces=["e0", "e1"]))
-    assert await _reconcile(store, _LLM([reply]), _now_said(cand)) == 1
+    # 更正(第 10 版:两条汇总行的成员都是用户说的,打标要候选带更正标记)。
+    assert await _reconcile(store, _LLM([reply]), _now_said(cand, correction=True)) == 1
     for summary in (first, second):
         row = _row(store, summary.id)
         assert row.review_flagged_at is not None and row.supersedes == cand.id
@@ -1266,7 +1300,8 @@ async def test_a_value_retired_earlier_in_the_batch_is_not_brought_back(
     stored = await _reconcile(
         store,
         _LLM([reply]),
-        _said(beijing, at=t1),
+        # 「搬到北京了」是更正(第 10 版:第一次的候选退用户说的要带更正标记)。
+        _said(beijing, at=t1, correction=True),
         _said(again, at=t_again),
         message_times={"m-0": _T0, "m-2": t1, "m-x": t_again},
     )
@@ -1406,3 +1441,174 @@ async def test_only_a_user_side_row_is_borrowed_as_the_basis_of_a_flag() -> None
     assert _SpyStore.flag_calls == 0
     assert _row(store, denied.id).review_flagged_at is None
     assert _row(store, repeated.id).review_flagged_at is None
+
+
+# ─── 第一次提炼的候选退用户一方要带更正(第 10 版,用户 11-17;测试 118.5 T39)──────
+
+
+async def _quiz_seed(c: _Ctx, store: InMemoryMemoryStore) -> tuple[MemoryItem, MemoryItem]:
+    """T39:用户自己说过工号 X(用户说的);后来回答助手、确认了 Y(用户确认 —— 默认规则下不退 X,
+    两条并存、Y 连着 X)。"""
+    x = c.mem("employee id is A1047", _at(0.95), origin="user_stated", confidence=0.95)
+    y = c.mem(
+        "employee id is A1407",
+        _at(0.9),
+        origin="user_confirmed",
+        confidence=0.8,
+        created_at=_T0 + timedelta(hours=1),
+        supersedes=x.id,
+    )
+    await store.write([x, y])
+    return x, y
+
+
+async def test_a_bare_quiz_answer_from_the_first_pass_retires_no_user_side_row() -> None:
+    """T39:用户说「考考我」后只答了一个错值;第一次提炼把它记成用户说的(不是更正),模型把 X、Y
+    都列进 ``replaces`` → 一条都不退;候选照写、连着 X(指向的行仍有效)。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    x, y = await _quiz_seed(c, store)
+    w = c.mem("employee id is A1074", origin="user_stated", confidence=0.9)
+    counts = _Counts("retire_refused_not_correction", "retired", "add")
+    llm = _LLM([_ops(_add(replaces=["e0", "e1"]))])
+    assert await _reconcile(store, llm, _said(w)) == 1
+    assert llm.payload()["candidates"][0]["is_correction"] is False
+    assert _stored(store, w)
+    assert _untouched(store, x) and _untouched(store, y)
+    assert _row(store, w.id).supersedes == x.id
+    assert counts.delta() == {"retire_refused_not_correction": 2, "retired": 0, "add": 1}
+    assert _write_guarantee_holds(store, w)
+
+
+async def test_a_first_pass_correction_still_retires_user_side_rows_by_order() -> None:
+    """同一句若带更正标记(「工号我之前说错了,是 A1074」):用户说的、用户确认都按先后退。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    x, y = await _quiz_seed(c, store)
+    w = c.mem("employee id is A1074", origin="user_stated", confidence=0.9)
+    counts = _Counts("retire_refused_not_correction", "retired")
+    reply = _ops(_add(replaces=["e0", "e1"]))
+    assert await _reconcile(store, _LLM([reply]), _said(w, correction=True)) == 1
+    assert _retired_into(store, x, w) and _retired_into(store, y, w)
+    assert counts.delta() == {"retire_refused_not_correction": 0, "retired": 2}
+
+
+@pytest.mark.parametrize("target", ["user_stated", "user_confirmed"])
+@pytest.mark.parametrize("correction", [False, True])
+async def test_a_first_pass_candidate_retires_a_user_side_row_only_as_a_correction(
+    target: str, correction: bool
+) -> None:
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    old = c.mem("the bike is kept in the hallway", _at(0.9), origin=target, confidence=0.99)
+    await store.write([old])
+    cand = c.mem("the bike is kept on the balcony", origin="user_stated")
+    counts = _Counts("retire_refused_not_correction", "retired")
+    reply = _ops(_add(replaces=["e0"]))
+    assert await _reconcile(store, _LLM([reply]), _said(cand, correction=correction)) == 1
+    assert _stored(store, cand)
+    if correction:
+        assert _retired_into(store, old, cand)
+    else:
+        assert _untouched(store, old) and _row(store, cand.id).supersedes == old.id
+    assert counts.delta() == {
+        "retire_refused_not_correction": 0 if correction else 1,
+        "retired": 1 if correction else 0,
+    }
+
+
+@pytest.mark.parametrize("target", ["user_stated", "user_confirmed"])
+async def test_a_first_pass_restatement_is_not_held_to_the_correction_rule(target: str) -> None:
+    """``restates``(候选把它整个重说一遍、说得更多)不受限。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    old = c.mem("lives in Hangzhou", _at(0.9), origin=target)
+    await store.write([old])
+    cand = c.mem("lives in Hangzhou, in the Xihu district", origin="user_stated")
+    assert await _reconcile(store, _LLM([_ops(_add(restates=["e0"]))]), _said(cand)) == 1
+    assert _retired_into(store, old, cand)
+
+
+async def test_rows_the_program_folds_in_are_not_held_to_the_correction_rule() -> None:
+    """程序并入的不受限:模型判重复、来源更弱的(``merged``)照退;同一条候选里模型自己列进
+    ``replaces`` 的用户说的旧行,候选不带更正 → 不退。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    assistant = c.mem("the weekly sync moved to Thursday", _at(0.95), origin="assistant_derived")
+    tuesday = c.mem("the weekly sync is on Tuesday", _at(0.9), origin="user_stated")
+    await store.write([assistant, tuesday])
+    cand = c.mem("weekly sync is on Thursday", origin="user_stated")
+    counts = _Counts("noop_weaker_target_written", "retired", "retire_refused_not_correction")
+    reply = _ops(_noop("e0", replaces=["e1"]))
+    assert await _reconcile(store, _LLM([reply]), _said(cand)) == 1
+    assert _stored(store, cand) and _retired_into(store, assistant, cand)
+    assert _untouched(store, tuesday)
+    assert counts.delta() == {
+        "noop_weaker_target_written": 1,
+        "retired": 1,
+        "retire_refused_not_correction": 1,
+    }
+
+
+@pytest.mark.parametrize("held_as", ["user_stated", "user_confirmed"])
+async def test_saying_a_stored_user_side_sentence_again_still_retires_what_it_replaces(
+    held_as: str,
+) -> None:
+    """候选与一条有效的用户一方行内容完全相同 → 不受限(场景 e1:与用户说的那条相同,确定性
+    「重复」、照样问模型退谁;场景 e2:与用户确认的那条相同,那条由程序并入、候选写下)。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    current = c.mem(
+        "ships to the office",
+        origin=held_as,
+        source_thread_id=_THREAD,
+        evidence_message_id="m-1",
+    )
+    old = c.mem("ships to the house", _at(0.9), origin="user_stated")
+    await store.write([current, old])
+    cand = c.mem(
+        "ships to the office",
+        origin="user_stated",
+        source_thread_id=_THREAD,
+        evidence_message_id="m-9",
+    )
+    counts = _Counts("retire_refused_not_correction")
+    llm = _LLM([_ops(_add(replaces=["e1"]))])
+    stored = await _reconcile(store, llm, _said(cand))
+    assert len(llm.calls) == 1
+    if held_as == "user_stated":  # e1:不写,旧值退到相同的那条上
+        assert stored == 0 and _retired_into(store, old, current)
+    else:  # e2:新的用户说的写下,相同的用户确认与旧值都退到它上
+        assert stored == 1
+        assert _retired_into(store, current, cand) and _retired_into(store, old, cand)
+    assert counts.delta() == {"retire_refused_not_correction": 0}
+
+
+async def test_a_reworded_first_pass_duplicate_without_a_correction_retires_nothing() -> None:
+    """换了说法的重复(不是内容完全相同)不算例外:候选不写,模型列的用户说的旧值不退。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    current = c.mem("governed by Singapore law", _at(0.99))
+    old = c.mem("governed by Shanghai law", _at(0.9))
+    await store.write([current, old])
+    cand = c.mem("the governing law is Singapore's")
+    counts = _Counts("retire_refused_not_correction", "retired")
+    reply = _ops(_noop("e0", replaces=["e1"]))
+    assert await _reconcile(store, _LLM([reply]), _said(cand)) == 0
+    assert not _stored(store, cand)
+    assert _untouched(store, old) and _untouched(store, current)
+    assert counts.delta() == {"retire_refused_not_correction": 1, "retired": 0}
+
+
+async def test_a_first_pass_candidate_flags_a_summary_only_as_a_correction() -> None:
+    """汇总行的「要重写」标记同样要求更正标记(打标的条件含「§7.3 第二步其余各项都过」):
+    一句被考时答的值不会让汇总句被改写。"""
+    c = _Ctx()
+    store = InMemoryMemoryStore()
+    summary = await _summary(store, c, "keeps a road bike; rides on weekends", "user_stated")
+    cand = c.mem("keeps a folding bike")
+    counts = _Counts("retire_refused_summary", "summary_rewrite_marked")
+    assert await _reconcile(store, _LLM([_ops(_add(replaces=["e0"]))]), _now_said(cand)) == 1
+    assert _stored(store, cand)
+    assert _row(store, summary.id).review_flagged_at is None
+    assert counts.delta() == {"retire_refused_summary": 1, "summary_rewrite_marked": 0}

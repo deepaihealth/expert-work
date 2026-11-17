@@ -244,6 +244,20 @@ def test_latin_script_section_points_at_the_users_own_messages() -> None:
     )
 
 
+_KEYS_IN_ENGLISH = (
+    'Only the "content" is written in this language: write every key, and the values of\n'
+    '"kind", "basis" and the like, in English exactly as the format above shows them.'
+)
+
+
+@pytest.mark.parametrize("language", ["Chinese", "English", None, LATIN_SCRIPT])
+def test_every_extraction_section_keeps_keys_and_values_in_english(language: str | None) -> None:
+    """B-300 重做第 10 版(用户 2026-11-17):只有 content 按这个语言写,键名与 kind / basis 等取值
+    照格式原样用英文。整理汇总那一节不输出这些键,不加。"""
+    assert extraction_language_section(language).endswith(_KEYS_IN_ENGLISH)
+    assert _KEYS_IN_ENGLISH not in summary_language_section(language)
+
+
 def test_summary_sections() -> None:
     assert "Write the summary in Chinese" in summary_language_section("Chinese")
     assert (

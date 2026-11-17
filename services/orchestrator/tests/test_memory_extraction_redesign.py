@@ -307,10 +307,17 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
     # 复审 MEDIUM(11-16):「(as of <date>)」只给当前状态;读数写测得那天;编号不带日期。
     assert 'such as "(as of <date>)", so it is not later taken' not in system
     assert "Write it with the date or time it refers to, so it is not later taken" not in system
+    # 第 10 版(用户 2026-11-17,测试 118.5 T39):给不给新值都算;只有一个值或名字的永远不是;
+    # 一组借书证的对照例子。
+    assert '"is_correction": true ONLY when' not in system
     assert (
-        '- "is_correction": true ONLY when the same message itself says what is being corrected '
-        "and gives the new value (e.g. the user says they moved, changed jobs, renamed a thing); "
-        'otherwise false. - "turn": the number of the line that states it. - "event_date": only '
+        '- "is_correction": true when the same message itself says that something said earlier '
+        "has changed, was wrong or no longer exists, whether or not it gives the new value (e.g. "
+        "the user says they moved, changed jobs, renamed a thing, or no longer has it); otherwise "
+        'false. A value or name on its own never is. For example: "借书证号我之前说错了,是 '
+        'L-3082" — the earlier one was wrong: true. "那张旧借书证已经注销了" — it no longer '
+        'exists: true. "我的借书证号是 L-3082" — it does not say that anything changed: false. '
+        '- "turn": the number of the line that states it. - "event_date": only '
         "for a value that happened or was observed on one day (a reading, a count, a payment "
         "made), that day as YYYY-MM-DD; null for anything else, including an id, a number that "
         "names something, or a current status, even when its date is written in the content. "
@@ -330,11 +337,28 @@ def test_user_text_prompt_has_the_appendix_c_changes() -> None:
         "which are never recorded." in system
     )
     # 第 9 版(附录 C):猜测别人的事照旧跳过;关于用户自己的事、带着犹豫说的,记下并把犹豫写进内容。
+    # 第 10 版(附录 C):被考 / 被要求复述时的回答、「是 Z 吧?」式的回忆也不算陈述;只有一个值或名字
+    # 的行,上面看得出指什么也跳过,唯一例外是接着用户自己没说完的半句;一对借书证的对照例子。
     assert (
-        "- A question, a hypothetical, a guess about something that is not the user's own, or a "
-        "repeat of what someone else said is not a statement by the user: skip it. "
+        '- A message that only agrees with, answers or refers to something (a bare "yes", '
+        '"ok, do that", or a value or name with nothing in the same message saying what it is) '
+        "states nothing by itself: skip it, and do not guess what it was about. Skip it even "
+        "when a line above shows what it refers to; the only exception is a line that finishes a "
+        "sentence the user left unfinished on the line just before it. - A value or name on its "
+        "own" in system
+    )
+    assert "refers to something that is not shown here" not in system
+    assert (
+        "- A question, a hypothetical, a guess about something that is not the user's own, a "
+        "repeat of what someone else said, an answer given while the user is being quizzed or "
+        'asked to say something again, or a recollection put as a question ("it\'s Z, right?") '
+        "is not a statement by the user: skip it. "
         "- When the user states something about themselves or their own things with doubt "
-        '("I think", "maybe", "not sure"), record it and keep the doubt in the content.' in system
+        '("I think", "maybe", "not sure"), record it and keep the doubt in the content. '
+        'For example: "[1] 考考我,看我还记不记得自己的借书证号" above "=== new ===", then "[2] '
+        'L-3028 吧?" — an answer while being quizzed: record nothing. "[1] 我的借书证号是" above '
+        '"=== new ===", then "[2] L-3082" — line 2 finishes the user\'s own sentence: record '
+        '"用户的借书证号是 L-3082" with "turn": 2.' in system
     )
 
 

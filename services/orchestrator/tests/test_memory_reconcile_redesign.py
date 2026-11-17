@@ -661,9 +661,9 @@ async def test_store_errors_inside_reconcile_raise_with_what_is_unwritten(
     other = c.mem("speaks German", _at(0.9), origin="user_stated")
     await store.write([target, other])
     cand = c.mem("speaks French well", origin="user_stated", confidence=0.9)
-    error = await _failed(
-        store, _LLM([reply]), _Candidate(cand, line_at=_LINE, in_new_segment=True)
-    )
+    # 带更正标记:「只退不写」那一项要过预判才会去调存储(第 10 版起第一次的候选退用户说的要带)。
+    candidate = _Candidate(cand, is_correction=True, line_at=_LINE, in_new_segment=True)
+    error = await _failed(store, _LLM([reply]), candidate)
     assert isinstance(error.__cause__, ConnectionError)
     assert [m.id for m in error.unwritten] == ([cand.id] if kept else [])
     assert len(store._rows) == 2

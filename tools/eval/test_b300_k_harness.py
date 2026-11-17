@@ -588,15 +588,30 @@ def _user_line(body: Any) -> int:
     return int([n for n in numbers if n.isdigit()][-1])
 
 
-def _scripted(content: str, listed: str, rewritten: str = "", *, duplicate_of: str = "") -> Any:
-    """假模型:第一次提炼把 ``content`` 记成用户说的(带 ``turn``);去重合并 ``ADD`` 并把正文是
-    ``listed`` 的那条已有记忆列进 ``replaces``(给了 ``duplicate_of`` 就判 ``NOOP``、目标是正文为它
-    的那条);重写回 ``rewritten``。"""
+def _scripted(
+    content: str,
+    listed: str,
+    rewritten: str = "",
+    *,
+    duplicate_of: str = "",
+    correction: bool = False,
+) -> Any:
+    """假模型:第一次提炼把 ``content`` 记成用户说的(带 ``turn``,``is_correction`` 取
+    ``correction``);去重合并 ``ADD`` 并把正文是 ``listed`` 的那条已有记忆列进 ``replaces``(给了
+    ``duplicate_of`` 就判 ``NOOP``、目标是正文为它的那条);重写回 ``rewritten``。设计第 10 版起
+    第一次的候选拿 ``replaces`` 退用户一方要带更正标记(内容与一条有效的用户一方行完全相同的
+    除外)。"""
 
     def reply(kind: str, body: Any) -> str:
         if kind == "pass1":
             turn = _user_line(body)
-            memory = {"kind": "fact", "content": content, "importance": 0.8, "turn": turn}
+            memory = {
+                "kind": "fact",
+                "content": content,
+                "importance": 0.8,
+                "turn": turn,
+                "is_correction": correction,
+            }
             return json.dumps({"memories": [memory]}, ensure_ascii=False)
         if kind == "reconcile":
             material = json.loads(body["messages"][-1]["content"])
@@ -620,7 +635,8 @@ def test_on_v9_code_a_full_sentence_change_retires_the_old_row_and_keeps_the_gua
     """代码侧第 9 版合进来之后:能力探测为真,K-a 的线与「写的保证」算得出来(不再 incomplete)。"""
     s = _k("K-a")
     it = ks.item_of(s)
-    result = _run(s, _scripted(it.y.memory, it.x.memory))
+    # 整句改口是更正(第 10 版:第一次的候选退用户说的要带更正标记)。
+    result = _run(s, _scripted(it.y.memory, it.x.memory, correction=True))
     assert result["capabilities"]["retire_split"] is True
     assert result["capabilities"]["summary_rewrite"] is True
     out, _items = kchk.checks({"key": "u", "result": result}, s)
@@ -652,7 +668,8 @@ def test_on_v9_code_a_denied_summary_is_marked_then_rewritten_in_place() -> None
     # 假嵌入按字面相近排名次:让假模型写出的那句贴着汇总句,汇总行才进同格前 2 名(§7.1 第 6 行);
     # 真跑时名次由真嵌入定,排不进前 2 名就只是不退、不打标(counts 的 listed_blocked 看得到)。
     said = f"{trio.summary} {trio.deny_b}"
-    result = _run(s, _scripted(said, trio.summary, rewritten))
+    # 否认是更正(第 10 版:第一次的候选给汇总行打标同样要带更正标记)。
+    result = _run(s, _scripted(said, trio.summary, rewritten, correction=True))
     rewrite = result["rounds"][0]["rewrite"]
     assert rewrite["before"] == {"summary_live": True, "summary_flagged": True}
     assert rewrite["ran"] is True and rewrite["outcomes"] == ["rewritten"]
@@ -803,7 +820,9 @@ def test_on_v9_code_a_reworded_statement_judged_duplicate_of_a_confirmed_row_coe
     s = _e2("reworded")
     it = ks.item_of(s)
     said = f"{it.y.memory} (said again in other words)"
-    result = _run(s, _scripted(said, it.x.memory, duplicate_of=it.y.memory))
+    # 换了说法、内容不完全相同:第 10 版起退 X 要带更正标记(逐字相同的一半不用,见下一条)。
+    scripted = _scripted(said, it.x.memory, duplicate_of=it.y.memory, correction=True)
+    result = _run(s, scripted)
     rows = {m["id"]: m for m in result["memories"]}
     confirmed = rows[result["seeded"]["y"]]
     new = next(m for m in result["memories"] if m["content"] == said)
@@ -878,7 +897,7 @@ def test_rewrite_failure_on_the_eval_side_makes_the_record_an_error() -> None:
     要补跑。"""
     s = next(x for x in K if x.cls == "K-s" and x.variant == "deny")
     trio = ks.item_of(s).trio
-    inner = _scripted(f"{trio.summary} {trio.deny_b}", trio.summary, "x")
+    inner = _scripted(f"{trio.summary} {trio.deny_b}", trio.summary, "x", correction=True)
     guard = spend.Guard(stop_line=5.0, prices={"mem": Price(1, 1, 1, "t")})
 
     def handler(request: httpx.Request) -> httpx.Response:
