@@ -16,7 +16,7 @@
 >
 > **修订(2026-11-17,最后几项)**:`working_memory` 加 `keep_first_turn: false`(01 §9 第 14 条);康豆按 01 新口径,`silent` 轮也扣。
 >
-> **修订(2026-11-17,智能体专用素材表)**:素材改由深护新建的 `t_project_agent_material` 提供(表名待深护确认),原「`t_project_material` + 分类表 + 分类关系表」设计作废;`material_list` 钉的是 `agent_code`,不再是分类编码(05 §3.3)。
+> **修订(2026-11-17,智能体专用素材表)**:素材改由深护新建的 `t_project_agent_material` 提供(表名待深护确认)(11-17 已定),原「`t_project_material` + 分类表 + 分类关系表」设计作废;`material_list` 钉的是 `agent_code`,不再是分类编码(05 §3.3)。
 >
 > **修订(2026-11-17,03 评审结论)**:变量 `input_message_ids` 改名为 `source_message_ids`(§5.1、§5.5、§5.6;含义见 01 §3.3.2)。
 >

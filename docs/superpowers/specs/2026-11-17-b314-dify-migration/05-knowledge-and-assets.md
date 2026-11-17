@@ -2,6 +2,8 @@
 
 > 所属:B-314 Dify「健管师」迁移(总览:00-overview.md)。状态:草稿 v1;11-17 评审已过,各项决定见下方修订说明与第 9 节。
 >
+> **修订(2026-11-17,开发计划前补契约)**:素材表名、`material_code` 格式 11-17 已定;SQL 09 的 `@agent_code`、`@created_by` / `updated_by`(999999)已预填,上线清单第 10 步和 §5.2 改为只填 `@project_code`;上线清单第 5 步改为确认引用已有的深护 MCP 注册(不另登记、不加专用 key,11-17 定)。
+>
 > **修订(2026-11-17,PR 复核修正)**:上线清单第 10 步改为执行 db-design `2026-11-17-b314-02~09`(`01` 最先已执行),`@created_by` 必填;第 14 步写明配置行 `adapter_type='wecom_chat'`、`enabled=1`、`api_key`;§4 改动清单不再提「素材 SQL」交付件(SQL 在 db-design);§5.2 只留建表骨架,初始化数据看 09 文件;§3.6.2 删掉重复的一句。
 >
 > **修订(2026-11-17,06 评审结论)**:`goods_info` / 小程序不迁(小程序不需要了);新增待办 —— 业务方如能提供「助糖 3 号」的一句话介绍(是什么、怎么吃),放进「公司与服务」库(不挡上线,§3.4)。
@@ -14,7 +16,7 @@
 >
 > **修订(2026-11-17,控制台)**:上线清单第 10 步加一句:保存后切到 YAML 视图核对三个上下文绝对上限(控制台表单没有这三项,06 §3.10)。
 >
-> **修订(2026-11-17,智能体专用素材表)**:深护为智能体**新建一张素材表** `t_project_agent_material`(表名是我们提的,待深护确认),`material_list` 只读这张表;原先「用 `t_project_material` + 分类表 + 分类关系表、标签分类、加 `description` 列」的设计作废。新表自带 `agent_code`(空 = 本项目所有智能体)、`media_type`、`description`、`tags`、`status`;建表与初始化脚本放交付文件夹 `素材库/Agent素材表建表与初始化.sql`(§3.3、§5)。(已被 11-17 拍板修订取代)
+> **修订(2026-11-17,智能体专用素材表)**:深护为智能体**新建一张素材表** `t_project_agent_material`(表名是我们提的,待深护确认)(11-17 已定),`material_list` 只读这张表;原先「用 `t_project_material` + 分类表 + 分类关系表、标签分类、加 `description` 列」的设计作废。新表自带 `agent_code`(空 = 本项目所有智能体)、`media_type`、`description`、`tags`、`status`;建表与初始化脚本放交付文件夹 `素材库/Agent素材表建表与初始化.sql`(§3.3、§5)。(已被 11-17 拍板修订取代)
 >
 > 本篇管三件事:Dify 里写死的「知识」迁到哪、运动视频怎么改走深护智能体素材表、测试环境建好的东西怎么原样搬到生产。
 > 输出字段总表、固定话术、提示词正文不在本篇,本篇只给它们需要的片段和约束(见总览里讲输出契约和智能体配置的那几篇)。
@@ -197,13 +199,13 @@ spec:
 
 **为什么新建一张表**:和其它业务的素材(营销、方案生成助手等)解耦,互不影响;表里按智能体划范围(`agent_code`),以后别的智能体也能用。
 
-#### 3.3.1 表结构:`t_project_agent_material`(表名待深护确认)
+#### 3.3.1 表结构:`t_project_agent_material`(表名 11-17 已定,以 db-design SQL 08 为准)
 
 | 列 | 类型 | 说明 |
 |---|---|---|
 | `id` | BIGINT UNSIGNED 自增主键 | 模型输出的就是这个短数字 |
 | `project_code` | VARCHAR(80) | 项目 |
-| `material_code` | VARCHAR(64),唯一 | 交付脚本按 `mat_` + SHA1(项目编码 + 固定前缀 + 素材名称) 前 16 位十六进制生成,同项目重跑结果一样;格式待深护确认 |
+| `material_code` | VARCHAR(64),唯一 | 交付脚本按 `mat_` + SHA1(项目编码 + 固定前缀 + 素材名称) 前 16 位十六进制生成,同项目重跑结果一样;格式 11-17 已定(§9 第 15 条) |
 | `agent_code` | VARCHAR(80),可空 | 哪个智能体能用;**空 = 本项目所有智能体都能用**。健管师的 41 条填它的智能体编码(= 深护员工绑定上的 `agent_code`,06 §3.11) |
 | `name` | VARCHAR(120) | 名称,如「坐姿抬腿」 |
 | `media_type` | ENUM `video` / `image` / `file` / `audio` | 发送方式;PDF 算 `file` |
@@ -220,7 +222,7 @@ spec:
 
 - **41 条运动视频**:按 Dify 表里现有的 CDN 链接各插一行(`media_type = video`),**不重新上传**;`agent_code` 填健管师的智能体编码,即深护员工绑定上的那个 `agent_code`(06 §3.11,已定);`material_list` 钉的也是这个值。
 - **标签和说明**:由深护运动教练给。原表没有任何强度信息,41 条里 21 条名字里也看不出要不要器械,补上 `tags`(如「低强度」「坐姿」「器械」)和 `description`(要领 / 适合人群 / 禁忌),模型才有依据;**空着也能上线**,没写的素材只按名称挑。
-- **怎么录**:SQL 在深护建库仓库 `deep-ai-health-db-design/1.5.7/project_tables/leyi/`:`2026-11-17-b314-08-agent-material-table.sql`(建表)、`2026-11-17-b314-09-agent-material-init.sql`(41 条初始化;占位 `@project_code`、`@agent_code`、`@created_by`,没填不写数据;可重复执行;文末有注释掉的回滚段,只删这 41 条)。给运动教练填标签和说明的 `素材库/素材清单.xlsx` 仍在本地交付文件夹。用户在测试、生产各执行一次;执行后核对条数。初始化脚本里的标签是助手按动作名推断的建议(如「中等强度」「站姿」「膝盖负担较大」),说明留空,等教练改完清单再更新。
+- **怎么录**:SQL 在深护建库仓库 `deep-ai-health-db-design/1.5.7/project_tables/leyi/`:`2026-11-17-b314-08-agent-material-table.sql`(建表)、`2026-11-17-b314-09-agent-material-init.sql`(41 条初始化;执行时只填 `@project_code`,`@agent_code` 已填 `agent_health_manager`、`@created_by` / `updated_by` 已填 999999,没填项目编码不写数据;可重复执行;文末有注释掉的回滚段,只删这 41 条)。给运动教练填标签和说明的 `素材库/素材清单.xlsx` 仍在本地交付文件夹。用户在测试、生产各执行一次;执行后核对条数。初始化脚本里的标签是助手按动作名推断的建议(如「中等强度」「站姿」「膝盖负担较大」),说明留空,等教练改完清单再更新。
 - 以后加 / 停用素材:改 SQL(加行;停用把 `status` 置 0 或软删),两个环境各执行一次;**智能体不用重新发布**。
 
 #### 3.3.3 模型怎么用
@@ -330,12 +332,12 @@ B-314健管师交付/                       ← 用户机器上的本地交付�
 | 2 | 平台 MCP 目录里有高德天气,地址和 key 是生产的 | 用户(系统管理员) | 平台 MCP 目录页能看到并显示可用 |
 | 3 | 租户 `mcp_allowlist` 放行高德 | 用户(租户管理员) | 租户 MCP 页面显示已启用 |
 | 4 | 深护生产 MCP 配好智能体 key 白名单(**不能为空**) | 深护运维 | 深护确认;拿一个不在白名单里的 key 调用应被拒 |
-| 5 | 租户 MCP 注册表登记深护 MCP:**注册名与配置书 YAML 里写的逐字一致**,地址和 key 用生产值 | 用户 | 注册表里能列出工具 |
+| 5 | 确认租户 MCP 注册表里已有深护 MCP 那一条(ahp 在用;健管师直接引用,不另登记、不加专用 key,11-17 定):**注册名与配置书 YAML 里写的逐字一致** | 用户 | 注册表里能列出工具 |
 | 6 | 模型目录里有 YAML 指定的主模型和备用模型,凭证可用 | 用户 | 模型页显示可用 |
 | 7 | 建库 `公司与服务`(名字逐字一致),按配置书的库设置表填参数 | 用户 | 库设置页每项和表一致 |
 | 8 | 上传交付文件夹 `知识库/公司与服务/` 下全部文件 → 看预估金额 → 确认 → 等全部「就绪」 | 用户 | 每个文件的**文件名、大小**和第 0 步清单一致;**段数和切块参数指纹**与测试环境一致(不一致先查两边切块参数和向量模型) |
 | 9 | 库的检索测试页跑 3 个问题(地址、控糖服务内容、能否开药) | 用户 | 每题前 3 条里有对应文档 |
-| 10 | 执行 `deep-ai-health-db-design/1.5.7/project_tables/leyi/` 里的 `2026-11-17-b314-02` ~ `-09`(按编号;`01` 已在最先执行过,07 §3.8 第 9 条);`-09-agent-material-init.sql` 先填 `@project_code`、`@agent_code`(= 深护员工绑定上的 `agent_code`)、`@created_by`(必填,留 NULL 不写数据) | 深护运维 + 用户 | 各文件末尾的校验查询都对;素材表 41 条启用、条数与测试一致。**必须在第 12 步冒烟之前做**:冒烟第 5、6 题要用到素材表 |
+| 10 | 执行 `deep-ai-health-db-design/1.5.7/project_tables/leyi/` 里的 `2026-11-17-b314-02` ~ `-09`(按编号;`01` 已在最先执行过,07 §3.8 第 9 条);`-09-agent-material-init.sql` 只填 `@project_code`(`@agent_code` 已填 `agent_health_manager`,`@created_by` / `updated_by` 已填 999999) | 深护运维 + 用户 | 各文件末尾的校验查询都对;素材表 41 条启用、条数与测试一致。**必须在第 12 步冒烟之前做**:冒烟第 5、6 题要用到素材表 |
 | 11 | 新建智能体 → YAML 页 → 粘贴配置书附录的 YAML → 填生产占位(若有)→ **保存草稿** | 用户 | 建好后切到 YAML 视图核对这三项:`tool_result_prune` 40000、`working_memory` 40000、`context_compression` 60000 的 `absolute_cap_tokens`(表单里没有,06 §3.10)。保存成功且**没有任何警告**。三类警告都要回头处理,不能带着发布:「平台没配凭证」→ 第 6 步;「MCP 连不上」→ 第 4–5 步;「参数绑定没匹配上任何工具」→ 第 5 步注册名不一致,这种情况下身份参数会退回给模型自己填,正是要防的事 |
 | 12 | 调试台**用草稿**跑冒烟问题(§3.6.5;第 5、6 题依赖第 10 步的素材表)| 用户 | 全部符合预期;`material_list` 能列出 41 条 |
 | 13 | 发布 | 用户 | 版本列表里是新版本 |
@@ -408,13 +410,13 @@ ORDER BY sort, id
 SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 -- 1. 占位(给 09 用;没填时 09 不写数据)
 SET @project_code = '<填项目编码>';
-SET @agent_code   = '<填健管师智能体编码>';   -- = 深护员工绑定上的 agent_code(06 §3.11)
-SET @created_by   = <填创建人 ID>;             -- 数字,必填(09 文件要求非 NULL);不知道问深护
+SET @agent_code   = 'agent_health_manager';  -- 已预填(11-17 定)
+SET @created_by   = 999999;                  -- 已预填(11-17 定:created_by、updated_by 都填 999999)
 -- 2. 建表(已存在就跳过;DDL 隐式提交,放在事务外)
 CREATE TABLE IF NOT EXISTS `t_project_agent_material` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '自增主键;模型输出的素材短 id 就是它',
   `project_code` varchar(80) NOT NULL DEFAULT '' COMMENT '项目唯一标识码',
-  `material_code` varchar(64) NOT NULL COMMENT '素材唯一标识码 mat_xxxx,服务端生成(格式待深护确认)',
+  `material_code` varchar(64) NOT NULL COMMENT '素材唯一标识码 mat_xxxx,服务端生成(格式 11-17 已定)',
   `agent_code` varchar(80) DEFAULT NULL COMMENT '哪个智能体能用;NULL = 本项目所有智能体都能用',
   `name` varchar(120) NOT NULL COMMENT '素材名称',
   `media_type` enum('video','image','file','audio') NOT NULL COMMENT 'PDF 算 file',
@@ -431,10 +433,10 @@ CREATE TABLE IF NOT EXISTS `t_project_agent_material` (
   KEY `idx_project_agent_status` (`project_code`, `agent_code`, `status`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 -- 3. 41 条初始化数据不在这里重复:见 2026-11-17-b314-09-agent-material-init.sql
---    (要先填 @project_code、@agent_code、@created_by;@created_by 必须是数字,留 NULL 时一条都不写)
+--    (执行时只填 @project_code;@agent_code、@created_by 已预填)
 ```
 
-执行前要确认的:表名、列长度(`name` 120、`description` 1000、`material_code` 64)、`material_code` 的格式、`created_by` 填什么。执行后核对条数;`description` 和 `tags` 空着不影响上线。回滚用 `09` 文件末尾注释掉的回滚段。
+表名、列长度、`material_code` 格式、`created_by` / `updated_by`(999999)都已定(11-17,§9 第 15 条),执行时只填 `@project_code`。执行后核对条数;`description` 和 `tags` 空着不影响上线。回滚用 `09` 文件末尾注释掉的回滚段。
 
 ### 5.3 `material_list` 返回(示例,详见 04 §5.12)
 
@@ -550,7 +552,7 @@ CREATE TABLE IF NOT EXISTS `t_project_agent_material` (
 11. ~~打包导出导入~~ **已定(11-17)**:暂不做,先手工按清单。
 12. ~~源文件目录布局与 `docs/agents/README.md` 约定~~ **作废(11-17)**:交付物改为本地文件夹里的文件,不进 git(§3.6.2)。
 13. ~~知识库内容的审核流程~~ **已定(11-17)**:业务方已授权内容,不设运营 + 法务双签;改动由业务方确认、记在配置书变更记录里。
-14. ~~素材用哪张表~~ **已定(11-17,改定)**:深护为智能体新建一张 `t_project_agent_material`(表名待深护确认),和其它业务的素材解耦、按智能体划范围;不复用 `t_project_material` 或方案生成助手的素材表。
+14. ~~素材用哪张表~~ **已定(11-17,改定)**:深护为智能体新建一张 `t_project_agent_material`(表名 11-17 已定),和其它业务的素材解耦、按智能体划范围;不复用 `t_project_material` 或方案生成助手的素材表。
 15. ~~素材 SQL 的几处值要深护确认~~ **已定(11-17)**:表名、列长度(`name` 120、`description` 1000、`material_code` 64)、`material_code` 的生成格式以用户提交到 db-design 的 SQL 为准;`@agent_code` = `agent_health_manager`(深护员工绑定上同值,06 §3.11);`created_by`、`updated_by` 都填 999999(SQL 09 已预填,执行时只填 `@project_code`)。
 
 ## 10. 出处

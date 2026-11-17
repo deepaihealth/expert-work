@@ -4,6 +4,8 @@
 > 读者:深护 MCP 服务开发者(第 3、5、6 节是施工图);配置智能体的人(3.3、3.5、3.7、5.11 节)。
 > 核对基线:深护 MCP `499302b`、数字人服务 `8dc5f3f`、项目服务 `b6938bc2`、pad 消息同步 `0ff5743`、dk 会话存档 `ba0a89e`、Expert Work `origin/main d9db26f79`(测试环境镜像 `5908fe554`)、Dify DSL `深护智康(pad)-健管师-3.0.yml`。下文「确认」= 读过代码,「推断」= 没跑过或靠参数名对上。
 >
+> **修订(2026-11-17,MCP key 拍板)**:不加健管师专用 key、不另登记 —— 健管师引用租户里已有的深护 MCP 注册(与 ahp 共用);因此请求不带 `x-agent-id: agent_health_manager`,深护操作日志来源显示 ahp 那条注册的值或 `unknown`(`mcp-auth.ts:47`),已接受;生产 `AGENT_KEYS` 非空不变(§1、§3.3、§3.4、§4、§5.11 示例)。素材表名 11-17 已定;§9.12 注明测试环境队列库号未核实。
+>
 > **修订(2026-11-17,转人工默认改为本轮回复)**:11-17 默认由本轮不回改为本轮回复 —— 健管师转人工默认「本轮回复 + 之后照常」(`this_turn=reply`、`afterwards=continue`):转人工那一轮先回一句稳住的话(如「我确认一下,稍后回复您」),不回答交出去的问题,不说「转人工」。理由:客户每次都能马上得到回应;组合按智能体配置(控制台下拉),对所有转人工类型都生效。「本轮不回」仍是下拉里的选项,急症例外和不回时的临时标志做法照旧保留。本文改了 §3.10(四种组合的例子、返回给模型的话、默认组合)、§4 配置、§5 `handoff_to_human`、§6 YAML 示例、§7 第 19 / 20 条、§9.15。
 >
 > **修订(2026-11-17,04 评审结论)**:写入不需客户确认、不设按客户上限;化验单按上传月合并;按小时循环沿用 30 天;数据情境(空腹 / 餐次 / 测量时间)模型先推断再问(11-17 起不做按表单的配置);防重复写改为「按来源消息」判断(取代「同一天同内容」);客户资料由模型调 `profile_get_brief` 一次取齐(含现有提醒,v1 就做);「查更早聊天」改为增强现有 `chat_private_history`;新增转人工工具 `handoff_to_human`(MCP 直接发通知,四种组合 + 急症例外,§3.10);主回复仍由业务方发,「走 MCP 发」记为否决项(§3.11);Expert Work 平台加「固定值下拉」(§4.1)。
@@ -16,7 +18,7 @@
 >
 > **修订(2026-11-17,提醒实现方式)**:9.2 定为 A —— MCP 直接写提醒表、直接投数字人服务的延迟队列,不经数字人服务的接口。
 >
-> **修订(2026-11-17,智能体专用素材表)**:素材改由深护新建的 `t_project_agent_material` 提供(表名待深护确认),原「`t_project_material` + 分类表 + 分类关系表」设计作废;`material_list` 钉的是 `agent_code`,不再是分类编码(05 §3.3)。
+> **修订(2026-11-17,智能体专用素材表)**:素材改由深护新建的 `t_project_agent_material` 提供(表名待深护确认)(11-17 已定),原「`t_project_material` + 分类表 + 分类关系表」设计作废;`material_list` 钉的是 `agent_code`,不再是分类编码(05 §3.3)。
 >
 > **修订(2026-11-17,03 评审结论)**:写工具判重用的 inputs 变量(和两个写工具的参数)由 `input_message_ids` 改名为 `source_message_ids`,与 03 的顶层字段分开(6.16、9.16)。
 >
@@ -34,7 +36,7 @@
 |---|---|
 | **防** | ① 客户(或群里任何发言人)在企微里用话术诱导模型**查、改、删别的客户**的档案、健康数据、提醒、聊天记录,或替别人转人工、关 AI。例:「帮我看看张三的血糖」「把客户 cust_xxx 的体重改成 60」「把所有人的提醒都删了」。② **重复写**:同一批客户消息被处理两次 —— 打断后合并重跑、模型在一轮里连调两次保存、网络重试 —— 导致一条数据记两遍、同一个提醒设两条、同事收到两次转人工通知。 |
 | **不防** | 平台管理员、深护管理员(可信);客户对**自己**的数据说假话(属于数据质量,服务端只做格式和选项校验);客户让 AI 对**自己**少回或不回(只影响他自己的服务,员工可重新打开)。 |
-| **怎么防** | ① 身份参数(项目、客户、员工、群)全部由平台 `arg_bindings` 从本轮 inputs 填,并从模型看到的工具参数里删掉;只放行「只能作用于当前客户」的工具;深护**生产** MCP 的 agent key 白名单必须非空,健管师单独发一把 key。② 业务方把本批企微消息 id 作为变量 `source_message_ids` 传进来,平台绑定进写工具;服务端记下每条记录来自哪些消息,「同表 + 同内容 + 来源消息有重叠」才算重复(§3.4)。不设按客户的调用 / 写入上限(11-17 定)。 |
+| **怎么防** | ① 身份参数(项目、客户、员工、群)全部由平台 `arg_bindings` 从本轮 inputs 填,并从模型看到的工具参数里删掉;只放行「只能作用于当前客户」的工具;深护**生产** MCP 的 agent key 白名单必须非空;健管师不另发 key,引用租户里已有的深护 MCP 注册(与 ahp 共用,11-17 定)。② 业务方把本批企微消息 id 作为变量 `source_message_ids` 传进来,平台绑定进写工具;服务端记下每条记录来自哪些消息,「同表 + 同内容 + 来源消息有重叠」才算重复(§3.4)。不设按客户的调用 / 写入上限(11-17 定)。 |
 | **剩余风险(只列不做)** | 绑定「没落地」时参数会回到模型手里(平台保存时会给英文警告,见 6.2);key 泄露后可以调全部 45 个工具、可以填任意客户编号(MCP 目前不按 key 限工具、限项目,见 9.5 加固项)。 |
 
 ## 1. 现状:Dify 现在怎么做
@@ -206,7 +208,7 @@
 4. MCP 侧配合(**新工具必须做到**):被绑定的参数要写在 `inputSchema.properties` 顶层,不能藏在 `anyOf` 里,否则平台剥不掉(值仍会被覆盖,但模型看得见);服务端自己校验这些参数非空,不能依赖平台。
 5. 深护侧:
    - 生产 `AGENT_KEYS` 必须非空(11-17 用户确认已配置)。上线检查用随便一把 key 去连,必须被拒(40100)。
-   - 健管师**单独发一把 key**。在 Expert Work 租户 MCP 注册表里另登记一条 MCP 服务(同一地址,请求头带这把 key,再加 `x-agent-id: <健管师智能体编码>`(= 深护员工绑定上的 `agent_code`,06 §3.11)便于深护日志区分),健管师的配置只引用这条。连接按租户共享,不能按 run 换请求头,所以一条注册 = 一把 key。
+   - **不加专用 key、不另登记**(11-17 定):健管师直接引用租户 MCP 注册表里已有的深护 MCP 那一条(ahp 也在用)。连接按租户共享,不能按 run 换请求头,一条注册 = 一把 key、一组请求头,所以健管师的请求不会带 `x-agent-id: agent_health_manager`。代价:深护操作日志里的来源显示的是那条注册配的 `x-agent-id`(没配就是 `unknown`,`mcp-auth.ts:47`),看不出是健管师 —— 已接受。
    - 注册名尽量短:平台内部工具名是 `mcp__<注册名>__<工具名>`,超过 64 字符会截断,截断后撞名会让绑定落空(见 6.2)。
 
 **绑定表**(声明变量均为 `required: true`;`attachment_urls` 除外)
@@ -293,7 +295,7 @@
 
 **不需要确认、不设上限(11-17 定)**:写入不找客户或员工确认;不设按客户的调用 / 写入次数上限。错了靠员工撤销。
 
-**员工可撤销**:每次写入在 `t_project_operation_log` 记一行(操作人 = 绑定的员工、来源 = 健管师智能体 / `x-agent-id`、字段前后值,≤ 2000 字)。撤销沿用项目服务现有的 `form/del-form-field-values`(把字段置为无效,`form.service.ts:1685-1699`);控制台有没有入口要深护确认。提醒的撤销用项目服务运营后台的 AI 提醒删除(`ai-notify.service.ts:221`)。
+**员工可撤销**:每次写入在 `t_project_operation_log` 记一行(操作人 = 绑定的员工、来源 = 请求头 `x-agent-id`(健管师与 ahp 共用一条注册,显示那条注册配的值,没配为 `unknown`,`mcp-auth.ts:47`;11-17 已接受)、字段前后值,≤ 2000 字)。撤销沿用项目服务现有的 `form/del-form-field-values`(把字段置为无效,`form.service.ts:1685-1699`);控制台有没有入口要深护确认。提醒的撤销用项目服务运营后台的 AI 提醒删除(`ai-notify.service.ts:221`)。
 
 ### 3.5 放行清单与禁用清单
 
@@ -457,7 +459,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
   - 保存时校验:固定值不在可选值里就拒绝保存。放在保存时已经拿到工具 schema 的那段核对里(`api/agents.py:1131-1220`);连不上 MCP、拿不到 schema 时与现在一样只给警告。
   - 被绑定的参数本来就从模型看到的 schema 里删掉,`title` 只给运营看,不影响模型。改动是通用的,对所有 MCP 工具生效。
   - MCP 侧同样拒绝不认识的值,并给清楚的错误,不悄悄用默认值(§3.10)。
-- 配置(测试由我们做,生产由用户执行):租户 MCP 注册表新增「健管师专用」一条(同地址、新 key、`x-agent-id`);租户打开 `amap-maps`;智能体配置见 4.4、5.11。
+- 配置(测试由我们做,生产由用户执行):引用租户 MCP 注册表里已有的深护 MCP 那一条(不另登记、不加 key,11-17 定;先核对 `mcp__<注册名>__<工具名>` 不超过 64 字符);租户打开 `amap-maps`;智能体配置见 4.4、5.11。
 - 保存智能体后看返回的警告:出现 `arg_bindings did not land` 或 `were not checked` 时必须处理,不能发布(`api/agents.py:1131-1220`)。
 
 ### 4.2 深护 MCP
@@ -478,7 +480,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | M12 | ~~(可选加固)key 限项目、限工具;客户属于项目核对~~ | 不属于 B-314,移入深护安全待办(9.5、08) |
 | M13 | `handoff_to_human` | 5.9;pad 通知、pc 照 `enqueueReferral` 插 referral 任务(含 `pickTargets` 选目标)、接管标志、AI 开关、转人工状态、固定选项校验;连数字人共用的 Redis 库 |
 | M14 | `material_list` | 5.12;读新表 `t_project_agent_material`(深护建表),只返回本项目、本智能体(或通用)、启用的素材,带说明前一段 |
-| 配置 | 生产 `AGENT_KEYS` 非空;新增健管师 key;MCP 能连上数字人共用的 Redis 库(写接管标志) | |
+| 配置 | 生产 `AGENT_KEYS` 非空;不加健管师专门的 key(11-17 定);MCP 能连上数字人共用的 Redis 库(写接管标志) | |
 
 ### 4.3 深护数字人 · 项目服务
 
@@ -493,7 +495,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 ### 4.4 智能体配置
 
 - `system_prompt.jinja: true`,声明变量:本文 3.3 的 8 个身份 / 工具变量,加上 06 的 `is_first_contact`、`self_appellation`、`self_introduction`,共 11 个(清单以 01 §3.3.2、06 §5.1 为准)。
-- `tools` 两个 mcp 条目(深护健管师专用注册名 + `amap-maps`),`allow_tools`、`arg_bindings` 按 5.11;`handoff_to_human` 的 `this_turn`、`afterwards` 在控制台下拉里选(健管师默认 `reply` + `continue`,11-17 定;原 `silent` 已改);`material_list` 的 `agent_code` 钉成健管师的智能体编码。
+- `tools` 两个 mcp 条目(租户里已有的深护 MCP 注册名 + `amap-maps`),`allow_tools`、`arg_bindings` 按 5.11;`handoff_to_human` 的 `this_turn`、`afterwards` 在控制台下拉里选(健管师默认 `reply` + `continue`,11-17 定;原 `silent` 已改);`material_list` 的 `agent_code` 钉成健管师的智能体编码。
 - 不开 `dynamic_workers`、不配 `subagents`(绑定在子智能体里的行为不在本文核对范围)。
 - `approval_required_tools` 留空(9.1:不确认,已定)。
 - 提示词里写清(全文在 06):只用手上的工具;写入和提醒以工具返回为准;日期参数只传 `YYYY-MM-DD`;`form_list_owner_submissions` 的 `page_size` ≤ 20;客户资料只在话题与健康有关时调、每轮最多一次;情境字段先推断再问;一条消息里重复的量合并或带时间;转人工的时机、急症信号、不说「已转人工」、不回答已交出去的问题。
@@ -733,7 +735,7 @@ spec:
       - {name: source_message_ids,    description: 本轮客户消息 id(JSON 数组),只给写工具判重用}
   tools:
     - type: mcp
-      servers: ["<健管师 MCP 注册名>"]
+      servers: ["<深护 MCP 注册名>"]
       allow_tools:
         - profile_get_brief
         - health_plan_get_brief
@@ -748,52 +750,52 @@ spec:
         - handoff_to_human
         - material_list
       arg_bindings:
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: profile_get_brief
           args: {project_code: project_code, customer_code: customer_code,
                  customer_pad_userid: customer_pad_userid, room_conversation_id: room_conversation_id}
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: health_plan_get_brief
           args: {project_code: project_code, customer_code: customer_code}
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: form_get_field_detail
           args: {project_code: project_code}
           fixed: {detail_level: brief}
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: form_get_latest_field_values
           args: {project_code: project_code, owner_code: customer_code}
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: form_list_owner_submissions
           args: {project_code: project_code, owner_code: customer_code}
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: form_save_customer_values
           args: {project_code: project_code, owner_code: customer_code,
                  employee_code: employee_code, attachments: attachment_urls,
                  source_message_ids: source_message_ids}
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: reminder_create
           args: {project_code: project_code, customer_code: customer_code,
                  customer_pad_userid: customer_pad_userid, employee_code: employee_code,
                  employee_pad_userid: employee_pad_userid, room_conversation_id: room_conversation_id}
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: reminder_list
           args: {project_code: project_code, customer_pad_userid: customer_pad_userid,
                  room_conversation_id: room_conversation_id}
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: reminder_delete
           args: {project_code: project_code, customer_pad_userid: customer_pad_userid}
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: chat_private_history
           args: {project_code: project_code, employee_code: employee_code, customer_code: customer_code}
           fixed: {scope: customer}
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: handoff_to_human
           args: {project_code: project_code, employee_code: employee_code,
                  employee_pad_userid: employee_pad_userid, customer_code: customer_code,
                  customer_pad_userid: customer_pad_userid, room_conversation_id: room_conversation_id,
                  source_message_ids: source_message_ids}
           fixed: {this_turn: reply, afterwards: continue}  # 健管师默认(11-17 定:本轮回复 + 之后照常);控制台下拉可改,见 3.10
-        - server: "<健管师 MCP 注册名>"
+        - server: "<深护 MCP 注册名>"
           tool: material_list
           args: {project_code: project_code}
           fixed: {agent_code: "<健管师智能体编码>"}
@@ -816,7 +818,7 @@ spec:
 - **用途**:客户明确要运动视频(或别的素材)时,让模型看到本智能体能发的全部素材,挑最合适的 ≤ 3 个,把 id 放进输出的 `media`(02)。
 - **说明文字**(给模型):「[列出可以发给客户的素材] 只在客户明确要视频或资料时调用。返回可发素材的完整清单(id、名称、类型、标签、说明),不含链接。对照说明里的适合人群和禁忌,按客户情况(年龄、关节、血压、器械条件等)挑最合适的,最多 3 个,把 id 填进回复的 media;清单里没有合适的就只给文字建议。」
 - **入参**:`project_code`(平台从 inputs 绑定);`agent_code`(智能体配置里钉死);模型不填任何参数。
-- **数据源**:深护新建的 `t_project_agent_material`(表名待深护确认,结构见 05 §3.3.1)。
+- **数据源**:深护新建的 `t_project_agent_material`(表名 11-17 已定,结构见 05 §3.3.1)。
 - **口径**:`project_code` = 本项目,`agent_code` = 本智能体**或为空**(空 = 全项目通用),`status = 1`,未删除;按 `sort` 排。
 - **返回**:`items[]`,每项 `id`(表主键,整数)、`name`、`media_type`(`video` / `image` / `file` / `audio`)、`tags`(JSON 数组,如「低强度」「坐姿」)、`description`(前 60 字左右:要领 / 适合人群 / 禁忌 / 用法;没写返回空串);外加 `total`、`server_now`。**返回全部符合条件的素材**(不分页、不按关键词搜 —— 关键词搜会漏同义词,全量清单不会漏),**永远不返回 `url`**。总长 ≤ 8000 字(41 条带说明约 4 千字)。
 - **以后**:素材超过约 150 条时再加一个按标签筛选的参数,v1 不做。
@@ -979,7 +981,7 @@ spec:
 - 本文做法:声明变量全部 `required: true`(`attachment_urls` 除外),没建档 / 私聊传空串;漏传当场 422(§7 用例 5)。06 §5.1 / §5.5 已改成同一口径。
 
 **9.12 Redis 库号(11-17 已核)**:
-- **提醒队列**:生产数字人服务 `QUEUE_REDIS_DB_INDEX = 15`(用户 11-17 查生产配置确认;代码默认 14 未生效)。MCP 投提醒按 15 连(与项目服务 `ai-notify` 一致,`ai-notify.const.ts:10-12`)。
+- **提醒队列**:生产数字人服务 `QUEUE_REDIS_DB_INDEX = 15`(用户 11-17 查生产配置确认;代码默认 14 未生效)。**测试环境的库号还没核实**,上测试前按测试环境配置核一次。MCP 投提醒按 15 连(与项目服务 `ai-notify` 一致,`ai-notify.const.ts:10-12`)。
 - **临时接管标志**:不在队列库,在数字人服务的缓存库(`CACHE_REDIS_DB_INDEX`,`src/config/redis.ts:18`,代码默认 0;`app.module.ts:89`),pad 同步 / dk 存档与它同库(`human-answered.service.ts:44`)。只在转人工配成「本轮不回」时才写;健管师默认是「本轮回复」(11-17),所以默认用不到。将来要配成本轮不回之前,先按生产配置核这个库号;写错库,`silent` 会悄悄失效(6.17)。
 
 **9.13 AI 开关被关掉后,谁、在哪重新打开(实现前必须确认)**:读代码在项目服务找到两个接口(私聊、群成员各一个,§1.5),但员工端有没有入口在用没核实。推荐:深护确认员工后台有按钮;没有就补一个,随 M13 一起上。没有入口时不要启用 `afterwards=stop`。
@@ -1052,7 +1054,7 @@ spec:
 **PC 机器任务服务**(`8527863`,确认)
 - `src/modules/pc-machine-task/claim.service.ts:188-192`(领取时对每条机器任务写 AI 已发标记);`recipient.resolver.ts:57-151`(收件人只能是外部联系人私聊或群)。
 
-**素材表**:`t_project_agent_material` 是深护为本次新建的表(表名待深护确认),结构见 05 §3.3.1、§5.2;现有代码里没有,不作读代码出处。
+**素材表**:`t_project_agent_material` 是深护为本次新建的表(表名 11-17 已定),结构见 05 §3.3.1、§5.2;现有代码里没有,不作读代码出处。
 
 **与共享背景不符或共享背景没写的**
 1. 共享背景说「提醒删除(1768787117123@8448)」:该节点标题在 8713 行,8448 附近是「是否要删除提醒」分支。
