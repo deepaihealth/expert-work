@@ -6818,7 +6818,7 @@ const en: TranslationKeys = {
     base_url_hint: "Leave empty to use the official address. Enter the address up to the version number only, e.g. https://your-host/v1 — the platform appends the API path. Public https addresses only; do not put a key in the address. Every call made with this key (chat, images, embeddings, rerank, document recognition, etc.) goes here. When you change the address, also enter this service's key. Saving makes one real call with this key to test it. If this address is unreachable, times out or errors, the platform does not switch to another key of the same provider; it switches to the agent's fallback model. If the address returns an error such as 400 / 404, or an answer breaks off midway, that turn fails without switching.",
     base_url_key_hint_new: "Enter this service's key.",
     base_url_needs_new_key: "To change the address, also enter this service's key.",
-    base_url_err_BASE_URL_INVALID: "The address is not valid: it must start with https and must not contain a user name or password, a ?, a #, or full-width or invisible characters in the host name.",
+    base_url_err_BASE_URL_INVALID: "The address is not valid. Check it — for example: it must start with https; no spaces or backslashes; no user name or password, ? or #; no full-width or invisible characters in the host name; not too long.",
     base_url_err_BASE_URL_BLOCKED_HOST: "This address is not allowed: only public https addresses are supported — not internal, local, cloud metadata or in-cluster addresses.",
     base_url_err_BASE_URL_UNRESOLVABLE: "The address's host name could not be found. Check the spelling.",
     base_url_err_BASE_URL_NOT_SUPPORTED: "This provider does not take a request address.",

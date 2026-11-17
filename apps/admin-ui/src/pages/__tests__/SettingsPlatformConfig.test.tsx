@@ -495,7 +495,9 @@ async function openKeyEdit(
   await screen.findByTestId("pc-edit-modal");
 }
 
-describe("SettingsPlatformConfig — request address (B-308)", () => {
+// Many dialog steps per case: the 5 s default is too tight when the whole
+// suite runs in parallel.
+describe("SettingsPlatformConfig — request address (B-308)", { timeout: 20_000 }, () => {
   it("shows 'Official' or only the host, with the check-failed marker", async () => {
     const user = userEvent.setup();
     renderWithProviders(b308View().providers);
@@ -716,6 +718,133 @@ describe("SettingsPlatformConfig — request address (B-308)", () => {
     );
   });
 
+  async function failCheckAndTick(
+    user: ReturnType<typeof userEvent.setup>,
+    upsertKey: { mock: { calls: unknown[][] } },
+  ) {
+    await openKeyEdit(user, "openai", "acct-b");
+    await user.type(
+      screen.getByTestId("pc-edit-base-url"),
+      "https://relay.example.com/v1",
+    );
+    await user.type(screen.getByTestId("pc-edit-value"), "sk-relay");
+    await user.click(screen.getByText("Save"));
+    await screen.findByTestId("pc-edit-check-failed");
+    await user.click(screen.getByTestId("pc-edit-force-save"));
+    expect(upsertKey.mock.calls).toHaveLength(1);
+  }
+
+  function checkFailedOnce() {
+    return vi
+      .spyOn(sdk, "upsertPlatformProviderKey")
+      .mockRejectedValueOnce(
+        new ApiError("check failed", "BASE_URL_CHECK_FAILED", 422, {
+          code: "BASE_URL_CHECK_FAILED",
+          reason: "unreachable",
+          status: null,
+          interface: "chat",
+        }),
+      )
+      .mockResolvedValue(SAVED_KEY);
+  }
+
+  it("editing a field after ticking 'save anyway' drops force_save", async () => {
+    const user = userEvent.setup();
+    const upsertKey = checkFailedOnce();
+    renderWithProviders(b308View().providers);
+    await failCheckAndTick(user, upsertKey);
+    // A different key now: the earlier "save anyway" no longer applies.
+    await user.type(screen.getByTestId("pc-edit-value"), "-2");
+    expect(screen.queryByTestId("pc-edit-check-failed")).toBeNull();
+    await user.click(screen.getByText("Save"));
+    await waitFor(() => expect(upsertKey).toHaveBeenCalledTimes(2));
+    expect("force_save" in upsertKey.mock.calls[1][2]).toBe(false);
+  });
+
+  it("switching paste / reference after ticking 'save anyway' drops force_save", async () => {
+    const user = userEvent.setup();
+    const upsertKey = checkFailedOnce();
+    renderWithProviders(b308View().providers);
+    await failCheckAndTick(user, upsertKey);
+    await user.click(screen.getByText("Reference (URI)"));
+    expect(screen.queryByTestId("pc-edit-check-failed")).toBeNull();
+    await user.clear(screen.getByTestId("pc-edit-ref"));
+    await user.type(screen.getByTestId("pc-edit-ref"), "kms://platform/relay");
+    await user.click(screen.getByText("Save"));
+    await waitFor(() => expect(upsertKey).toHaveBeenCalledTimes(2));
+    expect(upsertKey.mock.calls[1][2]).toEqual(
+      expect.objectContaining({ secret_ref: "kms://platform/relay" }),
+    );
+    expect("force_save" in upsertKey.mock.calls[1][2]).toBe(false);
+  });
+
+  it("the key field's error follows the address", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "openai", "acct-b");
+    const address = screen.getByTestId("pc-edit-base-url");
+    await user.type(address, "https://relay.example.com/v1");
+    await user.click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(
+          "To change the address, also enter this service's key.",
+        ).length,
+      ).toBeGreaterThan(1),
+    );
+    // Address put back: the stale "changing the address" error goes away.
+    await user.clear(address);
+    await waitFor(() =>
+      expect(
+        screen.queryByText(
+          "To change the address, also enter this service's key.",
+        ),
+      ).toBeNull(),
+    );
+    expect(
+      await screen.findByText("Paste a key, or switch to Reference."),
+    ).toBeInTheDocument();
+  });
+
+  it("the 'enter this service's key' hint goes away once a key is given", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "openai", "acct-b");
+    await user.type(
+      screen.getByTestId("pc-edit-base-url"),
+      "https://relay.example.com/v1",
+    );
+    expect(await screen.findByTestId("pc-edit-key-hint")).toBeInTheDocument();
+    await user.type(screen.getByTestId("pc-edit-value"), "sk-relay");
+    await waitFor(() =>
+      expect(screen.queryByTestId("pc-edit-key-hint")).toBeNull(),
+    );
+    // Reference mode: shown while the reference is the row's own, gone once changed.
+    await user.click(screen.getByText("Reference (URI)"));
+    expect(await screen.findByTestId("pc-edit-key-hint")).toBeInTheDocument();
+    await user.type(screen.getByTestId("pc-edit-ref"), "-relay");
+    await waitFor(() =>
+      expect(screen.queryByTestId("pc-edit-key-hint")).toBeNull(),
+    );
+  });
+
+  it("an error that is not about the address keeps the toast", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(sdk, "upsertPlatformProviderKey").mockRejectedValue(
+      new ApiError("store unavailable", "SOMETHING_ELSE", 500, {
+        code: "SOMETHING_ELSE",
+      }),
+    );
+    renderWithProviders(b308View().providers);
+    await openKeyEdit(user, "openai", "acct-b");
+    await user.type(screen.getByTestId("pc-edit-value"), "sk-x");
+    await user.click(screen.getByText("Save"));
+    expect(
+      await screen.findByText("SOMETHING_ELSE: store unavailable"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("pc-edit-error")).toBeNull();
+  });
+
   it.each([
     [
       "BASE_URL_FORMAT",
@@ -736,7 +865,8 @@ describe("SettingsPlatformConfig — request address (B-308)", () => {
       "without the API path",
     ],
     ["BASE_URL_BLOCKED_HOST", {}, "only public https addresses"],
-    ["BASE_URL_INVALID", {}, "must start with https"],
+    ["BASE_URL_INVALID", {}, "no spaces"],
+    ["BASE_URL_NOT_SUPPORTED", {}, "does not take a request address"],
     ["BASE_URL_UNRESOLVABLE", {}, "could not be found"],
     ["BASE_URL_NEEDS_NEW_KEY", {}, "also enter this service's key"],
     ["SECRET_NOT_FOUND", {}, "not found in the secret store"],
@@ -783,7 +913,9 @@ describe("SettingsPlatformConfig — request address (B-308)", () => {
   });
 });
 
-describe("SettingsPlatformConfig — tenant override request address (B-308)", () => {
+// Many dialog steps per case: the 5 s default is too tight when the whole
+// suite runs in parallel.
+describe("SettingsPlatformConfig — tenant override request address (B-308)", { timeout: 20_000 }, () => {
   function renderTenant(view: TenantCredentialsView) {
     setStoredToken(
       makeJwt({ sub: "u1", tenant_id: TENANT, roles: ["system_admin"] }),
@@ -885,5 +1017,64 @@ describe("SettingsPlatformConfig — tenant override request address (B-308)", (
         }),
       ),
     );
+  });
+
+  function existingOverrideView(): TenantCredentialsView {
+    return {
+      tenant_id: TENANT,
+      providers: [
+        {
+          provider: "openai",
+          override: OVERRIDE,
+          effective_source: "tenant",
+          effective_ref: "kms://tenant/openai",
+          official_base_url: "https://api.openai.com/v1",
+        },
+      ],
+      tools: [],
+    };
+  }
+
+  it("an existing override: a changed address without a new key is stopped", async () => {
+    const user = userEvent.setup();
+    const upsert = vi.spyOn(sdk, "upsertTenantProviderOverride");
+    renderTenant(existingOverrideView());
+    await screen.findByTestId("pc-providers-table");
+    await openDrawerAndPickTenant(user);
+    await user.click(await screen.findByTestId("pc-tenant-edit-openai"));
+    await screen.findByTestId("pc-edit-modal");
+    const address = screen.getByTestId("pc-edit-base-url");
+    expect(address).toHaveValue(OVERRIDE.base_url);
+    await user.clear(address);
+    await user.type(address, "https://other-relay.example.com/v1");
+    await user.click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(
+          "To change the address, also enter this service's key.",
+        ).length,
+      ).toBeGreaterThan(1),
+    );
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it("an existing override: clearing the address keeps the override's own key", async () => {
+    const user = userEvent.setup();
+    const upsert = vi
+      .spyOn(sdk, "upsertTenantProviderOverride")
+      .mockResolvedValue(OVERRIDE);
+    renderTenant(existingOverrideView());
+    await screen.findByTestId("pc-providers-table");
+    await openDrawerAndPickTenant(user);
+    await user.click(await screen.findByTestId("pc-tenant-edit-openai"));
+    await screen.findByTestId("pc-edit-modal");
+    await user.clear(screen.getByTestId("pc-edit-base-url"));
+    await user.click(screen.getByText("Save"));
+    await waitFor(() => expect(upsert).toHaveBeenCalledTimes(1));
+    expect(upsert.mock.calls[0]).toEqual([
+      TENANT,
+      "openai",
+      { secret_ref: "kms://tenant/openai", enabled: true, base_url: null },
+    ]);
   });
 });

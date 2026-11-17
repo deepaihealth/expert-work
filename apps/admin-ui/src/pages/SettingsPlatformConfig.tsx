@@ -220,7 +220,13 @@ export function SettingsPlatformConfig() {
       comparableAddress(raw, edit.officialBaseUrl) === "",
     [edit, showBaseUrl],
   );
-  const keyHint = addressChanged(watchedBaseUrl)
+  const watchedValue = Form.useWatch("value", editForm);
+  const watchedRef = Form.useWatch("secret_ref", editForm);
+  const keyGiven =
+    editMode === "value"
+      ? Boolean(watchedValue)
+      : (watchedRef ?? "").trim() !== (edit?.secret_ref ?? "");
+  const keyHint = addressChanged(watchedBaseUrl) && !keyGiven
     ? edit?.isNewRow
       ? t("settings_platform.base_url_key_hint_new")
       : t("settings_platform.base_url_needs_new_key")
@@ -1154,7 +1160,14 @@ export function SettingsPlatformConfig() {
           <Form.Item label={t("settings_platform.mode_label")}>
             <Segmented
               value={editMode}
-              onChange={(v) => setEditMode(v as "value" | "ref")}
+              onChange={(v) => {
+                setEditMode(v as "value" | "ref");
+                // B-308 — another key source: the earlier check result and
+                // "save anyway" no longer apply.
+                setCheckFailure(null);
+                setForceSave(false);
+                setSaveError(null);
+              }}
               options={[
                 { label: t("settings_platform.mode_value"), value: "value" },
                 { label: t("settings_platform.mode_ref"), value: "ref" },
@@ -1166,6 +1179,7 @@ export function SettingsPlatformConfig() {
           {editMode === "value" ? (
             <Form.Item
               name="value"
+              dependencies={["base_url"]}
               label={t("settings_platform.value_label")}
               extra={keyExtra(t("settings_platform.value_hint"))}
               rules={[
@@ -1194,6 +1208,7 @@ export function SettingsPlatformConfig() {
           ) : (
             <Form.Item
               name="secret_ref"
+              dependencies={["base_url"]}
               label={t("settings_platform.secret_ref_label")}
               extra={keyExtra(t("settings_platform.secret_ref_hint"))}
               rules={[
