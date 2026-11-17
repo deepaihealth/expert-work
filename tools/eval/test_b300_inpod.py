@@ -148,6 +148,22 @@ async def test_seed_writes_and_supersedes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_supersede_seed_still_speaks_the_old_interface() -> None:
+    """基线 pod 上的存储还是 ``supersede(old_id=...)``、返回新行或 ``None``:种子照样能种。"""
+    known, written = uuid4(), SimpleNamespace(id=uuid4())
+
+    class _OldStore:
+        async def supersede(
+            self, *, tenant_id: UUID, user_id: UUID, old_id: UUID, new_item: Any
+        ) -> Any:
+            return new_item if old_id == known else None
+
+    kw: dict[str, Any] = {"tenant_id": TENANT, "user_id": uuid4(), "new_item": written}
+    assert await inpod._supersede_seed(_OldStore(), old_id=known, **kw) == str(written.id)
+    assert await inpod._supersede_seed(_OldStore(), old_id=uuid4(), **kw) == ""
+
+
+@pytest.mark.asyncio
 async def test_seed_is_the_same_user_as_the_external_api() -> None:
     from control_plane.api._external import resolve_external_user_id
 
