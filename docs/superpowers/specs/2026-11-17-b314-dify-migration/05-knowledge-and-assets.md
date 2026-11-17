@@ -551,7 +551,7 @@ CREATE TABLE IF NOT EXISTS `t_project_agent_material` (
 12. ~~源文件目录布局与 `docs/agents/README.md` 约定~~ **作废(11-17)**:交付物改为本地文件夹里的文件,不进 git(§3.6.2)。
 13. ~~知识库内容的审核流程~~ **已定(11-17)**:业务方已授权内容,不设运营 + 法务双签;改动由业务方确认、记在配置书变更记录里。
 14. ~~素材用哪张表~~ **已定(11-17,改定)**:深护为智能体新建一张 `t_project_agent_material`(表名待深护确认),和其它业务的素材解耦、按智能体划范围;不复用 `t_project_material` 或方案生成助手的素材表。
-15. **素材 SQL 的几处值要深护确认**(不是取舍):表名、列长度(`name` 120、`description` 1000、`material_code` 64)、`material_code` 的生成格式、`created_by` 填什么。`@agent_code` 已定:填深护员工绑定上的 `agent_code`(06 §3.11)。
+15. ~~素材 SQL 的几处值要深护确认~~ **已定(11-17)**:表名、列长度(`name` 120、`description` 1000、`material_code` 64)、`material_code` 的生成格式以用户提交到 db-design 的 SQL 为准;`@agent_code` = `agent_health_manager`(深护员工绑定上同值,06 §3.11);`created_by`、`updated_by` 都填 999999(SQL 09 已预填,执行时只填 `@project_code`)。
 
 ## 10. 出处
 
