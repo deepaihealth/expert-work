@@ -12,7 +12,8 @@
 | 用户定 3 | 守卫改成**白名单受检面**:只查 MCP / http 的全部字符串叶子(绑定参数除外)、平台工具的 `path_args`、`ask_image.path` | §3.3 重写、§六 重写 |
 | 用户定 4 + 审查 H1 | 别名照收;`ResolvedPath.path` 与一切落盘 / 持久化 / 元数据都写**真实路径** `inputs/<run>/…`,短路径只出现在给模型看的文本里 | §3.2.2 |
 | 用户定 6 | 守卫仍在审批门之后;加计数「已批准后被字面量守卫拦下」 | §3.3.2 |
-| 审查 L1 | 已实测证实,`resolve_input_link` 必做;探针改成正式测试 | §1.2、§9.5 |
+| 审查 L1 | 协调方已实测证实,`resolve_input_link` 必做;探针作为正式测试提交进仓库 | §1.2、§9.5 |
+| 复审 LOW ×9 | 环境变量注入口径、挂载异常与 run id 双重校验、保留期措辞、场景 o / p、受检面 ② 用自维护的表、审计措辞、补测试、M3 已知漏拦 | §3.2、§3.3、§五、§六、§七、§九 |
 | 审查 M1 | 不加 `$7`,exec 视图脚本从已下发的环境变量 `EXPERT_WORK_INPUTS_DIR` 取 run id | §3.2.3 重写 |
 | 审查 M2 | run 目录不在时挂载阶段静默跳过,不写 stderr;run 目录在才建 `current` 桩 | §3.2.3 |
 | 审查 M3 | MCP / http 的字符串叶子整段是 `inputs/…` 本地路径时也拦 | §3.3.1 |
@@ -38,7 +39,7 @@
 
    这两句对每个声明了变量的智能体、每一轮都出现。模型读到「要用到下面任何值时从清单读」,又看到 `is_first_contact：已提供（非文件）`,自然就去跑代码读值。第二句的 `$EXPERT_WORK_INPUTS` 写法又教会了它「`$名字` 代表一个值」,于是有了 `$attachment_urls`。
 2. **`$EXPERT_WORK_INPUTS_DIR/...` 只有 exec_python / bash 认识。** 它是沙箱里的环境变量(`tools/sandbox.py:142-145`)。系统提示词渲染(`prompt_render.py:118`、`:181`、`:217`)和「本轮输入」段(`inputs_block.py:73`、`:76`、`:85`、`:89`)都把文件写成这种形式,但 `ask_image` 的 `path`(`tools/vision.py:1498-1508`)、`read_document`、`read_page`、文件工具都走 `resolve_workspace_path`(`tools/workspace_paths.py:282-358`),那里没有任何地方展开 `$`;MCP 工具更不可能展开。grep 全仓库也没有展开它的代码。
-3. **宿主侧读不了预下载的链接(审查已实测证实)。** 预下载建的是**符号链接** `org_logo.png -> ../cache/<摘要>.png`(`tools/prefetch_script.py:160-185`),而宿主侧读工作区文件的两条路 —— `NasWorkspaceStore.read_file`(`tools/nas_workspace_store.py:1063-1095`)和 `NasWorkspaceImageResolver`(`multimodal.py:188`,末段读在 `_read_workspace_leaf`,`:243`)—— 末段都用 `O_NOFOLLOW`。审查的探针(本地临时目录下建好上面那个链接,调 `NasWorkspaceImageResolver.resolve`)得到 `ValueError: workspace image ref escapes the user root`。所以今天就算模型手写出真实路径 `inputs/<run_id>/org_logo.png` 交给 `ask_image`,也读不到。`read_document` / `read_page` 在沙箱里按 `realpath` 读,链接在 `/workspace` 之内,这两个读得到。
+3. **宿主侧读不了预下载的链接(协调方实测证实)。** 预下载建的是**符号链接** `org_logo.png -> ../cache/<摘要>.png`(`tools/prefetch_script.py:160-185`),而宿主侧读工作区文件的两条路 —— `NasWorkspaceStore.read_file`(`tools/nas_workspace_store.py:1063-1095`)和 `NasWorkspaceImageResolver`(`multimodal.py:188`,末段读在 `_read_workspace_leaf`,`:243`)—— 末段都用 `O_NOFOLLOW`。协调方的探针(本地临时目录下建好上面那个链接,调 `NasWorkspaceImageResolver.resolve`)得到 `ValueError: workspace image ref escapes the user root`。所以今天就算模型手写出真实路径 `inputs/<run_id>/org_logo.png` 交给 `ask_image`,也读不到。`read_document` / `read_page` 在沙箱里按 `realpath` 读,链接在 `/workspace` 之内,这两个读得到。
 
 ### 1.3 现在长什么样
 
@@ -130,7 +131,7 @@ inputs/
    - `/agent/inputs/current/...`:老视图里不改写、直接报错并指路(文案见 §4.5;审查 LOW)—— 沙箱只在 `/workspace` 一侧挂载,老视图里 `/agent/inputs/current` 是空桩,宿主侧和沙箱侧要说同一句话。对话视图里 `/agent/inputs/` 本来就拒(`:344-351`),不变。
    - `inputs/<run_id>/...`、`inputs/cache/...`、`inputs/currentx/...` 都不改写,与今天相同。
 4. **真实路径与显示路径分开(审查 H1)**。`ResolvedPath`(`:202-214`)今天的 `path` 字段既被拿去给模型看,也被落盘。改成:
-   - `path` = **改写后的真实路径** `inputs/<run>/…`(别名同样)。凡是持久化、跨轮、写元数据的地方继续用 `path`,于是一律是真实路径:`read_page` 的 `figure_documents`(`tools/read_page.py:1553` 取、`:1751`、`:1814` 写进 state)、`ask_image` 的结果元数据(`vision.py:1482`、`:1493`、`:1496`、`:1508`)、审计里的路径、渲染页 ref。
+   - `path` = **改写后的真实路径** `inputs/<run>/…`(别名同样)。凡是持久化、跨轮、写元数据的地方继续用 `path`,于是一律是真实路径:`read_page` 的 `figure_documents`(`tools/read_page.py:1553` 取、`:1751`、`:1814` 写进 state)、`ask_image` 的结果元数据(`vision.py:1482`、`:1493`、`:1496`、`:1508`)、渲染页 ref。审计不在本次范围:它记的是模型传进来的原始参数(`builder.py:4317-4330`),照旧。
    - 新字段 `display` = 模型这一次能直接再用的写法:短路径或别名输入时是 `inputs/current/…`(别名也归一成短路径),其余等于 `path`。只用在**这一次工具调用**回给模型的文本里(回执、报错)。
    - 为什么:`figure_documents` 是跨轮的。下一轮 `figure_block._document_path`(`graph_builder/figure_block.py:193-205`)用**下一轮的** view 把记下的路径再算一遍 `doc_sha` 去核对。记的若是 `inputs/current/report.pdf`,下一轮它指向新一轮(或报「本轮没有输入」),哈希对不上 → 渲染页段丢了路径;更糟的是新一轮恰好也有一份 `report.pdf`,就指到另一份文档。记真实路径,哪一轮核对都是同一个文件。
    - 实现时 grep `ResolvedPath` 的 `.path` 全部使用点,按「落盘 / 跨轮」与「本次回给模型」分两类,前者不动(自动变成真实路径),后者改用 `.display`;清单写进实现计划。
@@ -161,13 +162,14 @@ inputs/
 
 **改 `orchestrator/tools/exec_view.py` 的 `EXEC_VIEW_SCRIPT` 和它在镜像里的逐字副本 `infra/sandbox-image/runner.py:76-`**(契约测试 `test_exec_view_script_matches_the_sandbox_image` 钉两份相等;argv、`exec_view_argv`、`build_exec_command`、`ExecRequest`、`runner_link` 都不动):
 
-1. shell 部分取 `inp="${EXPERT_WORK_INPUTS_DIR-}"`,用 `case` 校验它**恰好**是 `/workspace/inputs/<36 位小写 UUID 形状>`:是就取最后一段作 run id,否则(没设、空、形状不对)run id 为空串。run id 作为脚本内部的一个参数交给内嵌 python(脚本对外的 `$1`~`$6` 不变)。形状不对不报错、不退出:这是一个方便性的挂载,不是安全边界,失败方向是「不挂」,环境变量照旧可用;格式由契约测试保证。
+1. shell 部分取 `inp="${EXPERT_WORK_INPUTS_DIR-}"`,用 `case` 校验它**恰好**是 `/workspace/inputs/<36 位小写 UUID 形状>`。UUID 那一段逐位写成明确的字符类(`[0-9a-f]` 八位、`-`、四位……共 36 位),**不用 `*`** —— `*` 在 `case` 里能匹配 `/`,`/workspace/inputs/x/../y` 这类就混进来了:是就取最后一段作 run id,否则(没设、空、形状不对)run id 为空串。run id 作为脚本内部的一个参数交给内嵌 python(脚本对外的 `$1`~`$6` 不变)。形状不对不报错、不退出:这是一个方便性的挂载,不是安全边界,失败方向是「不挂」,环境变量照旧可用;格式由契约测试保证。
 2. 内嵌 python 的 `nas_view`(`exec_view.py:317-366`)在 `/workspace` 绑好之后、`shared/` 之前加一步,全程按 fd(与现有挂载同一套写法):
    ```
    if run_id:
        try:
            inputs = sub(ws, "inputs", False)     # 不建:没有 inputs/ 就没有本轮清单
            run    = sub(inputs, run_id, False)   # O_NOFOLLOW,必须是已存在的真目录
+                                                 # (run_id 已过 str(UUID(x)) == x)
        except OSError:
            run = None                            # 静默:不写 stderr
        if run is not None:
@@ -176,10 +178,15 @@ inputs/
            except OSError:
                stub = None                           # 被换成符号链接 / 普通文件:静默
            if stub is not None:
-               bind(run, stub)                       # open_tree + move_mount,记进 OURS
+               try:
+                   bind(run, stub)                   # open_tree + move_mount,记进 OURS
+               except OSError:
+                   pass                              # 静默:不挂
    ```
    - **静默跳过(M2)**:run 目录不在(清单写入失败只降级;审批挂得太久目录被回收)、`current` 被换成符号链接或普通文件,一律什么都不写。照 `hide_memory` 的做法:stderr 就是工具输出,写一行会被 B-226 的收尾判定当成失败。
    - **只在 run 目录确实存在时才建 `current` 桩**,不会每次 exec 都去建目录。
+   - `bind(run, stub)` 本身也包在 `try` 里:`open_tree` / `move_mount` 失败同样静默不挂,不让 exec 失败。
+   - **python 侧再校验一次 run id**:`str(UUID(x)) == x`,不等就不挂。shell 的 `case` 与 python 的 UUID 校验各自独立成立,任何一层被改松,另一层仍挡住。
    - 挂载可写,和今天 `inputs/<run_id>/` 可写一样(预下载要往里写),能力不比今天多;记进 `OURS`,`freeze()` 不会把它冻成只读。
    - 载荷跑在嵌套 user namespace 里,卸不掉这个挂载(与现有各层同理)。
    - 只挂 `/workspace` 一侧,不挂 `/agent`。
@@ -219,16 +226,18 @@ inputs/
 | 受检面 | 查哪些字符串 | 不查 |
 |---|---|---|
 | ① MCP 工具(名字以 `mcp__` 开头,`tools/mcp.py:88`)和 `http` 工具(`tools/http.py:116`) | 参数里**全部字符串叶子**(递归,不看字典键) | 这次被平台绑定填过的参数(`_fill_bound_args` 返回的逐调用参数名,`builder.py:1902-1927`) |
-| ② 平台工具的 `spec.path_args`(`registry.py:153`) | 这些参数的值 | 同一工具的其它参数 |
-| ③ `ask_image.path`(它没有声明 `path_args`) | 这个参数的值 | `question`、`image_ref` 等 |
+| ② 平台工具的路径参数:守卫自己维护的一张「工具名 → 路径参数名」表(`read_file` / `write_file` / `edit_file` / `list_dir` / `search_files` / `read_document` / `read_page` 的 `path`,`save_artifact` 的 `path`) | 表里这些参数的值 | 同一工具的其它参数 |
+| ③ `ask_image.path` | 这个参数的值 | `question`、`image_ref` 等 |
 
-不在表里的一律不查,包括:`exec_python` / `bash`、委派任务(`spawn_worker` / 子 Agent 的 task)、`update_plan`、技能编写(`author_skill` / `refine_skill` / `fork_skill`)、`remember`、`note_behavior_patch`、`write_file` / `edit_file` 的内容(含顶层 `edits` / `old_string` / `new_string`,它们不是 `path_args`)、`knowledge_search`、`web_search`。理由(用户已定):平台技能大量教 `$EXPERT_WORK_SKILLS_DIR/...` 的写法,在子代、在之后执行的脚本里都是有效的,拦下会把正确的路径改坏;而白名单里的三处,字面量 `$名字` 在任何情况下都不会被展开。
+不在表里的一律不查,包括:`exec_python` / `bash`、委派任务(`spawn_worker` / 子 Agent 的 task)、`update_plan`、技能编写(`author_skill` / `refine_skill` / `fork_skill`)、`remember`、`note_behavior_patch`、`write_file` / `edit_file` 的内容(含顶层 `edits` / `old_string` / `new_string`,它们不在路径参数表里)、`knowledge_search`、`web_search`。理由(用户已定):平台技能大量教 `$EXPERT_WORK_SKILLS_DIR/...` 的写法,在子代、在之后执行的脚本里都是有效的,拦下会把正确的路径改坏;而白名单里的三处,字面量 `$名字` 在任何情况下都不会被展开。
 
 **命中规则**(在受检的字符串里):
 
 1. `$名字` 或 `${名字}`,「名字」是 `$` 后**完整的**标识符(`[A-Za-z_][A-Za-z0-9_]*`,贪婪取完),且**恰好等于**一个声明过的变量名(区分大小写)。
 2. `$EXPERT_WORK_` 或 `${EXPERT_WORK_` 开头的标识符。例外:受检面 ②③ 里**开头**的 `$EXPERT_WORK_INPUTS_DIR/`(或 `${…}/`)不算 —— 解析函数认它(用户定 4)。
 3. **本地路径传给外部服务(审查 M3,只在受检面 ①)**:一个字符串叶子去掉首尾空白后,**整段**是一个不含空白的路径,且以 `inputs/current/`、`inputs/<UUID>/`、`inputs/cache/` 开头(前面可带 `/workspace/`)。只认整段,不认句子里的一截:`"inputs/outputs 比例"`、`"见 inputs/current/a.png"` 都不拦。
+
+**为什么不用 `spec.path_args`**:它是调度器的冲突键(`tools/scheduling.py:59-68`),不是「这是路径参数」的声明 —— `save_artifact` 的 `path_args=("name",)`(`artifact.py:228-231`)是产物名,真正的工作区路径参数是 `path`。拿它当受检面会查错参数、漏掉真参数。守卫的表与工具定义放在一起维护,测试钉住 `save_artifact` 查 `path` 不查 `name`。
 
 「声明过的变量名」= 本图 spec 声明的变量名(在 `agent_factory.py:1379-1382` 旁边按同样写法新增 `declared_input_names` 传进图)∪ 本次 config 里 `prompt_inputs` 的键(子代的图不一定带父的声明,但 `prompt_inputs` 是从父带下来的)。
 
@@ -365,7 +374,7 @@ inputs/
 | a | 纯对话,用了短编号(健管师:身份编号绑给 MCP,`is_first_contact` 进 `if`) | 段里每个变量「已提供」,被绑的加「由平台填进绑定它的工具参数」;没有文件句,没有任何命令 | 编号的值照旧由 `arg_bindings` 填进工具(`arg_bindings.py:212`,不改);模板渲染非地址值不改;段里不再出现「要用值就去读清单」。万一仍把 `$customer_code` 写进 MCP 参数,守卫 ① 拦下并说明由平台填 |
 | b | 文档分析:模板渲染了上传文件的链接,要用代码处理 | 提示词里 `inputs/current/report.pdf（本轮输入文件；预先下载失败时不在）`,段里「文件 inputs/current/report.pdf」 | exec_python `open("inputs/current/report.pdf")` 经挂载打开;`read_document` / `read_page` 经解析函数读 `inputs/<run>/report.pdf`;`ask_image` 再经链接解析读到缓存文件。下载失败时代码工具描述说按清单原地址下载;`$EXPERT_WORK_INPUTS_DIR` 仍可用 |
 | b2 | 场景 b 多轮追问,**第二轮有新输入**(又一份 `report.pdf`) | 第二轮 `inputs/current/report.pdf` 是新的那份;渲染页段里上一轮读过的页给的是真实路径 `inputs/<第一轮>/report.pdf` | `figure_documents` 记的是真实路径(H1),下一轮按任何 view 算出的 `doc_sha` 都是第一轮那份;两份同名文档各有各的 `doc_sha`(按 `rel` 算),不会互相顶替 |
-| b3 | 场景 b 多轮追问,**第二轮没有输入** | 模型若再写 `inputs/current/report.pdf`,得到「本轮没有输入变量……之前几轮的文件用当时工具结果或渲染页段里给出的路径」 | 第一轮的文件仍在 `inputs/<第一轮>/`(保留 30 天);渲染页段给的真实路径照样能用;沙箱里本轮不挂,`inputs/current/` 是空桩 |
+| b3 | 场景 b 多轮追问,**第二轮没有输入** | 模型若再写 `inputs/current/report.pdf`,得到「本轮没有输入变量……之前几轮的文件用当时工具结果或渲染页段里给出的路径」 | 第一轮的 run 目录(清单和链接)保留 30 天,但链接指向的缓存文件只保留 7 天(`workspace_janitor.py:173`、`:186`),过期后链接失效、要按清单原地址重下;而且同一 URL 重新下载时会覆盖同扩展名的旧缓存,新鲜度判断看的又是链接本身的 lstat(`prefetch_script.py:297-317`、`figure_lookup.py:375-384`)—— 这些是今天就有的行为,本方案不改,只是不把「仍在」说满。在保留期内,渲染页段给的真实路径照样能用;沙箱里本轮不挂,`inputs/current/` 是空桩 |
 | c | 附件只绑给工具 | 段里:是地址字符串就「文件 inputs/current/x.jpg；由平台填进绑定它的工具参数」,是裸字符串数组(健管师 `attachment_urls`,不预下载,`inputs_doc.py:317-352`)就「已提供；由平台填进…」 | 绑定填值不改;文件那句是事实;工具参数已从 schema 删掉。写了 `$x` 或把 `inputs/current/x.jpg` 填进 MCP 参数,守卫 ① 拦并说「用绑定或原始链接」 |
 | d | 附件绑给工具,同时要在代码里分析 | 段里同 c;代码里用 `inputs/current/x.jpg` 或读清单 | 两条路互不影响:绑定走 `prompt_inputs`,代码走挂载 / 清单,都指同一轮 |
 | e | untrusted 文本 | 提示词里照旧围栏;段里「已提供（外部数据）」;untrusted 地址只说「名字以 {var} 开头」 | 段里仍不写值、不写由值推出的名字(零值测试钉住);守卫提示只含名字,不必围栏 |
@@ -378,9 +387,9 @@ inputs/
 | l | 模板里自己写了 `$EXPERT_WORK_INPUTS_DIR` | 提示词原样带着这串(租户文字不改写) | 代码工具里环境变量值不变;交给路径参数时解析函数当别名,落盘写真实路径;写进 MCP 参数时守卫 ① 拦 |
 | m | 审批续跑 / regenerate / 压缩 | 续跑的 `inputs_run_id` 指回首段(`turn_inputs.py`);段按标重放、压缩后放回 | `inputs_run` 跟着 `inputs_run_id` 走,环境变量与挂载仍是首段的目录;段的标记和构造不改 |
 | n | `render: raw` 的变量(值是地址) | 提示词里是原地址(trusted)或围栏里的原地址(untrusted),不改写;段里仍有「文件 inputs/current/x」 | `render_value` 对 `raw` 早返回(`prompt_render.py:202-203`,不改);预下载按 `linked_sites` 照做,与 render 无关,所以文件那行是真的。原地址留给模型填进没绑定的工具,守卫不查 URL |
-| o | 没有任何读文件工具的智能体(现实里不存在,`exec_python` 恒装;结构上要成立) | 段里文件变量写「已提供」,没有文件句 | §3.1 第 7 条的门;其余行为与 a 相同 |
-| p | 多轮追问且本轮没有输入,模型拿上一轮的回执路径再调工具 | 同一轮里回执显示的是 `inputs/current/…`;跨轮的渲染页段显示真实路径 | 同 b3。上一轮回执里的短路径在本轮会报「本轮没有输入」并指向渲染页段,不会静默读错文件 |
-| q | 后台任务、子代跨过了父对话的下一轮 | 子代 / 后台任务仍挂、仍解析到父**派它那一轮**的目录 | 这是对的:它拿到的 `prompt_inputs` 也是那一轮的,绑定填的是那一轮的值,文件必须同一轮才对得上;那一轮的目录保留 30 天,与今天环境变量的口径一样 |
+| o | 没有任何读文件工具的智能体(现实里不存在,`exec_python` 恒装;结构上要成立) | 段里文件变量写「已提供」,没有文件句 | §3.1 第 7 条的门;其余行为与 a 相同。系统提示词里的文件变量仍渲染成 `inputs/current/…`(渲染层不看工具表)。眼下 `exec_python` 每个智能体都装,这个分支走不到 |
+| p | 多轮追问且本轮没有输入,模型拿上一轮的回执路径再调工具 | 同一轮里回执显示的是 `inputs/current/…`;跨轮的渲染页段显示真实路径 | 本轮没有输入时,上一轮回执里的短路径会报「本轮没有输入」并指向渲染页段。**本轮若有同名的新输入**,历史回执里的短路径会**静默**指向新文件 —— 与风险 4 一致,和今天 `$EXPERT_WORK_INPUTS_DIR` 的行为相同;跨轮要用的路径(渲染页段)给的是真实路径,不受影响 |
+| q | 后台任务、子代跨过了父对话的下一轮 | 子代 / 后台任务仍挂、仍解析到父**派它那一轮**的目录 | 这是对的:它拿到的 `prompt_inputs` 也是那一轮的,绑定填的是那一轮的值,文件必须同一轮才对得上;那一轮的 run 目录保留 30 天(缓存文件 7 天,同 b3),与今天环境变量的口径一样 |
 
 ---
 
@@ -402,11 +411,20 @@ inputs/
 | 被平台绑定填进去的值(含 `$…` 或 `inputs/…` 字样) | MCP / http | 不拦 | 绑定参数排除,那是租户数据 |
 | exec_python / bash 代码里的任何写法 | — | 不查 | 不在受检面 |
 | 委派任务、`update_plan`、技能编写、`remember`、`note_behavior_patch` 里的 `$EXPERT_WORK_SKILLS_DIR/...` | — | 不查 | 不在受检面;这些写法在子代和之后执行的脚本里有效 |
-| `write_file` / `edit_file` 的内容(`content`、`edits`、`old_string`、`new_string`) | — | 不查 | 不是 `path_args` |
+| `write_file` / `edit_file` 的内容(`content`、`edits`、`old_string`、`new_string`) | — | 不查 | 不在路径参数表里 |
 | `knowledge_search` / `web_search` 的查询 | — | 不查 | 不在受检面 |
 | `ask_image(path="$EXPERT_WORK_INPUTS_DIR/x.png")` | ③ | 不拦,并且读得到 | 开头别名由解析函数认 |
 | `read_file(path="$EXPERT_WORK_SKILLS_DIR/a/SKILL.md")` | ② | 拦,提示用 skill_view | 今天这条本来就读不到,现在提示更准 |
 | `read_document(path="$report")` | ② | 拦,提示写 `inputs/current/` 下的路径 | 今天会报「文件不存在」,现在说清原因 |
+
+**M3 已知会漏拦的写法**(规则 3 只认整段以 `inputs/…` 或 `/workspace/inputs/…` 开头的路径,下面这些不认,接受):
+
+- `./inputs/current/x`(前面带 `./`);
+- `file:///workspace/inputs/…`(URL 形式);
+- Markdown 图片写法 `![](inputs/current/x.png)`、句子里夹带的路径;
+- JSON 字符串里嵌的路径(参数值本身是一段 JSON 文本,如 `"{\"img\": \"inputs/current/x\"}"`)。
+
+这些写法漏过去的后果是对方服务收到一个打不开的路径、报错或忽略 —— 与今天相同,不会更坏。要收得更紧就得在句子里找路径,误伤自由文本,不划算。
 
 开销:受检的字符串每条扫一遍,一个正则找 `$` 标识符再查集合,外加一次整段前缀比较;线性,不需要预算。
 
@@ -414,7 +432,7 @@ inputs/
 
 ## 七、兼容和迁移
 
-- **两个环境变量照旧注入、值不变**(`/workspace/inputs/<run_id>/inputs.json` 和它的目录)。已有模板、技能、第三方代码里写 `os.environ["EXPERT_WORK_INPUTS"]`、`$EXPERT_WORK_INPUTS_DIR/x` 的,在代码工具里继续可用。
+- **两个环境变量在绑了智能体的 run 上照旧注入、值不变**(`/workspace/inputs/<run_id>/inputs.json` 和它的目录)。没绑智能体的 run(`agent_key` 为空,只有合成评测路径)因为 `inputs_run` 多了 `agent_key` 条件,**不再注入**这两个变量 —— 那条路径本来就没有租户、不写清单,注入的是悬空路径。已有模板、技能、第三方代码里写 `os.environ["EXPERT_WORK_INPUTS"]`、`$EXPERT_WORK_INPUTS_DIR/x` 的,在代码工具里继续可用。
 - **清单 `local_path` 不变**,仍是 `inputs/<run_id>/…`(相对 `/workspace`),它是代码读的,不经模型手抄。
 - **落盘的路径一律是真实路径**(H1):`figure_documents`、渲染页 ref、ask_image 元数据、审计。发布前已经记下的 `figure_documents` 里没有短路径(那时还没有这个写法),不用迁移。
 - **旧会话里的旧段**:历史里留着写 `$EXPERT_WORK_INPUTS_DIR/…` 的旧段。代码工具里照旧可用;路径参数里由别名接住;压缩后只放回最新一段(新格式)。
@@ -474,18 +492,21 @@ inputs/
 | P3 | `inputs_run is None` 时 `inputs/current/x` 报 §4.5 的文案 | 静默放行成 `inputs/current/x`(读到空桩) |
 | P4 | `inputs/<uuid>/x`、`inputs/cache/x`、`inputs/currentx/y` 与今天结果相同;老视图 `/agent/inputs/current/x` 报 §4.5 的文案;对话视图 `/agent/inputs/…` 仍是现有拒绝 | 改写范围过宽;老视图没拦 |
 | P5 | 对话视图:`agent_relative` 得到 `threads/<conv>/work/inputs/<R>/x` | 对话视图下拼错前缀 |
-| P6 | `ToolContext.workspace_view.inputs_run`:主 run = `run_id`;有 `inputs_run_id` 用它;`prompt_inputs` 为空或 `agent_key` 为空时 `None`;`_child_config` 出来的子代 = 父首段 | 子代用了自己的 `sub_run_id`;没 inputs / 没绑智能体也给了值 |
+| P6 | `ToolContext.workspace_view.inputs_run`:主 run = `run_id`;有 `inputs_run_id` 用它;`prompt_inputs` 为空或 `agent_key` 为空时 `None`;`_child_config` 出来的子代 = 父首段。现有 `test_exec_python_tool.py:33-34` 的 `_ctx()` 不带 `agent_key`,要补上(否则 `:66-78`、`:93-105` 两条「有 inputs 就传 run id」的断言会因为新条件拿到 `None`);另加一条没绑智能体 → `None` | 子代用了自己的 `sub_run_id`;没 inputs / 没绑智能体也给了值 |
 | P7 | **H1 多轮**:第 1 轮 `read_page("inputs/current/report.pdf")` 写进 state 的 `figure_documents` 值是 `inputs/<R1>/report.pdf`;第 2 轮(有新输入 R2 / 没有输入两种)用第 2 轮的 view 跑 `figure_block._document_path`,两种都返回第 1 轮的真实路径 | `figure_documents` 记了短路径 → 第 2 轮返回 `None` 或指到 R2 |
 | P8 | 两轮同名 `inputs/current/report.pdf` 的 `doc_sha` 不同 | `rel` 没换成真实路径 |
 | P9 | `ask_image` 结果元数据的 `path` 是真实路径;回给模型的文本用短路径 | `display` / `path` 用反 |
-| P10 | `run_in_sandbox` 传给 `client.exec` 的 run id 来自 `view.inputs_run` | 两处各算各的、走散 |
+| P10 | `run_in_sandbox` 传给 `client.exec` 的 run id 来自 `view.inputs_run`;`agent_key` 为空时传 `None`(不注入环境变量) | 两处各算各的、走散 |
+| P11 | `read_page("inputs/current/report.pdf")` 这一对:回给模型的回执文本里是 `inputs/current/report.pdf`(display),同一次结果的 `state_updates["figure_documents"]` 值是 `inputs/<R>/report.pdf`(path) | `display` 与 `path` 用反或用成同一个 |
 
 ### 9.4 沙箱挂载(`test_exec_view.py`、`test_exec_view_kernel.py`)
 
 | # | 测试 | 改坏哪一处会红 |
 |---|---|---|
 | X1 | 契约:`inputs_doc.inputs_abs_dir(R)` 的形状恰好被脚本的 `case` 接受,并取出 `str(R)`;脚本里的 `/workspace/inputs/` 前缀与 `EXEC_VIEW` + `WORKSPACE_INPUTS_DIR` 相等 | 任一边改了目录名或前缀 |
-| X2 | 环境变量缺失、为空、是 `/workspace/inputs/../x`、`/workspace/inputs/<UUID>/y`、大写 UUID → 不挂、exit 0、stderr 为空 | 校验过宽;或形状不对时报错退出 |
+| X2 | 环境变量缺失、为空、是 `/workspace/inputs/../x`、`/workspace/inputs/<UUID>/y`、大写 UUID、36 位但含 `/` 的串(`aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa/aaa`)→ 不挂、exit 0、stderr 为空;脚本文本里 UUID 段不含 `*` | 校验过宽(`case` 用了 `*`);或形状不对时报错退出 |
+| X2b | 绕过 shell 直接给内嵌 python 一个过了形状但不是规范 UUID 的 run id(如带大括号或无横杠的 32 位)→ 不挂 | python 侧的 `str(UUID(x)) == x` 被删 |
+| X2c | 让 `bind` 失败(把 `open_tree` 换成抛 `OSError` 的桩,或在不允许挂载的环境里跑)→ exec 成功、stderr 为空、没挂 | `bind` 没包 `try`,异常让 exec 失败 |
 | X3 | 真命名空间:对话视图、老视图各一例,exec 里 `open("inputs/current/org_logo.png")` 读到缓存里的字节;`inputs/current/materials/0-x.mp4`(两层链接)也读得到 | 挂载缺失;挂到了 `/workspace/inputs` 上把 `../cache` 弄断 |
 | X4 | 同一工作区两个 run 并发 exec,各自的 `inputs/current` 是各自的 run | 用了平铺链接或共享符号链接 |
 | X5 | run 目录不在 → 不挂、**stderr 为空**、`inputs/current` 没有被建出来;`current` 是符号链接 / 普通文件 → 不挂、stderr 为空、exec 成功;`current` 桩里原有文件在有挂载的 exec 里看不见 | 跳过时写了 stderr(M2);每次都建桩;跟着符号链接挂到了别处 |
@@ -497,7 +518,7 @@ inputs/
 
 | # | 测试 | 改坏哪一处会红 |
 |---|---|---|
-| L1 | 审查探针(`scratchpad/l1probe/test_l1_probe.py`)改成正式测试:`ask_image(path="inputs/current/org_logo.png")`,链接 `-> ../cache/<32hex>.png`。先确认今天是红的(越界拒绝),修好后变绿 | `resolve_input_link` 没接进 `ask_image` |
+| L1 | 协调方探针(临时目录里的 `l1probe/test_l1_probe.py`)作为正式测试提交进仓库:`ask_image(path="inputs/current/org_logo.png")`,链接 `-> ../cache/<32hex>.png`。先确认今天是红的(越界拒绝),修好后变绿 | `resolve_input_link` 没接进 `ask_image` |
 | L2 | `resolve_input_link` 把 `inputs/<R>/x.png -> ../cache/<32hex>.png`、`inputs/<R>/m/0-a.png -> ../../cache/<32hex>.png` 解析成 `inputs/cache/<32hex>.png` | 只处理了一层 |
 | L3 | 指向 `../../../etc/passwd`、`../cache/sub/x`、`../other/x`、`../cache/notHex.png`、绝对路径的链接 → 原样返回,随后照旧被拒 | 目标校验放宽 |
 | L4 | `inputs/<R>/` 之外的符号链接不解析 | 范围放宽到整个工作区 |
@@ -511,6 +532,7 @@ inputs/
 | G1 | MCP 调用非绑定参数里有 `$attachment_urls` → 不派发,消息含绑定参数名 | 守卫没接进 `tools_node`;命中后仍派发 |
 | G2 | §六里 MCP / http「不拦」的每一行各一例 | 标识符没贪婪取完;数字 / 空格当成名字;大小写不分;规则 3 认了半截路径 |
 | G3 | `${customer_code}` 拦;MCP 参数整段 `inputs/current/a.png`、`/workspace/inputs/<UUID>/a.png` 拦,文案是 M3 那句 | 只认 `$name`;规则 3 缺失 |
+| G4b | `save_artifact` 的 `path` 是 `$org_logo` → 拦;`name` 是 `$org_logo` → 不拦 | 受检面 ② 用了 `spec.path_args` |
 | G4 | 不在受检面的工具(`exec_python`、`bash`、`spawn_worker` 的 task、`update_plan`、`author_skill`、`remember`、`note_behavior_patch`、`knowledge_search`、`web_search`)含 `$customer_code` / `$EXPERT_WORK_SKILLS_DIR/x` → 不拦 | 受检面写成黑名单 / 默认全查 |
 | G5 | `write_file` 的 `content`、`edit_file` 的顶层 `edits` / `old_string` / `new_string` 含 `$org_logo` 不拦;同一调用的 `path` 是 `$org_logo` 拦 | 受检面扩到非 `path_args` 参数 |
 | G6 | 绑定参数里填进去的值含 `$customer_code` / `inputs/current/x` 不拦 | 没排除绑定参数 |
@@ -573,9 +595,9 @@ inputs/
 
 ## 十二、决定记录与剩余待定点
 
-第 1 版的 6 点用户已于 11-18 全部定下(见开头的修订表)。第 2 版新增的取舍,我按下面的推荐写进了正文;需要确认的只有第 1、2 条:
+第 1 版的 6 点用户已于 11-18 全部定下(见开头的修订表)。第 2 版新增的两条取舍(下面第 1、2 条)复审时已按推荐定下;第 3、4 条按推荐写入:
 
-1. **同一轮的回执用短路径,跨轮的渲染页段用真实路径。** 协调方转述的要求是「只在给模型看的文本里用短路径」。渲染页段也是给模型看的,但它是跨轮的:如果也写短路径,下一轮它就指向新的一轮,正是 H1 要防的错。所以我只在**本次工具调用**回给模型的文本里用短路径,渲染页段照旧显示 `figure_documents` 里的真实路径(带 run id)。请确认这样理解对。
-2. **能力门控连每行的文件路径一起关**,不只是关文件句。没有读文件工具时路径对模型没用,这样与「平台提示词跟着能力走」一致。眼下 `exec_python` 恒装,这道门实际上恒开。
+1. **同一轮的回执用短路径,跨轮的渲染页段用真实路径。** 协调方转述的要求是「只在给模型看的文本里用短路径」。渲染页段也是给模型看的,但它是跨轮的:如果也写短路径,下一轮它就指向新的一轮,正是 H1 要防的错。所以只在**本次工具调用**回给模型的文本里用短路径,渲染页段照旧显示 `figure_documents` 里的真实路径(带 run id)。**已定。**
+2. **能力门控连每行的文件路径一起关**,不只是关文件句。没有读文件工具时路径对模型没用,这样与「平台提示词跟着能力走」一致。眼下 `exec_python` 恒装,这道门实际上恒开。**已定。**
 3. (已按推荐写入,不必再定)环境变量形状不对时静默不挂,而不是让 exec 失败:这是方便性的挂载,不是安全边界。
 4. (已按推荐写入,不必再定)GraphQL 同名误拦不加例外,靠审计观察。
