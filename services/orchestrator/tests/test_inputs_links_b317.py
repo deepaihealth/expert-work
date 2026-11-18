@@ -7,6 +7,7 @@ L1 的来源是协调方的探针:预拉建的 ``inputs/<run>/org_logo.png -> ..
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -250,19 +251,17 @@ def test_a_document_read_by_short_path_is_found_again_next_turn(
 async def test_list_dir_reads_links_only_under_an_inputs_run_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import orchestrator.tools.nas_workspace_store as nas
-
     store = NasWorkspaceStore(root=str(tmp_path))
     _plant(tmp_path, link=f"inputs/{_RUN}/ok.png", target=f"../cache/{_DIGEST}.png")
     _plant(tmp_path, link="crops/l.png", target=f"../inputs/cache/{_DIGEST}.png")
     calls: list[str] = []
-    real = nas.os.readlink
+    real = os.readlink
 
     def _spy(name: Any, *args: Any, **kwargs: Any) -> str:
         calls.append(str(name))
         return real(name, *args, **kwargs)
 
-    monkeypatch.setattr(nas.os, "readlink", _spy)
+    monkeypatch.setattr(os, "readlink", _spy)
     await store.list_dir(tenant_id=_TENANT, user_id=_USER, path=f"agents/{_AGENT}/crops")
     assert calls == []
     await store.list_dir(tenant_id=_TENANT, user_id=_USER, path=f"agents/{_AGENT}/inputs/{_RUN}")

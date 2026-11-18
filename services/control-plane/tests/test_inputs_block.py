@@ -65,7 +65,7 @@ def test_block_lists_every_declared_variable_with_status_and_never_a_value() -> 
         "- project_code（项目唯一标识码）：已提供；由平台填进绑定它的工具参数",
         "- org_logo（机构 LOGO）：文件 inputs/current/org_logo.png",
         "- materials（员工勾选素材）：3 项，其中 2 个文件在 inputs/current/materials/ 下"
-        "（按 <下标-说明> 命名）",
+        + "（按 <下标-说明> 命名）",
         "- brand（品牌资源）：1 个文件在 inputs/current/ 下（按 brand.<字段名> 命名）",
         "- disclaimer（免责声明）：已提供（外部数据）",
     ]
