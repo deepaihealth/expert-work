@@ -392,12 +392,19 @@ export function nextFieldName(fields: readonly SchemaField[]): string {
 
 const isNumeric = (t: SchemaNodeType): boolean => t === "number" || t === "integer";
 
+// Rounding helpers that never yield -0 (Math.ceil(-0.5) is -0, which js-yaml
+// would write as "-0.0").
+const roundUp = (n: number): number => Math.ceil(n) + 0;
+const roundDown = (n: number): number => Math.floor(n) + 0;
+
 // Raw keys kept across a type change: managed keys (re-emitted or dropped by
 // the writer), title / $comment, and — number ↔ integer only — the numeric
 // pass-through keywords. To integer, exclusive bounds round to the integer
 // bound that admits the same integers (exclusiveMinimum down, exclusiveMaximum
 // up); a fractional multipleOf is kept as-is (still valid on an integer, and
 // it keeps exactly the same integers — rounding it would change the rule).
+// A non-numeric exclusive bound (draft-04's boolean form) is dropped on the
+// way to integer, as any type change did before.
 function keptRawOnTypeChange(
   raw: Record<string, unknown>,
   from: SchemaNodeType,
@@ -411,11 +418,11 @@ function keptRawOnTypeChange(
       (keepNumeric && NUMERIC_PASS_THROUGH.includes(k)),
   );
   return Object.fromEntries(
-    entries.map(([k, v]) => {
-      if (to !== "integer" || typeof v !== "number") return [k, v];
-      if (k === "exclusiveMinimum") return [k, Math.floor(v)];
-      if (k === "exclusiveMaximum") return [k, Math.ceil(v)];
-      return [k, v];
+    entries.flatMap(([k, v]): [string, unknown][] => {
+      if (to !== "integer" || (k !== "exclusiveMinimum" && k !== "exclusiveMaximum")) return [[k, v]];
+      // A non-numeric bound (draft-04 boolean form) is dropped, as before.
+      if (typeof v !== "number") return [];
+      return [[k, k === "exclusiveMinimum" ? roundDown(v) : roundUp(v)]];
     }),
   );
 }
@@ -442,8 +449,8 @@ export function changeNodeType(
   }
   // Switching to integer: pull fractional bounds inward to whole numbers.
   if (type === "integer") {
-    if (constraints.minimum !== undefined) constraints.minimum = Math.ceil(constraints.minimum);
-    if (constraints.maximum !== undefined) constraints.maximum = Math.floor(constraints.maximum);
+    if (constraints.minimum !== undefined) constraints.minimum = roundUp(constraints.minimum);
+    if (constraints.maximum !== undefined) constraints.maximum = roundDown(constraints.maximum);
   }
   const raw = node.raw ? keptRawOnTypeChange(node.raw, node.type, type) : undefined;
   return {

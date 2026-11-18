@@ -131,7 +131,10 @@ export function ManifestTab({
 
   /** 三个动作共用的错误处理 —— 409 是并发,给人话;其余照抛。 */
   const runAction = useCallback(
-    async (kind: "draft" | "publish" | "discard", fn: () => Promise<AgentDetailResponse>) => {
+    async (
+      kind: "draft" | "publish" | "discard",
+      fn: () => Promise<AgentDetailResponse>,
+    ): Promise<boolean> => {
       setBusy(kind);
       setError(null);
       setBuildWarning(null);
@@ -141,6 +144,7 @@ export function ManifestTab({
         setBuildWarning(result.build_warning ?? null);
         setBuildError(result.build_error ?? null);
         onSaved();
+        return true;
       } catch (err) {
         // 409 = 别人在你编辑期间动过这一版。这不是「操作失败」那种技术错误,
         // 而是一条要人做决定的消息(去看对方改了什么,再决定怎么合)。
@@ -155,6 +159,7 @@ export function ManifestTab({
                 : "unknown error";
           setError(message);
         }
+        return false;
       } finally {
         setBusy(null);
       }
@@ -180,10 +185,20 @@ export function ManifestTab({
     [runAction, r.name, r.version, r.spec_sha256],
   );
 
-  const handleDiscard = useCallback(
-    () => runAction("discard", () => discardAgentDraft(r.name, r.version, editingSha)),
-    [runAction, r.name, r.version, editingSha],
-  );
+  // B-315 — after a discard, drop every local edit the way Reset does
+  // (remount + buffer from the snapshot). The refetch alone can't be relied
+  // on: when draft and live dump to the same YAML, ``snapshotYaml`` doesn't
+  // change and the editor would keep its edits (incl. ones paused by a
+  // broken output-schema name), only to save them as a new draft later. A
+  // different live version still arrives through the refetch and is adopted
+  // in place as usual; the active group lives in the URL and survives.
+  const handleDiscard = useCallback(async () => {
+    const ok = await runAction("discard", () => discardAgentDraft(r.name, r.version, editingSha));
+    if (ok) {
+      setBuffer(snapshotYaml);
+      setResetNonce((n) => n + 1);
+    }
+  }, [runAction, r.name, r.version, editingSha, snapshotYaml]);
 
   return (
     <Card data-testid="manifest-tab">

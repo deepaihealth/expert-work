@@ -168,6 +168,17 @@ describe("OutputSchemaEditor field tree", () => {
     expect(screen.getByTestId("af-output-schema-limits-0")).toHaveTextContent("(3)");
   });
 
+  it("the allowed-values hint mentions commas only for numbers", async () => {
+    const user = userEvent.setup();
+    renderControlled(withSchema({ type: "object", properties: { s: { type: "string" }, n: { type: "integer" } } }));
+    await user.click(screen.getByTestId("af-output-schema-limits-0"));
+    const text = await screen.findByTestId("af-output-schema-enum-0");
+    expect(within(text).getByText(i18n.t("agent_form.output_schema.enum_placeholder_text"))).toBeInTheDocument();
+    await user.click(screen.getByTestId("af-output-schema-limits-1"));
+    const num = await screen.findByTestId("af-output-schema-enum-1");
+    expect(within(num).getByText(i18n.t("agent_form.output_schema.enum_placeholder"))).toBeInTheDocument();
+  });
+
   it("a text allowed value may contain commas: Enter confirms it, a comma doesn't split", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();

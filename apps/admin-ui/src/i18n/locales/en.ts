@@ -1734,6 +1734,7 @@ export interface TranslationKeys {
       limit_uniqueItems: string;
       enum_label: string;
       enum_placeholder: string;
+      enum_placeholder_text: string;
       strict_optional_warn: string;
       limit_range_warn: string;
       enum_rejected_number: string;
@@ -5791,6 +5792,7 @@ const en: TranslationKeys = {
       limit_uniqueItems: "No duplicates",
       enum_label: "Allowed values",
       enum_placeholder: "Type a value, then Enter or comma",
+      enum_placeholder_text: "Type a value, then press Enter",
       strict_optional_warn: "Strict mode: consider making this required",
       limit_range_warn: "The minimum is larger than the maximum - no reply can meet both.",
       enum_rejected_number: "Not a number, not added: {{values}}",

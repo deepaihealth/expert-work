@@ -157,6 +157,35 @@ describe("pass-through keywords and root annotations", () => {
     );
   });
 
+  it("to integer: negative exclusive bounds round outward too; whole-number bounds stay", () => {
+    const neg = editable(parseSchemaNode({ type: "number", exclusiveMinimum: -2.5, exclusiveMaximum: -0.5 }, 1));
+    // > -2.5 ⇔ > -3 and < -0.5 ⇔ < 0 for integers.
+    expect(writeSchemaNode(changeNodeType(neg, "integer"))).toEqual({
+      type: "integer",
+      exclusiveMinimum: -3,
+      exclusiveMaximum: 0,
+    });
+    const whole = editable(parseSchemaNode({ type: "number", exclusiveMinimum: -2, exclusiveMaximum: 5 }, 1));
+    expect(writeSchemaNode(changeNodeType(whole, "integer"))).toEqual({
+      type: "integer",
+      exclusiveMinimum: -2,
+      exclusiveMaximum: 5,
+    });
+  });
+
+  it("draft-04 boolean exclusive bounds: dropped on the way to integer, kept integer → number", () => {
+    const old = editable(
+      parseSchemaNode({ type: "number", minimum: 0.5, exclusiveMinimum: true, maximum: 9, exclusiveMaximum: false }, 1),
+    );
+    expect(writeSchemaNode(changeNodeType(old, "integer"))).toEqual({ type: "integer", minimum: 1, maximum: 9 });
+    const back = editable(parseSchemaNode({ type: "integer", minimum: 1, exclusiveMinimum: true }, 1));
+    expect(writeSchemaNode(changeNodeType(back, "number"))).toEqual({
+      type: "number",
+      minimum: 1,
+      exclusiveMinimum: true,
+    });
+  });
+
   it("integer → number keeps multipleOf and the exclusive bounds as they are", () => {
     const count = editable(parseSchemaNode({ type: "integer", multipleOf: 2, exclusiveMinimum: 0, exclusiveMaximum: 9 }, 1));
     expect(writeSchemaNode(changeNodeType(count, "number"))).toEqual({
@@ -218,6 +247,9 @@ describe("changeNodeType", () => {
   it("number → integer rounds minimum up and maximum down", () => {
     const node = editable(parseSchemaNode({ type: "number", minimum: 0.5, maximum: 2.5 }, 1));
     expect(writeSchemaNode(changeNodeType(node, "integer"))).toEqual({ type: "integer", minimum: 1, maximum: 2 });
+    // never -0 (toEqual tells -0 from 0; js-yaml would write "-0.0")
+    const neg = editable(parseSchemaNode({ type: "number", minimum: -0.5, maximum: -2.5 }, 1));
+    expect(writeSchemaNode(changeNodeType(neg, "integer"))).toEqual({ type: "integer", minimum: 0, maximum: -3 });
   });
 
   it("integer → number keeps minimum/maximum and a still-valid enum", () => {

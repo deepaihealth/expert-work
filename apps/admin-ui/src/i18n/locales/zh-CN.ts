@@ -1841,6 +1841,7 @@ const zhCN: TranslationKeys = {
       limit_uniqueItems: "不能重复",
       enum_label: "只能填这几个值",
       enum_placeholder: "输入一个值后按回车或逗号",
+      enum_placeholder_text: "输入一个值后按回车",
       strict_optional_warn: "严格模式下最好设为必填",
       limit_range_warn: "最小值比最大值还大，模型怎么回都满足不了",
       enum_rejected_number: "这些不是数字，没加进去：{{values}}",

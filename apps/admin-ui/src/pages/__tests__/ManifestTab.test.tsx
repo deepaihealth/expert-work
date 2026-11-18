@@ -228,7 +228,13 @@ describe("ManifestTab", () => {
   // B-315 M-1 — discarding the draft (same output schema as live, other
   // fields differ) must also drop the output-schema edits paused by a broken
   // name, not keep them because the incoming schema "looks like ours".
-  it("discarding the draft drops paused output-schema edits and unblocks saving", async () => {
+  // Both shapes: draft differs from live elsewhere (the refetch brings a new
+  // snapshot) and draft identical to live (the snapshot string doesn't change
+  // at all — only the post-discard remount drops the local edits).
+  it.each([
+    ["differs from live elsewhere", "draft"],
+    ["is identical to live", "live"],
+  ])("discarding a draft that %s drops paused output-schema edits and unblocks saving", async (_label, draftPrompt) => {
     const user = userEvent.setup();
     const outputSchema = {
       json_schema: { type: "object", properties: { a: { type: "string" }, b: { type: "string" } } },
@@ -246,7 +252,7 @@ describe("ManifestTab", () => {
     const live = { ...sampleDetail, record: { ...sampleDetail.record, spec: specWith("live") } } as AgentDetailResponse;
     const drafted = {
       ...live,
-      record: { ...live.record, draft: { ...withDraft().record.draft, spec: specWith("draft") } },
+      record: { ...live.record, draft: { ...withDraft().record.draft, spec: specWith(draftPrompt) } },
     } as AgentDetailResponse;
     discardMock.mockResolvedValue(live);
     const { rerender } = renderTab(drafted);
