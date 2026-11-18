@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -338,3 +340,175 @@ async def test_a_file_that_exists_but_fails_for_another_reason_gets_no_list(
     assert failed.status == "error"
     assert "parser crashed" in str(failed.content)
     assert "其他轮次" not in str(failed.content)
+
+
+# --- 第四轮复审 LOW-1 / LOW-2 / LOW-6 ------------------------------------------------------
+
+
+@dataclass
+class _Missing:
+    """路径类工具,文件不在时抛的那种错。"""
+
+    name: str = "read_document"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=self.name, description="d", is_read_only=True)
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        del args, ctx
+        msg = "missing"
+        raise FileNotFoundError(msg)
+
+
+_MISSING_ERROR = "[tool error] FileNotFoundError: missing"
+
+
+async def _missing_call(store: Any, path: str) -> ToolMessage:
+    registry = ToolRegistry()
+    registry.register(_Missing())
+    llm = _ScriptedLLM(
+        [
+            AIMessage(content="", tool_calls=[_tc("read_document", {"path": path}, "tc-1")]),
+            AIMessage(content="done"),
+        ]
+    )
+    cfg: RunnableConfig = {
+        "configurable": {
+            "thread_id": str(uuid4()),
+            "tenant_id": str(_TENANT),
+            "user_id": str(_USER),
+            "run_id": str(uuid4()),
+            "agent_key": _AGENT,
+        }
+    }
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=llm, tool_registry=registry, workspace_store=store)
+        )
+        state = await compiled.ainvoke(
+            {"messages": [HumanMessage(content="x")], "step_count": 0, "max_steps": 5},
+            config=cfg,
+        )
+    return _tool_messages(state)["tc-1"]
+
+
+def _inputs_dir(root: Path) -> Path:
+    return root / str(_TENANT) / str(_USER) / "agents" / _AGENT / "inputs"
+
+
+class _ListingFails(NasWorkspaceStore):
+    async def list_dir(self, **kwargs: Any) -> Any:
+        if kwargs.get("path") == "inputs":
+            msg = "nas hiccup"
+            raise RuntimeError(msg)
+        return await super().list_dir(**kwargs)
+
+
+async def test_a_store_error_while_listing_leaves_the_original_error_untouched(
+    tmp_path: Path,
+) -> None:
+    """LOW-6 —— 列候选时存储抛了任何异常:模型看到的就是原来那条报错,一个字不多。"""
+    _plant(tmp_path, uuid4())
+    healthy = await _missing_call(NasWorkspaceStore(root=str(tmp_path)), "inputs/current/lab.png")
+    assert _candidates(healthy)  # 对照:存储正常时这里有候选
+    failed = await _missing_call(_ListingFails(root=str(tmp_path)), "inputs/current/lab.png")
+    assert failed.status == "error"
+    assert str(failed.content) == _MISSING_ERROR
+
+
+async def test_only_the_newest_run_dirs_are_scanned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LOW-6 —— 只看最新的 ``MAX_RUN_DIRS_SCANNED`` 个 run 目录;更旧的里面有也不列。"""
+    from orchestrator.tools import inputs_candidates
+
+    monkeypatch.setattr(inputs_candidates, "MAX_RUN_DIRS_SCANNED", 2)
+    _plant(tmp_path, uuid4(), mtime=1_000_000)  # 最旧:有 lab.png
+    for i in range(2):
+        newer = _inputs_dir(tmp_path) / str(uuid4())
+        newer.mkdir()
+        os.utime(newer, (2_000_000 + i, 2_000_000 + i))
+    failed = await _missing_call(NasWorkspaceStore(root=str(tmp_path)), "inputs/current/lab.png")
+    assert failed.status == "error"
+    assert _candidates(failed) == []
+
+
+async def test_a_symlinked_directory_inside_one_run_neither_leaks_nor_hides_the_others(
+    tmp_path: Path,
+) -> None:
+    """LOW-2 / LOW-6 —— 某个 run 里中间一段是指向别处的符号链接:那个 run 不算(不跟随链接),
+    也不连累别的 run 的候选。"""
+    base = _inputs_dir(tmp_path)
+    secret = base.parent / "secret"
+    secret.mkdir(parents=True)
+    (secret / "lab.png").write_bytes(_PNG)
+    older, newer = uuid4(), uuid4()
+    (base / str(older) / "sub").mkdir(parents=True)
+    (base / str(older) / "sub" / "lab.png").write_bytes(_PNG)
+    (base / str(newer)).mkdir()
+    (base / str(newer) / "sub").symlink_to(secret)
+    os.utime(base / str(older), (1_000_000, 1_000_000))
+    os.utime(base / str(newer), (2_000_000, 2_000_000))
+    failed = await _missing_call(
+        NasWorkspaceStore(root=str(tmp_path)), "inputs/current/sub/lab.png"
+    )
+    assert _candidates(failed) == [f"inputs/{older}/sub/lab.png"]
+
+
+class _SlowExists(NasWorkspaceStore):
+    async def path_exists(self, **kwargs: Any) -> bool:
+        await asyncio.sleep(3)
+        return bool(await super().path_exists(**kwargs))
+
+
+async def test_listing_candidates_is_bounded_in_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LOW-1 —— 存储再慢,报错也不会被列候选拖住:超时就不列。"""
+    from orchestrator.graph_builder import builder
+
+    monkeypatch.setattr(builder, "_CANDIDATES_TIMEOUT_S", 0.1)
+    _plant(tmp_path, uuid4())
+    started = time.monotonic()
+    failed = await _missing_call(_SlowExists(root=str(tmp_path)), "inputs/current/lab.png")
+    assert time.monotonic() - started < 2.0
+    assert str(failed.content) == _MISSING_ERROR
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"image_ref": "expert_work://image/t/u/a.png", "question": "?"},
+        {"image_ref": "  expert_work://image/t/u/a.png", "question": "?"},
+    ],
+)
+def test_an_uploaded_image_ref_is_not_a_workspace_path(args: dict[str, Any]) -> None:
+    """LOW-6 —— ``_path_arg`` 跳过 ``expert_work://`` 引用(上传图不是工作区路径)。"""
+    from orchestrator.graph_builder.builder import _path_arg
+
+    assert _path_arg("ask_image", args) is None
+    assert _path_arg("ask_image", {**args, "path": "inputs/current/a.png"}) == (
+        "inputs/current/a.png"
+    )
+
+
+class _CountingStore(NasWorkspaceStore):
+    def __init__(self, root: str) -> None:
+        super().__init__(root=root)
+        self.listed: list[str] = []
+
+    async def list_dir(self, **kwargs: Any) -> Any:
+        self.listed.append(str(kwargs.get("path")))
+        return await super().list_dir(**kwargs)
+
+
+async def test_existence_checks_do_not_list_directories(tmp_path: Path) -> None:
+    """LOW-1 —— 只列一次 ``inputs/``;每个 run 里在不在用 ``lstat`` 判断,不列 run 目录(列 run
+    目录会对每条链接再去读一次链接、看一次缓存文件)。"""
+    for i in range(3):
+        _plant(tmp_path, uuid4(), mtime=1_000_000 + i)
+    store = _CountingStore(str(tmp_path))
+    failed = await _missing_call(store, "inputs/current/lab.png")
+    assert len(_candidates(failed)) == 3
+    assert [p for p in store.listed if p.startswith("inputs")] == ["inputs"]

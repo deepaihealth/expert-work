@@ -4337,6 +4337,9 @@ def _guard_sandbox_calls(
 #: B-317 复审 L5 —— 「之后的轮次」那句在围栏外,只回显链接名形状的路径:链接名只由变量名、
 #: slug(``[\w-]``)、``.`` / ``/`` 与扩展名组成(``inputs_doc.link_names``),整段有长度上界。
 #: 模型写的带空白、标点的长文本不在围栏外原样回显。
+#: **240 的取舍(第四轮 LOW-7,已知不改):** 真实路径 = ``inputs/<36 位 run>/`` 加链接名,链接名
+#: 里 slug 每段最多 40 字,但变量名与嵌套键的段数没有上限;超过 240 字的那几条就不补这句。不补
+#: 只是少一句提示:文件照样能用,之后的轮次写错了还有报错后面列出的候选(``inputs_candidates``)。
 _LINK_SHAPED_PATH_RE = re.compile(r"[\w./-]{1,240}")
 
 
@@ -4371,16 +4374,22 @@ def _with_later_turns_path(
     return replace(result, notice=f"{result.notice}\n{note}" if result.notice else note)
 
 
+#: B-317 第四轮 LOW-1 —— 列候选的总时限(秒)。这是一次已经失败的调用后面的一句提示,NAS 慢的
+#: 时候宁可不列,也不能把报错拖住。
+_CANDIDATES_TIMEOUT_S = 2.0
+
+
 async def _inputs_candidates_hint(
     store: WorkspaceStore | None, name: str, args: Mapping[str, Any], ctx: ToolContext
 ) -> str:
     """B-317 复审 L1 —— 失败的调用写的是某一轮输入目录下的文件、而它不在:接一句别的轮次里同名
-    的文件(宿主侧列出,模型不必手抄长 run id)。没有候选、没接存储、出任何意外都是空串。"""
+    的文件(宿主侧列出,模型不必手抄长 run id)。没有候选、没接存储、超时、出任何意外都是空串。"""
     raw = _path_arg(name, args)
     if store is None or raw is None:
         return ""
     try:
-        note = candidates_note(await input_candidates(store, ctx, raw))
+        found = await asyncio.wait_for(input_candidates(store, ctx, raw), _CANDIDATES_TIMEOUT_S)
+        note = candidates_note(found)
     except Exception as exc:
         logger.warning("tools.inputs_candidates_skipped err=%s", type(exc).__name__)
         return ""

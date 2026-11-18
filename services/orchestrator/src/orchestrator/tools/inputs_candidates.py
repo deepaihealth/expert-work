@@ -11,9 +11,8 @@
 
 from __future__ import annotations
 
-import posixpath
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from expert_work.persistence import WORKSPACE_INPUTS_DIR
@@ -31,7 +30,7 @@ MAX_CANDIDATES = 5
 MAX_RUN_DIRS_SCANNED = 50
 #: 本轮没有输入时,``inputs/current/`` 先改写到这个不存在的 run 上,再走同一份解析规则。
 _NO_RUN = UUID(int=0)
-_OLDEST = datetime.min
+_OLDEST = datetime.min.replace(tzinfo=UTC)
 
 
 def _is_canonical_uuid(text: str) -> bool:
@@ -60,33 +59,38 @@ def input_file_rest(raw: str, view: WorkspaceView) -> tuple[str, str] | None:
     return target.rel, "/".join(parts[2:])
 
 
-async def _names_in(
-    store: WorkspaceStore, binding: tuple[UUID, UUID], scope: str, rel_dir: str
-) -> dict[str, tuple[bool, datetime]] | None:
+async def _run_dirs(store: WorkspaceStore, binding: tuple[UUID, UUID], scope: str) -> list[str]:
+    """``inputs/`` 下的 run 目录名,按修改时间新的在前,最多 :data:`MAX_RUN_DIRS_SCANNED` 个。
+
+    **截断(第四轮 LOW-3,已知不修):** ``list_dir`` 自己有条目上限(NAS 实现 2000),超出时按
+    **名字**排序截断,之后才在这里按时间排。run 目录多过那个上限时,被截掉的可能恰好是最新的
+    几个,候选会漏。这只是报错后面的一句提示,漏了模型照旧可以 ``list_dir inputs/``;不为它多
+    走一遍全量列目录。
+    """
     tenant_id, user_id = binding
     try:
         listing = await store.list_dir(
-            tenant_id=tenant_id, user_id=user_id, scope=scope, path=rel_dir
+            tenant_id=tenant_id, user_id=user_id, scope=scope, path=WORKSPACE_INPUTS_DIR
         )
     except MISSING_DIR_ERRORS:
-        return None
-    return {e.name: (e.is_dir, e.mtime or _OLDEST) for e in listing.entries}
-
-
-async def _exists(store: WorkspaceStore, binding: tuple[UUID, UUID], scope: str, rel: str) -> bool:
-    parent, name = posixpath.split(rel)
-    names = await _names_in(store, binding, scope, parent or ".")
-    return names is not None and name in names
+        return []
+    runs = [e for e in listing.entries if e.is_dir and _is_canonical_uuid(e.name)]
+    runs.sort(key=lambda e: e.mtime or _OLDEST, reverse=True)
+    return [e.name for e in runs[:MAX_RUN_DIRS_SCANNED]]
 
 
 async def input_candidates(store: WorkspaceStore, ctx: ToolContext, raw: str) -> tuple[str, ...]:
     """``raw`` 指向的输入文件不在时,别的轮次里同名的文件(视图相对、新的在前、有上界)。
 
-    文件在、不是输入目录下的路径、没绑工作区,都是空;存储出错按「没有候选」处理。
+    文件在、不是输入目录下的路径、没绑工作区、存储没有 ``path_exists``(只做 ``lstat`` 的存在性
+    检查,不列目录),都是空。某一个 run 查不了(中间一段是符号链接、权限……)只跳过那一个。
+    开销:一次列 ``inputs/``,加至多 ``1 + MAX_RUN_DIRS_SCANNED`` 次逐段打开 + ``lstat``;调用方
+    另有总时限(``builder._CANDIDATES_TIMEOUT_S``)。
     """
     view = ctx.workspace_view
     parsed = input_file_rest(raw, view)
-    if parsed is None or ctx.tenant_id is None or ctx.user_id is None:
+    exists = getattr(store, "path_exists", None)
+    if parsed is None or exists is None or ctx.tenant_id is None or ctx.user_id is None:
         return ()
     requested, rest = parsed
     binding = (ctx.tenant_id, ctx.user_id)
@@ -97,26 +101,25 @@ async def input_candidates(store: WorkspaceStore, ctx: ToolContext, raw: str) ->
         thread_id=None if view.child_run else view.own_thread,
         child_run=view.child_run,
     )
-    try:
-        if await _exists(store, binding, scope, requested):
-            return ()
-        runs = await _names_in(store, binding, scope, WORKSPACE_INPUTS_DIR)
-        if not runs:
-            return ()
-        newest = sorted(
-            (name for name, (is_dir, _) in runs.items() if is_dir and _is_canonical_uuid(name)),
-            key=lambda name: runs[name][1],
-            reverse=True,
-        )[:MAX_RUN_DIRS_SCANNED]
-        found: list[str] = []
-        for run in newest:
-            path = f"{WORKSPACE_INPUTS_DIR}/{run}/{rest}"
-            if await _exists(store, binding, scope, path):
-                found.append(path)
-                if len(found) == MAX_CANDIDATES:
-                    break
-    except SandboxSupervisorError:
+
+    async def _has(rel: str) -> bool:
+        return bool(
+            await exists(tenant_id=ctx.tenant_id, user_id=ctx.user_id, scope=scope, path=rel)
+        )
+
+    if await _has(requested):
         return ()
+    found: list[str] = []
+    for run in await _run_dirs(store, binding, scope):
+        path = f"{WORKSPACE_INPUTS_DIR}/{run}/{rest}"
+        try:
+            hit = await _has(path)
+        except (OSError, SandboxSupervisorError, ValueError):
+            continue
+        if hit:
+            found.append(path)
+            if len(found) == MAX_CANDIDATES:
+                break
     return tuple(found)
 
 

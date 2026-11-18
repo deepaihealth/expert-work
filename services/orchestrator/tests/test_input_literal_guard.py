@@ -65,7 +65,6 @@ def test_a_declared_variable_after_a_dollar_is_caught_anywhere_in_a_remote_call(
         "{{ customer_code }}",
         "inputs/outputs 比例",
         "见 inputs/current/a.png",
-        "./inputs/current/a.png",
         "file:///workspace/inputs/current/a.png",
         "![](inputs/current/a.png)",
         '{"img": "inputs/current/a.png"}',
@@ -112,7 +111,15 @@ OTHER_RUN = "1f1e2d3c-4b5a-4968-8776-655443322111"
 
 
 @pytest.mark.parametrize(
-    "value", [f"inputs/{OTHER_RUN}/a.png", f"/workspace/inputs/{OTHER_RUN}/m/0"]
+    "value",
+    [
+        f"inputs/{OTHER_RUN}/a.png",
+        f"/workspace/inputs/{OTHER_RUN}/m/0",
+        # 第四轮 LOW-5 —— 相对写法 ``./`` 与 agent 根写法同样是本地路径。
+        "./inputs/current/a.png",
+        f"./inputs/{OTHER_RUN}/a.png",
+        f"/agent/inputs/{OTHER_RUN}/a.png",
+    ],
 )
 def test_a_previous_turns_input_path_sent_to_a_remote_service_is_caught(value: str) -> None:
     """复审 L2 —— 之后的轮次模型会照回执用 ``inputs/<上一轮 run>/x``,同样不能交给外部服务。"""
@@ -168,6 +175,21 @@ def test_long_remote_text_that_mentions_a_platform_env_name_passes(text: str) ->
     不是被当成路径的那串字;只有整段像路径(以它开头,或整段没有空白)才拦。"""
     assert _hit(MCP, {"body": text}) is None
     assert _hit("http", {"body": {"content": text}}) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "name"),
+    [
+        ("请查看 $EXPERT_WORK_INPUTS_DIR/report.pdf", "EXPERT_WORK_INPUTS_DIR"),
+        ("清单在 $EXPERT_WORK_INPUTS 里", "EXPERT_WORK_INPUTS"),
+        ("见 ${EXPERT_WORK_INPUTS_DIR}/m/0-a.mp4 这个视频", "EXPERT_WORK_INPUTS_DIR"),
+    ],
+)
+def test_only_the_skills_dir_is_let_through_in_long_remote_text(text: str, name: str) -> None:
+    """第四轮 LOW-4 —— 长正文的放宽只给 ``$EXPERT_WORK_SKILLS_DIR``(技能脚本、SKILL.md 正文
+    里的合法写法);别的 ``$EXPERT_WORK_*`` 出现在发给对方的正文里,对方收到的就是这串字,照拦。"""
+    hit = _hit("mcp__wecom__send_message", {"content": text})
+    assert hit is not None and (hit.kind, hit.name) == ("env", name)
 
 
 def test_long_text_in_a_platform_path_argument_is_still_caught() -> None:
@@ -355,7 +377,6 @@ def test_remote_messages_never_point_at_a_local_path() -> None:
     "value",
     [
         "见 inputs/current/a.png",
-        "./inputs/current/a.png",
         "file:///workspace/inputs/current/a.png",
         "![](inputs/current/a.png)",
         '{"img": "inputs/current/a.png"}',

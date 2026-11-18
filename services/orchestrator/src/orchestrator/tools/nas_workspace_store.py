@@ -1199,6 +1199,30 @@ class NasWorkspaceStore:
             os.close(dfd)
         return info.st_size if stat.S_ISREG(info.st_mode) else fallback
 
+    async def path_exists(self, *, tenant_id: UUID, user_id: UUID, scope: str, path: str) -> bool:
+        """B-317 —— 作用域内的 ``path`` 这个名字在不在:``O_NOFOLLOW`` 逐段打开父目录,再对最后
+        一段做一次 ``lstat``(不跟随:链接以它自己的身份算在)。不列目录、不读链接。
+
+        不存在(含中间某段不存在)是 ``False``;中间某段是符号链接按越界抛
+        :class:`WorkspacePathEscapeError`,与 ``read_file`` 同一道闸。
+        """
+
+        def _check() -> bool:
+            rel = scoped_path(scope, path)
+            try:
+                dfd, name = self._open_parent_dir_fd(tenant_id, user_id, rel, create=False)
+            except MISSING_DIR_ERRORS:
+                return False
+            try:
+                os.lstat(name, dir_fd=dfd)
+            except (FileNotFoundError, NotADirectoryError):
+                return False
+            finally:
+                os.close(dfd)
+            return True
+
+        return await asyncio.to_thread(_check)
+
     async def resolve_input_link(self, *, tenant_id: UUID, user_id: UUID, path: str) -> str:
         """B-317 —— 宿主侧直读一律 ``O_NOFOLLOW``,预拉建的 ``inputs/<run>/x -> ../cache/<摘要>``
         因此按越界被拒(``ask_image`` 读不到本轮输入的图)。这里把**只这一种**链接换成它指向的

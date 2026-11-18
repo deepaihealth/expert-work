@@ -11,8 +11,9 @@
    (``inputs/current/…`` 或任一轮的 ``inputs/<规范 UUID>/…``,之后的轮次模型会照回执用前一轮
    的)也拦(对方读不到沙箱里的文件)。既没输入也没变量的智能体不查这一条:别的服务完全可能有
    自己的 ``inputs/…`` 路径(仓库类 MCP 的 ``get_file_contents``),拦了绕不开。
-   ``$EXPERT_WORK_*`` 在这里只在整段像路径时拦(以它开头,或整段没有空白):交给外部服务的
-   脚本、SKILL.md 正文里提到 ``$EXPERT_WORK_SKILLS_DIR`` 是正文,不是一个会被当路径用的值。
+   ``$EXPERT_WORK_SKILLS_DIR`` 在这里只在整段像路径时拦(以它开头,或整段没有空白):交给外部
+   服务的脚本、SKILL.md 正文里提到它是正文,不是一个会被当路径用的值。别的 ``$EXPERT_WORK_*``
+   在哪都拦。
 2. 平台工具的工作区路径参数:本模块自己维护的 :data:`PATH_ARGS` 表。**不用**
    ``ToolSpec.path_args``:那是调度器的冲突键,``save_artifact`` 的是产物名 ``name``,真正的
    路径参数是 ``path``。
@@ -59,13 +60,17 @@ _SKILLS_DIR_ENV = "EXPERT_WORK_SKILLS_DIR"
 _ALIAS_PREFIXES = (f"${_INPUTS_DIR_ENV}/", f"${{{_INPUTS_DIR_ENV}}}/")
 
 
+_RUN_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 #: 整段是输入文件的本地路径(规则 3):``inputs/current/`` 或 ``inputs/<规范 UUID>/`` 开头(任一
-#: 轮;run id 一律是 ``str(UUID)`` 的小写带连字符写法),可带 ``/workspace/``,整段不含空白。
-#: 不认 ``inputs/cache/``。
+#: 轮;run id 一律是 ``str(UUID)`` 的小写带连字符写法),可带 ``/workspace/`` 或 ``./``;老视图里
+#: agent 根下的 ``/agent/inputs/<规范 UUID>/`` 也算(``/agent/inputs/current/`` 解析时就被拒,
+#: 不是一条能用的路径)。整段不含空白。不认 ``inputs/cache/``。
 _LOCAL_INPUT_RE = re.compile(
-    r"(?:/workspace/)?inputs/(?:current|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/\S+"
+    rf"(?:(?:/workspace/|\./)?inputs/(?:current|{_RUN_ID})|/agent/inputs/{_RUN_ID})/\S+"
 )
-#: 外部服务参数里 ``$EXPERT_WORK_*`` 只在整段像路径时算数(复审 L3)。
+#: 外部服务参数里 ``$EXPERT_WORK_SKILLS_DIR`` 只在整段像路径时算数(复审 L3):交给对方的技能
+#: 脚本、SKILL.md 正文里提到它是合法写法。别的 ``$EXPERT_WORK_*`` 出现在正文里照拦(第四轮
+#: LOW-4):企微消息里写「请查看 $EXPERT_WORK_INPUTS_DIR/report.pdf」,对方收到的就是这串字。
 _ENV_HEADS = ("$" + _ENV_PREFIX, "${" + _ENV_PREFIX)
 _WHITESPACE_RE = re.compile(r"\s")
 
@@ -113,7 +118,7 @@ def _dollar_hit(text: str, names: Collection[str], *, path_arg: bool) -> tuple[K
         if aliased and match.start() == lead:
             continue
         if name.startswith(_ENV_PREFIX):
-            if env_counts:
+            if env_counts or name != _SKILLS_DIR_ENV:
                 return "env", name
             continue
         if name in names:
@@ -137,9 +142,9 @@ def find_literal(
     ``inputs_run`` 是本轮输入目录的 run(``None`` = 本轮没有输入)。``inputs_run`` 与 ``names``
     都没有时规则 3 不查。
 
-    规则 2(``$EXPERT_WORK_*``)不看本轮有没有输入:这个前缀归平台所有,路径参数里、外部服务
-    的一个像路径的值里出现它,只可能是模型照抄了沙箱环境变量;``$EXPERT_WORK_SKILLS_DIR`` 的
-    提示也要对没声明变量的智能体成立。外部服务的长正文(脚本、技能说明)里提到它不拦。
+    规则 2(``$EXPERT_WORK_*``)不看本轮有没有输入:这个前缀归平台所有,出现它只可能是模型照抄
+    了沙箱环境变量;``$EXPERT_WORK_SKILLS_DIR`` 的提示也要对没声明变量的智能体成立。外部服务的
+    长正文(脚本、技能说明)里只放过 ``$EXPERT_WORK_SKILLS_DIR``。
     """
     check_local = bool(inputs_run) or bool(names)
     remote = tool.startswith(_MCP_PREFIX) or tool == _HTTP_TOOL

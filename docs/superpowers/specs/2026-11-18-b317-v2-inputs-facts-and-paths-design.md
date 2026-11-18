@@ -24,6 +24,9 @@
 | 第三轮复审 L3 | 外部服务参数里的 `$EXPERT_WORK_*` 只在整段像路径时拦(以它开头,或整段没有空白);脚本、SKILL.md 正文里提到它放行。路径参数不变 | `input_literal_guard._path_shaped` |
 | 第三轮复审 L4–L6 | 补「工具报告失败不补那句」的测试;「之后的轮次」那句只回显链接名形状的路径(`[\w./-]`,≤240 字);`ask_image.image_ref` 填工作区路径时补那句、守卫也查 | `builder._with_later_turns_path`、`PATH_ARGS` |
 | 第三轮安全复审 | 内核测试补 `current` 被种成 FIFO / 硬链接;符号链接那条改成指向工作区里有内容的目录并断言内容不变 | `test_exec_view_kernel.py` X5 |
+| 第四轮复审 LOW-1 / LOW-2 | 列候选不再借列目录判断在不在(列 run 目录会对每条链接读链接、看缓存文件):存储加只做 `O_NOFOLLOW` 逐段打开 + `lstat` 的 `path_exists`,只列一次 `inputs/`;总时限 2 秒,超时不列;某个 run 查不了只跳过那一个 | `NasWorkspaceStore.path_exists`、`inputs_candidates.input_candidates`、`builder._CANDIDATES_TIMEOUT_S` |
+| 第四轮复审 LOW-4 / LOW-5 | 外部服务长正文的放宽只给 `$EXPERT_WORK_SKILLS_DIR`,别的 `$EXPERT_WORK_*` 照拦;规则 3 补 `./inputs/…` 与 `/agent/inputs/<规范 UUID>/…` | `input_literal_guard` |
+| 第四轮复审 LOW-3 / LOW-7 | `inputs/` 列表按名字截断后才按时间排、240 字上限:只在注释里写明取舍,不改 | `inputs_candidates._run_dirs`、`builder._LINK_SHAPED_PATH_RE` |
 | 审查 M1 | 不加 `$7`,exec 视图脚本从已下发的环境变量 `EXPERT_WORK_INPUTS_DIR` 取 run id | §3.2.3 重写 |
 | 审查 M2 | run 目录不在时挂载阶段静默跳过,不写 stderr;run 目录在才建 `current` 桩 | §3.2.3 |
 | 审查 M3 | MCP / http 的字符串叶子整段是 `inputs/…` 本地路径时也拦 | §3.3.1 |
