@@ -1,3 +1,9 @@
+import {
+  parseSchemaRoot,
+  writeSchemaNode,
+  type SchemaNode,
+} from "./output_schema_tree";
+
 export interface ModelFields {
   provider?: string;
   name?: string;
@@ -233,10 +239,9 @@ export interface AgentManifest {
     } | null;
     // Stream RT-1 (RT-ADR-4) — structured final reply: a JSON Schema the
     // agent's FINAL assistant message must validate against (intermediate
-    // tool-calling turns are unaffected). Flat schemas are editable in the
-    // curated form's field-list editor (config-page redesign v2 Task 7 —
-    // see the "structured output field editor" section below); non-flat
-    // schemas stay YAML-only behind a read-only notice.
+    // tool-calling turns are unaffected). Editable in the curated form's
+    // field-tree editor (B-315 — see the "structured output field tree"
+    // section below); parts the form can't represent show read-only there.
     output_schema?: {
       name?: string;
       json_schema?: Record<string, unknown>;
@@ -1373,157 +1378,42 @@ export function setWorkerBudgetField(
   return patchSpec(m, { dynamic_workers: { ...existing, [key]: value } });
 }
 
-// ---- structured output field editor (config-page redesign v2 Task 7) ----
-// A flat "field list" visualization over ``spec.output_schema.json_schema``
-// (Stream RT-1 / RT-ADR-4's structured-final-reply JSON Schema — see the
-// block's own doc comment on ``AgentManifest.spec.output_schema`` above).
-// Only a FLAT object schema — top-level scalar properties, or a homogeneous
-// array of scalars — is representable in the curated form; anything richer
-// (a nested object property, ``$ref``, ``oneOf``, an extra top-level key, …)
-// reads as ``"unrepresentable"`` so the widget can fall back to a read-only
-// notice and defer to the YAML view rather than silently mangle it.
-// ``name``/``strict`` never surface in the curated form — ``setOutputSchemaRows``
-// preserves them (and any other unknown sibling key already on the block)
-// untouched, only ever replacing the ``json_schema`` key itself.
-export type SchemaFieldType =
-  | "string"
-  | "number"
-  | "integer"
-  | "boolean"
-  | "array_string"
-  | "array_number";
-
-export interface SchemaFieldRow {
-  name: string;
-  type: SchemaFieldType;
-  required: boolean;
-  description: string;
-}
-
-const OUTPUT_SCHEMA_TOP_KEYS = new Set([
-  "type",
-  "properties",
-  "required",
-  "additionalProperties",
-]);
-const OUTPUT_SCHEMA_PROPERTY_KEYS = new Set(["type", "description", "items"]);
-const OUTPUT_SCHEMA_SCALAR_TYPES = new Set(["string", "number", "integer", "boolean"]);
-const OUTPUT_SCHEMA_ARRAY_ITEM_TYPES = new Set(["string", "number"]);
-
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === "object" && !Array.isArray(v);
-}
-
-// A single property's JSON-Schema fragment → its ``SchemaFieldType``, or
-// ``null`` when it doesn't fit one of the six representable shapes (the
-// caller then declares the WHOLE schema "unrepresentable"). Strict about
-// ``items``: only present (and only ``{type}``-shaped) when the property
-// itself is an array — a stray ``items`` key on a scalar property is
-// rejected rather than silently discarded, so a hand-authored schema never
-// loses data across a read→edit→write round trip.
-function propertyFieldType(prop: unknown): SchemaFieldType | null {
-  if (!isPlainObject(prop)) return null;
-  if (!Object.keys(prop).every((k) => OUTPUT_SCHEMA_PROPERTY_KEYS.has(k))) return null;
-  if ("description" in prop && typeof prop.description !== "string") return null;
-  const { type } = prop;
-  if (typeof type === "string" && OUTPUT_SCHEMA_SCALAR_TYPES.has(type)) {
-    return "items" in prop ? null : (type as SchemaFieldType);
-  }
-  if (type === "array") {
-    const items = prop.items;
-    if (!isPlainObject(items)) return null;
-    if (Object.keys(items).length !== 1 || typeof items.type !== "string") return null;
-    if (!OUTPUT_SCHEMA_ARRAY_ITEM_TYPES.has(items.type)) return null;
-    return items.type === "string" ? "array_string" : "array_number";
-  }
-  return null;
-}
+// ---- structured output field tree (B-315) ----
+// A nested field-tree view over ``spec.output_schema.json_schema`` (Stream
+// RT-1 / RT-ADR-4's structured-final-reply JSON Schema). The tree logic —
+// parsing, per-node readonly fallback, order-preserving write-back — lives
+// in ``output_schema_tree.ts``; these are only the manifest adapters.
+// ``name``/``strict`` (and any other sibling key on the block) never surface
+// in the tree: ``setOutputSchemaTree`` only ever replaces ``json_schema``.
 
 // ``undefined`` = ``spec.output_schema`` absent/null (not configured);
-// ``"unrepresentable"`` = configured but not flat (read-only in the form);
-// otherwise the flat field rows.
-export function readOutputSchemaRows(
-  m: unknown,
-): SchemaFieldRow[] | "unrepresentable" | undefined {
+// otherwise the root node (``readonly`` when the root itself can't be shown).
+export function readOutputSchemaTree(m: unknown): SchemaNode | undefined {
   const block = specOf(m).output_schema;
   if (block == null) return undefined;
-  const schema = block.json_schema;
-  if (!isPlainObject(schema)) return "unrepresentable";
-  if (!Object.keys(schema).every((k) => OUTPUT_SCHEMA_TOP_KEYS.has(k))) {
-    return "unrepresentable";
-  }
-  if ("type" in schema && schema.type !== "object") return "unrepresentable";
-
-  const propertiesRaw = "properties" in schema ? schema.properties : {};
-  if (!isPlainObject(propertiesRaw)) return "unrepresentable";
-  const properties = propertiesRaw;
-
-  const requiredRaw = "required" in schema ? schema.required : [];
-  if (
-    !Array.isArray(requiredRaw) ||
-    !requiredRaw.every((r) => typeof r === "string")
-  ) {
-    return "unrepresentable";
-  }
-  const required = requiredRaw as string[];
-  const names = Object.keys(properties);
-  if (!required.every((r) => names.includes(r))) return "unrepresentable";
-
-  const rows: SchemaFieldRow[] = [];
-  for (const name of names) {
-    const type = propertyFieldType(properties[name]);
-    if (type === null) return "unrepresentable";
-    const prop = properties[name] as Record<string, unknown>;
-    rows.push({
-      name,
-      type,
-      required: required.includes(name),
-      description: typeof prop.description === "string" ? prop.description : "",
-    });
-  }
-  return rows;
+  return parseSchemaRoot(block.json_schema);
 }
 
-// A field row → its JSON-Schema property fragment (the inverse of
-// ``propertyFieldType``).
-function rowToProperty(row: SchemaFieldRow): Record<string, unknown> {
-  const base: Record<string, unknown> =
-    row.type === "array_string"
-      ? { type: "array", items: { type: "string" } }
-      : row.type === "array_number"
-        ? { type: "array", items: { type: "number" } }
-        : { type: row.type };
-  return row.description ? { ...base, description: row.description } : base;
-}
+// The block's ``json_schema`` exactly as stored (for echo detection).
+export const readOutputJsonSchema = (m: unknown): unknown =>
+  specOf(m).output_schema?.json_schema;
 
-// Writes the flat rows back as ``spec.output_schema.json_schema``, preserving
-// any existing ``name``/``strict``/unknown sibling key on the block
-// untouched. ``rows === null`` deletes the WHOLE ``output_schema`` block (the
-// form's off-switch — js-yaml omits the ``undefined``-valued key). An empty
-// ``rows`` array still writes a (non-empty, backend-legal) ``json_schema``
-// dict — ``{type:"object", properties:{}, additionalProperties:false}`` —
-// rather than a bare ``{}`` the backend would reject.
-export function setOutputSchemaRows(
+// Strict mode is on unless the block says ``strict: false`` (backend default).
+export const readOutputSchemaStrict = (m: unknown): boolean =>
+  specOf(m).output_schema?.strict !== false;
+
+// Writes the tree back as ``spec.output_schema.json_schema``, keeping every
+// other key on the block untouched. ``root === null`` deletes the WHOLE
+// ``output_schema`` block (the form's off-switch — js-yaml omits the
+// ``undefined``-valued key).
+export function setOutputSchemaTree(
   m: unknown,
-  rows: SchemaFieldRow[] | null,
+  root: SchemaNode | null,
 ): AgentManifest {
-  if (rows === null) return patchSpec(m, { output_schema: undefined });
-
-  let json_schema: Record<string, unknown>;
-  if (rows.length === 0) {
-    json_schema = { type: "object", properties: {}, additionalProperties: false };
-  } else {
-    const properties: Record<string, unknown> = {};
-    const required: string[] = [];
-    for (const row of rows) {
-      properties[row.name] = rowToProperty(row);
-      if (row.required) required.push(row.name);
-    }
-    json_schema = { type: "object", properties, required, additionalProperties: false };
-  }
-
+  if (root === null) return patchSpec(m, { output_schema: undefined });
+  const json_schema = writeSchemaNode(root) as Record<string, unknown>;
   const existing = specOf(m).output_schema;
-  const base = isPlainObject(existing) ? existing : {};
+  const base = existing != null && typeof existing === "object" ? existing : {};
   return patchSpec(m, { output_schema: { ...base, json_schema } });
 }
 

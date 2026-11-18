@@ -1704,14 +1704,34 @@ export interface TranslationKeys {
       type_number: string;
       type_integer: string;
       type_boolean: string;
-      type_array_string: string;
-      type_array_number: string;
+      type_object: string;
+      type_array: string;
+      items_label: string;
       add_field: string;
+      add_child: string;
+      depth_limit: string;
       remove_field: string;
+      expand: string;
+      collapse: string;
       name_invalid: string;
       name_duplicate: string;
       complex_readonly: string;
+      readonly_node: string;
+      readonly_tag: string;
       off_confirm: string;
+      limits: string;
+      limit_minLength: string;
+      limit_maxLength: string;
+      limit_pattern: string;
+      limit_minimum: string;
+      limit_maximum: string;
+      limit_minItems: string;
+      limit_maxItems: string;
+      limit_uniqueItems: string;
+      enum_label: string;
+      enum_placeholder: string;
+      strict_optional_warn: string;
+      strict_optional_tip: string;
     };
     inject_date_label: string;
     inject_date_hint: string;
@@ -5731,15 +5751,36 @@ const en: TranslationKeys = {
       type_number: "Number",
       type_integer: "Integer",
       type_boolean: "Yes/No",
-      type_array_string: "Text list",
-      type_array_number: "Number list",
+      type_object: "Object",
+      type_array: "List",
+      items_label: "Each item",
       add_field: "Add field",
+      add_child: "Add sub-field",
+      depth_limit: "Up to 5 levels deep",
       remove_field: "Remove",
+      expand: "Expand",
+      collapse: "Collapse",
       name_invalid:
         "Field names must start with a letter or underscore, and contain only letters, numbers, and underscores.",
       name_duplicate: "Duplicate field name - a field above already uses this name.",
       complex_readonly: "Configured (complex structure) - edit it in the YAML view.",
+      readonly_node: "This part uses a structure the form can't edit - change it in the YAML view.",
+      readonly_tag: "Read-only",
       off_confirm: "Turning this off will clear the reply template you've defined. Continue?",
+      limits: "Limits",
+      limit_minLength: "Min characters",
+      limit_maxLength: "Max characters",
+      limit_pattern: "Format (regex)",
+      limit_minimum: "Min value",
+      limit_maximum: "Max value",
+      limit_minItems: "Min items",
+      limit_maxItems: "Max items",
+      limit_uniqueItems: "No duplicates",
+      enum_label: "Allowed values",
+      enum_placeholder: "Type a value, then Enter or comma",
+      strict_optional_warn: "Strict mode: better make it required",
+      strict_optional_tip:
+        "In strict mode some model providers require every field to be required. This one isn't, so the model may reject the template. Saving still works.",
     },
     inject_date_label: "Inject current date",
     inject_date_hint:

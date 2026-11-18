@@ -1,304 +1,295 @@
 /**
- * form_model_output_schema.test.ts — config-page redesign v2 Task 7's
- * structured-output field editor (``readOutputSchemaRows``/
- * ``setOutputSchemaRows``, form_model.ts). Split from ``form_model.test.ts``
- * for the same reason ``form_model_profiles.test.ts`` was: a single,
- * self-contained feature over one manifest path.
+ * form_model_output_schema.test.ts — B-315 structured-output field tree,
+ * manifest adapters (``readOutputSchemaTree``/``setOutputSchemaTree``/
+ * ``readOutputSchemaStrict``) over ``output_schema_tree.ts``.
  *
- * The linchpin invariants:
- *  - round-trip: rows → setOutputSchemaRows → readOutputSchemaRows returns
- *    the SAME rows for every flat shape (required/description/both array
- *    item types).
- *  - the unrepresentable guardrail: anything not flat (nested object
- *    property, ``$ref``, ``oneOf``, an extra top-level key, a malformed
- *    ``required``) reads as ``"unrepresentable"`` — never silently
- *    misread as an empty/partial row list.
- *  - ``name``/``strict`` (and any other unknown sibling key) on an existing
- *    ``output_schema`` block survive a rows write untouched.
+ * The linchpin invariant is the round-trip: read → write with no edits must
+ * deep-equal the original ``output_schema`` block, KEY ORDER INCLUDED (each
+ * case also compares ``JSON.stringify``, which is order-sensitive). Every
+ * round-trip case also pins which nodes came out editable vs readonly — a
+ * round-trip that passes only because the whole root fell back to readonly
+ * would otherwise be a free pass.
  */
 import { describe, expect, it } from "vitest";
 
 import {
-  readOutputSchemaRows,
-  setOutputSchemaRows,
+  readOutputSchemaStrict,
+  readOutputSchemaTree,
+  setOutputSchemaTree,
   type AgentManifest,
-  type SchemaFieldRow,
 } from "../form_model";
+import {
+  nodeAt,
+  updateNodeAt,
+  type SchemaNode,
+  type SchemaPath,
+} from "../output_schema_tree";
+import { parseYaml } from "../yaml";
 
 const BLANK: AgentManifest = { spec: {} };
 
-describe("readOutputSchemaRows", () => {
-  it("returns undefined when output_schema is absent", () => {
-    expect(readOutputSchemaRows(BLANK)).toBeUndefined();
+const HEALTH_MANAGER_YAML = `
+json_schema:
+  type: object
+  additionalProperties: false
+  required: [messages, media]
+  properties:
+    messages:
+      type: array
+      maxItems: 4
+      items: {type: string, minLength: 1, maxLength: 300, pattern: "\\\\S"}
+    media:
+      type: array
+      maxItems: 3
+      uniqueItems: true
+      items: {type: integer, minimum: 1}
+`;
+
+const healthManagerBlock = (): Record<string, unknown> =>
+  parseYaml(HEALTH_MANAGER_YAML) as Record<string, unknown>;
+
+const manifestWith = (block: unknown): AgentManifest =>
+  ({ spec: { output_schema: block } }) as AgentManifest;
+
+function rootOf(block: unknown): SchemaNode {
+  const root = readOutputSchemaTree(manifestWith(block));
+  if (root === undefined) throw new Error("expected a configured block");
+  return root;
+}
+
+function kindAt(root: SchemaNode, path: SchemaPath): string | undefined {
+  return nodeAt(root, path)?.kind;
+}
+
+// read → write with no edits; returns the written block.
+function roundTrip(block: unknown): unknown {
+  const m = manifestWith(block);
+  return setOutputSchemaTree(m, rootOf(block)).spec?.output_schema;
+}
+
+function expectIdentical(actual: unknown, expected: unknown): void {
+  expect(actual).toEqual(expected);
+  expect(JSON.stringify(actual)).toBe(JSON.stringify(expected));
+}
+
+describe("round-trip: read → write unchanged is identical (key order too)", () => {
+  it("health-manager schema", () => {
+    const block = healthManagerBlock();
+    const root = rootOf(block);
+    expect(kindAt(root, [])).toBe("editable");
+    expect(kindAt(root, [0])).toBe("editable");
+    expect(kindAt(root, [0, "items"])).toBe("editable");
+    expect(kindAt(root, [1, "items"])).toBe("editable");
+    expectIdentical(roundTrip(block), block);
   });
 
-  it("returns undefined when output_schema is explicit null", () => {
-    const m = { spec: { output_schema: null } };
-    expect(readOutputSchemaRows(m)).toBeUndefined();
-  });
-
-  it("reads a flat schema back as rows (string/number/integer/boolean/array_string/array_number)", () => {
-    const m = {
-      spec: {
-        output_schema: {
-          json_schema: {
-            type: "object",
-            properties: {
-              title: { type: "string", description: "the title" },
-              score: { type: "number" },
-              rank: { type: "integer" },
-              ok: { type: "boolean" },
-              tags: { type: "array", items: { type: "string" } },
-              scores: { type: "array", items: { type: "number" } },
-            },
-            required: ["title", "ok"],
-            additionalProperties: false,
-          },
-        },
-      },
-    };
-    const rows = readOutputSchemaRows(m);
-    expect(rows).toEqual([
-      { name: "title", type: "string", required: true, description: "the title" },
-      { name: "score", type: "number", required: false, description: "" },
-      { name: "rank", type: "integer", required: false, description: "" },
-      { name: "ok", type: "boolean", required: true, description: "" },
-      { name: "tags", type: "array_string", required: false, description: "" },
-      { name: "scores", type: "array_number", required: false, description: "" },
-    ]);
-  });
-
-  it("reads a schema with no properties key as an empty row list", () => {
-    const m = { spec: { output_schema: { json_schema: { type: "object" } } } };
-    expect(readOutputSchemaRows(m)).toEqual([]);
-  });
-
-  it("reads a schema with no type key (defaults to object) as flat rows", () => {
-    const m = {
-      spec: {
-        output_schema: {
-          json_schema: { properties: { a: { type: "string" } } },
-        },
-      },
-    };
-    expect(readOutputSchemaRows(m)).toEqual([
-      { name: "a", type: "string", required: false, description: "" },
-    ]);
-  });
-
-  it("unrepresentable: top-level type is not 'object'", () => {
-    const m = {
-      spec: { output_schema: { json_schema: { type: "array" } } },
-    };
-    expect(readOutputSchemaRows(m)).toBe("unrepresentable");
-  });
-
-  it("unrepresentable: nested object property", () => {
-    const m = {
-      spec: {
-        output_schema: {
-          json_schema: {
-            type: "object",
-            properties: { nested: { type: "object", properties: {} } },
-          },
-        },
-      },
-    };
-    expect(readOutputSchemaRows(m)).toBe("unrepresentable");
-  });
-
-  it("unrepresentable: $ref property", () => {
-    const m = {
-      spec: {
-        output_schema: {
-          json_schema: {
-            type: "object",
-            properties: { a: { $ref: "#/definitions/Foo" } },
-          },
-        },
-      },
-    };
-    expect(readOutputSchemaRows(m)).toBe("unrepresentable");
-  });
-
-  it("unrepresentable: top-level oneOf", () => {
-    const m = {
-      spec: {
-        output_schema: {
-          json_schema: { oneOf: [{ type: "object" }, { type: "string" }] },
-        },
-      },
-    };
-    expect(readOutputSchemaRows(m)).toBe("unrepresentable");
-  });
-
-  it("unrepresentable: extra top-level key", () => {
-    const m = {
-      spec: {
-        output_schema: {
-          json_schema: {
-            type: "object",
-            properties: {},
-            $schema: "http://json-schema.org/draft-07/schema#",
-          },
-        },
-      },
-    };
-    expect(readOutputSchemaRows(m)).toBe("unrepresentable");
-  });
-
-  it("unrepresentable: required contains a name not in properties", () => {
-    const m = {
-      spec: {
-        output_schema: {
-          json_schema: {
-            type: "object",
-            properties: { a: { type: "string" } },
-            required: ["a", "ghost"],
-          },
-        },
-      },
-    };
-    expect(readOutputSchemaRows(m)).toBe("unrepresentable");
-  });
-
-  it("unrepresentable: array item type outside string/number", () => {
-    const m = {
-      spec: {
-        output_schema: {
-          json_schema: {
-            type: "object",
-            properties: { a: { type: "array", items: { type: "boolean" } } },
-          },
-        },
-      },
-    };
-    expect(readOutputSchemaRows(m)).toBe("unrepresentable");
-  });
-
-  it("unrepresentable: items key on a scalar (non-array) property", () => {
-    const m = {
-      spec: {
-        output_schema: {
-          json_schema: {
-            type: "object",
-            properties: { a: { type: "string", items: { type: "string" } } },
-          },
-        },
-      },
-    };
-    expect(readOutputSchemaRows(m)).toBe("unrepresentable");
-  });
-
-  it("unrepresentable: json_schema missing/not an object", () => {
-    expect(readOutputSchemaRows({ spec: { output_schema: {} } })).toBe(
-      "unrepresentable",
-    );
-    expect(
-      readOutputSchemaRows({ spec: { output_schema: { json_schema: "nope" } } }),
-    ).toBe("unrepresentable");
-  });
-});
-
-describe("setOutputSchemaRows", () => {
-  it("rows === null deletes the whole output_schema block", () => {
-    const m = {
-      spec: { output_schema: { json_schema: { type: "object", properties: {} } } },
-    };
-    const next = setOutputSchemaRows(m, null);
-    expect(next.spec?.output_schema).toBeUndefined();
-  });
-
-  it("empty rows write the documented non-empty empty-object schema", () => {
-    const next = setOutputSchemaRows(BLANK, []);
-    expect(next.spec?.output_schema).toEqual({
-      json_schema: { type: "object", properties: {}, additionalProperties: false },
-    });
-  });
-
-  it("two fields produce the exact documented json_schema shape", () => {
-    const rows: SchemaFieldRow[] = [
-      { name: "title", type: "string", required: true, description: "the title" },
-      { name: "count", type: "integer", required: false, description: "" },
-    ];
-    const next = setOutputSchemaRows(BLANK, rows);
-    expect(next.spec?.output_schema).toEqual({
+  it("an object-list schema (list items are objects; required ≠ property order)", () => {
+    const block = {
+      name: "links_reply",
+      strict: true,
       json_schema: {
         type: "object",
         properties: {
-          title: { type: "string", description: "the title" },
-          count: { type: "integer" },
+          summary: { type: "string", description: "one line" },
+          links: {
+            description: "related links",
+            type: "array",
+            minItems: 1,
+            items: {
+              type: "object",
+              properties: {
+                title: { type: "string" },
+                url: { type: "string", pattern: "^https://" },
+              },
+              required: ["url", "title"],
+              additionalProperties: false,
+            },
+          },
         },
-        required: ["title"],
+        required: ["links", "summary"],
         additionalProperties: false,
       },
-    });
+    };
+    const root = rootOf(block);
+    expect(kindAt(root, [1, "items"])).toBe("editable");
+    expect(kindAt(root, [1, "items", 1])).toBe("editable");
+    expectIdentical(roundTrip(block), block);
   });
 
-  it("preserves an existing name and strict:false across a rows write", () => {
-    const m = {
-      spec: {
-        output_schema: {
-          name: "custom",
-          strict: false,
-          json_schema: { type: "object", properties: {} },
+  it("5 levels of nesting are all editable", () => {
+    const block = {
+      json_schema: {
+        type: "object",
+        properties: {
+          l1: {
+            type: "object",
+            properties: {
+              l2: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    l4: {
+                      type: "object",
+                      properties: { l5: { type: "string", maxLength: 9 } },
+                      required: ["l5"],
+                    },
+                  },
+                },
+              },
+            },
+          },
         },
       },
     };
-    const rows: SchemaFieldRow[] = [
-      { name: "a", type: "string", required: false, description: "" },
-    ];
-    const next = setOutputSchemaRows(m, rows);
-    expect(next.spec?.output_schema?.name).toBe("custom");
-    expect(next.spec?.output_schema?.strict).toBe(false);
-    expect(next.spec?.output_schema?.json_schema).toEqual({
-      type: "object",
-      properties: { a: { type: "string" } },
-      required: [],
-      additionalProperties: false,
-    });
+    const root = rootOf(block);
+    expect(kindAt(root, [0, 0, "items", 0, 0])).toBe("editable");
+    expectIdentical(roundTrip(block), block);
   });
 
-  it("a brand-new block (rows on a previously-unconfigured manifest) writes no name/strict", () => {
-    const next = setOutputSchemaRows(BLANK, []);
-    expect(next.spec?.output_schema).not.toHaveProperty("name");
-    expect(next.spec?.output_schema).not.toHaveProperty("strict");
+  it("a 6th level reads readonly, its level-5 parent stays editable", () => {
+    const deep = { type: "string", minLength: 2 };
+    const block = {
+      json_schema: {
+        type: "object",
+        properties: {
+          a: {
+            type: "object",
+            properties: {
+              b: {
+                type: "object",
+                properties: {
+                  c: {
+                    type: "object",
+                    properties: {
+                      d: {
+                        type: "object",
+                        properties: { e: { type: "object", properties: { f: deep } } },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+    const root = rootOf(block);
+    expect(kindAt(root, [0, 0, 0, 0, 0])).toBe("editable");
+    expect(nodeAt(root, [0, 0, 0, 0, 0, 0])).toEqual({ kind: "readonly", raw: deep });
+    expectIdentical(roundTrip(block), block);
+  });
+
+  it("a oneOf node is readonly, its siblings editable", () => {
+    const choice = { oneOf: [{ type: "string" }, { type: "integer" }] };
+    const block = {
+      json_schema: {
+        type: "object",
+        properties: { kind: choice, note: { type: "string" } },
+        required: ["kind"],
+        additionalProperties: false,
+      },
+    };
+    const root = rootOf(block);
+    expect(nodeAt(root, [0])).toEqual({ kind: "readonly", raw: choice });
+    expect(kindAt(root, [1])).toBe("editable");
+    expectIdentical(roundTrip(block), block);
+  });
+
+  it("title/default/examples/$comment annotations survive", () => {
+    const block = {
+      json_schema: {
+        title: "Reply",
+        $comment: "v2",
+        type: "object",
+        properties: {
+          level: {
+            description: "severity",
+            title: "Level",
+            type: "string",
+            enum: ["low", "high"],
+            default: "low",
+            examples: ["high"],
+          },
+          score: { type: "number", default: 0, minimum: 0, maximum: 1 },
+        },
+      },
+    };
+    expect(kindAt(rootOf(block), [0])).toBe("editable");
+    expectIdentical(roundTrip(block), block);
+  });
+
+  it("the existing flat sample (no required key, no type on root)", () => {
+    const block = {
+      json_schema: {
+        properties: {
+          title: { type: "string", description: "the title" },
+          score: { type: "number" },
+          rank: { type: "integer" },
+          ok: { type: "boolean" },
+          tags: { type: "array", items: { type: "string" } },
+          scores: { type: "array", items: { type: "number" } },
+        },
+      },
+    };
+    const root = rootOf(block);
+    expect(kindAt(root, [])).toBe("editable");
+    expect(kindAt(root, [4, "items"])).toBe("editable");
+    expectIdentical(roundTrip(block), block);
+  });
+
+  it("one edit changes only that value (health manager messages.maxItems 4 → 3)", () => {
+    const block = healthManagerBlock();
+    const m = manifestWith(block);
+    const edited = updateNodeAt(rootOf(block), [0], (n) => ({
+      ...n,
+      constraints: { ...n.constraints, maxItems: 3 },
+    }));
+    const expected = structuredClone(block) as {
+      json_schema: { properties: { messages: { maxItems: number } } };
+    };
+    expected.json_schema.properties.messages.maxItems = 3;
+    expectIdentical(setOutputSchemaTree(m, edited).spec?.output_schema, expected);
   });
 });
 
-describe("round-trip", () => {
-  const CASES: SchemaFieldRow[][] = [
-    [],
-    [{ name: "title", type: "string", required: true, description: "" }],
-    [
-      { name: "a", type: "string", required: true, description: "desc a" },
-      { name: "b", type: "number", required: false, description: "" },
-      { name: "c", type: "integer", required: true, description: "desc c" },
-      { name: "d", type: "boolean", required: false, description: "" },
-      { name: "e", type: "array_string", required: true, description: "list" },
-      { name: "f", type: "array_number", required: false, description: "" },
-    ],
-  ];
+describe("readOutputSchemaTree", () => {
+  it("undefined when output_schema is absent or null", () => {
+    expect(readOutputSchemaTree(BLANK)).toBeUndefined();
+    expect(readOutputSchemaTree({ spec: { output_schema: null } })).toBeUndefined();
+  });
 
-  it.each(CASES.map((rows, i) => [i, rows] as const))(
-    "rows[%i] round-trips through set → read",
-    (_i, rows) => {
-      const next = setOutputSchemaRows(BLANK, rows);
-      expect(readOutputSchemaRows(next)).toEqual(rows);
-    },
-  );
+  it("root readonly when json_schema is missing, not an object, or not type object", () => {
+    expect(readOutputSchemaTree({ spec: { output_schema: {} } })?.kind).toBe("readonly");
+    expect(rootOf({ json_schema: "nope" }).kind).toBe("readonly");
+    expect(rootOf({ json_schema: { type: "array", items: {} } }).kind).toBe("readonly");
+    expect(rootOf({ json_schema: { oneOf: [{ type: "object" }] } }).kind).toBe("readonly");
+  });
+});
 
-  it("round-trips on top of an existing name/strict block", () => {
-    const m = {
-      spec: {
-        output_schema: { name: "review_verdict", strict: true, json_schema: {} },
-      },
-    };
-    const rows: SchemaFieldRow[] = [
-      { name: "verdict", type: "string", required: true, description: "" },
-    ];
-    const next = setOutputSchemaRows(m, rows);
-    expect(readOutputSchemaRows(next)).toEqual(rows);
-    expect(next.spec?.output_schema?.name).toBe("review_verdict");
+describe("setOutputSchemaTree", () => {
+  it("null deletes the whole output_schema block", () => {
+    const next = setOutputSchemaTree(manifestWith(healthManagerBlock()), null);
+    expect(next.spec?.output_schema).toBeUndefined();
+  });
+
+  it("keeps name/strict and other sibling keys untouched", () => {
+    const block = { name: "custom", strict: false, extra: 1, json_schema: { type: "object" } };
+    const next = setOutputSchemaTree(manifestWith(block), rootOf(block));
+    expect(next.spec?.output_schema).toEqual(block);
+  });
+
+  it("a brand-new block writes no name/strict", () => {
+    const next = setOutputSchemaTree(BLANK, rootOf({ json_schema: { type: "object" } }));
+    expect(next.spec?.output_schema).toEqual({ json_schema: { type: "object" } });
+  });
+});
+
+describe("readOutputSchemaStrict", () => {
+  it("strict unless the block says strict: false", () => {
+    expect(readOutputSchemaStrict(manifestWith({ json_schema: {} }))).toBe(true);
+    expect(readOutputSchemaStrict(manifestWith({ strict: true, json_schema: {} }))).toBe(true);
+    expect(readOutputSchemaStrict(manifestWith({ strict: false, json_schema: {} }))).toBe(false);
   });
 });

@@ -392,11 +392,9 @@ export function FormView({
           )}
         </section>
         <PromptVariablesEditor formData={formData} onChange={onChange} />
-        {/* Stream RT-1 (RT-ADR-4) — structured final reply. config-page
-            redesign v2 Task 7 replaced the former state-only hint block with
-            a flat field-list editor (falls back to a read-only notice for
-            hand-authored non-flat schemas — see OutputSchemaEditor's own doc
-            comment). */}
+        {/* Stream RT-1 (RT-ADR-4) — structured final reply. B-315: a nested
+            field-tree editor; parts the form can't represent show read-only
+            (see OutputSchemaEditor's own doc comment). */}
         <OutputSchemaEditor formData={formData} onChange={onChange} />
         <div
           style={{

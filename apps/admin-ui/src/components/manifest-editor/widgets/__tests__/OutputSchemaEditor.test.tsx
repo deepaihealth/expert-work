@@ -1,5 +1,7 @@
 /**
- * OutputSchemaEditor — config-page redesign v2 Task 7. Contract under test:
+ * OutputSchemaEditor — config-page redesign v2 Task 7 (flat rows), now the
+ * B-315 field tree (nested cases: OutputSchemaEditor.tree.test.tsx). Contract
+ * under test (top-level rows keep the old test ids, path "0", "1" …):
  *  - off by default, on writes the empty-object default schema.
  *  - editing rows emits the exact ``setOutputSchemaRows``-shaped manifest.
  *  - PER-ROW commit, no whole-table gate (review-fixed Important): a row
@@ -14,7 +16,7 @@
  *    row is excluded from the write (duplicate-specific error message), so
  *    typing "title2" next to an existing "title" never last-wins-overwrites
  *    the seeded property's type/description at the "title" keystroke.
- *  - an "unrepresentable" (non-flat) schema renders read-only: the Switch is
+ *  - a root the form can't show at all renders read-only: the Switch is
  *    hidden, only an info Alert shows, and NOTHING in that state ever calls
  *    ``onChange`` (there is nothing interactive to click).
  *  - turning off with existing fields confirms first (App.useApp() modal,
@@ -203,25 +205,20 @@ describe("OutputSchemaEditor", () => {
     it("editing a valid row while another row's name is invalid commits immediately with just the valid subset", async () => {
       const user = userEvent.setup();
       const onChange = vi.fn();
-      // Seeded directly with a structurally-valid-but-locally-invalid-name
-      // property ("1bad") — readOutputSchemaRows doesn't enforce NAME_RE (only
-      // structural representability), so this is a legitimate way to start
-      // the widget already showing one invalid row alongside one valid row.
       const seeded = {
         spec: {
           output_schema: {
             json_schema: {
               type: "object",
-              properties: {
-                title: { type: "string" },
-                "1bad": { type: "string" },
-              },
+              properties: { title: { type: "string" } },
               additionalProperties: false,
             },
           },
         },
       };
       renderEditor(seeded, onChange);
+      await user.click(screen.getByTestId("af-output-schema-add"));
+      await user.type(screen.getByTestId("af-output-schema-name-1"), "1bad");
       expect(screen.getByTestId("af-output-schema-name-1")).toHaveAttribute(
         "aria-invalid",
         "true",
@@ -231,12 +228,10 @@ describe("OutputSchemaEditor", () => {
 
       const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
       // Only "title" (the valid row) made it into the write; "1bad" is
-      // excluded — the bug this fixes was that "1bad" being invalid used to
-      // block "title"'s edit from committing AT ALL.
+      // excluded — one invalid row never blocks another row's edit.
       expect(last.spec?.output_schema?.json_schema).toEqual({
         type: "object",
         properties: { title: { type: "string", description: "hi" } },
-        required: [],
         additionalProperties: false,
       });
     });
@@ -389,7 +384,6 @@ describe("OutputSchemaEditor", () => {
           title: { type: "integer", description: "keep me" },
           title2: { type: "string" },
         },
-        required: [],
         additionalProperties: false,
       });
     });
@@ -464,14 +458,11 @@ describe("OutputSchemaEditor", () => {
     expect(last.spec?.output_schema?.strict).toBe(false);
   });
 
-  describe("unrepresentable schema", () => {
+  describe("root the form can't show (root-level oneOf)", () => {
     const seeded = {
       spec: {
         output_schema: {
-          json_schema: {
-            type: "object",
-            properties: { nested: { type: "object", properties: {} } },
-          },
+          json_schema: { oneOf: [{ type: "object" }, { type: "string" }] },
         },
       },
     };
