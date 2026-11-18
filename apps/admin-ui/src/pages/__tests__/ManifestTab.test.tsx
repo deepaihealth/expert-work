@@ -183,6 +183,200 @@ describe("ManifestTab", () => {
     expect(screen.queryByTestId("manifest-discard-btn")).toBeNull();
   });
 
+  // B-315 — a broken output-schema field name pauses the form's write-back;
+  // the editor reports it up and saving / publishing waits until it's fixed.
+  it("blocks save and publish while an output-schema field name is broken", async () => {
+    const user = userEvent.setup();
+    saveDraftMock.mockResolvedValue(sampleDetail);
+    const outputSchema = {
+      json_schema: { type: "object", properties: { a: { type: "string" }, b: { type: "string" } } },
+    };
+    const detail = withDraft({
+      spec: {
+        apiVersion: "expert_work.io/v1",
+        kind: "Agent",
+        metadata: { name: "demo-agent", version: "1.0.0" },
+        spec: { model: { provider: "anthropic", name: "claude-sonnet-4-6" }, output_schema: outputSchema },
+      },
+    });
+    renderTab(detail);
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("cfg-nav-prompt"));
+    const name = await screen.findByTestId("af-output-schema-name-1");
+    expect(screen.getByTestId("manifest-save-btn")).not.toBeDisabled();
+
+    await user.clear(name);
+    await user.type(name, "a");
+    expect(screen.getByTestId("manifest-save-btn")).toBeDisabled();
+    expect(screen.getByTestId("manifest-publish-btn")).toBeDisabled();
+
+    // Leaving for another group is refused (it would drop the un-applied
+    // edits); saving stays blocked.
+    await user.click(screen.getByTestId("cfg-nav-basic"));
+    expect(screen.getByTestId("manifest-switch-blocked")).toBeInTheDocument();
+    expect(screen.getByTestId("af-output-schema-name-1")).toHaveValue("a");
+    expect(screen.getByTestId("manifest-save-btn")).toBeDisabled();
+
+    await user.type(name, "2");
+    expect(screen.getByTestId("manifest-save-btn")).not.toBeDisabled();
+    expect(screen.getByTestId("manifest-publish-btn")).not.toBeDisabled();
+    await user.click(screen.getByTestId("manifest-save-btn"));
+    await waitFor(() => expect(saveDraftMock).toHaveBeenCalledTimes(1));
+    expect(saveDraftMock.mock.calls[0][2].manifest_yaml).toContain("a2:");
+  });
+
+  // B-315 M-1 — discarding the draft (same output schema as live, other
+  // fields differ) must also drop the output-schema edits paused by a broken
+  // name, not keep them because the incoming schema "looks like ours".
+  // Both shapes: draft differs from live elsewhere (the refetch brings a new
+  // snapshot) and draft identical to live (the snapshot string doesn't change
+  // at all — only the post-discard remount drops the local edits).
+  it.each([
+    ["differs from live elsewhere", "draft"],
+    ["is identical to live", "live"],
+  ])("discarding a draft that %s drops paused output-schema edits and unblocks saving", async (_label, draftPrompt) => {
+    const user = userEvent.setup();
+    const outputSchema = {
+      json_schema: { type: "object", properties: { a: { type: "string" }, b: { type: "string" } } },
+    };
+    const specWith = (prompt: string) => ({
+      apiVersion: "expert_work.io/v1",
+      kind: "Agent",
+      metadata: { name: "demo-agent", version: "1.0.0" },
+      spec: {
+        model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+        system_prompt: prompt,
+        output_schema: structuredClone(outputSchema),
+      },
+    });
+    const live = { ...sampleDetail, record: { ...sampleDetail.record, spec: specWith("live") } } as AgentDetailResponse;
+    const drafted = {
+      ...live,
+      record: { ...live.record, draft: { ...withDraft().record.draft, spec: specWith(draftPrompt) } },
+    } as AgentDetailResponse;
+    discardMock.mockResolvedValue(live);
+    const { rerender } = renderTab(drafted);
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("cfg-nav-prompt"));
+    const name = await screen.findByTestId("af-output-schema-name-1");
+    await user.clear(name);
+    await user.type(name, "a");
+    expect(screen.getByTestId("manifest-save-btn")).toBeDisabled();
+
+    await user.click(screen.getByTestId("manifest-discard-btn"));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    rerender(
+      <MemoryRouter>
+        <ManifestTab detail={live} onSaved={onSaved} memberNameOf={rawId} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("af-output-schema-name-1")).toHaveValue("b");
+    expect(screen.queryByTestId("af-output-schema-name-errors")).not.toBeInTheDocument();
+    expect(screen.getByTestId("manifest-save-btn")).not.toBeDisabled();
+  });
+
+  // B-315 — what the post-discard reset must and must not do, with draft ==
+  // live (the refetch then changes nothing the editor can see).
+  describe("discard with a draft identical to live", () => {
+    const sameSpec = () => ({
+      apiVersion: "expert_work.io/v1",
+      kind: "Agent",
+      metadata: { name: "demo-agent", version: "1.0.0" },
+      spec: { model: { provider: "anthropic", name: "claude-sonnet-4-6" }, system_prompt: "same" },
+    });
+    const live = () =>
+      ({ ...sampleDetail, record: { ...sampleDetail.record, spec: sameSpec() } }) as AgentDetailResponse;
+    const drafted = () =>
+      ({
+        ...live(),
+        record: { ...live().record, draft: { ...withDraft().record.draft, spec: sameSpec() } },
+      }) as AgentDetailResponse;
+
+    async function editInYaml(user: ReturnType<typeof userEvent.setup>) {
+      await screen.findByTestId("manifest-editor-edit");
+      await user.click(screen.getByTestId("cfg-yaml-toggle"));
+      const ta = screen.getByTestId("monaco-stub") as HTMLTextAreaElement;
+      await user.clear(ta);
+      await user.type(ta, "EDITED: yaml");
+    }
+
+    it("a successful discard drops the buffer: a later save carries no discarded edit", async () => {
+      const user = userEvent.setup();
+      discardMock.mockResolvedValue(live());
+      saveDraftMock.mockResolvedValue(live());
+      const { rerender } = renderTab(drafted());
+      await editInYaml(user);
+
+      await user.click(screen.getByTestId("manifest-discard-btn"));
+      await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+      rerender(
+        <MemoryRouter>
+          <ManifestTab detail={live()} onSaved={onSaved} memberNameOf={rawId} />
+        </MemoryRouter>,
+      );
+      await user.click(screen.getByTestId("manifest-save-btn"));
+      await waitFor(() => expect(saveDraftMock).toHaveBeenCalledTimes(1));
+      expect(saveDraftMock.mock.calls[0][2].manifest_yaml).not.toContain("EDITED");
+    });
+
+    it("a failed discard keeps the edits and the YAML view; a later save carries them", async () => {
+      const user = userEvent.setup();
+      discardMock.mockRejectedValue(new ApiError("boom", "INTERNAL", 500));
+      saveDraftMock.mockResolvedValue(drafted());
+      renderTab(drafted());
+      await editInYaml(user);
+
+      await user.click(screen.getByTestId("manifest-discard-btn"));
+      await screen.findByTestId("manifest-error");
+      expect(onSaved).not.toHaveBeenCalled();
+      expect(screen.getByTestId("manifest-yaml-view")).toBeInTheDocument();
+      expect(screen.getByTestId("monaco-stub")).toHaveValue("EDITED: yaml");
+
+      await user.click(screen.getByTestId("manifest-save-btn"));
+      await waitFor(() => expect(saveDraftMock).toHaveBeenCalledTimes(1));
+      expect(saveDraftMock.mock.calls[0][2].manifest_yaml).toContain("EDITED");
+    });
+  });
+
+  // B-315 M-1 — after a save the refetched manifest is re-read (new
+  // objects); the group and the output-schema collapse state stay put.
+  it("keeps the group and collapsed output-schema rows across a save + refetch", async () => {
+    const user = userEvent.setup();
+    const withSchema = (sha: string) =>
+      ({
+        ...sampleDetail,
+        record: {
+          ...sampleDetail.record,
+          spec_sha256: sha,
+          spec: {
+            ...sampleDetail.record.spec,
+            spec: {
+              ...(sampleDetail.record.spec.spec as Record<string, unknown>),
+              output_schema: { json_schema: { type: "object", properties: { l: { type: "array", items: { type: "string" } } } } },
+            },
+          },
+        },
+      }) as AgentDetailResponse;
+    saveDraftMock.mockResolvedValue(withSchema("e".repeat(64)));
+    const { rerender } = renderTab(withSchema("a".repeat(64)));
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("cfg-nav-prompt"));
+    await user.click(await screen.findByTestId("af-output-schema-toggle-0"));
+    expect(screen.queryByTestId("af-output-schema-row-0.items")).not.toBeInTheDocument();
+
+    await user.click(screen.getByTestId("manifest-save-btn"));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    const refetched = withSchema("e".repeat(64));
+    (refetched.record.spec.spec as Record<string, unknown>).system_prompt = "re-dumped";
+    rerender(
+      <MemoryRouter>
+        <ManifestTab detail={refetched} onSaved={onSaved} memberNameOf={rawId} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("af-output-schema-toggle-0")).toHaveTextContent("+");
+    expect(screen.queryByTestId("af-output-schema-row-0.items")).not.toBeInTheDocument();
+  });
+
   it("exposes the raw YAML escape-hatch toggle", async () => {
     renderTab();
     await screen.findByTestId("manifest-editor-edit");

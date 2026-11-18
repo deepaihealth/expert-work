@@ -78,6 +78,9 @@ export function ManifestTab({
   const editingSha = r.draft?.spec_sha256 ?? r.spec_sha256;
 
   const [buffer, setBuffer] = useState<string>(snapshotYaml);
+  // B-315 — a form widget holds edits it can't write back yet (e.g. a
+  // duplicated output-schema field name): saving / publishing waits.
+  const [formHasErrors, setFormHasErrors] = useState(false);
   // Bumped on Reset to remount the editor and re-seed it from the snapshot.
   const [resetNonce, setResetNonce] = useState(0);
   const [busy, setBusy] = useState<null | "draft" | "publish" | "discard">(null);
@@ -128,7 +131,10 @@ export function ManifestTab({
 
   /** 三个动作共用的错误处理 —— 409 是并发,给人话;其余照抛。 */
   const runAction = useCallback(
-    async (kind: "draft" | "publish" | "discard", fn: () => Promise<AgentDetailResponse>) => {
+    async (
+      kind: "draft" | "publish" | "discard",
+      fn: () => Promise<AgentDetailResponse>,
+    ): Promise<boolean> => {
       setBusy(kind);
       setError(null);
       setBuildWarning(null);
@@ -138,6 +144,7 @@ export function ManifestTab({
         setBuildWarning(result.build_warning ?? null);
         setBuildError(result.build_error ?? null);
         onSaved();
+        return true;
       } catch (err) {
         // 409 = 别人在你编辑期间动过这一版。这不是「操作失败」那种技术错误,
         // 而是一条要人做决定的消息(去看对方改了什么,再决定怎么合)。
@@ -152,12 +159,17 @@ export function ManifestTab({
                 : "unknown error";
           setError(message);
         }
+        return false;
       } finally {
         setBusy(null);
       }
     },
     [onSaved, t],
   );
+
+  // Why Save / Publish are greyed: the tenant-switch copy wins (default
+  // title), otherwise the form-errors one.
+  const blockedTitle = isTenantSwitched ? undefined : t("manifest_editor.form_has_errors");
 
   const handleSaveDraft = useCallback(
     () =>
@@ -173,10 +185,20 @@ export function ManifestTab({
     [runAction, r.name, r.version, r.spec_sha256],
   );
 
-  const handleDiscard = useCallback(
-    () => runAction("discard", () => discardAgentDraft(r.name, r.version, editingSha)),
-    [runAction, r.name, r.version, editingSha],
-  );
+  // B-315 — after a discard, drop every local edit the way Reset does
+  // (remount + buffer from the snapshot). The refetch alone can't be relied
+  // on: when draft and live dump to the same YAML, ``snapshotYaml`` doesn't
+  // change and the editor would keep its edits (incl. ones paused by a
+  // broken output-schema name), only to save them as a new draft later. A
+  // different live version still arrives through the refetch and is adopted
+  // in place as usual; the active group lives in the URL and survives.
+  const handleDiscard = useCallback(async () => {
+    const ok = await runAction("discard", () => discardAgentDraft(r.name, r.version, editingSha));
+    if (ok) {
+      setBuffer(snapshotYaml);
+      setResetNonce((n) => n + 1);
+    }
+  }, [runAction, r.name, r.version, editingSha, snapshotYaml]);
 
   return (
     <Card data-testid="manifest-tab">
@@ -217,19 +239,19 @@ export function ManifestTab({
           )}
           {!readOnly && (
             <>
-              <ReadonlyTooltip on={isTenantSwitched}>
+              <ReadonlyTooltip on={isTenantSwitched || formHasErrors} title={blockedTitle}>
                 <Button
                   size="small"
                   icon={<Save size={14} strokeWidth={1.75} />}
                   onClick={handleSaveDraft}
                   loading={busy === "draft"}
-                  disabled={saving || isTenantSwitched}
+                  disabled={saving || isTenantSwitched || formHasErrors}
                   data-testid="manifest-save-btn"
                 >
                   {t("manifest_tab.save_draft")}
                 </Button>
               </ReadonlyTooltip>
-              <ReadonlyTooltip on={isTenantSwitched}>
+              <ReadonlyTooltip on={isTenantSwitched || formHasErrors} title={blockedTitle}>
                 <Button
                   size="small"
                   type="primary"
@@ -237,7 +259,7 @@ export function ManifestTab({
                   onClick={handlePublish}
                   loading={busy === "publish"}
                   // 没有草稿就没有可发布的东西 —— 后端 409,这里不该让人点到那一步。
-                  disabled={saving || isTenantSwitched || !hasDraft}
+                  disabled={saving || isTenantSwitched || !hasDraft || formHasErrors}
                   data-testid="manifest-publish-btn"
                 >
                   {t("manifest_tab.publish")}
@@ -305,6 +327,7 @@ export function ManifestTab({
         mode="edit"
         initialYaml={snapshotYaml}
         onChange={setBuffer}
+        onValidityChange={setFormHasErrors}
         activeGroup={activeGroup}
         onActiveGroupChange={handleGroupChange}
         // 委派增强层 3 — 已保存 Agent 才有「生成委派策略」(后端读已保存

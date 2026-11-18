@@ -26,6 +26,7 @@ import {
   type DuplicateDeletedTarget,
 } from "../api/agents";
 import { DuplicateDeletedNotice } from "./DuplicateDeletedNotice";
+import { ReadonlyTooltip } from "./ReadonlyTooltip";
 import { ManifestEditor } from "./manifest-editor";
 import { BASE_MANIFEST_YAML, buildDefaultManifest } from "./manifest-editor/defaults";
 import { loadModelCatalog } from "./manifest-editor/catalog";
@@ -51,6 +52,8 @@ export function CreateAgentModal({ open, onClose, onCreated }: CreateAgentModalP
   const [buffer, setBuffer] = useState<string>(BASE_MANIFEST_YAML);
   const [initialYaml, setInitialYaml] = useState<string>(BASE_MANIFEST_YAML);
   const [submitting, setSubmitting] = useState(false);
+  // B-315 — see ManifestEditor ``onValidityChange``.
+  const [formHasErrors, setFormHasErrors] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // B-278 — the name+version clashed with a deleted / mid-purge agent.
   const [duplicateDeleted, setDuplicateDeleted] = useState<DuplicateDeletedTarget | null>(null);
@@ -147,16 +150,18 @@ export function CreateAgentModal({ open, onClose, onCreated }: CreateAgentModalP
           >
             {t("create_agent.cancel")}
           </Button>
-          <Button
-            type="primary"
-            icon={<Plus size={14} strokeWidth={1.75} />}
-            onClick={handleSubmit}
-            loading={submitting}
-            disabled={submitting || blocked}
-            data-testid="create-agent-submit"
-          >
-            {t("create_agent.submit")}
-          </Button>
+          <ReadonlyTooltip on={formHasErrors} title={t("manifest_editor.form_has_errors")}>
+            <Button
+              type="primary"
+              icon={<Plus size={14} strokeWidth={1.75} />}
+              onClick={handleSubmit}
+              loading={submitting}
+              disabled={submitting || blocked || formHasErrors}
+              data-testid="create-agent-submit"
+            >
+              {t("create_agent.submit")}
+            </Button>
+          </ReadonlyTooltip>
         </div>
       }
     >
@@ -216,6 +221,7 @@ export function CreateAgentModal({ open, onClose, onCreated }: CreateAgentModalP
           mode="create"
           initialYaml={initialYaml}
           onChange={setBuffer}
+          onValidityChange={setFormHasErrors}
         />
       )}
       </div>

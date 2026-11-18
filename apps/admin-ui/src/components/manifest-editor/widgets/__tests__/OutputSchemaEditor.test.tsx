@@ -1,25 +1,22 @@
 /**
- * OutputSchemaEditor — config-page redesign v2 Task 7. Contract under test:
- *  - off by default, on writes the empty-object default schema.
- *  - editing rows emits the exact ``setOutputSchemaRows``-shaped manifest.
- *  - PER-ROW commit, no whole-table gate (review-fixed Important): a row
- *    whose name is currently invalid is excluded from the write and shown
- *    with an error state, but every OTHER row's own edit still lands in the
- *    manifest immediately — one bad/blank row never blocks unrelated edits.
- *  - a resync from a genuinely new ``formData`` (not our own echo) preserves
- *    any local WIP (invalid-name) row untouched — including already-typed
- *    text in its other fields — rather than clobbering it.
- *  - a name that duplicates an EARLIER row's is locally invalid too
- *    (review-fixed Important #2, transient-collision data loss): the later
- *    row is excluded from the write (duplicate-specific error message), so
- *    typing "title2" next to an existing "title" never last-wins-overwrites
- *    the seeded property's type/description at the "title" keystroke.
- *  - an "unrepresentable" (non-flat) schema renders read-only: the Switch is
- *    hidden, only an info Alert shows, and NOTHING in that state ever calls
- *    ``onChange`` (there is nothing interactive to click).
- *  - turning off with existing fields confirms first (App.useApp() modal,
- *    not the static Modal.confirm — renders under test); cancelling applies
- *    nothing.
+ * OutputSchemaEditor — top-level basics (the flat cases this widget started
+ * with; nested / tree cases: OutputSchemaEditor.tree.test.tsx; the name
+ * rule end to end: OutputSchemaEditor.names.test.tsx). Top-level rows keep
+ * the old test ids (path "0", "1" …). Contract under test:
+ *  - off by default; switching on writes the empty-object default schema.
+ *  - every edit writes the exact ``setOutputSchemaTree``-shaped manifest.
+ *  - B-315 name rule: while any field name is blank, invalid or duplicated,
+ *    nothing is written back — ``formData`` keeps its last valid state and
+ *    every offending row is flagged (both rows of a duplicate). Fixing the
+ *    names writes the whole tree, including edits made in the meantime.
+ *    Nothing is ever picked, pruned or dropped automatically.
+ *  - a new ``formData`` whose ``json_schema`` equals what the widget last
+ *    wrote (our own echo, or a sibling field's edit) is ignored, so local
+ *    edits (an unnamed new row and its typed text) survive it.
+ *  - a root the form can't show at all renders read-only: the Switch is
+ *    hidden, only an info Alert shows, and nothing calls ``onChange``.
+ *  - turning off with existing fields confirms first (App.useApp() modal);
+ *    cancelling applies nothing.
  */
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -117,11 +114,13 @@ describe("OutputSchemaEditor", () => {
 
     // add field 1, name it "title", mark required
     await user.click(screen.getByTestId("af-output-schema-add"));
+    await user.clear(screen.getByTestId("af-output-schema-name-0"));
     await user.type(screen.getByTestId("af-output-schema-name-0"), "title");
     await user.click(screen.getByTestId("af-output-schema-required-0"));
 
     // add field 2, name it "count" (default type: string)
     await user.click(screen.getByTestId("af-output-schema-add"));
+    await user.clear(screen.getByTestId("af-output-schema-name-1"));
     await user.type(screen.getByTestId("af-output-schema-name-1"), "count");
 
     const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
@@ -136,13 +135,7 @@ describe("OutputSchemaEditor", () => {
     });
   });
 
-  it("an invalid field name is excluded from the write and shows an error state (review-fixed: no whole-table gate)", async () => {
-    // Contract change from the pre-fix version: that gated the ENTIRE
-    // commit (no onChange at all) on every row's name being valid, which is
-    // exactly the Important bug this test now documents the fix for — one
-    // invalid row (here, the ONLY row) must not block a write; it's simply
-    // excluded, so the manifest's `properties` reflects "no valid rows"
-    // rather than going stale/frozen.
+  it("an invalid field name writes nothing back and shows an error state", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     const seeded = {
@@ -159,17 +152,11 @@ describe("OutputSchemaEditor", () => {
     renderEditor(seeded, onChange);
     const nameInput = screen.getByTestId("af-output-schema-name-0");
     await user.clear(nameInput);
-    onChange.mockClear();
     await user.type(nameInput, "1bad");
-    expect(onChange).toHaveBeenCalled();
-    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
-    expect(last.spec?.output_schema?.json_schema).toEqual({
-      type: "object",
-      properties: {},
-      additionalProperties: false,
-    });
+    expect(onChange).not.toHaveBeenCalled();
     expect(nameInput).toHaveValue("1bad");
     expect(nameInput).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByTestId("af-output-schema-name-errors")).toBeInTheDocument();
   });
 
   it("removing the invalid-name row un-blocks (no leftover invalid field)", async () => {
@@ -199,49 +186,8 @@ describe("OutputSchemaEditor", () => {
     });
   });
 
-  describe("per-row commit (review-fixed Important: no whole-table gate + no clobber-on-resync)", () => {
-    it("editing a valid row while another row's name is invalid commits immediately with just the valid subset", async () => {
-      const user = userEvent.setup();
-      const onChange = vi.fn();
-      // Seeded directly with a structurally-valid-but-locally-invalid-name
-      // property ("1bad") — readOutputSchemaRows doesn't enforce NAME_RE (only
-      // structural representability), so this is a legitimate way to start
-      // the widget already showing one invalid row alongside one valid row.
-      const seeded = {
-        spec: {
-          output_schema: {
-            json_schema: {
-              type: "object",
-              properties: {
-                title: { type: "string" },
-                "1bad": { type: "string" },
-              },
-              additionalProperties: false,
-            },
-          },
-        },
-      };
-      renderEditor(seeded, onChange);
-      expect(screen.getByTestId("af-output-schema-name-1")).toHaveAttribute(
-        "aria-invalid",
-        "true",
-      );
-
-      await user.type(screen.getByTestId("af-output-schema-desc-0"), "hi");
-
-      const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
-      // Only "title" (the valid row) made it into the write; "1bad" is
-      // excluded — the bug this fixes was that "1bad" being invalid used to
-      // block "title"'s edit from committing AT ALL.
-      expect(last.spec?.output_schema?.json_schema).toEqual({
-        type: "object",
-        properties: { title: { type: "string", description: "hi" } },
-        required: [],
-        additionalProperties: false,
-      });
-    });
-
-    it("adding a field (blank row) does not block other rows' edits from committing", async () => {
+  describe("name problems pause write-back; nothing is dropped", () => {
+    it("edits to a valid row wait while another row's name is invalid, then land together", async () => {
       const user = userEvent.setup();
       const onChange = vi.fn();
       const seeded = {
@@ -257,20 +203,21 @@ describe("OutputSchemaEditor", () => {
       };
       renderEditor(seeded, onChange);
       await user.click(screen.getByTestId("af-output-schema-add"));
-      expect(screen.getByTestId("af-output-schema-name-1")).toHaveValue("");
-
+      await user.clear(screen.getByTestId("af-output-schema-name-1"));
       onChange.mockClear();
+      await user.type(screen.getByTestId("af-output-schema-desc-0"), "hi");
       await user.click(screen.getByTestId("af-output-schema-required-0"));
+      expect(onChange).not.toHaveBeenCalled();
 
-      expect(onChange).toHaveBeenCalled();
-      const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
-      // The freshly-added blank row (index 1, name "") is excluded — but
-      // "title"'s own edit still landed, immediately.
-      expect(last.spec?.output_schema?.json_schema).toEqual({
+      // The first keystroke makes every name valid: that write carries all of it.
+      await user.type(screen.getByTestId("af-output-schema-name-1"), "c");
+      expect(onChange).toHaveBeenCalledTimes(1);
+      await user.type(screen.getByTestId("af-output-schema-name-1"), "ount");
+      expect((onChange.mock.calls.at(-1)?.[0] as AgentManifest).spec?.output_schema?.json_schema).toEqual({
         type: "object",
-        properties: { title: { type: "string" } },
-        required: ["title"],
+        properties: { title: { type: "string", description: "hi" }, count: { type: "string" } },
         additionalProperties: false,
+        required: ["title"],
       });
     });
 
@@ -291,10 +238,11 @@ describe("OutputSchemaEditor", () => {
       };
       const { rerender } = renderEditor(seeded, onChange);
 
-      // Add a blank row and type into its description — its name stays ""
-      // (invalid), so this row never reaches the manifest; it only lives in
-      // local overlay state.
+      // Add a row (written as field_1), then blank its name and type into its
+      // description — with the name broken, those edits stay local only.
       await user.click(screen.getByTestId("af-output-schema-add"));
+      const written = onChange.mock.calls.at(-1)?.[0] as typeof seeded;
+      await user.clear(screen.getByTestId("af-output-schema-name-1"));
       await user.type(screen.getByTestId("af-output-schema-desc-1"), "wip notes");
       expect(screen.getByTestId("af-output-schema-name-1")).toHaveValue("");
 
@@ -304,8 +252,8 @@ describe("OutputSchemaEditor", () => {
       // exactly the "any formData change" trigger that used to blow away
       // local state wholesale.
       const siblingEdited = {
-        ...seeded,
-        spec: { ...seeded.spec, description: "v2" },
+        ...written,
+        spec: { ...written.spec, description: "v2" },
       };
       rerender(
         <App>
@@ -321,16 +269,7 @@ describe("OutputSchemaEditor", () => {
       );
     });
 
-    it("a transiently duplicate name never clobbers the earlier row's property (typing title2 next to seeded title)", async () => {
-      // Review-fixed Important #2. Pre-fix repro: at the 5th keystroke of
-      // "title2" the new row's name is exactly "title" — pattern-valid — so
-      // BOTH rows entered the write; ``properties`` being a record, the
-      // later row last-wins-overwrote the seeded title (integer + "keep me"
-      // → bare {type:"string"}), and the collapsed 1-row readback no longer
-      // matched lastWrittenRef's 2 written rows, so the echo check misfired
-      // into the external-resync branch and the typing row itself vanished
-      // mid-word. Controlled harness on purpose — the echo/resync half only
-      // exists when formData feeds back.
+    it("a transiently duplicate name flags both rows and writes nothing until it resolves (typing title2 next to title)", async () => {
       const user = userEvent.setup();
       const onChange = vi.fn();
       const seeded = {
@@ -348,48 +287,27 @@ describe("OutputSchemaEditor", () => {
 
       await user.click(screen.getByTestId("af-output-schema-add"));
       const nameInput = screen.getByTestId("af-output-schema-name-1");
-      await user.type(nameInput, "title");
+      await user.clear(nameInput);
+      await user.type(nameInput, "titl");
+      onChange.mockClear();
+      await user.type(nameInput, "e");
 
-      // Mid-collision: the later row is locally invalid — duplicate-specific
-      // message, error state, still holding the typed text.
-      expect(nameInput).toHaveValue("title");
       expect(nameInput).toHaveAttribute("aria-invalid", "true");
-      expect(
-        screen.getByText(i18n.t("agent_form.output_schema.name_duplicate")),
-      ).toBeInTheDocument();
-      // The EARLIER row is not the one flagged (first occurrence wins).
-      expect(screen.getByTestId("af-output-schema-name-0")).toHaveAttribute(
-        "aria-invalid",
-        "false",
-      );
+      expect(screen.getByTestId("af-output-schema-name-0")).toHaveAttribute("aria-invalid", "true");
+      expect(screen.getAllByText(i18n.t("agent_form.output_schema.name_duplicate"))).toHaveLength(2);
+      expect(onChange).not.toHaveBeenCalled();
 
-      // EVERY write so far — add-click and each keystroke — preserved the
-      // seeded property byte-for-byte (the mutation-level core: pre-fix, the
-      // "title" keystroke's write destroyed it).
-      expect(onChange).toHaveBeenCalled();
-      for (const call of onChange.mock.calls) {
-        const m = call[0] as AgentManifest;
-        const props = m.spec?.output_schema?.json_schema?.properties as Record<
-          string,
-          unknown
-        >;
-        expect(props.title).toEqual({ type: "integer", description: "keep me" });
-      }
-
-      // Finish the word — "title2" no longer collides: both rows land.
       await user.type(nameInput, "2");
       expect(nameInput).toHaveAttribute("aria-invalid", "false");
-      expect(
-        screen.queryByText(i18n.t("agent_form.output_schema.name_duplicate")),
-      ).not.toBeInTheDocument();
-      const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+      expect(screen.queryByText(i18n.t("agent_form.output_schema.name_duplicate"))).not.toBeInTheDocument();
+      expect(onChange).toHaveBeenCalledTimes(1);
+      const last = onChange.mock.calls[0][0] as AgentManifest;
       expect(last.spec?.output_schema?.json_schema).toEqual({
         type: "object",
         properties: {
           title: { type: "integer", description: "keep me" },
           title2: { type: "string" },
         },
-        required: [],
         additionalProperties: false,
       });
     });
@@ -464,14 +382,11 @@ describe("OutputSchemaEditor", () => {
     expect(last.spec?.output_schema?.strict).toBe(false);
   });
 
-  describe("unrepresentable schema", () => {
+  describe("root the form can't show (root-level oneOf)", () => {
     const seeded = {
       spec: {
         output_schema: {
-          json_schema: {
-            type: "object",
-            properties: { nested: { type: "object", properties: {} } },
-          },
+          json_schema: { oneOf: [{ type: "object" }, { type: "string" }] },
         },
       },
     };

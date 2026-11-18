@@ -96,6 +96,30 @@ describe("CreateAgentModal", () => {
     expect(onCreated).toHaveBeenCalledWith(sampleCreated);
   });
 
+  // B-315 — a broken output-schema field name blocks creating.
+  it("disables Create while an output-schema field name is duplicated", async () => {
+    const user = userEvent.setup();
+    const createMock = vi.spyOn(agentsSdk, "createAgent").mockResolvedValue(sampleCreated);
+    render(<CreateAgentModal open onClose={onClose} onCreated={onCreated} />);
+    await screen.findByTestId("manifest-editor-create");
+    await user.click(screen.getByTestId("cfg-nav-prompt"));
+    await user.click(await screen.findByTestId("af-output-schema-switch"));
+    await user.click(await screen.findByTestId("af-output-schema-add"));
+    await user.click(screen.getByTestId("af-output-schema-add"));
+    const second = screen.getByTestId("af-output-schema-name-1");
+    expect(screen.getByTestId("create-agent-submit")).not.toBeDisabled();
+
+    await user.clear(second);
+    await user.type(second, "field_1");
+    expect(screen.getByTestId("create-agent-submit")).toBeDisabled();
+
+    await user.type(second, "b");
+    expect(screen.getByTestId("create-agent-submit")).not.toBeDisabled();
+    await user.click(screen.getByTestId("create-agent-submit"));
+    await waitFor(() => expect(createMock).toHaveBeenCalledTimes(1));
+    expect((createMock.mock.calls[0][0] as { manifest_yaml: string }).manifest_yaml).toContain("field_1b:");
+  });
+
   it("surfaces server errors and keeps the drawer open", async () => {
     const user = userEvent.setup();
     vi.spyOn(agentsSdk, "createAgent").mockRejectedValue(

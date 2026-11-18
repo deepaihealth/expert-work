@@ -100,6 +100,8 @@ export const AgentTemplateConfigForm = forwardRef<
     [editing],
   );
   const [yaml, setYaml] = useState(initialYaml);
+  // B-315 — see ManifestEditor ``onValidityChange``; ``submit`` refuses meanwhile.
+  const [formHasErrors, setFormHasErrors] = useState(false);
 
   useEffect(() => {
     setYaml(initialYaml);
@@ -126,6 +128,10 @@ export const AgentTemplateConfigForm = forwardRef<
   const submit = useMemo(
     () => async (): Promise<void> => {
       const meta = await form.validateFields();
+      if (formHasErrors) {
+        message.error(t("manifest_editor.form_has_errors"));
+        return;
+      }
       onSubmittingChange?.(true);
       try {
         let spec: Record<string, unknown>;
@@ -179,7 +185,7 @@ export const AgentTemplateConfigForm = forwardRef<
         onSubmittingChange?.(false);
       }
     },
-    [editing, form, isEditing, message, onSaved, onSubmittingChange, t, yaml],
+    [editing, form, formHasErrors, isEditing, message, onSaved, onSubmittingChange, t, yaml],
   );
 
   useImperativeHandle(ref, () => ({ submit }), [submit]);
@@ -313,6 +319,7 @@ export const AgentTemplateConfigForm = forwardRef<
         mode={isEditing ? "edit" : "create"}
         initialYaml={initialYaml}
         onChange={setYaml}
+        onValidityChange={setFormHasErrors}
         mcpSource="catalog"
         leadingTabs={[
           {
