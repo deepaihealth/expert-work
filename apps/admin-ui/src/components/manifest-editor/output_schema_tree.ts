@@ -6,14 +6,17 @@
 // for every input, key order included. How:
 //  - a node the form cannot represent (oneOf/anyOf/allOf/$ref/$defs/const,
 //    a type union, patternProperties, if/then/else, depth > MAX_DEPTH, or
-//    any key outside the editable set below) becomes a ``readonly`` node
-//    holding its original value, written back verbatim. Only THAT node is
-//    readonly — siblings and ancestors stay editable.
+//    any key outside the editable + pass-through sets below) becomes a
+//    ``readonly`` node holding its original value, written back verbatim.
+//    Only THAT node is readonly — siblings and ancestors stay editable.
 //  - an editable node keeps its original object (``raw``). The writer walks
 //    ``raw``'s keys in order: a key the form manages is re-emitted from the
-//    node (or dropped when the node no longer has it); any other key
-//    (``title``/``default``/``examples``/``$comment`` annotations) is copied
-//    from ``raw`` untouched. Keys the form newly adds are appended after.
+//    node (or dropped when the node no longer has it); any other key is an
+//    annotation (``title``/``default``/``examples``/``$comment``; root
+//    ``$schema``/``$id``) or a pass-through keyword the form doesn't show
+//    (``format``; ``multipleOf``/``exclusiveMinimum``/``exclusiveMaximum``)
+//    and is copied from ``raw`` untouched. Keys the form newly adds are
+//    appended after.
 
 export type SchemaNodeType =
   | "string"
@@ -37,6 +40,10 @@ export const MAX_DEPTH = 5;
 
 /** Same field-name rule the flat editor used. */
 export const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** A name the user may type: NAME_RE, minus the prototype-polluting key. */
+export const isValidFieldName = (name: string): boolean =>
+  NAME_RE.test(name) && name !== "__proto__";
 
 export interface SchemaConstraints {
   minLength?: number;
@@ -80,13 +87,22 @@ export interface ReadonlySchemaNode {
 export type SchemaNode = EditableSchemaNode | ReadonlySchemaNode;
 
 export interface SchemaField {
+  /** Local identity (React key / collapse state); never written. */
+  uid: string;
   name: string;
   required: boolean;
   node: SchemaNode;
+  /** The name as read from the original; absent for a field added here. */
+  originalName?: string;
+  /** The original name fails the form's rule: keep it, but don't let it be edited. */
+  nameLocked?: boolean;
 }
 
 /** A node's position: field indexes, plus ``"items"`` to step into a list. */
 export type SchemaPath = readonly (number | "items")[];
+
+let uidCounter = 0;
+export const makeFieldUid = (): string => `f${++uidCounter}`;
 
 const CONSTRAINTS_BY_TYPE: Record<SchemaNodeType, readonly ConstraintKey[]> = {
   string: ["minLength", "maxLength", "pattern"],
@@ -106,6 +122,19 @@ export function supportsEnum(type: SchemaNodeType): boolean {
 }
 
 const ANNOTATION_KEYS = ["title", "default", "examples", "$comment"];
+const ROOT_ANNOTATION_KEYS = ["$schema", "$id"];
+// Kept as-is, not shown in the form, dropped when the type changes.
+const NUMERIC_PASS_THROUGH = ["multipleOf", "exclusiveMinimum", "exclusiveMaximum"];
+const PASS_THROUGH_BY_TYPE: Record<SchemaNodeType, readonly string[]> = {
+  string: ["format"],
+  number: NUMERIC_PASS_THROUGH,
+  integer: NUMERIC_PASS_THROUGH,
+  boolean: [],
+  object: [],
+  array: [],
+};
+// Raw keys that survive a type change (besides the managed ones).
+const KEEP_ON_TYPE_CHANGE = ["title", "$comment"];
 const STRUCTURE_KEYS: Record<SchemaNodeType, readonly string[]> = {
   string: [],
   number: [],
@@ -178,48 +207,63 @@ function parseFields(
   const names = Object.keys(props);
   if (new Set(required).size !== required.length) return null;
   if (!required.every((r) => names.includes(r))) return null;
-  return names.map((name) => ({
-    name,
-    required: required.includes(name),
-    // A name the form's own rule would reject can't be re-typed safely, so
-    // the whole field stays as-is (readonly) rather than dropping it.
-    node: NAME_RE.test(name)
-      ? parseSchemaNode(props[name], depth + 1)
-      : readonlyNode(props[name]),
-  }));
+  return names.map((name) => {
+    const field: SchemaField = {
+      uid: makeFieldUid(),
+      name,
+      originalName: name,
+      required: required.includes(name),
+      node: parseSchemaNode(props[name], depth + 1),
+    };
+    return isValidFieldName(name) ? field : { ...field, nameLocked: true };
+  });
+}
+
+function allowedKeys(type: SchemaNodeType, root: boolean): Set<string> {
+  return new Set<string>([
+    "type",
+    "description",
+    ...ANNOTATION_KEYS,
+    ...(root ? ROOT_ANNOTATION_KEYS : []),
+    ...CONSTRAINTS_BY_TYPE[type],
+    ...PASS_THROUGH_BY_TYPE[type],
+    ...STRUCTURE_KEYS[type],
+    ...(supportsEnum(type) ? ["enum"] : []),
+  ]);
+}
+
+function readConstraints(
+  raw: Record<string, unknown>,
+  type: SchemaNodeType,
+): SchemaConstraints | null {
+  const constraints: SchemaConstraints = {};
+  for (const key of CONSTRAINTS_BY_TYPE[type]) {
+    if (!(key in raw)) continue;
+    if (!CONSTRAINT_VALID[key](raw[key])) return null;
+    (constraints as Record<string, unknown>)[key] = raw[key];
+  }
+  return constraints;
 }
 
 /** ``depth`` = this node's depth (root 0, the root's fields 1, …). */
 export function parseSchemaNode(
   raw: unknown,
   depth: number,
-  opts: { implicitObject?: boolean } = {},
+  opts: { root?: boolean } = {},
 ): SchemaNode {
   if (depth > MAX_DEPTH || !isPlainObject(raw)) return readonlyNode(raw);
-  const typeImplicit = !("type" in raw) && opts.implicitObject === true;
+  const typeImplicit = !("type" in raw) && opts.root === true;
   const type = typeImplicit ? "object" : raw.type;
   if (typeof type !== "string" || !SCHEMA_NODE_TYPES.includes(type as SchemaNodeType)) {
     return readonlyNode(raw);
   }
   const t = type as SchemaNodeType;
-  const allowed = new Set<string>([
-    "type",
-    "description",
-    ...ANNOTATION_KEYS,
-    ...CONSTRAINTS_BY_TYPE[t],
-    ...STRUCTURE_KEYS[t],
-    ...(supportsEnum(t) ? ["enum"] : []),
-  ]);
+  const allowed = allowedKeys(t, opts.root === true);
   if (!Object.keys(raw).every((k) => allowed.has(k))) return readonlyNode(raw);
   if ("description" in raw && typeof raw.description !== "string") return readonlyNode(raw);
   if ("enum" in raw && !enumValidFor(t, raw.enum)) return readonlyNode(raw);
-
-  const constraints: SchemaConstraints = {};
-  for (const key of CONSTRAINTS_BY_TYPE[t]) {
-    if (!(key in raw)) continue;
-    if (!CONSTRAINT_VALID[key](raw[key])) return readonlyNode(raw);
-    (constraints as Record<string, unknown>)[key] = raw[key];
-  }
+  const constraints = readConstraints(raw, t);
+  if (constraints === null) return readonlyNode(raw);
 
   const node: EditableSchemaNode = { kind: "editable", type: t, constraints, raw };
   if (typeImplicit) node.typeImplicit = true;
@@ -242,7 +286,7 @@ export function parseSchemaNode(
 
 /** The ``json_schema`` value → the root node (always an object, or readonly). */
 export function parseSchemaRoot(raw: unknown): SchemaNode {
-  const node = parseSchemaNode(raw, 0, { implicitObject: true });
+  const node = parseSchemaNode(raw, 0, { root: true });
   return node.kind === "editable" && node.type !== "object" ? readonlyNode(raw) : node;
 }
 
@@ -271,8 +315,8 @@ function managedValues(node: EditableSchemaNode): Record<string, unknown> {
   for (const key of CONSTRAINTS_BY_TYPE[node.type]) out[key] = node.constraints[key];
   if (node.type === "object") {
     const fields = node.fields ?? [];
-    const properties: Record<string, unknown> = {};
-    for (const f of fields) properties[f.name] = writeSchemaNode(f.node);
+    // fromEntries defines own properties — a "__proto__" name can't touch the prototype.
+    const properties = Object.fromEntries(fields.map((f) => [f.name, writeSchemaNode(f.node)]));
     const required = requiredList(node);
     out.properties =
       fields.length > 0 || node.keepEmptyProperties ? properties : undefined;
@@ -288,18 +332,18 @@ export function writeSchemaNode(node: SchemaNode): unknown {
   if (node.kind === "readonly") return node.raw;
   const managed = managedValues(node);
   const raw = node.raw ?? {};
-  const out: Record<string, unknown> = {};
+  const entries: [string, unknown][] = [];
   for (const key of Object.keys(raw)) {
     if (key in managed || KEY_ORDER.includes(key)) {
-      if (managed[key] !== undefined) out[key] = managed[key];
+      if (managed[key] !== undefined) entries.push([key, managed[key]]);
     } else {
-      out[key] = raw[key];
+      entries.push([key, raw[key]]);
     }
   }
   for (const key of KEY_ORDER) {
-    if (!(key in raw) && managed[key] !== undefined) out[key] = managed[key];
+    if (!(key in raw) && managed[key] !== undefined) entries.push([key, managed[key]]);
   }
-  return out;
+  return Object.fromEntries(entries);
 }
 
 // ---- build / edit (all immutable) ----
@@ -322,12 +366,17 @@ export function newSchemaNode(type: SchemaNodeType): EditableSchemaNode {
 }
 
 export const newSchemaField = (): SchemaField => ({
+  uid: makeFieldUid(),
   name: "",
   required: false,
   node: newSchemaNode("string"),
 });
 
-/** Switch a node's type: drops constraints/enum/children the new type can't use. */
+/**
+ * Switch a node's type: drops constraints/enum/children the new type can't
+ * use, and the raw keys tied to the old type (``default``/``examples``,
+ * pass-through keywords). ``title``/``description``/``$comment`` stay.
+ */
 export function changeNodeType(
   node: EditableSchemaNode,
   type: SchemaNodeType,
@@ -340,12 +389,19 @@ export function changeNodeType(
       (constraints as Record<string, unknown>)[key] = node.constraints[key];
     }
   }
+  const raw = node.raw
+    ? Object.fromEntries(
+        Object.entries(node.raw).filter(
+          ([k]) => KEY_ORDER.includes(k) || KEEP_ON_TYPE_CHANGE.includes(k),
+        ),
+      )
+    : undefined;
   return {
     ...fresh,
     constraints,
     description: node.description,
     enum: node.enum !== undefined && enumValidFor(type, node.enum) ? node.enum : undefined,
-    raw: node.raw,
+    raw,
   };
 }
 
@@ -396,17 +452,32 @@ export function updateFieldsAt(
 
 export type FieldIssue = "invalid" | "duplicate" | null;
 
+/** The name can't change here (readonly node, or locked original name). */
+export const isNameFixed = (f: SchemaField): boolean =>
+  f.node.kind === "readonly" || f.nameLocked === true;
+
+// Still carrying the name it was read with (fixed names always are).
+const keepsOriginalName = (f: SchemaField): boolean =>
+  isNameFixed(f) || (f.originalName !== undefined && f.name === f.originalName);
+
 /**
- * ``"invalid"`` = fails NAME_RE; ``"duplicate"`` = an EARLIER sibling has
- * the same name (first one wins). Readonly fields keep their original name
- * and are never flagged.
+ * ``"invalid"`` = fails the name rule; ``"duplicate"`` = a sibling with the
+ * same name wins over this one. A field still holding its original name
+ * (incl. every readonly / name-locked field) always wins over one that is
+ * being renamed onto it — so typing over an existing name flags the row
+ * being typed in, never the untouched one. Otherwise the earlier row wins.
+ * Fields with a fixed name are never flagged.
  */
 export function fieldIssue(fields: readonly SchemaField[], i: number): FieldIssue {
   const field = fields[i];
-  if (field.node.kind === "readonly") return null;
-  if (!NAME_RE.test(field.name)) return "invalid";
-  for (let j = 0; j < i; j++) {
-    if (fields[j].name === field.name) return "duplicate";
+  if (isNameFixed(field)) return null;
+  if (!isValidFieldName(field.name)) return "invalid";
+  const mine = keepsOriginalName(field);
+  for (let j = 0; j < fields.length; j++) {
+    if (j === i || fields[j].name !== field.name) continue;
+    const theirs = keepsOriginalName(fields[j]);
+    if (theirs && !mine) return "duplicate";
+    if (theirs === mine && j < i) return "duplicate";
   }
   return null;
 }

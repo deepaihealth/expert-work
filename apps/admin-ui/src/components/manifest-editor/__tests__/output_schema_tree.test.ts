@@ -8,6 +8,8 @@ import { describe, expect, it } from "vitest";
 import {
   changeNodeType,
   fieldIssue,
+  isValidFieldName,
+  makeFieldUid,
   newSchemaField,
   newSchemaNode,
   nodeAt,
@@ -28,9 +30,16 @@ function editable(node: SchemaNode | undefined): EditableSchemaNode {
 }
 
 const field = (name: string, node: SchemaNode = newSchemaNode("string")): SchemaField => ({
+  uid: makeFieldUid(),
   name,
   required: false,
   node,
+});
+
+// A field as if read from the original (still carrying its read-in name).
+const original = (name: string, node: SchemaNode = newSchemaNode("string")): SchemaField => ({
+  ...field(name, node),
+  originalName: name,
 });
 
 describe("constraints: read and write per type", () => {
@@ -81,13 +90,16 @@ describe("readonly triggers (only that node)", () => {
     ["type union", { type: ["string", "null"] }],
     ["patternProperties", { type: "object", patternProperties: { "^x": { type: "string" } } }],
     ["if/then/else", { type: "object", if: {}, then: {}, else: {} }],
-    ["unlisted key (format)", { type: "string", format: "email" }],
+    ["unlisted key (minProperties)", { type: "object", properties: {}, minProperties: 1 }],
+    ["unlisted key (contentEncoding)", { type: "string", contentEncoding: "base64" }],
+    ["$schema below the root", { type: "string", $schema: "x" }],
     ["constraint on the wrong type", { type: "integer", minLength: 1 }],
     ["enum on boolean", { type: "boolean", enum: [true] }],
     ["enum value of the wrong type", { type: "integer", enum: [1.5] }],
     ["bad constraint value", { type: "string", maxLength: -1 }],
     ["array without items", { type: "array" }],
     ["required names a missing property", { type: "object", properties: {}, required: ["x"] }],
+    ["required lists a name twice", { type: "object", properties: { x: { type: "string" } }, required: ["x", "x"] }],
     ["not an object", true],
   ];
 
@@ -100,21 +112,91 @@ describe("readonly triggers (only that node)", () => {
     expect(nodeAt(root, [1])?.kind).toBe("editable");
   });
 
-  it("a property name the form would reject keeps that field readonly", () => {
-    const root = parseSchemaRoot({ type: "object", properties: { "1bad": { type: "string" } } });
-    expect(nodeAt(root, [0])?.kind).toBe("readonly");
+  it("a property name the form would reject only locks the name; the node stays editable", () => {
+    const raw = { type: "object", properties: { "1bad": { type: "string" }, "客户-名字": { type: "string", maxLength: 9 } } };
+    const root = editable(parseSchemaRoot(raw));
+    expect(root.fields?.map((f) => f.nameLocked)).toEqual([true, true]);
+    expect(nodeAt(root, [1])?.kind).toBe("editable");
+    expect(writeSchemaNode(updateNodeAt(root, [1], (n) => ({ ...n, description: "d" })))).toEqual({
+      type: "object",
+      properties: { "1bad": { type: "string" }, "客户-名字": { type: "string", maxLength: 9, description: "d" } },
+    });
+  });
+
+  it("tuple-style items (an array) keep the list editable, the item row readonly", () => {
+    const tuple = [{ type: "string" }, { type: "integer" }];
+    const raw = { type: "object", properties: { pair: { type: "array", maxItems: 2, items: tuple } } };
+    const root = parseSchemaRoot(raw);
+    expect(nodeAt(root, [0])?.kind).toBe("editable");
+    expect(nodeAt(root, [0, "items"])).toEqual({ kind: "readonly", raw: tuple });
+    expect(JSON.stringify(writeSchemaNode(root))).toBe(JSON.stringify(raw));
+  });
+});
+
+describe("pass-through keywords and root annotations", () => {
+  it("root $schema/$id, format, multipleOf/exclusive bounds are kept and the nodes stay editable", () => {
+    const raw = {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      $id: "reply",
+      type: "object",
+      properties: {
+        email: { type: "string", format: "email", maxLength: 80 },
+        price: { type: "number", multipleOf: 0.01, exclusiveMinimum: 0, exclusiveMaximum: 1000 },
+        count: { type: "integer", multipleOf: 2 },
+      },
+    };
+    const root = parseSchemaRoot(raw);
+    expect(root.kind).toBe("editable");
+    expect([0, 1, 2].map((i) => nodeAt(root, [i])?.kind)).toEqual(["editable", "editable", "editable"]);
+    expect(JSON.stringify(writeSchemaNode(root))).toBe(JSON.stringify(raw));
+  });
+
+  it("a type change drops format / multipleOf / exclusive bounds", () => {
+    const email = editable(parseSchemaNode({ type: "string", format: "email" }, 1));
+    expect(writeSchemaNode(changeNodeType(email, "integer"))).toEqual({ type: "integer" });
+    const price = editable(parseSchemaNode({ type: "number", multipleOf: 0.5, exclusiveMinimum: 0 }, 1));
+    expect(writeSchemaNode(changeNodeType(price, "string"))).toEqual({ type: "string" });
+  });
+});
+
+describe("other values kept as written", () => {
+  it("uniqueItems: false, required: [], and a schema-valued additionalProperties", () => {
+    const raw = {
+      type: "object",
+      properties: {
+        tags: { type: "array", uniqueItems: false, items: { type: "string" } },
+        extra: { type: "object", properties: {}, required: [], additionalProperties: { type: "string" } },
+      },
+      required: [],
+    };
+    const root = parseSchemaRoot(raw);
+    expect(nodeAt(root, [1])?.kind).toBe("editable");
+    expect(JSON.stringify(writeSchemaNode(root))).toBe(JSON.stringify(raw));
   });
 });
 
 describe("changeNodeType", () => {
-  it("string → integer drops string limits and string enum, keeps description/annotations", () => {
+  it("string → integer drops string limits, enum, default and examples; keeps title/description/$comment", () => {
     const node = editable(
-      parseSchemaNode({ type: "string", title: "T", description: "d", minLength: 1, pattern: "x", enum: ["a"] }, 1),
+      parseSchemaNode(
+        {
+          type: "string",
+          title: "T",
+          description: "d",
+          $comment: "c",
+          default: "a",
+          examples: ["a"],
+          minLength: 1,
+          pattern: "x",
+          enum: ["a"],
+        },
+        1,
+      ),
     );
     const next = changeNodeType(node, "integer");
     expect(next.constraints).toEqual({});
     expect(next.enum).toBeUndefined();
-    expect(writeSchemaNode(next)).toEqual({ type: "integer", title: "T", description: "d" });
+    expect(writeSchemaNode(next)).toEqual({ type: "integer", title: "T", description: "d", $comment: "c" });
   });
 
   it("integer → number keeps minimum/maximum and a still-valid enum", () => {
@@ -199,8 +281,19 @@ describe("building and editing", () => {
     });
   });
 
-  it("newSchemaField is a blank, optional text field", () => {
-    expect(newSchemaField()).toEqual({ name: "", required: false, node: newSchemaNode("string") });
+  it("newSchemaField is a blank, optional text field with its own uid", () => {
+    const a = newSchemaField();
+    expect(a).toEqual({ uid: expect.any(String), name: "", required: false, node: newSchemaNode("string") });
+    expect(newSchemaField().uid).not.toBe(a.uid);
+  });
+
+  it("writing a __proto__ field defines an own property and leaves the prototype alone", () => {
+    const raw = JSON.parse('{"type":"object","properties":{"__proto__":{"type":"string"}}}') as unknown;
+    const root = editable(parseSchemaRoot(raw));
+    expect(root.fields?.[0].nameLocked).toBe(true);
+    const out = writeSchemaNode(root) as { properties: Record<string, unknown> };
+    expect(Object.keys(out.properties)).toEqual(["__proto__"]);
+    expect(Object.getPrototypeOf(out.properties)).toBe(Object.prototype);
   });
 });
 
@@ -213,6 +306,23 @@ describe("field names", () => {
   it("never flags a readonly field", () => {
     const fields = [field("9odd", { kind: "readonly", raw: {} })];
     expect(fieldIssue(fields, 0)).toBeNull();
+  });
+
+  it("__proto__ is not a name the user may type", () => {
+    expect(isValidFieldName("__proto__")).toBe(false);
+    expect(fieldIssue([field("__proto__")], 0)).toBe("invalid");
+  });
+
+  it("renaming onto a readonly sibling flags the renamed field, wherever the readonly one sits", () => {
+    const fields = [{ ...original("a"), name: "b" }, original("b", { kind: "readonly", raw: { oneOf: [] } })];
+    expect(fieldIssue(fields, 0)).toBe("duplicate");
+    expect(fieldIssue(fields, 1)).toBeNull();
+  });
+
+  it("renaming onto a later untouched sibling flags the renamed one, not the untouched one", () => {
+    const fields = [{ ...original("a"), name: "b" }, original("b", newSchemaNode("object"))];
+    expect(fieldIssue(fields, 0)).toBe("duplicate");
+    expect(fieldIssue(fields, 1)).toBeNull();
   });
 
   it("pruneInvalidFields drops bad names at every depth", () => {

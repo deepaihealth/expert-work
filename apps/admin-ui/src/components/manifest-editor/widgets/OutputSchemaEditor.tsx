@@ -41,6 +41,7 @@ import {
   newSchemaNode,
   pruneInvalidFields,
   updateFieldsAt,
+  type SchemaField,
   type SchemaNode,
 } from "../output_schema_tree";
 import {
@@ -63,15 +64,9 @@ interface OutputSchemaEditorProps {
   onChange: (data: unknown) => void;
 }
 
-export function OutputSchemaEditor({ formData, onChange }: OutputSchemaEditorProps) {
-  const { t } = useTranslation();
-  const { modal } = App.useApp();
-
-  const external = readOutputSchemaTree(formData);
-  const on = external !== undefined;
-  const rootReadonly = external?.kind === "readonly";
-
-  const [tree, setTree] = useState<SchemaNode | undefined>(external);
+// Local tree + collapse state, and the commit / resync logic (module doc).
+function useOutputSchemaTree({ formData, onChange }: OutputSchemaEditorProps) {
+  const [tree, setTree] = useState<SchemaNode | undefined>(() => readOutputSchemaTree(formData));
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
   const lastWrittenRef = useRef<string | undefined>(snapshot(formData));
 
@@ -89,44 +84,66 @@ export function OutputSchemaEditor({ formData, onChange }: OutputSchemaEditorPro
     onChange(written);
   };
 
-  const toggleCollapsed = (key: string): void =>
+  const toggleCollapsed = (rowKey: string): void =>
     setCollapsed((prev) => {
       const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
+      if (next.has(rowKey)) next.delete(rowKey);
+      else next.add(rowKey);
       return next;
     });
 
+  return { tree, commit, collapsed, toggleCollapsed };
+}
+
+function TreeTable({ ctx, fields }: { ctx: TreeContext; fields: SchemaField[] }) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
+        <span style={{ ...HEAD, width: 20 + COL_NAME }}>{t("agent_form.output_schema.col_name")}</span>
+        <span style={{ ...HEAD, width: COL_TYPE }}>{t("agent_form.output_schema.col_type")}</span>
+        <span style={{ ...HEAD, width: COL_REQUIRED, textAlign: "center" }}>
+          {t("agent_form.output_schema.col_required")}
+        </span>
+        <span style={{ ...HEAD, flex: 1 }}>{t("agent_form.output_schema.col_desc")}</span>
+      </div>
+      <FieldRows parentPath={[]} fields={fields} ctx={ctx} />
+      <Button
+        type="dashed"
+        size="small"
+        data-testid="af-output-schema-add"
+        onClick={() => ctx.commit(updateFieldsAt(ctx.root, [], (fs) => [...fs, newSchemaField()]))}
+      >
+        {t("agent_form.output_schema.add_field")}
+      </Button>
+    </>
+  );
+}
+
+export function OutputSchemaEditor({ formData, onChange }: OutputSchemaEditorProps) {
+  const { t } = useTranslation();
+  const { modal } = App.useApp();
+  const { tree, commit, collapsed, toggleCollapsed } = useOutputSchemaTree({ formData, onChange });
+
+  const external = readOutputSchemaTree(formData);
+  const on = external !== undefined;
   const root = tree?.kind === "editable" ? tree : undefined;
   const fields = root?.fields ?? [];
 
   const handleToggle = (checked: boolean): void => {
-    if (checked) {
-      commit(newSchemaNode("object"));
-      return;
-    }
-    if (fields.length === 0) {
-      onChange(setOutputSchemaTree(formData, null));
-      return;
-    }
-    modal.confirm({
-      title: t("agent_form.output_schema.off_confirm"),
-      onOk: () => onChange(setOutputSchemaTree(formData, null)),
-    });
+    if (checked) return commit(newSchemaNode("object"));
+    const off = (): void => onChange(setOutputSchemaTree(formData, null));
+    if (fields.length === 0) return off();
+    modal.confirm({ title: t("agent_form.output_schema.off_confirm"), onOk: off });
   };
 
-  const ctx: TreeContext | undefined = root && {
-    root,
-    strict: readOutputSchemaStrict(formData),
-    commit,
-    collapsed,
-    toggleCollapsed,
-  };
+  const strict = readOutputSchemaStrict(formData);
+  const ctx: TreeContext | undefined = root && { root, strict, commit, collapsed, toggleCollapsed };
 
   return (
     <section data-testid="af-output-schema" style={SECTION}>
       <h3 style={{ fontSize: 15, margin: "0 0 12px" }}>{t("agent_form.section_output_schema")}</h3>
-      {rootReadonly ? (
+      {external?.kind === "readonly" ? (
         <Alert
           type="info"
           showIcon
@@ -145,27 +162,7 @@ export function OutputSchemaEditor({ formData, onChange }: OutputSchemaEditorPro
             <Text>{t("agent_form.output_schema.on_label")}</Text>
           </div>
           {!on && <Text type="secondary">{t("agent_form.output_schema.hint_off")}</Text>}
-          {on && ctx && (
-            <>
-              <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
-                <span style={{ ...HEAD, width: 20 + COL_NAME }}>{t("agent_form.output_schema.col_name")}</span>
-                <span style={{ ...HEAD, width: COL_TYPE }}>{t("agent_form.output_schema.col_type")}</span>
-                <span style={{ ...HEAD, width: COL_REQUIRED, textAlign: "center" }}>
-                  {t("agent_form.output_schema.col_required")}
-                </span>
-                <span style={{ ...HEAD, flex: 1 }}>{t("agent_form.output_schema.col_desc")}</span>
-              </div>
-              <FieldRows parentPath={[]} fields={fields} ctx={ctx} />
-              <Button
-                type="dashed"
-                size="small"
-                data-testid="af-output-schema-add"
-                onClick={() => commit(updateFieldsAt(ctx.root, [], (fs) => [...fs, newSchemaField()]))}
-              >
-                {t("agent_form.output_schema.add_field")}
-              </Button>
-            </>
-          )}
+          {on && ctx && <TreeTable ctx={ctx} fields={fields} />}
         </>
       )}
     </section>

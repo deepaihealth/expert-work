@@ -1,7 +1,10 @@
 /**
  * OutputSchemaEditor — B-315 field-tree behaviour: add a sub-field, the
  * fixed "each item" row of a list, the Limits popover, type change clearing
- * limits that no longer apply, delete, a readonly node (no controls, raw
+ * limits that no longer apply, delete, a readonly node (only "required" and
+ * remove; raw kept on sibling edits), renames that collide with untouched
+ * siblings, collapse state following its field, external re-read, limit
+ * hints,
  * kept on sibling edits), nested name checks and the strict-mode reminder.
  * Controlled harness throughout so the echo/resync path is exercised.
  */
@@ -205,15 +208,20 @@ describe("OutputSchemaEditor field tree", () => {
       required: ["reason"],
     };
 
-    it("greyed with the YAML note and no editable control", () => {
-      renderControlled(withSchema(schema));
+    it("greyed with the YAML note; only 'required' (a parent setting) is editable", async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      renderControlled(withSchema(schema), onChange);
       const row = screen.getByTestId("af-output-schema-row-0");
       expect(within(row).getByText(i18n.t("agent_form.output_schema.readonly_node"))).toBeInTheDocument();
       expect(within(row).queryByRole("textbox")).not.toBeInTheDocument();
       expect(within(row).queryByRole("combobox")).not.toBeInTheDocument();
-      expect(within(row).queryByRole("checkbox")).not.toBeInTheDocument();
+      expect(within(row).getAllByRole("checkbox")).toHaveLength(1);
       expect(screen.queryByTestId("af-output-schema-limits-0")).not.toBeInTheDocument();
       expect(screen.getByTestId("af-output-schema-name-1")).toBeEnabled();
+
+      await user.click(screen.getByTestId("af-output-schema-required-0"));
+      expect(lastSchema(onChange)).toEqual({ ...schema, required: [] });
     });
 
     it("editing a sibling keeps the readonly node's original text", async () => {
@@ -225,6 +233,119 @@ describe("OutputSchemaEditor field tree", () => {
         ...schema,
         properties: { reason: choice, note: { type: "string", description: "x" } },
       });
+    });
+  });
+
+  it("renaming onto a readonly sibling flags the renamed row and leaves the original untouched", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const choice = { oneOf: [{ type: "string" }, { type: "integer" }] };
+    renderControlled(
+      withSchema({
+        type: "object",
+        properties: { a: { type: "string", description: "keep me" }, b: choice },
+        required: ["a"],
+      }),
+      onChange,
+    );
+    const name = screen.getByTestId("af-output-schema-name-0");
+    await user.clear(name);
+    await user.type(name, "b");
+    expect(name).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByText(i18n.t("agent_form.output_schema.name_duplicate"))).toBeInTheDocument();
+    // "a" is out of the write while its name collides; "b" is exactly the original.
+    expect(lastSchema(onChange)).toEqual({ type: "object", properties: { b: choice }, required: [] });
+  });
+
+  it("renaming onto a later untouched sibling flags the renamed row, the sibling keeps its subtree", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const b = { type: "object", properties: { x: { type: "integer" } }, required: ["x"] };
+    renderControlled(withSchema({ type: "object", properties: { a: { type: "string" }, b } }), onChange);
+    const name = screen.getByTestId("af-output-schema-name-0");
+    await user.clear(name);
+    await user.type(name, "b");
+    expect(name).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByTestId("af-output-schema-name-1")).toHaveAttribute("aria-invalid", "false");
+    expect(lastSchema(onChange)).toEqual({ type: "object", properties: { b } });
+  });
+
+  it("collapse state follows its field when an earlier field is removed", async () => {
+    const user = userEvent.setup();
+    renderControlled(
+      withSchema({
+        type: "object",
+        properties: {
+          a: { type: "array", items: { type: "string" } },
+          b: { type: "array", items: { type: "integer" } },
+        },
+      }),
+    );
+    await user.click(screen.getByTestId("af-output-schema-toggle-1"));
+    expect(screen.queryByTestId("af-output-schema-row-1.items")).not.toBeInTheDocument();
+    expect(screen.getByTestId("af-output-schema-row-0.items")).toBeInTheDocument();
+
+    await user.click(screen.getByTestId("af-output-schema-remove-0"));
+    expect(screen.getByTestId("af-output-schema-name-0")).toHaveValue("b");
+    expect(screen.queryByTestId("af-output-schema-row-0.items")).not.toBeInTheDocument();
+    expect(screen.getByTestId("af-output-schema-toggle-0")).toHaveTextContent("+");
+  });
+
+  it("re-reads the tree when json_schema really changes from outside", () => {
+    const first = withSchema({ type: "object", properties: { old: { type: "string" } } });
+    const second = withSchema({ type: "object", properties: { fresh: { type: "integer" } } });
+    const { rerender } = render(
+      <App>
+        <OutputSchemaEditor formData={first} onChange={vi.fn()} />
+      </App>,
+    );
+    expect(screen.getByTestId("af-output-schema-name-0")).toHaveValue("old");
+    rerender(
+      <App>
+        <OutputSchemaEditor formData={second} onChange={vi.fn()} />
+      </App>,
+    );
+    expect(screen.getByTestId("af-output-schema-name-0")).toHaveValue("fresh");
+  });
+
+  describe("limit hints", () => {
+    it("uniqueItems: false is not counted as a limit", () => {
+      renderControlled(
+        withSchema({
+          type: "object",
+          properties: { tags: { type: "array", uniqueItems: false, maxItems: 2, items: { type: "string" } } },
+        }),
+      );
+      expect(screen.getByTestId("af-output-schema-limits-0")).toHaveTextContent(/\(1\)$/);
+    });
+
+    it("warns, in the row and the panel, when a minimum is above its maximum", async () => {
+      const user = userEvent.setup();
+      renderControlled(
+        withSchema({
+          type: "object",
+          properties: { bad: { type: "string", minLength: 5, maxLength: 2 }, ok: { type: "string", minLength: 1, maxLength: 2 } },
+        }),
+      );
+      expect(screen.getByTestId("af-output-schema-row-range-warn-0")).toBeInTheDocument();
+      expect(screen.queryByTestId("af-output-schema-row-range-warn-1")).not.toBeInTheDocument();
+      await user.click(screen.getByTestId("af-output-schema-limits-0"));
+      expect(await screen.findByTestId("af-output-schema-range-warn-0")).toBeInTheDocument();
+    });
+
+    it("says which allowed values were dropped for an integer field", async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      renderControlled(withSchema({ type: "object", properties: { n: { type: "integer" } } }), onChange);
+      await user.click(screen.getByTestId("af-output-schema-limits-0"));
+      const box = within(await screen.findByTestId("af-output-schema-enum-0")).getByRole("combobox");
+      await user.type(box, "1,x,");
+      expect(screen.getByTestId("af-output-schema-enum-rejected-0")).toHaveTextContent(/: x$/);
+      await user.type(box, "2.5,");
+      expect(screen.getByTestId("af-output-schema-enum-rejected-0")).toHaveTextContent(/: 2\.5$/);
+      expect(lastSchema(onChange)).toEqual({ type: "object", properties: { n: { type: "integer", enum: [1] } } });
+      await user.type(box, "3,");
+      expect(screen.queryByTestId("af-output-schema-enum-rejected-0")).not.toBeInTheDocument();
     });
   });
 

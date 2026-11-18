@@ -3,14 +3,17 @@
  * B-315 field tree (nested cases: OutputSchemaEditor.tree.test.tsx). Contract
  * under test (top-level rows keep the old test ids, path "0", "1" …):
  *  - off by default, on writes the empty-object default schema.
- *  - editing rows emits the exact ``setOutputSchemaRows``-shaped manifest.
+ *  - editing rows emits the exact ``setOutputSchemaTree``-shaped manifest.
  *  - PER-ROW commit, no whole-table gate (review-fixed Important): a row
  *    whose name is currently invalid is excluded from the write and shown
  *    with an error state, but every OTHER row's own edit still lands in the
  *    manifest immediately — one bad/blank row never blocks unrelated edits.
- *  - a resync from a genuinely new ``formData`` (not our own echo) preserves
- *    any local WIP (invalid-name) row untouched — including already-typed
- *    text in its other fields — rather than clobbering it.
+ *  - a new ``formData`` whose ``json_schema`` equals what the widget last
+ *    wrote (our own echo, or a sibling field's edit) is ignored, so a local
+ *    WIP (invalid-name) row and its typed text survive. A ``json_schema``
+ *    that really changed from outside is re-read from scratch and replaces
+ *    the local tree, WIP rows included (only the YAML view can do that, and
+ *    switching to it unmounts this widget anyway).
  *  - a name that duplicates an EARLIER row's is locally invalid too
  *    (review-fixed Important #2, transient-collision data loss): the later
  *    row is excluded from the write (duplicate-specific error message), so

@@ -1828,7 +1828,7 @@ const zhCN: TranslationKeys = {
       limits: "限制",
       limit_minLength: "最少几个字",
       limit_maxLength: "最多几个字",
-      limit_pattern: "格式（正则）",
+      limit_pattern: "格式（正则表达式，可不填）",
       limit_minimum: "最小值",
       limit_maximum: "最大值",
       limit_minItems: "最少几项",
@@ -1837,6 +1837,9 @@ const zhCN: TranslationKeys = {
       enum_label: "只能填这几个值",
       enum_placeholder: "输入一个值后按回车或逗号",
       strict_optional_warn: "严格模式下最好设为必填",
+      limit_range_warn: "最小值比最大值还大，模型怎么回都满足不了",
+      enum_rejected_number: "这些不是数字，没加进去：{{values}}",
+      enum_rejected_integer: "这些不是整数，没加进去：{{values}}",
       strict_optional_tip:
         "严格模式下，有些模型厂商要求每个字段都必填。这个字段没勾必填，模型可能不接受这份模板。不影响保存。",
     },

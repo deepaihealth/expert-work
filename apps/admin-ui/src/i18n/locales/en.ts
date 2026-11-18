@@ -1731,6 +1731,9 @@ export interface TranslationKeys {
       enum_label: string;
       enum_placeholder: string;
       strict_optional_warn: string;
+      limit_range_warn: string;
+      enum_rejected_number: string;
+      enum_rejected_integer: string;
       strict_optional_tip: string;
     };
     inject_date_label: string;
@@ -5778,7 +5781,10 @@ const en: TranslationKeys = {
       limit_uniqueItems: "No duplicates",
       enum_label: "Allowed values",
       enum_placeholder: "Type a value, then Enter or comma",
-      strict_optional_warn: "Strict mode: better make it required",
+      strict_optional_warn: "Strict mode: consider making this required",
+      limit_range_warn: "The minimum is larger than the maximum - no reply can meet both.",
+      enum_rejected_number: "Not a number, not added: {{values}}",
+      enum_rejected_integer: "Not a whole number, not added: {{values}}",
       strict_optional_tip:
         "In strict mode some model providers require every field to be required. This one isn't, so the model may reject the template. Saving still works.",
     },
