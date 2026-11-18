@@ -657,9 +657,10 @@ describe("ManifestTab", () => {
 
 // B-319 — the hand-written records above spell the root key ``apiVersion``;
 // the real API once sent ``api_version`` and every agent's YAML → form switch
-// failed with no edit at all. This fixture is a real GET response, kept in
-// step with the backend by test_agent_manifest_wire_shape.py, validated
-// against the schema's real root contract (required + no extra keys).
+// failed with no edit at all. This fixture is a hand-maintained snapshot of a
+// GET response; test_agent_manifest_wire_shape.py checks its record keys and
+// spec root keys against the live backend (not the nested body), and it
+// carries the schema's real root contract (required + no extra keys).
 describe("ManifestTab — YAML ↔ form on the record the API really returns (B-319)", () => {
   const realDetail = typedFixture<AgentDetailResponse>(MANIFEST_CONTRACT.detail);
   const withoutDraft: AgentDetailResponse = {
