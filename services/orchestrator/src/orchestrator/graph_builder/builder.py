@@ -66,6 +66,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -165,6 +166,12 @@ from orchestrator.graph_builder.figure_block import (
     figure_freshness,
     with_figure_block,
 )
+from orchestrator.graph_builder.input_literal_guard import (
+    PATH_ARGS,
+    LiteralHit,
+    find_literal,
+    literal_guard_message,
+)
 from orchestrator.graph_builder.input_url_guard import (
     GuardHit,
     UrlCandidate,
@@ -228,7 +235,7 @@ from orchestrator.tools._guards import (
     usage_total,
 )
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
-from orchestrator.tools.arg_bindings import apply_arg_bindings
+from orchestrator.tools.arg_bindings import ToolArgBindings, apply_arg_bindings
 from orchestrator.tools.artifact import (
     ARTIFACT_RECORDER_KEY,
     SAVE_ARTIFACT_TOOL_NAME,
@@ -255,6 +262,7 @@ from orchestrator.tools.figure_lookup import figure_run_ids
 from orchestrator.tools.figure_reads import stamp_step
 from orchestrator.tools.file_ops import EditFileMismatchError
 from orchestrator.tools.find_tools import promotion_events
+from orchestrator.tools.inputs_candidates import candidates_note, input_candidates
 from orchestrator.tools.knowledge_probe import (
     KnowledgeProbe,
     ProbeOutcome,
@@ -291,7 +299,11 @@ from orchestrator.tools.registry import (
 )
 from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
-from orchestrator.tools.workspace_paths import WorkspaceView, conversation_work_prefix
+from orchestrator.tools.workspace_paths import (
+    WorkspaceView,
+    conversation_work_prefix,
+    resolve_workspace_path,
+)
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.tools.workspace_tree import workspace_prompt_block
 from orchestrator.usage_metering import without_served_by
@@ -375,6 +387,13 @@ _tool_call_total = expert_work_counter(
 #: B-272 — calls rescued by restoring a JSON-stringified top-level array /
 #: object argument (``"region": "[0,0,100,100]"``) after schema validation
 #: failed. Same ``tool`` label normalisation as ``_tool_call_total``.
+#: B-317 —— 审批通过之后,被批准的那条调用又被字面量守卫拦下的次数。守卫放在审批门之后(与
+#: 手抄 URL 守卫同一口径),这个数看人被白问了多少次,再决定要不要挪到审批门之前。
+_literal_guard_blocked_after_approval_total = expert_work_counter(
+    "expert_work_tools_literal_guard_blocked_after_approval_total",
+    "Approved tool calls the literal guard then blocked (B-317).",
+    ("tool",),
+)
 _tool_args_coerced_total = expert_work_counter(
     "expert_work_tool_args_coerced_total",
     "Tool calls dispatched after restoring a JSON-stringified array/object argument (B-272).",
@@ -564,6 +583,8 @@ def build_react_graph(
     # B-67 §七 —— 本 agent 声明为 ``trusted`` 的变量名。手抄守卫的提示只对这些变量写出
     # 链接名与模型抄的那串(那条合成消息不过 spotlight 围栏);默认空 = 一律不写。
     trusted_input_names: frozenset[str] = frozenset(),
+    # B-317 —— 本 agent 声明的全部变量名(字面量守卫认 ``$名字`` 用);默认空。
+    declared_input_names: frozenset[str] = frozenset(),
     escalated_llm_caller: LLMCaller | None = None,
     before_llm_chain: MiddlewareChain | None = None,
     after_llm_chain: MiddlewareChain | None = None,
@@ -1972,6 +1993,8 @@ def build_react_graph(
         # B-226 ⑤ — the approved ``risk_confirmation`` ``ask_for_approval`` among
         # ``answered`` (B-79): the only answer that settles a refused one.
         approved_questions: frozenset[int] = frozenset()
+        # B-317 —— 审批续跑时被人批准、这一步要派发的调用(只给「批准后被拦」计数用)。
+        approved_calls: frozenset[int] = frozenset()
         if approval_resume is not None:
             # Stream CM-8 (Mini-ADR CM-I4) — the resume re-entry skips the
             # entry chain (``aupdate_state(as_node="agent")`` lands the
@@ -2035,6 +2058,7 @@ def build_react_graph(
             approved_questions = frozenset(
                 index for index in resume_outcome.answered if asks_to_act(tool_calls[index])
             )
+            approved_calls = frozenset(range(len(resume_outcome.tool_calls))) - frozenset(answered)
             #
             # B-61 §5.3 —— 再套一遍绑定。``modify`` 拿人工给的 ``modified_args``
             # **整份替换**那条 call 的 args,于是(a)被绑参数会被人在审批面上静默
@@ -2147,6 +2171,26 @@ def build_react_graph(
             edit_file_history=state.get("edit_file_history"),
             figure_view_steps=figure_view_steps,
         )
+        # B-317 —— 字面量守卫:MCP / http 参数与平台工具的路径参数里不会被展开的 ``$名字``、
+        # ``$EXPERT_WORK_*``,以及交给外部服务的本轮本地路径。与手抄守卫同一口径(审批门之后、
+        # 只影响派发);在建好 ``ctx_obj`` 之后算,本轮输入目录的 run 与工具解析路径用同一个值。
+        literal_hits = _guard_literal_calls(
+            tool_calls,
+            config,
+            registry_bindings,
+            declared_names=declared_input_names,
+            inputs_run=ctx_obj.workspace_view.inputs_run,
+        )
+        for index in sorted(literal_hits.keys() & approved_calls):
+            hit_name = str(tool_calls[index].get("name", ""))
+            _literal_guard_blocked_after_approval_total.labels(
+                tool=_metric_tool_label(hit_name)
+            ).inc()
+            logger.warning(
+                "tools.literal_guard_blocked_after_approval tool=%s kind=%s",
+                hit_name,
+                literal_hits[index].kind,
+            )
         # Stream TE-2 — per-tool-call audit sink (may be None on the dev /
         # unit-test path; ``_dispatch_tool`` treats the emit as best-effort).
         audit_logger = audit_logger_from_config(config)
@@ -2200,6 +2244,7 @@ def build_react_graph(
                     spotlight_nonce=spotlight_nonce,
                     budget_enabled=tool_output_budget_enabled,
                     bound_args=bound_args,
+                    inputs_store=workspace_store,
                 )
             )
 
@@ -2220,6 +2265,9 @@ def build_react_graph(
                 return await _reject_retyped_url(
                     tc, hit, ctx_obj, audit_logger, trusted_input_names=guard_trusted_names
                 )
+            literal = literal_hits.get(index)
+            if literal is not None:
+                return await _reject_literal(tc, literal, ctx_obj, audit_logger)
             async with semaphore:
                 return await _run_call(tc, bound_args)
 
@@ -2304,9 +2352,12 @@ def build_react_graph(
                 if idx in approved_questions:
                     batch_outcomes.append((_ledger_key(tool_calls[idx], tool_message, None), None))
                 continue
-            file_events.append(_file_tool_event(tool_calls[idx], tool_message))
+            # B-317 —— 守卫拦下、没执行的调用不进 B-302 的文件账(与下面 ``ran_calls`` 同一个条件)。
+            if not (idx in guard_hits or idx in literal_hits):
+                file_events.append(_file_tool_event(tool_calls[idx], tool_message))
             if not (
                 idx in guard_hits
+                or idx in literal_hits
                 or _is_refused_repeat(tool_message)
                 or (classified is not None and classified.error_class == "blocked_by_policy")
             ):
@@ -3987,6 +4038,7 @@ async def _dispatch_tool(
     spotlight_nonce: str | None = None,
     budget_enabled: bool = True,
     bound_args: Sequence[str] = (),
+    inputs_store: WorkspaceStore | None = None,
 ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
     """Dispatch one tool call.
 
@@ -4042,6 +4094,7 @@ async def _dispatch_tool(
                 overflow_writer=overflow_writer,
                 spotlight_nonce=spotlight_nonce,
                 budget_enabled=budget_enabled,
+                inputs_store=inputs_store,
             )
             _record_tool_io(span, args, outcome[0].content)
             if outcome[0].status == "error":
@@ -4279,6 +4332,157 @@ def _guard_sandbox_calls(
         logger.warning("tools.input_url_guard_skipped err=%s", type(exc).__name__)
         return {}
     return hits
+
+
+#: B-317 复审 L5 —— 「之后的轮次」那句在围栏外,只回显链接名形状的路径:链接名只由变量名、
+#: slug(``[\w-]``)、``.`` / ``/`` 与扩展名组成(``inputs_doc.link_names``),整段有长度上界。
+#: 模型写的带空白、标点的长文本不在围栏外原样回显。
+#: **240 的取舍(第四轮 LOW-7,已知不改):** 真实路径 = ``inputs/<36 位 run>/`` 加链接名,链接名
+#: 里 slug 每段最多 40 字,但变量名与嵌套键的段数没有上限;超过 240 字的那几条就不补这句。不补
+#: 只是少一句提示:文件照样能用,之后的轮次写错了还有报错后面列出的候选(``inputs_candidates``)。
+_LINK_SHAPED_PATH_RE = re.compile(r"[\w./-]{1,240}")
+
+
+def _path_arg(name: str, args: Mapping[str, Any]) -> str | None:
+    """这次调用的工作区路径参数(守卫那张表里的第一个字符串值)。``ask_image.image_ref`` 填的是
+    上传图的 ``expert_work://`` 引用时不算路径(复审 L6)。"""
+    for key in PATH_ARGS.get(name, ()):
+        raw = args.get(key)
+        if isinstance(raw, str) and not raw.strip().startswith("expert_work://"):
+            return raw
+    return None
+
+
+def _with_later_turns_path(
+    result: ToolResult, name: str, args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """B-317 —— 路径参数用的是短路径(或别名)时,在平台 notice(围栏外)里补一句真实路径。
+
+    只看守卫那张「工具名 → 路径参数」表里的工具;解析不了、写法本来就是真实路径、调用失败、
+    路径不是链接名形状(复审 L5),都原样返回。真实路径是平台目录名加 run id 加链接名。
+    """
+    raw = _path_arg(name, args)
+    if raw is None or result.failed:
+        return result
+    try:
+        target = resolve_workspace_path(raw, view=ctx.workspace_view, tool=name)
+    except ValueError:
+        return result
+    if target.display == target.path or not _LINK_SHAPED_PATH_RE.fullmatch(target.path):
+        return result
+    note = f"（之后的轮次请用 {target.path}）"  # noqa: RUF001
+    return replace(result, notice=f"{result.notice}\n{note}" if result.notice else note)
+
+
+#: B-317 第四轮 LOW-1 —— 列候选的总时限(秒)。这是一次已经失败的调用后面的一句提示,NAS 慢的
+#: 时候宁可不列,也不能把报错拖住。
+_CANDIDATES_TIMEOUT_S = 2.0
+
+
+async def _inputs_candidates_hint(
+    store: WorkspaceStore | None, name: str, args: Mapping[str, Any], ctx: ToolContext
+) -> str:
+    """B-317 复审 L1 —— 失败的调用写的是某一轮输入目录下的文件、而它不在:接一句别的轮次里同名
+    的文件(宿主侧列出,模型不必手抄长 run id)。没有候选、没接存储、超时、出任何意外都是空串。"""
+    raw = _path_arg(name, args)
+    if store is None or raw is None:
+        return ""
+    try:
+        found = await asyncio.wait_for(input_candidates(store, ctx, raw), _CANDIDATES_TIMEOUT_S)
+        note = candidates_note(found)
+    except Exception as exc:
+        logger.warning("tools.inputs_candidates_skipped err=%s", type(exc).__name__)
+        return ""
+    return f"\n{note}" if note else ""
+
+
+def _guard_literal_calls(
+    calls: Sequence[Mapping[str, Any]],
+    config: RunnableConfig,
+    bindings: Mapping[str, ToolArgBindings],
+    *,
+    declared_names: frozenset[str],
+    inputs_run: UUID | None,
+) -> dict[int, LiteralHit]:
+    """B-317 —— 对本批调用做一次字面量检查,返回 ``{下标: 命中}``(设计 §3.3)。
+
+    变量名 = 本图声明的,并上本次 ``prompt_inputs`` 的键(子代的图不一定带父的声明,但
+    ``prompt_inputs`` 是从父带下来的)。平台绑定的参数(含固定值)不查:那里是平台填的值。
+    永不让 run 失败:出任何意外放行整批,只记异常类型。
+    """
+    configurable = config.get("configurable") or {}
+    raw_inputs = configurable.get(PROMPT_INPUTS_KEY)
+    names = set(declared_names)
+    if isinstance(raw_inputs, Mapping):
+        names.update(str(key) for key in raw_inputs)
+    run = str(inputs_run) if inputs_run is not None else None
+    hits: dict[int, LiteralHit] = {}
+    try:
+        for index, call in enumerate(calls):
+            tool = str(call.get("name", ""))
+            args = call.get("args") or {}
+            if not isinstance(args, Mapping):
+                continue
+            bound = bindings.get(tool)
+            skip = {*bound.args, *bound.fixed} if bound else set()
+            by_var = {var: param for param, var in bound.args.items()} if bound else {}
+            hit = find_literal(
+                tool, args, names=names, skip_args=skip, bound_params=by_var, inputs_run=run
+            )
+            if hit is not None:
+                hits[index] = hit
+    except Exception as exc:
+        logger.warning("tools.literal_guard_skipped err=%s", type(exc).__name__)
+        return {}
+    return hits
+
+
+async def _reject_literal(
+    tool_call: Mapping[str, Any],
+    hit: LiteralHit,
+    ctx: ToolContext,
+    audit_logger: AuditLogger | None,
+) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
+    """B-317 —— 字面量守卫命中:不派发,合成错误 ToolMessage(形状同手抄 URL 守卫)。
+
+    审计记的是模型传进来的原始参数(与其它 ``tool:blocked`` 行同一口径),details 只加名字:
+    变量名 / 环境变量名与参数名,不加任何值。提示里也只有名字 —— 配置与 schema 里的,不是
+    租户数据,不必围栏。
+    """
+    name = str(tool_call.get("name", ""))
+    call_id = str(tool_call.get("id", ""))
+    reason = "input_local_path_to_remote" if hit.kind == "local_path" else "input_variable_literal"
+    logger.warning(
+        "tools.input_literal_blocked tool=%s reason=%s kind=%s arg=%s",
+        name,
+        reason,
+        hit.kind,
+        hit.arg,
+    )
+    _tool_call_total.labels(tool=_metric_tool_label(name), outcome="blocked").inc()
+    await _emit_tool_audit(
+        audit_logger,
+        ctx,
+        name=name,
+        call_id=call_id,
+        args=tool_call.get("args") or {},
+        path_args=(),
+        from_skill=None,
+        action=AuditAction.TOOL_BLOCKED,
+        result=AuditResult.DENIED,
+        reason=reason,
+        duration_ms=0,
+        extra_details={"input_variable": hit.name, "argument": hit.arg},
+    )
+    message = ToolMessage(
+        content=literal_guard_message(hit),
+        tool_call_id=call_id,
+        status="error",
+        name=name,
+        additional_kwargs={"duration_ms": 0},
+    )
+    classified = classified_invalid_arguments(tool_name=name, summary=reason)
+    return message, {}, 0, classified
 
 
 async def _reject_retyped_url(
@@ -4884,6 +5088,7 @@ async def _invoke_tool(
     overflow_writer: WorkspaceFileWriter | None = None,
     spotlight_nonce: str | None = None,
     budget_enabled: bool = True,
+    inputs_store: WorkspaceStore | None = None,
 ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
     # B2 — 让工具知道自己服务的 tool_call id(worker 帧挂前端工具卡用)。
     ctx = replace(ctx, tool_call_id=call_id)
@@ -4925,9 +5130,10 @@ async def _invoke_tool(
         # B-302 PR 3 —— the kind of an ``edit_file`` mismatch rides the (model-invisible)
         # artifact, for the tools node's per-file consecutive-failure count.
         kind = exc.kind if isinstance(exc, EditFileMismatchError) else None
+        hint = await _inputs_candidates_hint(inputs_store, tool.spec.name, args, ctx)
         return (
             ToolMessage(
-                content=_format_error(exc),
+                content=_format_error(exc) + hint,
                 tool_call_id=call_id,
                 status="error",
                 name=tool.spec.name,
@@ -4937,6 +5143,9 @@ async def _invoke_tool(
             0,
             classified,
         )
+    # B-317 —— 这一次用短路径(``inputs/current/…``)读的文件,回执末尾说一次真实路径:
+    # 下一轮 ``inputs/current/`` 指向别的一轮(或本轮没有输入),模型要接着用就得有它。
+    result = _with_later_turns_path(result, tool.spec.name, args, ctx)
     # Stream CM-5 — recoverable compression: save an oversized result to the
     # workspace and let the LLM see a recoverable reference (the tool's own
     # truncated body, or a head+tail preview for tools that didn't pre-truncate)

@@ -12,7 +12,8 @@ substitution (shared nonce with the model-side tool/RAG channels);
 ``trusted=True`` (the owner-set default, §4) renders verbatim.
 
 B-67 §五 —— 本轮传了的变量,值先过 :func:`render_value`,**按值的形态**决定放什么进
-模板:``render: raw`` → 原值;URL → 本地链接路径;列表 / 对象 / 可解析的 JSON 字符串里有
+模板:``render: raw`` → 原值;URL → 本地链接路径(B-317:短路径
+``inputs/current/<链接名>``,所有工具都认);列表 / 对象 / 可解析的 JSON 字符串里有
 URL → 逐项「说明 → 路径」(trusted 的真 list / dict 保留结构,URL 换成路径);其它 → 原值
 (今天行为)。被绑定的变量同样按形态渲染 —— 绑定是逐工具的,漏绑的工具还要从提示词里
 拿值;绑定状态由「本轮输入」段报告。没传的变量取今天的值,不走形态渲染。渲染早于预拉,
@@ -31,16 +32,19 @@ from jinja2 import TemplateError
 
 from control_plane.manifest.loader import build_sandboxed_environment
 from expert_work.common.spotlight import spotlight_untrusted
-from orchestrator.tools.inputs_doc import LinkedSite, linked_sites, parse_json_value
+from orchestrator.tools.inputs_doc import (
+    LinkedSite,
+    current_input_path,
+    linked_sites,
+    parse_json_value,
+)
 
 logger = logging.getLogger(__name__)
 
-#: 沙箱里两个环境变量的名字(``sandbox.agent_key_envs`` 注入);提示词里写成 ``$NAME``,
-#: 模型在 exec_python / bash 里直接用,不用手抄任何路径。
-INPUTS_ENV = "EXPERT_WORK_INPUTS"
-INPUTS_DIR_ENV = "EXPERT_WORK_INPUTS_DIR"
-#: URL / 逐项渲染的尾注:不断言「已下载」(渲染早于预拉),只说名字与回落办法。
-URL_NOTE = "（已就位；不在则按输入清单里的原地址下载）"  # noqa: RUF001
+#: URL / 逐项渲染的尾注:不断言「已下载」(渲染早于预拉)。B-317 —— 只说事实,补救办法(按清单
+#: 原地址下载)写在代码工具描述里:这里每轮都进系统提示词,写了命令,不写代码的智能体也会被
+#: 引去跑代码。
+URL_NOTE = "（本轮输入文件；预先下载失败时不在）"  # noqa: RUF001
 #: 带路径的行以它收尾:untrusted 的 datamarking 把空白换成 ``▁``,不能直接贴在路径上。
 _PATH_END = "；"  # noqa: RUF001
 
@@ -115,7 +119,7 @@ def _render_items(var: Any, root: Any, sites: list[LinkedSite], *, nonce: str | 
     for head, item in members:
         links = by_head.get(head)
         if links:
-            paths = "、".join(f"${INPUTS_DIR_ENV}/{link}" for link in links)
+            paths = "、".join(current_input_path(link) for link in links)
             if not is_list:
                 lines.append(f"- {head} → {paths}{_PATH_END}")
             elif isinstance(item, Mapping):
@@ -178,7 +182,7 @@ def _render_url(var: Any, raw: str, link: str, *, nonce: str | None) -> str:
     trusted:路径紧跟尾注,说明文字原样接在后面;untrusted:路径与说明文字同在一个围栏里
     (以 :data:`_PATH_END` 隔开,datamarking 不会贴在路径上),尾注在围栏外。
     """
-    path = f"${INPUTS_DIR_ENV}/{link}"
+    path = current_input_path(link)
     rest = raw[len(raw.split(maxsplit=1)[0]) :]
     if var.trusted:
         return f"{path}{URL_NOTE}{rest}" if rest.strip() else f"{path}{URL_NOTE}"
@@ -214,7 +218,7 @@ def render_value(var: Any, raw: Any, *, nonce: str | None) -> tuple[Any, bool]:
         return block, True
     # trusted 的真 list / dict:模板可能 ``{{ brand.name }}`` / ``{% for m in materials %}``,
     # 给字符串会在建 run 之后渲染失败、``length`` 变成字数。结构照旧,URL 换成路径。
-    replaced = _with_paths(raw, (), {s.site.path: f"${INPUTS_DIR_ENV}/{s.link}" for s in sites})
+    replaced = _with_paths(raw, (), {s.site.path: current_input_path(s.link) for s in sites})
     if isinstance(raw, list):
         return _ReferencedList(replaced, block), True
     return _ReferencedDict(replaced, block), True

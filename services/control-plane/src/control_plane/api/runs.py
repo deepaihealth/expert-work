@@ -63,7 +63,12 @@ from control_plane.approval_void import (
     void_if_superseded,
 )
 from control_plane.audit import emit
-from control_plane.inputs_block import block_stats, build_inputs_block, inputs_block_message
+from control_plane.inputs_block import (
+    block_stats,
+    build_inputs_block,
+    inputs_block_message,
+    reads_files_from_catalog,
+)
 from control_plane.kill_switch import run_block_reason
 from control_plane.platform_migration import prepare_run_workspace
 from control_plane.prompt_render import (
@@ -472,6 +477,16 @@ def _file_attached_line(name: str, original: str | None) -> str:
     return f"[file attached: {name}{original_name_note(name, original)}]"
 
 
+def _reads_files(built: Any) -> bool:
+    """B-317 —— 这个智能体有没有能读文件的工具(「本轮输入」段写不写文件路径)。
+
+    工具表为空只出现在测试替身里(真实构建至少有平台常驻的 ``exec_python``),按「有」处理:
+    不知道的时候照旧写路径,不悄悄删掉信息。
+    """
+    names = [entry.name for entry in getattr(built, "tool_catalog", ()) or ()]
+    return reads_files_from_catalog(names) if names else True
+
+
 def _build_human_message(
     *,
     input_text: str | None,
@@ -597,7 +612,12 @@ def build_run_graph_input(
     # 消息同一 run 戳,取代 / 墓碑按区间照旧罩住它。
     if getattr(built, "prompt_jinja", False):
         bindings = bound_variable_names(built)
-        block = build_inputs_block(built.prompt_variables, inputs or {}, bindings=bindings)
+        block = build_inputs_block(
+            built.prompt_variables,
+            inputs or {},
+            bindings=bindings,
+            reads_files=_reads_files(built),
+        )
         if block is not None:
             hidden = inputs_block_message(block)
             if run_id is not None:

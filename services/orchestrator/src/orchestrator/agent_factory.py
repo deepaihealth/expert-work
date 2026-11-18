@@ -1380,6 +1380,8 @@ async def build_agent(
         trusted_input_names=frozenset(
             var.name for var in spec.spec.system_prompt.variables if var.trusted
         ),
+        # B-317 —— 字面量守卫认 ``$名字`` 用的全部声明变量名。
+        declared_input_names=frozenset(var.name for var in spec.spec.system_prompt.variables),
         # Stream J.8 (Mini-ADR J-24) — declarative approval gate.
         approval_required_tools=frozenset(spec.spec.policies.approval_required_tools),
         approval_timeout_s=spec.spec.policies.approval_timeout_s,

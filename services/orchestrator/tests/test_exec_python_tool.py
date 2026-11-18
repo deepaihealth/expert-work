@@ -30,8 +30,10 @@ from orchestrator.tools import (
 )
 
 
-def _ctx(*, user_id: UUID | None = None) -> ToolContext:
-    return ToolContext(tenant_id=uuid4(), run_id=uuid4(), user_id=user_id)
+def _ctx(*, user_id: UUID | None = None, agent_key: str = "demo-agent") -> ToolContext:
+    # B-317 —— 绑了 agent 才注入输入指针(``ToolContext.workspace_view.inputs_run``);用户的
+    # 每条 run 入口都带 agent_key,这里照此给一个。
+    return ToolContext(tenant_id=uuid4(), run_id=uuid4(), user_id=user_id, agent_key=agent_key)
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +89,19 @@ async def test_a_run_without_inputs_gets_no_inputs_pointer() -> None:
     )
 
     assert client.exec_run_ids == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_an_unbound_run_gets_no_inputs_pointer_even_with_inputs() -> None:
+    """B-317 —— 没绑 agent(只有合成评测路径)时 exec 视图不挂 ``inputs/current/``,宿主侧也不
+    改写;环境变量同一口径不注入,三者说同一句话。"""
+    client = RecordingSandboxRuntime()
+    ctx = replace(_ctx(agent_key=""), prompt_inputs={"org_logo": "https://x.invalid/a.png"})
+
+    await ExecPythonTool(client=client).call({"code": "print(1)"}, ctx=ctx)
+
+    assert client.exec_run_ids == [None]
+    assert ctx.workspace_view.inputs_run is None
 
 
 @pytest.mark.asyncio
@@ -199,7 +214,7 @@ async def test_exec_python_passes_skill_seed_files_to_acquire() -> None:
     seed = (("agent-1/pptx/SKILL.md", b"---\nname: pptx\n---\n"),)
     tool = ExecPythonTool(client=client, skill_seed_files=seed)
 
-    await tool.call({"code": "pass"}, ctx=_ctx())
+    await tool.call({"code": "pass"}, ctx=_ctx(agent_key=""))
 
     assert client.acquired[0][3] == seed  # 4th acquire tuple slot = seed_files
 
@@ -449,11 +464,34 @@ def test_both_sandbox_tool_descriptions_state_the_local_path_fallback() -> None:
 
 
 def test_description_tells_the_model_about_the_inputs_dir() -> None:
-    """B-67 —— 描述里提 $EXPERT_WORK_INPUTS_DIR、按变量名的文件与列表项的 local_path 位置;
+    """B-67 / B-317 —— 描述里提 inputs/current/(与 $EXPERT_WORK_INPUTS_DIR 同一目录)、按变量名的
+    文件与列表项的 local_path 位置;
     平台文本,不写任何租户的变量名。"""
     description = ExecPythonTool(client=RecordingSandboxRuntime()).spec.description
     assert "$EXPERT_WORK_INPUTS_DIR" in description
+    assert "inputs/current/" in description
     assert "<变量名>" in description
     assert "value_parsed[i].local_path" in description
     for tenant_name in ("org_logo", "materials", "ai-health-plan"):
         assert tenant_name not in description
+
+
+def test_both_code_tools_carry_the_one_shared_inputs_note() -> None:
+    """B-317 —— 两个代码工具的输入说明是同一个常量,保护(清单、别手抄、原地址回退)都在。"""
+    from orchestrator.tools.bash import BashTool
+    from orchestrator.tools.inputs_doc import INPUTS_CODE_NOTE
+
+    for tool in (
+        ExecPythonTool(client=RecordingSandboxRuntime()),
+        BashTool(client=RecordingSandboxRuntime()),
+    ):
+        assert INPUTS_CODE_NOTE in tool.spec.description
+    for phrase in (
+        "$EXPERT_WORK_INPUTS ",
+        "不要从上文手抄",
+        "inputs/current/",
+        "与 $EXPERT_WORK_INPUTS_DIR 是同一个目录",
+        "local_path",
+        "按清单里的原地址下载",
+    ):
+        assert phrase in INPUTS_CODE_NOTE, phrase

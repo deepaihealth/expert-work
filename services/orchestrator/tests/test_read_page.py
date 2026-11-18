@@ -2944,3 +2944,20 @@ async def test_a_real_conversation_view_ref_is_recognised_end_to_end(
     parsed = parse_rendered_figure_ref(ref)
     assert parsed is not None and parsed.unit == 3
     assert figure_run_ids([ref]) == {ctx.run_id}
+
+
+@pytest.mark.anyio
+async def test_read_page_shows_the_short_path_but_records_the_real_one() -> None:
+    """B-317 H1 —— 回执给模型看短路径(这一次就能再用),``figure_documents`` 记真实路径
+    (下一轮 ``inputs/current/`` 已指向别的一轮)。"""
+    ctx = replace(
+        _ctx(agent_key="report-aaaaaaaa"), prompt_inputs={"report": "https://x.invalid/r.pdf"}
+    )
+    real = f"inputs/{ctx.run_id}/report.pdf"
+    result = await ReadPageTool(
+        client=_one_rendered_page_runtime(ctx), figure_delivery="inline"
+    ).call({"path": "inputs/current/report.pdf", "units": [3]}, ctx=ctx)
+    assert "inputs/current/report.pdf" in result.content
+    assert str(ctx.run_id) not in result.content
+    view = ctx.workspace_view
+    assert result.state_updates["figure_documents"] == {document_sha(real, view=view): real}

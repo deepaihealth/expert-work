@@ -1550,7 +1550,10 @@ class ReadPageTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        raw = _require_path(args, tool="read_page", view=ctx.workspace_view).path
+        target = _require_path(args, tool="read_page", view=ctx.workspace_view)
+        # B-317 —— ``raw`` 是真实路径(落盘、跨轮:``figure_documents``、渲染源);
+        # ``display_path`` 是这一次回执与报错里给模型看的写法(``inputs/current/…`` 留短路径)。
+        raw, display_path = target.path, target.display
         units = _require_units(args)
         # ``ext`` 上提到这里(回修第 1 轮 M-3)—— 下面那句拒绝文案要按格式选量词:
         # docx 传进来的是图清单编号,说"你传了 4 页"是在用一个它没有的单位说话。
@@ -1580,7 +1583,9 @@ class ReadPageTool:
             return ToolResult(content=rejection)
         delivery = self.figure_delivery
         if delivery == "none" and self.workers_view_pages:
-            return ToolResult(content=f"Not rendered: {raw}.", notice=WORKERS_VIEW_PAGES_NOTICE)
+            return ToolResult(
+                content=f"Not rendered: {display_path}.", notice=WORKERS_VIEW_PAGES_NOTICE
+            )
         if delivery == "none":
             # 回修第 3 轮 —— 看不了图、也没有 ask_image 时不进沙箱:渲出来也没人看,
             # 白跑一次 soffice + pdftoppm。**仍然注册** read_page,不是撤掉它 ——
@@ -1589,7 +1594,7 @@ class ReadPageTool:
             # B-64 Task 8 —— 说清缺的是什么、去哪配,让模型能原样转告用户。
             return ToolResult(
                 content=(
-                    f"没有渲染 {raw}:这个 Agent 的主模型不能看图,也没有配置视觉模型,"
+                    f"没有渲染 {display_path}:这个 Agent 的主模型不能看图,也没有配置视觉模型,"
                     "所以看不了文档里的图。如需读取,请在 Agent 配置的「图像理解(VL 模型)」"
                     "里配一个视觉模型。"
                 )
@@ -1643,8 +1648,8 @@ class ReadPageTool:
                 # 上一轮我写"按集合自己的定义补齐,不靠『今天到不了』当理由",
                 # 而这一条恰恰只能靠"今天到不了"成立(10 种 kind 全在表里)——
                 # **与它自己刚批评的立论同形**。按判据走,不按可达性走。
-                return ToolResult(content=f"无法渲染 {raw}:{per_unit}")
-            msg = f"无法渲染 {raw}:{_explain_error(kind, env.get('detail'))}"
+                return ToolResult(content=f"无法渲染 {display_path}:{per_unit}")
+            msg = f"无法渲染 {display_path}:{_explain_error(kind, env.get('detail'))}"
             if per_unit:
                 msg = f"{msg} {per_unit}"
             return ToolResult(content=msg)
@@ -1691,7 +1696,7 @@ class ReadPageTool:
                 notes.append(item)
         all_failed = _normalize_failed(env.get("failed")) + rejected
         if not refs:
-            msg = f"无法渲染 {raw}:没有取到任何页。"
+            msg = f"无法渲染 {display_path}:没有取到任何页。"
             per_unit = _describe_failed_units(all_failed, unit_label=label)
             if per_unit:
                 msg = f"{msg} {per_unit}"
@@ -1702,6 +1707,7 @@ class ReadPageTool:
                 raw,
                 refs[0],
                 region,
+                display_path=display_path,
                 ctx=ctx,
                 doc_sha=doc_sha,
                 notes=notes,
@@ -1722,13 +1728,13 @@ class ReadPageTool:
         if rendered_units:
             if label != _DEFAULT_UNIT_LABEL:
                 shown = "、".join(f"第 {u} {label}(文档第 {p} 页)" for u, p in rendered_units)
-                head = f"已渲染 {raw} {shown}"
+                head = f"已渲染 {display_path} {shown}"
             else:
                 pages = "、".join(str(u) for u, _ in rendered_units)
-                head = f"已渲染 {raw} 第 {pages} {label}"
+                head = f"已渲染 {display_path} 第 {pages} {label}"
         else:
-            head = f"已渲染 {raw} {len(refs)} 页"
-        content = _delivery_sentence(head, refs, delivery, path=raw, unit_label=label)
+            head = f"已渲染 {display_path} {len(refs)} 页"
+        content = _delivery_sentence(head, refs, delivery, path=display_path, unit_label=label)
         caveats = _describe_render_notes(notes, unit_label=label)
         if caveats:
             content = f"{content} {caveats}"
@@ -1774,6 +1780,7 @@ class ReadPageTool:
         page_ref: str,
         region: Box,
         *,
+        display_path: str,
         ctx: ToolContext,
         doc_sha: str,
         notes: Sequence[Mapping[str, Any]],
@@ -1788,12 +1795,14 @@ class ReadPageTool:
                 path=raw, figure_ref=page_ref, boxes=[region], ctx=ctx
             )
         except RegionRenderError as exc:
-            return ToolResult(content=f"Could not render region {list(region)} of {raw}: {exc}")
+            return ToolResult(
+                content=f"Could not render region {list(region)} of {display_path}: {exc}"
+            )
         crop = rendered.crops[0]
         figure = parse_rendered_figure_ref(page_ref)
         page = figure.page if figure is not None else "?"
         content = (
-            f"Rendered region {list(region)} of page {page} of {raw} at {crop.dpi} dpi "
+            f"Rendered region {list(region)} of page {page} of {display_path} at {crop.dpi} dpi "
             f"({crop.width}x{crop.height} px); from the next turn you will see it in your context."
         )
         caveats = _describe_render_notes(notes, unit_label=label)

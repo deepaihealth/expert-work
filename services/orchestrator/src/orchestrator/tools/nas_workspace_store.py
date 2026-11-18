@@ -171,10 +171,12 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.workspace.layout import (
     WORKSPACE_CONVERSATION_WORK_DIR,
+    WORKSPACE_INPUTS_DIR,
     WORKSPACE_PLATFORM_MIGRATED_MARKER,
     WORKSPACE_SEED_MARKER,
     WORKSPACE_THREADS_DIR,
 )
+from orchestrator.tools.inputs_doc import in_inputs_run_dir, input_link_cache_path
 from orchestrator.tools.sandbox import (
     SandboxSupervisorError,
     WorkspaceFileChangedError,
@@ -1141,6 +1143,96 @@ class NasWorkspaceStore:
 
         return await asyncio.to_thread(_read)
 
+    def _input_link_target(self, tenant_id: UUID, user_id: UUID, path: str) -> str | None:
+        """``path`` 是预拉链接时,它指向的缓存文件路径(:func:`input_link_cache_path`);否则 ``None``。
+
+        ``readlink`` 在已钉住的父目录 fd 上做,不跟随任何东西;链接之外的任何情形(普通文件、
+        不存在、走不到)都是 ``None``,调用方照旧按 ``O_NOFOLLOW`` 读。
+        """
+        if f"{WORKSPACE_INPUTS_DIR}/" not in path:
+            return None
+        try:
+            dfd, name = self._open_parent_dir_fd(tenant_id, user_id, path, create=False)
+        except (OSError, SandboxSupervisorError, ValueError):
+            return None
+        try:
+            target = os.readlink(name, dir_fd=dfd)
+        except OSError:
+            return None
+        finally:
+            os.close(dfd)
+        relpath, _parts = normalize_workspace_path(path)
+        return input_link_cache_path(relpath, target)
+
+    def _input_link_size(
+        self,
+        tenant_id: UUID,
+        user_id: UUID,
+        listing: tuple[int, str],
+        name: str,
+        fallback: int | None,
+    ) -> int | None:
+        """列目录时一条链接的大小:平台建的预拉链接报缓存文件的大小,其余报 ``fallback``。
+
+        ``listing`` 是被列目录已经握着的 fd 与它的用户根相对路径:``readlink`` 直接在这个 fd
+        上做(不重走路径);缓存文件仍按 ``O_NOFOLLOW`` 的逐段打开去 ``lstat``。
+        """
+        dfd_listed, dir_rel = listing
+        try:
+            raw = os.readlink(name, dir_fd=dfd_listed)
+        except OSError:
+            return fallback
+        link = f"{dir_rel}/{name}" if dir_rel not in ("", ".") else name
+        relpath, _parts = normalize_workspace_path(link)
+        target = input_link_cache_path(relpath, raw)
+        if target is None:
+            return fallback
+        try:
+            dfd, leaf = self._open_parent_dir_fd(tenant_id, user_id, target, create=False)
+        except (OSError, SandboxSupervisorError, ValueError):
+            return fallback
+        try:
+            info = os.lstat(leaf, dir_fd=dfd)
+        except OSError:
+            return fallback
+        finally:
+            os.close(dfd)
+        return info.st_size if stat.S_ISREG(info.st_mode) else fallback
+
+    async def path_exists(self, *, tenant_id: UUID, user_id: UUID, scope: str, path: str) -> bool:
+        """B-317 —— 作用域内的 ``path`` 这个名字在不在:``O_NOFOLLOW`` 逐段打开父目录,再对最后
+        一段做一次 ``lstat``(不跟随:链接以它自己的身份算在)。不列目录、不读链接。
+
+        不存在(含中间某段不存在)是 ``False``;中间某段是符号链接按越界抛
+        :class:`WorkspacePathEscapeError`,与 ``read_file`` 同一道闸。
+        """
+
+        def _check() -> bool:
+            rel = scoped_path(scope, path)
+            try:
+                dfd, name = self._open_parent_dir_fd(tenant_id, user_id, rel, create=False)
+            except MISSING_DIR_ERRORS:
+                return False
+            try:
+                os.lstat(name, dir_fd=dfd)
+            except (FileNotFoundError, NotADirectoryError):
+                return False
+            finally:
+                os.close(dfd)
+            return True
+
+        return await asyncio.to_thread(_check)
+
+    async def resolve_input_link(self, *, tenant_id: UUID, user_id: UUID, path: str) -> str:
+        """B-317 —— 宿主侧直读一律 ``O_NOFOLLOW``,预拉建的 ``inputs/<run>/x -> ../cache/<摘要>``
+        因此按越界被拒(``ask_image`` 读不到本轮输入的图)。这里把**只这一种**链接换成它指向的
+        缓存文件路径(用户根相对);其余原样返回,后面的读照旧拒绝越界链接。"""
+
+        def _resolve() -> str:
+            return self._input_link_target(tenant_id, user_id, path) or path
+
+        return await asyncio.to_thread(_resolve)
+
     async def list_files(
         self,
         *,
@@ -1291,6 +1383,8 @@ class NasWorkspaceStore:
                     # 的 ``threads/``),与 ``scoped_path`` 拒绝寻址它同一个口径。
                     names = [n for n in names if n not in scope_hidden_heads(scope)]
                 truncated = len(names) > max_entries
+                # B-317 —— 只有列的是 ``inputs/<run>/`` 或它的子目录时才看链接指向哪里。
+                links_resolved = in_inputs_run_dir(rel)
                 for name in names[:max_entries]:
                     try:
                         info = os.lstat(name, dir_fd=dfd)
@@ -1301,11 +1395,16 @@ class NasWorkspaceStore:
                         entries.append(WorkspaceDirEntry(name=name, is_dir=False, size=None))
                         continue
                     is_dir = stat.S_ISDIR(info.st_mode)
+                    size = None if is_dir else info.st_size
+                    if links_resolved and stat.S_ISLNK(info.st_mode):
+                        # B-317 —— ``inputs/current/`` 里是预拉链接,lstat 大小只有几十字节,
+                        # 模型会当成坏文件。只对平台建的那种链接报缓存文件的大小。
+                        size = self._input_link_size(tenant_id, user_id, (dfd, rel), name, size)
                     entries.append(
                         WorkspaceDirEntry(
                             name=name,
                             is_dir=is_dir,
-                            size=None if is_dir else info.st_size,
+                            size=size,
                             mtime=datetime.fromtimestamp(info.st_mtime, tz=UTC),
                         )
                     )

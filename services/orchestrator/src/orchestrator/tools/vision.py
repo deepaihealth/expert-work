@@ -37,6 +37,7 @@ from expert_work.common.observability.metrics import expert_work_counter
 from expert_work.persistence import (
     RENDERED_CROP_DIR,
     RENDERED_FIGURE_SHA_HEX_LEN,
+    WORKSPACE_INPUTS_DIR,
     WORKSPACE_OVERFLOW_DIR,
     region_crop_stem,
 )
@@ -1436,7 +1437,7 @@ class AskImageTool:
             if not raw.startswith("expert_work://") and _is_image_path(raw):
                 return await self._workspace_image(raw, ctx=ctx)
             return _Located(raw)
-        if has_path and not has_unit and _is_image_path(args.get("path")):
+        if has_path and not has_unit and await self._names_an_image(args.get("path"), ctx=ctx):
             return await self._workspace_image(args["path"], ctx=ctx)
         if not has_path and not has_unit:
             msg = (
@@ -1505,7 +1506,38 @@ class AskImageTool:
         view = ctx.workspace_view
         target = resolve_workspace_path(path, view=view, tool="ask_image")
         rel = scoped_path(figure_scope(view), agent_relative(target, view))
+        # B-317 —— 预拉建的 ``inputs/<run>/x -> ../cache/<摘要>``:宿主侧直读拒绝符号链接,换成
+        # 它指向的缓存文件。元数据仍记模型能再用的真实路径(``target.path``)。
+        rel = await self._input_link_target(rel, ctx=ctx)
         return _Located(workspace_figure_ref(ctx.tenant_id, ctx.user_id, rel), {"path": path})
+
+    async def _input_link_target(self, rel: str, *, ctx: ToolContext) -> str:
+        """用户根相对的 ``rel`` 若是预拉链接,换成缓存文件路径;存储不支持或不是链接就原样。"""
+        if f"{WORKSPACE_INPUTS_DIR}/" not in rel:
+            return rel
+        resolver = getattr(self.workspace_store, "resolve_input_link", None)
+        if resolver is None or ctx.tenant_id is None or ctx.user_id is None:
+            return rel
+        resolved: str = await resolver(tenant_id=ctx.tenant_id, user_id=ctx.user_id, path=rel)
+        return resolved
+
+    async def _names_an_image(self, raw: object, *, ctx: ToolContext) -> bool:
+        """``path`` 指的是一张图吗。先看扩展名(B-250);预拉链接名的扩展名取自 URL,URL 没有
+        扩展名时链接名也没有,这时看它指向的缓存文件(扩展名按 content-type 定)。"""
+        if _is_image_path(raw):
+            return True
+        if not isinstance(raw, str) or ctx.tenant_id is None or ctx.user_id is None:
+            return False
+        view = ctx.workspace_view
+        try:
+            target = resolve_workspace_path(raw, view=view, tool="ask_image")
+        except ValueError:
+            return False
+        if not target.rel.startswith(f"{WORKSPACE_INPUTS_DIR}/"):
+            return False
+        rel = scoped_path(figure_scope(view), agent_relative(target, view))
+        resolved = await self._input_link_target(rel, ctx=ctx)
+        return resolved != rel and _is_image_path(resolved)
 
     async def _require_readable_workspace_image(self, ref_str: str) -> None:
         """B-64 Task 7 回修第 2 轮 —— 工作区图读不出来就让**这一次工具调用**显式失败。

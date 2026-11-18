@@ -135,7 +135,7 @@ def test_message_names_the_variable_the_link_and_the_distance() -> None:
     text = guard_message(NEAR, trusted=True)
     assert text.startswith("[blocked]")
     assert "org_logo" in text
-    assert "$EXPERT_WORK_INPUTS_DIR/org_logo.png" in text
+    assert "inputs/current/org_logo.png" in text
     assert "疑似抄错 1 处" in text
     assert "https://x/bad.png" in text  # 模型自己写的那串,不是输入值
     assert "$EXPERT_WORK_INPUTS" in text
@@ -146,12 +146,12 @@ def test_message_names_the_variable_the_link_and_the_distance() -> None:
 def test_exact_hit_message_keeps_the_wording() -> None:
     assert guard_message(EXACT, trusted=True) == (
         "[blocked] 代码里的地址 https://x/ok.png 是输入 org_logo 的手抄件（平台比对：与输入一致）。"  # noqa: RUF001
-        "这个文件应在 $EXPERT_WORK_INPUTS_DIR/org_logo.png（不在则按清单里的原地址下载）；"  # noqa: RUF001
+        "这个文件应在 inputs/current/org_logo.png（不在则按清单里的原地址下载）；"  # noqa: RUF001
         "请改用它，或用代码从 $EXPERT_WORK_INPUTS 清单里读 org_logo 的原地址，不要手抄。"  # noqa: RUF001
     )
     assert guard_message(EXACT, trusted=False) == (
         "[blocked] 代码里有一处地址是输入 org_logo 的手抄件（平台比对：与输入一致）。"  # noqa: RUF001
-        "这个文件应在 $EXPERT_WORK_INPUTS_DIR 下，确切文件名见 $EXPERT_WORK_INPUTS 清单里"  # noqa: RUF001
+        "这个文件应在 inputs/current/ 下，确切文件名见 $EXPERT_WORK_INPUTS 清单里"  # noqa: RUF001
         " org_logo 对应条目的 local_path（不在则按清单里的原地址下载）；"  # noqa: RUF001
         "请用代码从清单里读路径或原地址，不要手抄。"  # noqa: RUF001
     )
@@ -173,7 +173,7 @@ def test_near_hit_message_leaves_an_out_for_a_different_address(trusted: bool) -
     assert OUT in text
     assert "从它自己的来源取得" in text
     assert ("https://x/bad.png" in text) is trusted
-    assert ("$EXPERT_WORK_INPUTS_DIR/org_logo.png" in text) is trusted
+    assert ("inputs/current/org_logo.png" in text) is trusted
 
 
 # --- C1:代码里的正则 / sed 片段、畸形 URL 不能让守卫抛异常。
@@ -453,3 +453,15 @@ def test_host_match_is_case_insensitive() -> None:
     )
     hit = find_retyped_url(f"open('{LOGO}')", cand)
     assert hit == GuardHit(var_name="org_logo", link="org_logo.png", distance=0, written=LOGO)
+
+
+@pytest.mark.parametrize("hit", [EXACT, NEAR])
+@pytest.mark.parametrize("trusted", [True, False])
+def test_guard_message_uses_the_short_path_not_the_env_spelling(
+    hit: GuardHit, trusted: bool
+) -> None:
+    """B-317 —— 提示里的目录说法与「本轮输入」段、工具描述一致:``inputs/current/``。"""
+    text = guard_message(hit, trusted=trusted)
+    assert "$EXPERT_WORK_INPUTS_DIR" not in text
+    if trusted:
+        assert "inputs/current/" in text

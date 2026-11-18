@@ -38,7 +38,7 @@ from expert_work.common.observability import inject_context
 from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
 from orchestrator.agent_timezone import resolve_agent_timezone
 from orchestrator.llm.providers._http import client_for
-from orchestrator.tools.inputs_doc import inputs_abs_dir, inputs_abs_path
+from orchestrator.tools.inputs_doc import INPUTS_CODE_NOTE, inputs_abs_dir, inputs_abs_path
 from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock, write_lock_conversation
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox_image_contract import preinstalled_note
@@ -959,9 +959,11 @@ async def run_in_sandbox(
     # 声明了但一个都没传时跳过;多出来的键 control-plane 早已拒掉)。ctx.prompt_inputs
     # 就是「本轮有值」:主 run 来自入口,审批续跑 / 孤儿复活 / 重新生成由入口取回,子代由
     # _child_config 从父那里带下来(父有才带)—— 与 sse.run_agent 写 inputs_run_id 同一口径。
-    inputs_run_id = (ctx.inputs_run_id or ctx.run_id) if ctx.prompt_inputs else None
     # B-236 —— 本次 exec 的视图与宿主侧解析路径用的是同一个值(``ctx.workspace_view``)。
     view = ctx.workspace_view
+    # B-317 —— 同理,注入 ``EXPERT_WORK_INPUTS(_DIR)`` 的 run 就是宿主侧 ``inputs/current/``
+    # 改写到的那个 run(``view.inputs_run``);exec 视图脚本再从这个环境变量取 run id 挂载。
+    inputs_run_id = view.inputs_run
     cancelled = False
     try:
         return await client.exec(
@@ -1104,19 +1106,7 @@ class ExecPythonTool:
                 "Execute a Python 3 snippet in the sandbox and return "
                 "its stdout / stderr / exit code. Use for calculations, data "
                 f"transforms, or anything better done by running code. {EXEC_WORKSPACE_NOTE} "
-                "本轮如果有输入变量，它们在 $EXPERT_WORK_INPUTS 指向的 JSON 文件里"  # noqa: RUF001 — verbatim spec text (B-61 task-4-brief)
-                "（含 URL、编码、本地文件路径）；本轮没有输入变量时这个文件不存在，"  # noqa: RUF001
-                "读不到就照上文办，不必重试。"  # noqa: RUF001
-                "需要用到某个输入值时，用代码读这个文件，不要从上文手抄——长串抄错一位就是 404。"  # noqa: RUF001
-                "文件里 local_path 非空表示平台已把该文件下载到本地，直接用它，不必再联网下载；"  # noqa: RUF001
-                "极少数情况下（挂起很久之后续跑）该文件已被清理，"  # noqa: RUF001
-                "这时改用同一项里的原始 URL 自己下载。"
-                "平台预先下载的文件在 $EXPERT_WORK_INPUTS_DIR 目录里按变量名放着："  # noqa: RUF001 — B-67 §4.1
-                "整个值是地址的变量叫 <变量名><扩展名>，对象字段里的叫 <变量名>.<字段名><扩展名>，"  # noqa: RUF001
-                "列表项叫 <变量名>/<下标-说明><扩展名>；"  # noqa: RUF001
-                "列表项的确切路径在清单里该项的 local_path"
-                "（值是 JSON 字符串时在 value_parsed[i].local_path）。"  # noqa: RUF001
-                "文件不在就按清单里的原地址下载。地址一律从清单读或用这些文件，不要手抄。"  # noqa: RUF001
+                + INPUTS_CODE_NOTE
                 # B-82 —— 预装清单。不说,模型就只能「先探测环境」或干脆先装一遍,
                 # 而在阿里云上装一遍是一两分钟(B-81)。渲染在 contract 模块一处。
                 + preinstalled_note()

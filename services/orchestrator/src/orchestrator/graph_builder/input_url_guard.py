@@ -31,7 +31,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from orchestrator.tools.inputs_doc import linked_sites
+from orchestrator.tools.inputs_doc import CURRENT_INPUTS_REL, current_input_path, linked_sites
 
 logger = logging.getLogger(__name__)
 
@@ -250,14 +250,14 @@ def guard_message(hit: GuardHit, *, trusted: bool) -> str:
     if trusted:
         subject = f"代码里的地址 {hit.written} "
         where = (
-            f"这个文件应在 $EXPERT_WORK_INPUTS_DIR/{hit.link}（不在则按清单里的原地址下载）；"  # noqa: RUF001
+            f"这个文件应在 {current_input_path(hit.link)}（不在则按清单里的原地址下载）；"  # noqa: RUF001
             f"请改用它，或用代码从 $EXPERT_WORK_INPUTS 清单里读 {hit.var_name} 的原地址，"  # noqa: RUF001
             "不要手抄。"
         )
     else:
         subject = "代码里有一处地址"
         where = (
-            "这个文件应在 $EXPERT_WORK_INPUTS_DIR 下，确切文件名见 $EXPERT_WORK_INPUTS 清单里"  # noqa: RUF001
+            f"这个文件应在 {CURRENT_INPUTS_REL}/ 下，确切文件名见 $EXPERT_WORK_INPUTS 清单里"  # noqa: RUF001
             f" {hit.var_name} 对应条目的 local_path（不在则按清单里的原地址下载）；"  # noqa: RUF001
             "请用代码从清单里读路径或原地址，不要手抄。"  # noqa: RUF001
         )

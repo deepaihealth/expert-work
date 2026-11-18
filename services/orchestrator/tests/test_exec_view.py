@@ -37,7 +37,8 @@ def _sh_and_helper() -> tuple[str, str]:
 
 _HELPER_OPEN = "/usr/local/bin/python3 -I -S -c '"
 _HELPER_CLOSE = (
-    '\n\' "$root" "$conv" "$own" "$code" "$sum" "$child" || { rc=$?; drop; exit "$rc"; }\n'
+    '\n\' "$root" "$conv" "$own" "$code" "$sum" "$child" "$inputs" '
+    '|| { rc=$?; drop; exit "$rc"; }\n'
 )
 
 
@@ -280,7 +281,7 @@ def test_script_platform_dirs_are_the_resolver_platform_dirs() -> None:
 # 只读、竞态)由 ``test_exec_view_kernel.py`` 在真镜像真内核上验。
 
 _FAKE_PY = """#!/bin/sh
-shift 4  # -I -S -c <helper>(其后只有挂载阶段的六个参数)
+shift 4  # -I -S -c <helper>(其后只有挂载阶段的七个参数)
 printf '%s\\n' "$@" > "$EW_PY_LOG"
 exit "${EW_PY_RC:-0}"
 """
@@ -365,8 +366,8 @@ def test_rehearsal_hands_the_mount_phase_to_the_helper_then_runs_the_payload(
     )
 
     assert proc.returncode == 0, proc.stderr
-    # 挂载阶段只拿到 $1..$6,载荷 argv 不交给它
-    assert r.helper_args() == [r.root, str(_CONV), str(_CONV), "ew-exec-abc.py", _SUM, ""]
+    # 挂载阶段只拿到 $1..$6 与 B-317 的本轮输入 run id(这里没有环境变量,空串),载荷 argv 不交给它
+    assert r.helper_args() == [r.root, str(_CONV), str(_CONV), "ew-exec-abc.py", _SUM, "", ""]
     # 载荷:在 /workspace 里、PATH 还原成调用方的、由 unshare -Ur 起;B-242 —— HOME 等是镜像
     # 里的值(外层 shell 的 HOME=/ 不带进来),BASH_ENV / ENV 不留
     assert proc.stdout == (
@@ -379,16 +380,16 @@ def test_rehearsal_conversation_id_wins_over_the_thread_id(tmp_path: Path) -> No
     """对话视图里本对话那一格就是对话 id;老视图里才用 ``$3``。"""
     r = _Rehearsal(tmp_path)
     assert r.run(str(_CONV), "true", own="").returncode == 0
-    assert r.helper_args() == [r.root, str(_CONV), str(_CONV), "", "", ""]
+    assert r.helper_args() == [r.root, str(_CONV), str(_CONV), "", "", "", ""]
     assert r.run("", "true", own=_OTHER).returncode == 0
-    assert r.helper_args() == [r.root, "", _OTHER, "", "", ""]
+    assert r.helper_args() == [r.root, "", _OTHER, "", "", "", ""]
 
 
 def test_rehearsal_hands_the_child_flag_to_the_helper(tmp_path: Path) -> None:
     """B-300 —— ``$6`` 是委派子代标记(``1`` / 空串),原样交给挂载阶段。"""
     r = _Rehearsal(tmp_path)
     assert r.run(str(_CONV), "true", child="1").returncode == 0
-    assert r.helper_args() == [r.root, str(_CONV), str(_CONV), "", "", "1"]
+    assert r.helper_args() == [r.root, str(_CONV), str(_CONV), "", "", "1", ""]
 
 
 @pytest.mark.parametrize("child", ["0", "true", "11", "x"])
@@ -414,9 +415,9 @@ def test_helper_child_view_keeps_only_the_work_dir_and_covers_the_root_projectio
     assert "        hide_memory(view)\n        if not conv:\n            hide_memory(ws)\n" in (
         helper
     )
-    assert "main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])" in (
-        helper
-    )
+    assert (
+        "sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7]"
+    ) in helper
 
 
 def test_rehearsal_mount_failure_never_runs_the_payload(tmp_path: Path) -> None:
@@ -659,3 +660,203 @@ def test_rehearsal_early_exits_delete_the_outer_script(tmp_path: Path) -> None:
         proc = r.run_raw(r.root, conv, conv, name, _SUM, "", "sh", "-c", "echo ran")
         assert proc.returncode in (97, 98), (case, proc.stderr)
         assert (outer / name).exists() is (case == "bad-name"), case
+
+
+# ---------------------------------------------------------------------------
+# B-317 —— 本轮输入 inputs/<run>/ 也挂在 inputs/current/,run id 取自已下发的环境变量
+# ---------------------------------------------------------------------------
+
+_INPUTS_RUN = "0f1e2d3c-4b5a-4968-8776-655443322110"
+
+
+def test_inputs_env_shape_is_the_one_the_platform_injects() -> None:
+    """X1 —— 脚本认的形状就是 ``inputs_abs_dir`` 给的值;目录名、前缀与常量同源。"""
+    from uuid import UUID
+
+    from orchestrator.tools.inputs_doc import (
+        CURRENT_INPUTS_DIRNAME,
+        inputs_abs_dir,
+    )
+    from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
+
+    sh, helper = _sh_and_helper()
+    assert inputs_abs_dir(UUID(_INPUTS_RUN)) == f"{EXEC_VIEW}/inputs/{_INPUTS_RUN}"
+    assert f"  {EXEC_VIEW}/inputs/$q$q-" in sh
+    assert '"${EXPERT_WORK_INPUTS_DIR#/workspace/inputs/}"' in sh
+    assert f'INPUTS, CURRENT = "inputs", "{CURRENT_INPUTS_DIRNAME}"' in helper
+
+
+def test_inputs_uuid_glob_is_explicit_character_classes() -> None:
+    """``case`` 里的 ``*`` 会匹配 ``/``:UUID 那一段必须逐位写字符类,一个 ``*`` 都没有。"""
+    sh, _ = _sh_and_helper()
+    assert '\nx="[0-9a-f]"\nq="$x$x$x$x"\n' in sh
+    line = next(ln for ln in sh.splitlines() if ln.startswith("  /workspace/inputs/"))
+    pattern = line.split(")", 1)[0]
+    assert pattern == "  /workspace/inputs/$q$q-$q-$q-$q-$q$q$q"
+    expanded = pattern.replace("$q", "$x" * 4).replace("$x", "[0-9a-f]")
+    assert "*" not in expanded and "?" not in expanded
+    assert expanded.count("[0-9a-f]") == 32
+
+
+@pytest.mark.parametrize(
+    ("value", "handed"),
+    [
+        (f"/workspace/inputs/{_INPUTS_RUN}", _INPUTS_RUN),
+        (None, ""),
+        ("", ""),
+        ("/workspace/inputs/../x", ""),
+        (f"/workspace/inputs/{_INPUTS_RUN}/y", ""),
+        (f"/workspace/inputs/{_INPUTS_RUN.upper()}", ""),
+        ("/workspace/inputs/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa/aaa", ""),
+        (f"/agent/inputs/{_INPUTS_RUN}", ""),
+        (f"/workspace/inputs/{_INPUTS_RUN}x", ""),
+    ],
+)
+def test_rehearsal_hands_only_a_well_formed_inputs_run_to_the_helper(
+    tmp_path: Path, value: str | None, handed: str
+) -> None:
+    """X2 —— 形状不对不报错、不退出,只是不交 run id(不挂);stderr 为空。"""
+    r = _Rehearsal(tmp_path)
+    if value is not None:
+        r.extra_env["EXPERT_WORK_INPUTS_DIR"] = value
+    proc = r.run(str(_CONV), "true")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+    args = r.helper_args()
+    assert args is not None
+    assert args[6] == handed
+
+
+def _current_inputs_ns(binds: list[tuple[int, int]], *, fail: bool = False) -> dict[str, object]:
+    import uuid
+
+    ns = _helper_functions("current_inputs", "sub")
+    ns["uuid"] = uuid
+    ns["INPUTS"], ns["CURRENT"] = "inputs", "current"
+    # 本机没有 O_PATH:换成同样不跟随符号链接的只读目录打开,判定逻辑不变。
+    ns["DIR"] = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def bind(source: int, target: int) -> int:
+        if fail:
+            raise OSError(1, "operation not permitted")
+        binds.append((source, target))
+        return target
+
+    ns["bind"] = bind
+    return ns
+
+
+def _run_current_inputs(ws: Path, run: str, ns: dict[str, object]) -> None:
+    fd = os.open(ws, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        ns["current_inputs"](fd, run)  # type: ignore[operator]
+    finally:
+        os.close(fd)
+
+
+def test_current_inputs_binds_the_run_dir_onto_a_new_stub(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "inputs" / _INPUTS_RUN).mkdir(parents=True)
+    binds: list[tuple[int, int]] = []
+    _run_current_inputs(tmp_path, _INPUTS_RUN, _current_inputs_ns(binds))
+    assert len(binds) == 1
+    assert (tmp_path / "inputs" / "current").is_dir()
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        _INPUTS_RUN.upper(),
+        "{" + _INPUTS_RUN + "}",
+        _INPUTS_RUN.replace("-", ""),
+        "urn:uuid:" + _INPUTS_RUN,
+        "../" + _INPUTS_RUN[3:],
+    ],
+)
+def test_current_inputs_refuses_a_run_id_that_is_not_a_canonical_uuid(
+    tmp_path: Path, run: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """X2b —— shell 之外再校验一次:``str(UUID(x)) == x``。"""
+    (tmp_path / "inputs" / run).mkdir(parents=True, exist_ok=True)
+    binds: list[tuple[int, int]] = []
+    _run_current_inputs(tmp_path, run, _current_inputs_ns(binds))
+    assert binds == []
+    assert not (tmp_path / "inputs" / "current").exists()
+    assert capsys.readouterr().err == ""
+
+
+def test_current_inputs_without_the_run_dir_is_silent_and_makes_no_stub(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M2 —— run 目录不在(清单写入失败、已被回收):不挂、不建桩、stderr 为空。"""
+    binds: list[tuple[int, int]] = []
+    _run_current_inputs(tmp_path, _INPUTS_RUN, _current_inputs_ns(binds))
+    (tmp_path / "inputs").mkdir()
+    _run_current_inputs(tmp_path, _INPUTS_RUN, _current_inputs_ns(binds))
+    assert binds == []
+    assert list((tmp_path / "inputs").iterdir()) == []
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("planted", ["symlink", "file", "dangling"])
+def test_current_inputs_repairs_a_planted_stub_and_binds(
+    tmp_path: Path, planted: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """S1 —— ``current`` 这个名字归平台:被换成符号链接 / 普通文件时删掉它(``unlink`` 不跟随)、
+    重建目录再挂;链接指向的东西不动。"""
+    run_dir = tmp_path / "inputs" / _INPUTS_RUN
+    run_dir.mkdir(parents=True)
+    stub = tmp_path / "inputs" / "current"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep.txt").write_text("k")
+    if planted == "symlink":
+        stub.symlink_to(elsewhere)
+    elif planted == "file":
+        stub.write_text("x")
+    else:
+        stub.symlink_to(tmp_path / "nowhere")
+    binds: list[tuple[int, int]] = []
+    _run_current_inputs(tmp_path, _INPUTS_RUN, _current_inputs_ns(binds))
+    assert len(binds) == 1
+    assert stub.is_dir() and not stub.is_symlink()
+    assert (elsewhere / "keep.txt").read_text() == "k"
+    assert capsys.readouterr().err == ""
+
+
+def test_current_inputs_skips_silently_when_the_planted_stub_cannot_be_removed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """删不掉(目录不可写)就照旧静默跳过,exec 照常。"""
+    inputs = tmp_path / "inputs"
+    (inputs / _INPUTS_RUN).mkdir(parents=True)
+    (inputs / "current").write_text("x")
+    inputs.chmod(0o500)
+    try:
+        binds: list[tuple[int, int]] = []
+        _run_current_inputs(tmp_path, _INPUTS_RUN, _current_inputs_ns(binds))
+    finally:
+        inputs.chmod(0o700)
+    assert binds == []
+    assert (inputs / "current").is_file()
+    assert capsys.readouterr().err == ""
+
+
+def test_current_inputs_survives_a_refused_bind_silently(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """X2c —— ``open_tree`` / ``move_mount`` 被拒:不挂,exec 照常(不抛、不写 stderr)。"""
+    (tmp_path / "inputs" / _INPUTS_RUN).mkdir(parents=True)
+    _run_current_inputs(tmp_path, _INPUTS_RUN, _current_inputs_ns([], fail=True))
+    assert capsys.readouterr().err == ""
+
+
+def test_current_inputs_runs_after_the_workspace_is_bound_and_only_with_a_run() -> None:
+    _, helper = _sh_and_helper()
+    body = helper[helper.index("def nas_view(") : helper.index("def local(")]
+    assert body.index("ws = bind(") < body.index("current_inputs(ws, run)")
+    assert "    if run:\n        current_inputs(ws, run)\n" in body
+    # 没绑 agent 时早返回,不挂(宿主侧 inputs_run 同样为 None)
+    assert body.index("    if not root:\n") < body.index("current_inputs(ws, run)")
