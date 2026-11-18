@@ -93,7 +93,7 @@
    - 下载那张照片,按文件头判断是 JPEG,带 `session_id` 上传,拿到 `upload_id`;
    - 拼 input:首行「[本轮时间 2026-11-17 14:31 周二 · 私聊]」(会话不分窗口,首行注明本批来自私聊还是群聊),后面每条消息一行、带发送时间;
    - 按本批消息身份算 Idempotency-Key;
-   - `is_first_contact` 照数字人服务传来的值转给平台(E 与 A 之间从没有过文字消息才是 "1",§3.3.2);A 第一次走本智能体(会话表里原来没有这一格)时,03 落地后按 03 带上「最近的企微消息」做衔接,03 之前不带(已知缺口,§3.11);
+   - `is_first_contact` 照数字人服务传来的值转给平台(E 与 A 在这个聊天窗口里从没有过文字或语音消息才是 "1",不限时间,§3.3.2;11-18 开发中定);A 第一次走本智能体(会话表里原来没有这一格)时,03 落地后按 03 带上「最近的企微消息」做衔接,03 之前不带(已知缺口,§3.11);
    - 发 `POST /v1/agents/{code}/runs`(`mode: stream`、`stream_format: items`),从响应头拿到 run_id,写进轮次状态(供取消用)和 run 台账。
 6. 平台跑这一轮:召回客户 A 的长期记忆(私聊和群里说过的都在),按需调深护 MCP 查档案、写健康数据,最后给出回答。项目服务在流里收到 `item.done`(`type=assistant_message`、`channel=final`),再收到 `end`(`status=success`)。
 7. 项目服务按场景扣康豆(口径见 §3.8),把最终回复按 02 解析(`media` 里的素材 id 查深护智能体素材表、校验、按类型取链接),按 §5.1 返回 `outcome: "reply"` 和 `answer_text[]`、`file_link_list[]` 及各自来源。
@@ -140,7 +140,7 @@
 
 **为什么时间放 input、不放系统提示词变量**(核实结果,读代码确认):
 
-- 平台自己只注入**日期**:构建智能体时算一次「The current date is …」放进系统提示词(`agent_factory.py:1203-1211, 1888-1908`),构建结果缓存 30 分钟(`runtime.py:452`),所以过零点后最多 30 分钟里还是昨天的日期;这段文字还叫模型「要精确时间就调 exec_python」,而健管师没有代码工具。
+- 平台自己只注入**日期**:构建智能体时算一次「The current date is …」放进系统提示词(`agent_factory.py:1203-1211, 1888-1908`),构建结果缓存 30 分钟(`runtime.py:452`),所以过零点后最多 30 分钟里还是昨天的日期;这段文字还叫模型「要精确时间就调 exec_python」;~~而健管师没有代码工具~~ 健管师不该靠代码工具取时间(平台基础能力里有代码执行、关不掉,06 §3.10;11-18 更正)。
 - 系统提示词开了模板模式后,**每一轮都用本轮 inputs 重新渲染**(`prompt_render.py:260-265`)。被模板引用的变量一变,系统提示词的字节就变,提示词缓存从第一个字起全部失效;没被引用的变量不进系统提示词,不影响缓存。所以「每分钟都变」的值不能放进被引用的变量。
 - 平台每一步把计划、预警等「平台段」贴在**最后一条消息末尾**、不落库(`platform_context.py:1-35`),前面的消息不动,缓存才稳;把时间写在本轮客户消息里,同样只影响最后一段。
 - Dify 现在也是把时间放在本轮「用户」消息开头(DSL @7466),行为上一致。
@@ -148,7 +148,7 @@
 代价与配套:
 
 - input 整段会被当作「客户说的话」:长期记忆第一次提炼只读 input 这一段(`runs.py:503-521`),记忆召回和知识库探测的检索词也取最新客户消息。时间行会混进去,属于少量噪声。验收里专门查(§7 第 14 条)。
-- 建议这个智能体**关掉平台的日期注入**(`dynamic_context.inject_current_date: false`,`agent_spec.py:338`):每轮都有精确时间,再留一个可能滞后 30 分钟的日期只会打架;关掉后系统提示词跨天也不变,缓存更稳。提示词里写明「以本轮消息开头的时间为准」(06 节 C)。
+- ~~建议这个智能体关掉平台的日期注入(`inject_current_date: false`)……~~ **改定(用户 11-18 定):打开平台的日期注入**(`dynamic_context.inject_current_date: true`,`agent_spec.py:338`)。原因:后台调试时没有「本轮时间」那一行,模型也能知道今天的日期。11-18 测试环境实测:消息第一行带「本轮时间」时,3 次都没有去调代码工具;不带时,3 次都会调一次代码工具算时间,答案都正确。所以平台那句「精确时间调代码工具」不用改。实测用的是 v1 正式提示词,里面写明「以本轮消息开头的时间为准、不要调工具查时间」(06 节 C);没有首行时间时这句约束不住,模型仍会调一次代码工具,后台调试接受这个行为。正式对话里首行一定有时间,所以节 C 不改。
 
 #### 3.3.2 `inputs`:要声明哪些变量
 
@@ -172,7 +172,7 @@
 | `room_conversation_id` | 群会话 id;私聊传空串 | 是 | 是 | 工具身份绑定(提醒发到群) | 否 |
 | `attachment_urls` | 本轮客户发来的图片 / 文件原始链接,JSON 数组(数组里的链接平台不预下载,06 §5.1) | 是 | 否(没附件不传) | 工具参数绑定(表单写入的附件,04) | 否(`render: raw`) |
 | `source_message_ids` | 这一轮要回答的客户消息的 id:03 之前 = 合并后的整批;03 之后(S-8)= 本轮 input 那批 + 经补消息重新带上的被取消轮的客户消息;JSON 数组,带通道前缀:pad `"pad:" + msg_app_info`、dk `"dk:" + msgid`(由 §5.1 数字人服务另传的 `source_msg_keys` 加前缀生成,与 03 同一规则)。不是 03 的顶层字段 `input_message_ids`(那个只含本轮 input 那批,给平台补消息判重) | 是 | 是 | 写工具判重(同表 + 同内容 + 来源消息重叠才算重复)、转人工去重(04 §3.4、§3.10) | 否 |
-| `is_first_contact` | `"1"` / `"0"`;沿用 Dify 口径:这名员工与这个客户之间从没有过文字消息才是 `"1"`(数字人服务查消息表算出、随 §5.1 传来,项目服务原样转;不用「Expert Work 上第一轮」,否则从 Dify 切过来的老客户都会被重问,已拍板 11-17) | 是 | 否 | 首轮补问(02 待拍板 6、06 节 N) | 是(分支) |
+| `is_first_contact` | `"1"` / `"0"`;沿用 Dify 口径:这名员工与这个客户在这个聊天窗口(私聊、这个群)里从没有过文字或语音消息,不限时间才是 `"1"`(数字人服务查消息表算出、随 §5.1 传来,项目服务原样转;不用「Expert Work 上第一轮」,否则从 Dify 切过来的老客户都会被重问,已拍板 11-17)。**按聊天窗口算(11-18 开发中定,沿用 Dify 拉历史的窗口)**:私聊 = 员工和客户之间的消息;这个群 = 客户在该群发的 + 员工在该群 @ 这位客户的;不限时间;只看文字或语音;pad 侧不算撤回的;dk 会话存档没有撤回标记,撤回的原消息照算;本批消息整体排除;一条都没有才是 `"1"`(查库失败按 `"0"`,不多问客户) | 是 | 否 | 首轮补问(02 待拍板 6、06 节 N) | 是(分支) |
 | `self_appellation` | 健管师自称,≤ 100 字;数字人服务已在传,按员工绑定行 → 智能体行 → 员工名取(`invoke-agent.processor.ts:861`) | 是 | 否 | 人设名(06 §5.1、节 A) | 是 |
 | `self_introduction` | 自我介绍,≤ 2048 字,可空;取法同上(`:862`)。运营在深护后台配,不是客户输入 | 是 | 否 | 有就按它介绍自己,没有用默认人设(06 节 A) | 是(分支) |
 
@@ -308,9 +308,9 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
   - 那一轮还在跑:stream 模式下接上原来的事件流,照常等 `end`、取最终回复 —— 和第一次发起走同一条中继,不返回 `busy`;
   - 那一轮已经结束:拿到的就是原来那一轮,取它的最终回复返回(取不到按 §3.8 按 run_id 查条目);
   - 重放到的那一轮,这一行已标记我方取消(`settle_skip_charge=1`):返回 `outcome: cancelled`,不发、不扣。数字人服务收到这种 `cancelled` 不再排合并重跑 —— 这批已经有代次加 1 的那次合并重跑在处理;
-  - 都**不新建 run 行**。顺序是**先写行、再发请求**:先把本次执行的 `invoke_token`(不取自缓存)写进这一行(新键就是建行时写;取消入口按 `invoke_token` 找 run,§3.6),再发 POST。重放的响应头里同样带 `X-Expert-Work-Run-Id`(平台走同一个 `build_events_response`,`external_events.py:147`);这一行的 `ew_run_id` 如果还空着(上次在写进去之前就死了),就从这里补上。结算按行只做一次(`charged_k_dou` > 0 即已扣),不会扣第二次。
+  - 都**不新建 run 行**。顺序是**先写行、再发请求**:先把本次执行的 `invoke_token`(不取自缓存)写进这一行(新键就是建行时写;取消入口按 `invoke_token` 找 run,§3.6),再发 POST。重放的响应头里同样带 `X-Expert-Work-Run-Id`(平台走同一个 `build_events_response`,`external_events.py:147`);这一行的 `ew_run_id` 如果还空着(上次在写进去之前就死了),就从这里补上。扣费用条件 UPDATE(`charged_k_dou=0` 才更新)保证只扣一次,不会扣第二次(11-18 开发中定)。
   - 所以数字人服务处理到一半重启、任务被重新拉起时,重处理(用缓存的同一份请求体,见下面「请求体一字不差」)拿到的是原来那一轮的回答,只扣一次。**接受的残余风险**:回答已经发出去、但还没来得及从缓存里删掉这批消息(`zrem`,`invoke-agent.processor.ts:965`)时进程挂了,重处理会拿回原来的回答、再发一次 —— 不会发兜底;dk 发送任务的防重种子用 run_id(§4),同一 run 再入队应被挡住(未实测),pad 可能重复一次。
-- **同客户锁改成一步加锁、比对后释放**:现在是先查再设(`exists`,`invoke-agent.processor.ts:634`;`set ... EX 600`,`:700`),两个任务可能同时查到「没锁」一起进去;释放是无条件删除(`:925-927`),一个跑了超过 600 秒的慢任务会把下一个任务的锁删掉。改成:加锁一步原子操作,锁的值 = 本次执行的 `invoke_token`(`SET 键 <invoke_token> NX EX 600`);释放时比对后再删(一段 Lua 脚本:值等于自己的 `invoke_token` 才删)。Dify 和 Expert Work 两条路共用,语义不变(同一客户 + 同一智能体一把锁)。
+- **同客户锁改成一步加锁、比对后释放**:现在是先查再设(`exists`,`invoke-agent.processor.ts:634`;`set ... EX 600`,`:700`),两个任务可能同时查到「没锁」一起进去;释放是无条件删除(`:925-927`),一个跑了超过 600 秒的慢任务会把下一个任务的锁删掉。改成:加锁一步原子操作,锁的值 = 本次执行的 `invoke_token`(`SET 键 <invoke_token> NX EX 600`);释放时比对后再删(一段 Lua 脚本:值等于自己的 `invoke_token` 才删)。Dify 和 Expert Work 两条路共用,语义不变(同一客户 + 同一智能体一把锁)。释放放在 `finally` 里、作为收尾的**最后一步**(删轮次状态、清消息缓存、排合并重跑都做完再放锁);释放失败只记日志、不抛,锁 600 秒后自然过期(11-18 开发中定)。
 - 总长 68 字符,不含任何密钥、客户信息。
 
 要做到「请求体一字不差」:
@@ -319,6 +319,7 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 - 附件复用已上传的 upload_id(§3.3.3)。
 - 新会话先建再跑,第一次发和重试都带同一个 session_id(§3.4.3)。
 - inputs 从同一批数据确定性生成;03 的补消息字段也必须按同一份「已在会话里的消息」计算(由 03 保证)。
+- **项目服务这边按幂等键整份缓存发给平台的请求体**(11-18 开发中定):`dh_ewreq:{幂等键}`(键里是 64 位十六进制,不带 `dh1:`),`SET NX`,900 秒;同一个键再处理、并发重复,一律发同一份。防的是项目服务自己现算的东西两次不一样 —— 例如附件第一次临时打不开、第二次打开了,input / files 就变了,同键请求体一变平台就回 422。
 - **重处理复用上次的请求体**(数字人服务做):有些值是处理时现算的,两次处理之间会变 —— `is_first_contact`(§4 数字人服务第 11 条;第一条回复发出后就从 `"1"` 变成 `"0"`)、03 之后的 `backfill` / `backfill_omitted_before`。重算一遍就和第一次不一样,平台回 422,客户收到兜底。所以:
   - **存什么**:数字人服务每次调项目服务前,把发出的请求体**去掉 `invoke_token`** 后存进 Redis;03 之后连同这次缺口查询扫过的最大行号一起存(03 S-9)。
   - **怎么复用**:同一批、同一代次再处理时,除 `invoke_token` 外全部原样用缓存里的(`generation` 也不变),不重算任何东西;`invoke_token` 填**本次执行**新生成的那个。每次执行都会生成新令牌(`invoke-agent.processor.ts:358`)并写进轮次状态(`:705-711`),取消时按它找 run;要是沿用缓存里上一次的令牌,取消就找不到这一轮。`invoke_token` 只在数字人服务和项目服务之间用,不进发给平台的请求体,换了它不会引起 422。
@@ -352,8 +353,8 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 - **被取消的轮次,结果一律丢弃不发。** 平台的取消是尽力而为:取消在两个步骤之间生效,正在生成最后一段时它会照常以 `success` 收尾,即使取消接口返回了 `stopped: true`(run-control.md §4.1)。所以判断依据是「我方是否发过取消」,不是 `end.status`。
 - 数字人服务收到项目服务的回答后、入发送队列前,再看一次轮次状态;已经是「取消中」就丢弃(窗口很小,与现在一致)。
 - **我方取消怎么记、怎么保证不扣**(用现有列 `settle_skip_charge`,不加列;§3.8):
-  1. 调 `:cancel` **之前**先把 run 行的 `settle_skip_charge` 写成 1(先写库再取消;取消后平台抢先跑完 `success` 时,结算也能看到)。
-  2. 实时中继的收尾要在决定扣费前**重新读一次**这一列:现在 `settleFromRelay`(`run-settlement.service.ts:104`)用的是调用方手里的内存行,抢租约(`:342`)只更新租约,`:170` 读的是这份旧值,会把平台跑完 `success` 的已取消轮扣掉。巡检路径 `settleFromPlatform` 本来就重读(`:141`),不用改。
+  1. 调 `:cancel` **之前**先把 run 行的 `settle_skip_charge` 写成 1(先写库再取消):扣费的条件 UPDATE 带着 `settle_skip_charge=0`,所以取消后平台即使抢先跑完 `success`,也扣不到(§3.8,11-18 开发中定)。
+  2. **只适用于非企微聊天的智能体**(它们在每轮结束时的计费处理里扣费):那条路径要在决定扣费前重新读一次这一列(B-314 不改,只是记下来)—— 现在 `settleFromRelay`(`run-settlement.service.ts:104`)用的是调用方手里的内存行,抢租约(`:342`)只更新租约,`:170` 读的是这份旧值,会把平台跑完 `success` 的已取消轮扣掉;巡检路径 `settleFromPlatform` 本来就重读(`:141`)。**企微聊天智能体不走这条**(11-18 开发中定):康豆在项目服务拿到回答的那一步扣,用条件 UPDATE(`charged_k_dou=0` 且 `settle_skip_charge=0`)防止重复扣、也挡住我方已取消的轮次(§3.8);每轮结束时的计费处理只记用量成本,不扣费。
   3. 这一列原意是「存量历史 run」,置 1 后结算跳过交付和计费。企微聊天适配器的 `onDeliver` 一律返回 null(回答已经在同步请求里返回给数字人服务了),跳过交付对它没影响;代价是被取消的轮次不走计费那一段(`:180`),也就没有用量成本日志 —— 接受。
   4. 项目服务模型里这一列的注释改成「存量历史 run,或我方已取消」(只改代码注释)。
 - 平台那一轮已经生成了最终回答的:这条回答留在会话里,客户没收到。v1 项目服务只在日志里记「未送达 · cancelled」(run 表不加列),03 时落表并按 03 报给平台(03 之前无法报,属已知缺口,§3.11)。
@@ -402,7 +403,7 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 | 层 | 值 | 说明 |
 |---|---|---|
 | 平台每轮时限 | 300 秒 | 已拍板 |
-| 项目服务等平台 | 从发起 runs 算起 360 秒 | 300 + 60 秒收尾余量(覆盖上面的正常情况;含排队等前一轮停下的几秒)。到点**必须**调 `:cancel`、按失败发兜底(§3.9):项目服务现有的转发流程没有超时,调用方不等了它也会接着跑(`expert-work-run.service.ts:632`),不调取消(`:603`)这一轮会跑完并按正常完成扣费;要不扣,得先把 run 行 `settle_skip_charge` 写成 1、再调 `:cancel`(同 §3.6)。只看 `interrupted` 不行:现有 `shouldCharge` 对 `interrupted` 是扣的(`expert-work-billing.service.ts:74-75`)。迟到的回答留在会话里,03 之前属已知缺口 |
+| 项目服务等平台 | 从发起 runs 算起 360 秒 | 300 + 60 秒收尾余量(覆盖上面的正常情况;含排队等前一轮停下的几秒)。到点**必须**调 `:cancel`、按失败发兜底(§3.9):不取消的话平台会接着跑(项目服务现有的转发流程没有超时,`expert-work-run.service.ts:632`),白花模型成本,迟到的回答还会留在会话里(03 之前属已知缺口)。防扣费:扣费的条件 UPDATE 带着 `settle_skip_charge=0`,取消前先把它写成 1,就扣不到了(§3.6、§3.8;11-18 开发中定) |
 | 数字人服务调项目服务新入口的 HTTP 超时 | 390 秒 | 现在默认 300 秒(`project.request.ts:33`),比前两层都短,必须改;调新入口时显式传 390000 毫秒。多出的 30 秒给项目服务建会话、下载上传附件、解析 |
 | 同客户锁、轮次状态、取消标记 | 600 秒(不变) | 一次调用最长约 390 秒,加上调用前的语音转写仍在 600 秒内;等锁总时限 600 秒(`msg-cache.util.ts:22, 34`)也盖得住前一轮的 390 秒 |
 
@@ -422,11 +423,12 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 
 现在 Dify 链路:按场景取固定价(文字 / 图片 / 图文,`kdou-cost-scenario.ts:105-119`),流正常结束才扣,被取消不扣,扣在发送之前(`agent.service.ts:820-847`)。项目服务里其它 Expert Work 智能体的口径不同:按用量折算;是否扣费由全局的 `shouldCharge` 决定,`paused` / `interrupted` 也扣、`error` 不扣(`expert-work-billing.service.ts:62-80`);计费项按 agent_code 精确匹配,认不出的不扣(`:39-56`)。
 
-**要改的(11-17 定)**:健管师沿用**按场景固定价**(文字 / 图片 / 图文),不按用量 × 单价。这需要在计费里加一个**按适配器的钩子**(结算现在按会话行的 agent_code 派发适配器和计费,`run-settlement.service.ts:171、189`,改成先看 `adapter_type`,§4):
+**要改的(11-17 定;扣在哪一步 11-18 开发中改定)**:健管师沿用**按场景固定价**(文字 / 图片 / 图文),不按用量 × 单价。**康豆在项目服务拿到回答的那一步扣**,不在每轮结束时的计费处理里扣(结算现在按会话行的 agent_code 派发适配器,`run-settlement.service.ts:171、189`,改成先看 `adapter_type`,§4;企微聊天适配器在这一步只记用量成本日志、不扣费)。理由:场景固定价要用请求里的计费上下文(合伙人、群、客户 openid),每轮结束时的处理和后台巡检拿不到。
   - **科目和单价**:`adapter_type = wecom_chat` 时用现成的 `resolveDigitalHumanScenario`(`src/modules/billing/kdou-cost-scenario.ts:105`),科目是 `AI_DIGITAL_HUMAN_CHAT_TEXT` / `_IMAGE` / `_TEXT_IMAGE`(`src/config/global.ts:139-141`),单价按它给出的价格字段取(和 Dify 链路现在一样)。都是现有的,不加表、不改表。
   - **启动自检**:巡检启动时用 `hasOperationType` 检查每个已开通智能体有没有登记科目(`expert-work-billing.service.ts:95`,`run-settlement.sweeper.ts:43`),现在只认 agent_code 精确登记的;要改成 `adapter_type = wecom_chat` 的智能体也算登记了,否则每次启动都报「未登记扣费科目」。
-  - **扣不扣**:按下表,由企微聊天适配器的解析结果决定。现有 `shouldCharge` 对 `incomplete` 只看 `delivered`(`expert-work-billing.service.ts:69-70`),不知道「有没有可用回答」;健管师的「`incomplete` 只有拿到可用回答才扣」要由适配器按解析结果给出(解析合法、含 `silent` 都算可用;解析不了、改发兜底算不可用)。
-  - **我方取消**:调 `:cancel` 前先把 run 行 `settle_skip_charge` 写成 1,实时收尾扣费前重读这一列(§3.6 第 1、2 步);不用 `interrupted` 判断(现有 `shouldCharge` 对 `interrupted` 是扣的,`expert-work-billing.service.ts:74-75`)。
+  - **扣不扣**:按下表,由项目服务拿到回答后的解析结果决定,不用现有 `shouldCharge`(它对 `incomplete` 只看 `delivered`,`expert-work-billing.service.ts:69-70`,不知道「有没有可用回答」)。解析合法、含 `silent` 都算可用 → 扣;解析不了、改发兜底 → 不扣。
+  - **怎么扣、怎么防重复(11-18 开发中定)**:对 run 行做条件 UPDATE(`charged_k_dou = 0 AND settle_skip_charge = 0` 才更新),和钱包扣款放在同一个事务里;条件不满足(已扣过,或我方已取消)就不扣。
+  - **我方取消**:调 `:cancel` 前先把 run 行 `settle_skip_charge` 写成 1(§3.6 第 1 步),上面的条件 UPDATE 就扣不到(11-18 开发中定)。
 
 已拍板(11-17,§9 第 5、15 条):沿用场景固定价;**智能体这一轮正常跑完就扣,包括不发消息的轮次(群里不是对 AI 说的话;转人工配成「本轮不回」时,默认是本轮回复);出错、超时、发兜底话术、被取消不扣**。
 
@@ -441,7 +443,7 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 | `paused` | 不该出现(健管师不配审批);出现按 `error` 处理并告警 |
 
 - 群里「不是对 AI 说的话」的 `silent` 轮其实不多:绑定开了「群里需要 @ 才回」(`invoke_agent_need_at`)、且这个群不在免 @ 名单(`no_need_at_invoke_agent_prd_room_id`)时,没 @ 员工的消息数字人服务根本不调智能体(`invoke-agent.processor.ts:603-630`,记 `need_at_not_at_me` / `need_at_no_text`)。只有关了这个开关或群在免 @ 名单里的,才会出现这类扣费的 `silent` 轮。
-- 扣费幂等:台账每个 run 一行,按 run_id 只扣一次(沿用现有「`charged_k_dou` > 0 即已扣」的做法)。
+- 扣费幂等:台账每个 run 一行,条件 UPDATE(`charged_k_dou=0` 才更新)保证只扣一次(11-18 开发中定)。
 - 每轮的平台用量(`end.usage_by_model`,或 `GET .../runs/{id}/usage`)按价目折成成本,**v1 只打进项目服务日志**(带 run_id,run 表不加列),供核对「康豆收入 vs 模型成本」,不参与扣费。取消后不等 `end` 的轮次,终局(`end_status`、`finished_at`)由后台巡检补记(照 `run-settlement.sweeper.ts` 的做法)。
 - 扣谁的豆照旧:群聊按群上的合伙人,私聊按客户归属(`agent.service.ts:578-582`)。
 
@@ -508,7 +510,7 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 | 被打断 / 被接管 / 发送失败但已生成的回答 | 留在会话里,模型以为客户收到了(已知缺口) | 报「未送达」,下一轮起从模型视野剔除 |
 | 打断后重跑的 input | 合并整批放进 input,可能重复一次(§3.6) | 新消息进 input,旧批走补消息 |
 | 客户第一次走本智能体(切换后第一轮) | 会话从空开始,靠长期记忆衔接 | 补最近一段聊天 |
-| 首轮补问 | 数字人服务查消息表传 `is_first_contact`(这名员工与这个客户之间从没有过文字消息),模型再看档案缺项(02 / 06) | 同左 |
+| 首轮补问 | 数字人服务查消息表传 `is_first_contact`(这名员工与这个客户在这个聊天窗口(私聊、这个群)里从没有过文字或语音消息,不限时间;11-18 开发中定),模型再看档案缺项(02 / 06) | 同左 |
 
 ## 4. 改动清单
 
@@ -516,7 +518,7 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 
 - 01 本身**不需要平台改动**:发起、幂等、取消、排队、条目模式、上传、时限、上下文门槛全是现成的。补消息字段与未送达回报的平台改动算在 03。
 - 可选一(通用能力):「本轮时间」平台段——按智能体开关,把精确到分钟的当前时间放进最后一条消息末尾的平台段,不落库、不进记忆提炼和检索词。好处是时间不再混进客户的话;代价约 1-1.5 人天。见 §9 第 7 条。03 PR-3 的平台时间标注上线后会取代这一项(03 §9-13),所以一般不单独做。
-- 可选二(先数再定):「本轮输入」说明段对没有代码工具的智能体只留必要的几行。它现在每轮都提「exec_python / bash 里从目录读」(`inputs_block.py:114-116`),对这类智能体是无用的 token。先在测试环境数一下每轮多少 token 再决定。
+- 可选二(先数再定):「本轮输入」说明段对提示词写明不跑代码、不读文件形态输入的智能体(如健管师)只留必要的几行(11-18 更正:平台代码执行对每个智能体都装、关不掉,原写的「没有代码工具的智能体」不存在,要改成按开关精简)。它现在每轮都提「exec_python / bash 里从目录读」(`inputs_block.py:114-116`),对这类智能体是无用的 token。先在测试环境数一下每轮多少 token 再决定。
 
 ### 深护 MCP
 
@@ -534,14 +536,14 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 6. Idempotency-Key(代次用数字人服务传来的 `generation`)、键已用过时复用原行并接上原来那一轮、请求体确定性(§3.5)。
 7. 发起、等待、取最终回复(§3.8);409 返回 `busy`;从发起起等满 360 秒仍没有 `end` 就主动取消(§3.7);失败时拼兜底原文、按聊天窗口限频(§3.9)。
 8. 取消入口按 provider 分流:Expert Work 的走 `:cancel`(§3.6),沿用 `dh_invoke:{invoke_token}` 轮次状态和预取消墓碑。
-9. 康豆:沿用场景固定价与余额闸(§3.8);调 `:cancel` 前先置 `settle_skip_charge=1`,实时收尾扣费前重读这一列(§3.6);用量成本 v1 只打日志;后台巡检补记被取消轮次的终局。
+9. 康豆:沿用场景固定价与余额闸(§3.8);在项目服务拿到回答的那一步扣:条件 UPDATE(`charged_k_dou=0` 且 `settle_skip_charge=0`)和钱包扣款同一事务(11-18 开发中定);调 `:cancel` 前先置 `settle_skip_charge=1`(§3.6);每轮结束时的计费处理只记用量成本,v1 只打日志;后台巡检补记被取消轮次的终局。
 10. 客户端改动:本链路请求日志遮蔽 `input` / `inputs` / `untrusted_content`;加 `wx:` user_id 生成函数、`isCustomerExternalUserId` 认 `wx:`(§3.4.1);加 `untrusted_content` 与 03 的字段(要用时)。
-10a. 计费:按 `adapter_type` 的钩子(§3.8)—— 科目与单价用现有 `resolveDigitalHumanScenario`;`hasOperationType` 自检认企微聊天适配器;`incomplete` 扣不扣看适配器的解析结果。
+10a. 计费:按 `adapter_type` 分(§3.8)—— 科目与单价用现有 `resolveDigitalHumanScenario`;`hasOperationType` 自检认企微聊天适配器;`incomplete` 扣不扣看拿到回答后的解析结果;企微聊天适配器在每轮结束时的计费处理只记用量成本、不扣费(11-18 开发中定)。
 11. 接 03(最后做):把数字人服务查好的补消息字段(`backfill` 等,缺口查询在数字人服务,03 §4.3 S-6)原样转给平台;发送失败、被接管、被取消的轮按 03 调「未送达」接口(03 已定单独接口、当场报)。
 
 ### 深护数字人服务
 
-1. 按员工绑定分流(用户 11-17 定):`t_project_employee_cpwx_pad_relation` / `t_project_employee_cpwx_pc_relation` 各加字段 `is_expert_work`(默认 0)。为 0 照旧按 `agent_code` 走 Dify;为 1 时调新入口,项目服务用(项目, 同一个 `agent_code`)查 `t_project_expert_work_config` 取开通状态与密钥 —— 约定 Expert Work 上的智能体编码与 Dify 那一行的 `agent_code` 相同(Expert Work 智能体名只限长度 1~128,一般编码可直接用;上线前核对健管师现有编码)。`agent_code` 仍指向 Dify 那一行,回复时段、群 / 私聊开关、自称、自我介绍继续从那一行读,不复制。该配置行 `enabled=0` 时这个项目的所有绑定退回 Dify(项目级总开关)。
+1. 按员工绑定分流(用户 11-17 定):`t_project_employee_cpwx_pad_relation` / `t_project_employee_cpwx_pc_relation` 各加字段 `is_expert_work`(默认 0)。为 0 照旧按 `agent_code` 走 Dify;为 1 时调新入口,项目服务用(项目, 同一个 `agent_code`)查 `t_project_expert_work_config` 取开通状态与密钥。**走 Expert Work 要同时满足(11-18 开发中定)**:绑定的 `is_expert_work=1`,且配置行「项目 + 同一个 `agent_code`」`enabled=1`、`adapter_type='wecom_chat'`、没被删;任一条不满足就退回 Dify,并打一条 warn。查配置表本身出错时记 error、这一轮不调用,不退回 Dify;读 `adapter_type` 要先跑 SQL 05(缺列就是查表出错)。数字人服务只读这张表的 `project_code` / `agent_code` / `enabled` / `adapter_type` 四列,不读 `api_key`;`is_expert_work` 不是 1 时根本不查这张表 —— 约定 Expert Work 上的智能体编码与 Dify 那一行的 `agent_code` 相同(Expert Work 智能体名只限长度 1~128,一般编码可直接用;上线前核对健管师现有编码)。`agent_code` 仍指向 Dify 那一行,回复时段、群 / 私聊开关、自称、自我介绍继续从那一行读,不复制。该配置行 `enabled=0` 时这个项目的所有绑定退回 Dify(项目级总开关)。
 2. 绑定闸:走 Expert Work 的智能体不再要求 Dify 应用密钥。
 3. 锁键去掉密钥;发给项目服务的请求体里不再带 `agent_key`。
 4. 本批消息按 §5.1 的结构传(每条带企微消息身份、类型、发送时间、文字或 OSS 链接),不再在这里拼 query、截 10 个附件。
@@ -551,15 +553,15 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 8. 收到 `silent` / `offline`:不发;`offline` 告警。
 9. 新链路不再需要 `receive-answer` 回调(Dify 路径保留到切换完成);健管师转人工也不走 `referral-human` 回调,由深护 MCP 直接发(04 §3.10),这里不用改。
 10. 调新入口时 HTTP 超时显式设 390 秒(现在默认 300 秒,`project.request.ts:33`;§3.7)。
-11. 算 `is_first_contact`:沿用 Dify 口径,查消息表看这名员工与这个客户之间有没有过文字消息,没有就传 `"1"`(§3.3.2、§5.1;已拍板 11-17)。
+11. 算 `is_first_contact`:沿用 Dify 口径,查消息表看这名员工与这个客户在这个聊天窗口里有没有过文字或语音消息,没有就传 `"1"`(§3.3.2、§5.1;已拍板 11-17)。按聊天窗口算:私聊 = 员工和客户之间的消息;这个群 = 客户发的 + 员工 @ 这位客户的;不限时间;只看文字或语音;pad 侧不算撤回的;dk 会话存档没有撤回标记,撤回的原消息照算;本批消息整体排除(11-18 开发中定)。
 12. 代次:合并重跑任务的 job 数据带 `generation`(被取消那一轮 + 1),`locked_retry` 重排、任务重试沿用原值,调新入口时传给项目服务(§3.5)。
 12a. 请求体缓存:每次调新入口前按「本批 + 代次」把请求体(去掉 `invoke_token`;03 之后连同缺口查询扫过的最大行号)存进 Redis,有效期 600~900 秒;同一批同一代次再处理时其余原样复用、`invoke_token` 填本次执行新生成的,不重算 `is_first_contact`、补消息等;这批消息从消息缓存删掉时、走合并重跑时删掉这条缓存(§3.5)。
-13. 同客户锁:一步加锁 `SET 键 <invoke_token> NX EX 600`,释放时用 Lua 比对值等于自己的 `invoke_token` 才删;Dify 和 Expert Work 两条路共用,语义不变(§3.5);07 加 Dify 回归用例。
+13. 同客户锁:一步加锁 `SET 键 <invoke_token> NX EX 600`,释放时用 Lua 比对值等于自己的 `invoke_token` 才删,在 `finally` 里最后释放(11-18 开发中定);Dify 和 Expert Work 两条路共用,语义不变(§3.5);07 加 Dify 回归用例。
 
 ### 智能体配置
 
 - `policies.run_deadline_s: 300`(已拍板,§3.7)。
-- `dynamic_context.inject_current_date: false`(§3.3.1)。
+- `dynamic_context.inject_current_date: true`(§3.3.1;用户 11-18 定,原为 false)。
 - `system_prompt.jinja: true`,按 §3.3.2 声明变量(已定,06 §5.5 同步)。
 - `policies.tool_result_prune.absolute_cap_tokens: 40000`、`policies.working_memory.max_recent_turns: 20`、`absolute_cap_tokens: 40000` 与 `keep_first_turn: false`(§9 第 14 条)、`policies.context_compression.absolute_cap_tokens: 60000`(已拍板,§3.4.4)。
 - 长期记忆开启(已拍板)。
@@ -581,10 +583,10 @@ Idempotency-Key = "dh1:" + sha256_hex( 项目 | 智能体 | session_id | 排好�
 | `customer_cpwx_openid` / `msg_cpwx_room_id` | string | 计费与流水用,同现有 |
 | `room_conversation_id` | string | 私聊为空串 |
 | `group_partner_code` | string,可缺 | 同现有语义:键存在即按群归属扣费 |
-| `invoke_token` | string | 轮次令牌,同现有 |
+| `invoke_token` | string | 轮次令牌,同现有。走 Expert Work 的轮次用短格式 `ewt_{对任务 id 取 sha1 的前 20 位十六进制}:{毫秒时间戳}:{6 位 base36 随机串}`(约 45 字符;原格式在 dk 群里会很长),Dify 路径格式不变;项目服务不校验格式,只限长 ≤ 128(11-18 开发中定) |
 | `generation` | int | 代次,默认 0;只有数字人服务自己取消后合并重跑时 = 被取消那一轮的代次 + 1(随重跑任务的 job 数据带着,§3.5) |
 | `persona` | object | `self_appellation`、`self_introduction`(取法同现有 Dify 调用,`invoke-agent.processor.ts:861-862`;私聊 / 群聊由 `room_conversation_id` 是否为空判断;客户备注名不再需要) |
-| `is_first_contact` | `"1"` / `"0"` | 数字人服务查消息表算出:这名员工与这个客户之间从没有过文字消息为 `"1"`(§3.3.2) |
+| `is_first_contact` | `"1"` / `"0"` | 数字人服务查消息表算出:这名员工与这个客户在这个聊天窗口(私聊、这个群)里从没有过文字或语音消息,不限时间,才为 `"1"`(§3.3.2,11-18 开发中定) |
 | `messages` | array | 本批客户消息,按发送时间排序,见下表 |
 | `source_msg_keys` | string[] | 这一轮要回答的客户消息的身份(`msg_key`,**不带通道前缀**;项目服务按 `source` 加 `pad:` / `dk:`,run 表 `source_msg_keys` 列和 inputs 变量 `source_message_ids` 里存的都是带前缀的值):本批,**加上正在重跑的被取消那批**。03 之前与合并后的 `messages` 相同;03 之后(S-8)被取消那批改走 `backfill`,但仍要列在这里 —— `backfill` 里还混着 AI 关闭期间的其它消息,项目服务分不出哪些是被取消那批。项目服务据此加通道前缀生成 inputs 变量 `source_message_ids`(§3.3.2) |
 | 03 的字段 | — | 补消息(`backfill`、`backfill_omitted_before`、`input_message_ids`),见 03;03 之前不传 |
@@ -695,11 +697,11 @@ Idempotency-Key: dh1:<64 位十六进制>
 
 - 加两列:`invoke_token`(数字人服务的轮次令牌)、`source_msg_keys`(JSON,这一轮要回答的客户消息身份,§5.1)。`source_msg_keys` 存**带前缀**的值(`pad:{msg_app_info}` / `dk:{msgid}`,与 SQL `2026-11-17-b314-04` 的列注释、inputs 的 `source_message_ids` 相同);数字人服务传来的是不带前缀的,项目服务按 `source` 加。
 - 幂等键:放现有的 `idempotency_key` 列(varchar 64),只存 64 位十六进制 sha256,不带 `dh1:` 前缀(发请求时再拼上);同一次调用的重试复用同一行,不新建行(§3.5)。
-- **不再加别的列**,v1 用现有列或日志代替:我方取消 → 调 `:cancel` 前写 `settle_skip_charge=1`,实时收尾重读(§3.6);代次 → 由数字人服务定、随请求传来,不存(§3.5);`invoke_token` 只用来让取消入口找到 run(复用已有行时改成本次的);扣费、终局照现有列(`charged_k_dou`、`end_status`、`finished_at`);用量成本 → v1 只打日志;送达结果(发出 / 被接管 / 发送失败 / 取消)→ v1 只打日志,落表的列随 03 期加。
+- **不再加别的列**,v1 用现有列或日志代替:我方取消 → 调 `:cancel` 前写 `settle_skip_charge=1`,扣费的条件 UPDATE 带上这一列(§3.6、§3.8,11-18 开发中定);代次 → 由数字人服务定、随请求传来,不存(§3.5);`invoke_token` 只用来让取消入口找到 run(复用已有行时改成本次的);扣费、终局照现有列(`charged_k_dou`、`end_status`、`finished_at`);用量成本 → v1 只打日志;送达结果(发出 / 被接管 / 发送失败 / 取消)→ v1 只打日志,落表的列随 03 期加。
 
 **配置行:`t_project_expert_work_config`**:加一列可空的 `adapter_type`(§4 第 2a 条)。
 
-建表 / 加列的 SQL 在 `deep-ai-health-db-design/1.5.7/project_tables/leyi/`,文件名以 `2026-11-17-b314-` 开头(05 §3.6.2 列了清单)。
+建表 / 加列的 SQL 在 `deep-ai-health-db-design/1.5.8/project_tables/leyi/`(11-18 从 1.5.7 挪过来),文件名以 `2026-11-17-b314-` 开头(SQL 13 以 `2026-11-18-b314-` 开头;05 §3.6.2 列了清单)。
 
 #### 键的算法(字节级,数字人服务和项目服务按同一套规则实现)
 
@@ -732,8 +734,10 @@ Idempotency-Key: dh1:<64 位十六进制>
 
 | 键 | 值 | 存活 |
 |---|---|---|
-| `invoke_lock:{项目}:{智能体}:{客户号}` | 1 | 600 秒(同现有) |
+| `invoke_lock:{项目}:{智能体}:{客户号}` | ~~1~~ 本轮的 `invoke_token`(`SET NX EX 600`,释放时 Lua 比对后再删,在 `finally` 里最后释放;数字人服务写,11-18 开发中定) | 600 秒(同现有) |
 | `dh_invoke:{invoke_token}` | `{status, ew_run_id, ew_user_id, agent_code}` | 600 秒(沿用现有键名) |
+| `dh_ewreq:{64 位十六进制幂等键,不带 dh1:}` | 项目服务写:发给平台的整份请求体(`SET NX`;§3.5,11-18 开发中定) | 900 秒 |
+| `ew_req:{64 位十六进制}` | 数字人服务写:发给项目服务的请求体,去掉 `invoke_token`(缓存键算法见上「键的算法」;§3.5) | 600~900 秒(数字人服务用 900 秒) |
 | `dh_upload:{session_id}:{msg_key}` | upload_id | 1 天 |
 | `dh_fallback:{项目}:p:{员工企微号}:{客户企微号}`(私聊)/ `dh_fallback:{项目}:g:{群会话 id}`(群) | 1 | 10 分钟(兜底限频,按聊天窗口;项目服务写,§3.9) |
 
@@ -743,7 +747,7 @@ Idempotency-Key: dh1:<64 位十六进制>
 
 - **群里没有客户行的发言人**:现在照常回复、`customer_code` 为空(`invoke-agent.processor.ts:378-387`)。user_id 和工具身份怎么办见 §9 第 2 条。
 - **客户编码变了**(客户被合并或重建):user_id 跟着变,之前的长期记忆接不上。现阶段接受,记一笔。
-- **跨零点**:平台日期段已建议关闭;本轮时间以 input 首行为准。
+- **跨零点**:~~平台日期段已建议关闭;~~ 平台日期注入已打开(§3.3.1,用户 11-18 定);本轮时间以 input 首行为准。平台的日期是构建智能体时算好、冻结在系统提示词里的(`agent_factory.py:1203-1211`),构建结果缓存 30 分钟(control-plane `runtime.py:452` `cache_ttl_s = 1800`,11-18 核代码),所以过零点后最多 30 分钟里系统提示词里的日期还是昨天;正式对话以首行时间为准,不受影响。
 - **图片超过 8 张**:只带最后 8 张,input 里说明「客户还发了 N 张更早的图片,这次没带上」。
 - **附件下载失败 / 类型不收**:不上传,input 对应行写明打不开;不让整轮失败。
 - **附件过期**:平台附件最后一次使用后保留 90 天(chat.md §2.6),缓存的 upload_id 只存 1 天,不会用到过期的。
@@ -788,7 +792,7 @@ Idempotency-Key: dh1:<64 位十六进制>
 |---|---|---|
 | Expert Work 平台 | 01 本身无改动;可选「本轮时间」平台段 1-1.5 人天(03 PR-3 会取代它,一般不单独做)、「本轮输入」段精简 1 人天 | 0(可选 2-2.5) |
 | 智能体配置 | 时限、日期段、变量声明、上下文门槛(与 02 / 04 一起) | 0.5 人天 |
-| 深护项目服务 | 新入口、复用两张表(加列加索引)、配置行 `adapter_type` 与通用企微聊天适配器、会话、附件、input / inputs、幂等与代次、取最终回复、取消、康豆(按适配器的计费钩子)与巡检、日志遮蔽 7-9;我方取消先写标记、实时收尾重读 0.5(§3.6);越权读会话修法 A 1.5~2(08 S13,切换前必做) | 9-11.5 人天(粗估) |
+| 深护项目服务 | 新入口、复用两张表(加列加索引)、配置行 `adapter_type` 与通用企微聊天适配器、会话、附件、input / inputs、幂等与代次、取最终回复、取消、康豆(按适配器的计费钩子)与巡检、日志遮蔽 7-9;我方取消先写标记、扣费用条件 UPDATE 0.5(§3.6;11-18 开发中定);越权读会话修法 A 1.5~2(08 S13,切换前必做) | 9-11.5 人天(粗估) |
 | 深护数字人服务 | 分流开关、锁键与绑定闸、消息结构、`is_first_contact` 查消息表、发送入队与回写、各 `outcome` 处理、HTTP 超时 390 秒;代次随重跑任务带、请求体缓存、锁改一步加锁与比对释放 1 | 4-5 人天 |
 | 联调与真栈验收 | §7 的 23 条(第 22、23 条要人为造故障)+ 07 的 Dify 回归两条 | 3.5 人天 |
 | 合计(只是 01 这一篇) | 不含 02~07 各篇;0.5 + 9~11.5 + 4~5 + 3.5 | 约 17-20.5 人天(粗估;全部模块合计约 56~67 人天,见开发计划 `docs/superpowers/plans/2026-11-17-b314-dev-plan.md` §1) |
@@ -832,7 +836,7 @@ Idempotency-Key: dh1:<64 位十六进制>
 11. ~~最终回复怎么取~~ **按推荐定(11-17)**:`stream_format: items`,流里收到本轮 `type=assistant_message`、`channel=final` 的 `item.done` 就拿正文;流断了用 `events?since_seq=` 续上;续不上、或续上后直到 `end` 都没收到 final,按 run_id 查条目(02 原来的取法就是这条退路,02 §3.4 已同步)。
     - 坑(读代码推断):条目转换器按连接新建(`_run_event_stream.py:288`),用 `since_seq` 续上的那条连接如果没有重放到最后那条助手消息,收尾时就不会补发 `final`,所以「续流后没收到 final」不能当成「没有回答」。
 
-12. ~~inputs 变量清单定稿~~ **按推荐定(11-17)**:身份变量(`project_code`、`customer_code`、`employee_code`、`employee_pad_userid`、`customer_pad_userid`、`room_conversation_id`)全部必填、没有就传空串;不传 `source`、`customer_display_name`;加 `is_first_contact`(沿用 Dify 口径「这名员工与这个客户之间从没有过文字消息」,由数字人服务查消息表算出,02 待拍板 6)、`attachment_urls`(JSON 数组,给表单写入的附件参数绑定用)。清单见 §3.3.2;04 §3.3、06 §5.1 / §5.5 已同步。客户资料不走变量(04 §9.4 已定:智能体调 `profile_get_brief` 自己查)。
+12. ~~inputs 变量清单定稿~~ **按推荐定(11-17)**:身份变量(`project_code`、`customer_code`、`employee_code`、`employee_pad_userid`、`customer_pad_userid`、`room_conversation_id`)全部必填、没有就传空串;不传 `source`、`customer_display_name`;加 `is_first_contact`(沿用 Dify 口径「这名员工与这个客户在这个聊天窗口(私聊、这个群)里从没有过文字或语音消息,不限时间」,11-18 开发中定,由数字人服务查消息表算出,02 待拍板 6)、`attachment_urls`(JSON 数组,给表单写入的附件参数绑定用)。清单见 §3.3.2;04 §3.3、06 §5.1 / §5.5 已同步。客户资料不走变量(04 §9.4 已定:智能体调 `profile_get_brief` 自己查)。
 
 13. ~~项目服务 → 数字人服务的返回契约~~ **按推荐定(11-17)**:用本文的新入口 `POST /agent/invoke-digital-human-ew`(Dify 入口一字不动,回退干净);`outcome` 合并为 `reply` / `silent`(模型决定不回)/ `fallback` / `cancelled` / `busy` / `offline`(智能体被下线,不发不兜底);带 02 的 `answer_origins` / `file_origins`;兜底原文由项目服务拼,限频按聊天窗口。字段表见 §5.1,02 §5.4 是同一份。
 
