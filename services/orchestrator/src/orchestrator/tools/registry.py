@@ -458,8 +458,19 @@ class ToolContext:
         """本次调用的工作区视图 —— 文件工具解析路径与 exec 建命名空间用的同一个值。"""
         thread = (self.workspace_thread_id or self.thread_id) if self.agent_key else None
         conv = thread if self.workspace_layout == "conversation" else None
+        # B-317 —— 本轮输入目录属于哪个 run:沙箱里 ``EXPERT_WORK_INPUTS(_DIR)`` 与
+        # ``inputs/current/`` 挂载、宿主侧 ``inputs/current/`` 改写都用这一个值。条件与
+        # ``run_in_sandbox`` 判「本轮有没有 inputs.json」同一口径,外加绑了 agent —— 没绑时
+        # exec 视图不挂(``nas_view`` 早返回),宿主侧也不能改写,两侧说同一句话。
+        inputs_run = (
+            (self.inputs_run_id or self.run_id) if (self.prompt_inputs and self.agent_key) else None
+        )
         return WorkspaceView(
-            agent_key=self.agent_key, conv_id=conv, thread_id=thread, child_run=self.child_run
+            agent_key=self.agent_key,
+            conv_id=conv,
+            thread_id=thread,
+            child_run=self.child_run,
+            inputs_run=inputs_run,
         )
 
 

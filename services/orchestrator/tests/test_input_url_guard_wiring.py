@@ -177,7 +177,7 @@ async def test_retyped_url_call_is_blocked_while_its_sibling_runs() -> None:
     msgs = _tool_messages(state)
     assert msgs["tc-bad"].status == "error"
     assert msgs["tc-bad"].content.startswith("[blocked]")
-    assert "$EXPERT_WORK_INPUTS_DIR/org_logo.png" in msgs["tc-bad"].content
+    assert "inputs/current/org_logo.png" in msgs["tc-bad"].content
     assert msgs["tc-ok"].content == "ran"
     rows = [e for e in audit.entries if e.action.value == "tool:blocked"]
     assert len(rows) == 1
@@ -312,7 +312,7 @@ async def test_untrusted_variable_message_names_neither_the_link_nor_the_written
     assert content.startswith("[blocked]")
     assert "materials" in content
     assert "疑似抄错 1 处" in content
-    assert "$EXPERT_WORK_INPUTS_DIR 下" in content
+    assert "inputs/current/ 下" in content
     assert "$EXPERT_WORK_INPUTS 清单里 materials 对应条目的 local_path" in content
     assert "示范视频" not in content
     assert "materials/0" not in content
@@ -333,7 +333,7 @@ async def test_trusted_variable_message_names_the_link() -> None:
 
     assert tool.calls == []
     content = _tool_messages(state)["tc-1"].content
-    assert "$EXPERT_WORK_INPUTS_DIR/materials/0-示范视频.mp4" in content
+    assert "inputs/current/materials/0-示范视频.mp4" in content
     assert MATERIAL_RETYPED in content
 
 
@@ -372,7 +372,7 @@ async def test_main_run_continuation_with_inputs_run_id_keeps_the_link_name() ->
     )
 
     assert tool.calls == []
-    assert "$EXPERT_WORK_INPUTS_DIR/org_logo.png" in _tool_messages(state)["tc-1"].content
+    assert "inputs/current/org_logo.png" in _tool_messages(state)["tc-1"].content
 
 
 # --- 下一步模型看到的恢复提示:要它改调用,不是等审批。

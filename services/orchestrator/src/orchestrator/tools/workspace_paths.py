@@ -34,6 +34,7 @@ from expert_work.persistence import (
     WORKSPACE_UPLOADS_DIR,
 )
 from expert_work.protocol.agent_key import require_safe_key as require_safe_key
+from orchestrator.tools.inputs_doc import CURRENT_INPUTS_DIRNAME, CURRENT_INPUTS_REL
 from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW, NAS_MOUNT
 
 #: 显式跨到用户级 ``shared/`` 区的前缀(照 ADK 的 ``user:`` 约定)。
@@ -182,12 +183,17 @@ class WorkspaceView:
 
     ``child_run``(B-300)= 委派出去的子代:``threads/`` 里那一格它不许寻址(主智能体的记忆
     投影在里面),agent 根下的旧投影 ``MEMORY.md`` 也不许。
+
+    ``inputs_run``(B-317)= 本轮输入目录属于哪个 run:``inputs/current/`` 改写到
+    ``inputs/<它>/``。与沙箱 exec 里 ``EXPERT_WORK_INPUTS_DIR`` 的 run id 同一个取值
+    (``ToolContext.workspace_view``);``None`` = 本轮没有输入(或没绑 agent)。
     """
 
     agent_key: str = ""
     conv_id: UUID | None = None
     thread_id: UUID | None = None
     child_run: bool = False
+    inputs_run: UUID | None = None
 
     @property
     def per_conversation(self) -> bool:
@@ -206,12 +212,22 @@ class ResolvedPath:
     ``ws`` 交给 ``build_*_wrapper(..., ws=ws)`` 与 ``store_scope``,``rel`` 是相对它的路径
     (``"."`` = 这个视图的根)。``path`` 是归一化后的、模型可再传回来的写法(``shared:``
     前缀保留),给报错与 ``read_page`` 的文档记录用。
+
+    B-317 —— ``path`` 永远是**真实路径**:``inputs/current/x`` 与别名改写成 ``inputs/<run>/x``。
+    凡是落盘、跨轮、写元数据的地方都用它(``figure_documents`` 下一轮要按下一轮的视图再算一遍
+    哈希,短路径那时已指向别的一轮)。``display`` 是**这一次**回给模型看的写法(短路径;其余
+    情形等于 ``path``),只用在本次工具调用的回执与报错里。
     """
 
     ws: str
     rel: str
     kind: ResolvedKind
     path: str
+    display: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.display:
+            object.__setattr__(self, "display", self.path)
 
 
 def _view_alias_rest(cleaned: str, agent_key: str) -> str | None:
@@ -279,6 +295,45 @@ def _reject_reserved_head(
         raise ValueError(msg)
 
 
+#: B-317 —— 老写法 ``$EXPERT_WORK_INPUTS_DIR/x``(会话历史里的旧段、租户模板)在路径参数开头
+#: 当作 ``inputs/current/x``。只认开头、只认这一个环境变量。
+_INPUTS_DIR_ALIASES = ("$EXPERT_WORK_INPUTS_DIR/", "${EXPERT_WORK_INPUTS_DIR}/")
+_CURRENT_HEAD = (WORKSPACE_INPUTS_DIR, CURRENT_INPUTS_DIRNAME)
+
+
+def _unalias_inputs_dir(raw: str) -> str:
+    for alias in _INPUTS_DIR_ALIASES:
+        if raw.startswith(alias):
+            return f"{CURRENT_INPUTS_REL}/{raw[len(alias) :]}"
+    return raw
+
+
+def _current_inputs_parts(
+    parts: tuple[str, ...], view: WorkspaceView, *, agent_view: bool, raw: str, tool: str
+) -> tuple[tuple[str, ...], str | None]:
+    """``inputs/current/…`` → ``inputs/<inputs_run>/…``,并返回给模型看的短写法。不是这种路径
+    原样返回(显示写法为 ``None``)。"""
+    if parts[:2] != _CURRENT_HEAD:
+        return parts, None
+    if agent_view:
+        if view.per_conversation:
+            # 对话视图里 /agent/inputs/ 由下面的平台目录规则拒,文案不变。
+            return parts, None
+        msg = (
+            f"{tool}: {CURRENT_INPUTS_REL}/ 只在 /workspace 下有效，"  # noqa: RUF001
+            f"请写 {CURRENT_INPUTS_REL}/<文件名>: {raw!r}"
+        )
+        raise ValueError(msg)
+    if view.inputs_run is None:
+        msg = (
+            f"{tool}: {CURRENT_INPUTS_REL}/ 是本轮输入文件的目录；"  # noqa: RUF001
+            "本轮没有输入变量，里面没有文件。"  # noqa: RUF001
+            f"之前几轮的文件用当时工具结果或渲染页段里给出的路径: {raw!r}"
+        )
+        raise ValueError(msg)
+    return (WORKSPACE_INPUTS_DIR, str(view.inputs_run), *parts[2:]), "/".join(parts)
+
+
 def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> ResolvedPath:
     """把工具收到的 ``path`` 解析成 ``(视图, 相对路径)`` —— 文件工具、``save_artifact``、
     ``read_page`` 与渲染页查找共用的唯一一份规则(B-236 之前分散在 ``_require_path`` /
@@ -308,7 +363,7 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
             raise ValueError(msg)
         return _shared_target(path, rel, tool=tool)
     agent_key = view.agent_key
-    cleaned = raw
+    cleaned = _unalias_inputs_dir(raw)
     if agent_key:
         alias_rest = _view_alias_rest(cleaned, agent_key)
         if alias_rest is not None:
@@ -331,7 +386,9 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
         if _SKILLS_SEGMENT in path:
             msg += _SKILLS_PATH_HINT
         raise ValueError(msg)
-    parts = PurePosixPath(cleaned).parts
+    parts, display = _current_inputs_parts(
+        PurePosixPath(cleaned).parts, view, agent_view=agent_view, raw=path, tool=tool
+    )
     head = parts[0] if parts else ""
     rel = "/".join(parts) if parts else "."
     if agent_key and not (head == THREADS_DIR and view.per_conversation and not agent_view):
@@ -351,9 +408,11 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
             raise ValueError(msg)
         target = ResolvedPath(ws=AGENT_VIEW, rel=rel, kind="agent", path=_agent_spelling(rel))
     elif not view.per_conversation:
-        target = ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="legacy", path=rel)
+        target = ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="legacy", path=rel, display=display or "")
     else:
-        target = ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="conversation", path=rel)
+        target = ResolvedPath(
+            ws=EXEC_VIEW, rel=rel, kind="conversation", path=rel, display=display or ""
+        )
     _refuse_root_projection_from_a_child(target, view, raw=path, tool=tool)
     return target
 

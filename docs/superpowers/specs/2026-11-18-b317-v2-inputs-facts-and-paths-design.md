@@ -226,7 +226,7 @@ inputs/
 | 受检面 | 查哪些字符串 | 不查 |
 |---|---|---|
 | ① MCP 工具(名字以 `mcp__` 开头,`tools/mcp.py:88`)和 `http` 工具(`tools/http.py:116`) | 参数里**全部字符串叶子**(递归,不看字典键) | 这次被平台绑定填过的参数(`_fill_bound_args` 返回的逐调用参数名,`builder.py:1902-1927`) |
-| ② 平台工具的路径参数:守卫自己维护的一张「工具名 → 路径参数名」表(`read_file` / `write_file` / `edit_file` / `list_dir` / `search_files` / `read_document` / `read_page` 的 `path`,`save_artifact` 的 `path`) | 表里这些参数的值 | 同一工具的其它参数 |
+| ② 平台工具的路径参数:守卫自己维护的一张「工具名 → 路径参数名」表(`read_file` / `write_file` / `edit_file` / `list_dir` / `read_document` / `read_page` / `ask_image` 的 `path`,`save_artifact` 的 `path`;`search_files` 没有路径参数,实现时核对后去掉) | 表里这些参数的值 | 同一工具的其它参数 |
 | ③ `ask_image.path` | 这个参数的值 | `question`、`image_ref` 等 |
 
 不在表里的一律不查,包括:`exec_python` / `bash`、委派任务(`spawn_worker` / 子 Agent 的 task)、`update_plan`、技能编写(`author_skill` / `refine_skill` / `fork_skill`)、`remember`、`note_behavior_patch`、`write_file` / `edit_file` 的内容(含顶层 `edits` / `old_string` / `new_string`,它们不在路径参数表里)、`knowledge_search`、`web_search`。理由(用户已定):平台技能大量教 `$EXPERT_WORK_SKILLS_DIR/...` 的写法,在子代、在之后执行的脚本里都是有效的,拦下会把正确的路径改坏;而白名单里的三处,字面量 `$名字` 在任何情况下都不会被展开。
@@ -337,7 +337,9 @@ inputs/
 
 新(两处引用同一个常量 `INPUTS_CODE_NOTE`):
 
-> 本轮如果有输入变量，它们在 $EXPERT_WORK_INPUTS 指向的 JSON 清单里（含原地址、编码、本地文件路径）；本轮没有输入变量时这个文件不存在，读不到就照上文办，不必重试。代码里要用到某个输入值时，从清单读，不要从上文手抄——长串抄错一位就是 404。平台预先下载的文件在 inputs/current/ 下（与 $EXPERT_WORK_INPUTS_DIR 是同一个目录）：整个值是地址的变量叫 <变量名><扩展名>，对象字段里的叫 <变量名>.<字段名><扩展名>，列表项叫 <变量名>/<下标-说明><扩展名>；确切路径见清单里该项的 local_path（值是 JSON 字符串时在 value_parsed[i].local_path）。文件不在（下载失败，或挂起很久后已被清理）就按清单里的原地址下载。地址一律从清单读或用这些文件，不要手抄。
+> 本轮如果有输入变量，它们在 $EXPERT_WORK_INPUTS 指向的 JSON 清单里（含原地址、编码、本地文件路径）；本轮没有输入变量时这个文件不存在，读不到就照上文办，不必重试。代码里要用到某个输入值时，从清单读，不要从上文手抄——长串抄错一位就是 404。清单里 local_path 非空表示平台已把该文件下载到本地，直接用它，不必再联网下载；极少数情况下（挂起很久之后续跑）该文件已被清理，这时改用同一项里的原始 URL 自己下载。平台预先下载的文件在 inputs/current/ 下（与 $EXPERT_WORK_INPUTS_DIR 是同一个目录）：整个值是地址的变量叫 <变量名><扩展名>，对象字段里的叫 <变量名>.<字段名><扩展名>，列表项叫 <变量名>/<下标-说明><扩展名>；确切路径见清单里该项的 local_path（值是 JSON 字符串时在 value_parsed[i].local_path）。文件不在就按清单里的原地址下载。地址一律从清单读或用这些文件，不要手抄。
+
+(实现时核对:旧文的「local_path 非空 → 直接用、不必联网」一句是现有测试 `test_both_sandbox_tool_descriptions_state_the_local_path_fallback` 钉住的常见路径说明,保留;与旧文相比只改了「文件」→「清单」两处措辞和目录写法。)
 
 ### 4.4 手抄 URL 守卫的提示(`input_url_guard.py:240-274`)
 

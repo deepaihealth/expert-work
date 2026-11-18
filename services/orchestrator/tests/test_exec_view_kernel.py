@@ -1077,3 +1077,135 @@ result["shell"] = ex_shell(D["command"], D["env"], (D["name"], D["code"]))
         assert options.get(point) == "ro", (point, options)
     assert r["masked"].startswith("/proc/"), r
     assert r["shell"]["out"] == "ok\n", ("云上那条路(bash -l + 代码文件)同样不出 98", r["shell"])
+
+
+# ---------------------------------------------------------------------------
+# B-317 —— 本轮 inputs/<run>/ 也挂在 inputs/current/(run id 取自 EXPERT_WORK_INPUTS_DIR)
+# ---------------------------------------------------------------------------
+
+_RUN_A = "0f1e2d3c-4b5a-4968-8776-655443322110"
+_RUN_B = "1f1e2d3c-4b5a-4968-8776-655443322111"
+_CACHED = "a" * 32
+
+
+def _plant_inputs(base: str, run: str, logo: str) -> str:
+    """驱动片段:``base`` 下建一份预拉后的 inputs(缓存 + 相对链接,与 prefetch_script 同形)。"""
+    return f"""
+        put("{base}/inputs/cache/{_CACHED}{run[:2]}.png", "{logo}")
+        link("{base}/inputs/{run}/org_logo.png", "../cache/{_CACHED}{run[:2]}.png")
+        put("{base}/inputs/cache/{_CACHED}{run[:2]}.mp4", "video-{logo}")
+        link("{base}/inputs/{run}/materials/0-demo.mp4", "../../cache/{_CACHED}{run[:2]}.mp4")
+        put("{base}/inputs/{run}/inputs.json", "{{}}")
+    """
+
+
+@pytest.mark.parametrize(
+    ("conv", "base"),
+    [(_CONV, f"agents/a/threads/{_CONV}/work"), ("", "agents/a")],
+)
+def test_this_turns_inputs_are_at_inputs_current(scenario: Scenario, conv: str, base: str) -> None:
+    """X3 / X6 —— 对话视图与老视图:相对路径 ``inputs/current/…`` 直接打开,两层链接照常解析;
+    挂载载荷卸不掉,可写(与 ``inputs/<run>/`` 今天一样)。"""
+    r = scenario(
+        _plant_inputs(base, _RUN_A, "LOGO-A")
+        + f"""
+        run = ex(
+            "cat inputs/current/org_logo.png; echo; cat inputs/current/materials/0-demo.mp4; echo; "
+            "umount inputs/current 2>/dev/null && echo unmounted || echo locked; "
+            "touch inputs/current/w && echo writable; " + MOUNTS,
+            env={{"EXPERT_WORK_INPUTS_DIR": "/workspace/inputs/{_RUN_A}"}},
+            conv="{conv}",
+        )
+        result["run"] = run
+        result["mounts"] = mounts_of(run)
+    """
+    )
+    run = r["run"]
+    assert run["rc"] == 0, run["err"]
+    assert run["err"] == ""
+    assert run["out"].splitlines()[:4] == ["LOGO-A", "video-LOGO-A", "locked", "writable"], run
+    assert "/workspace/inputs/current" in r["mounts"], r["mounts"]
+    assert "/agent/inputs/current" not in r["mounts"], r["mounts"]
+
+
+def test_two_runs_in_one_workspace_each_see_their_own_inputs(scenario: Scenario) -> None:
+    """X4 —— 同一个工作区并发的两次 exec(两轮):各自的 ``inputs/current`` 是各自的 run。"""
+    r = scenario(
+        _plant_inputs("agents/a", _RUN_A, "LOGO-A")
+        + _plant_inputs("agents/a", _RUN_B, "LOGO-B")
+        + f"""
+        import threading
+        out = {{}}
+
+        def go(run, key):
+            out[key] = ex(
+                "sleep 1; cat inputs/current/org_logo.png",
+                env={{"EXPERT_WORK_INPUTS_DIR": "/workspace/inputs/" + run}},
+            )
+
+        threads = [
+            threading.Thread(target=go, args=("{_RUN_A}", "a")),
+            threading.Thread(target=go, args=("{_RUN_B}", "b")),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        result.update(out)
+    """
+    )
+    assert (r["a"]["out"], r["b"]["out"]) == ("LOGO-A", "LOGO-B"), r
+
+
+def test_inputs_mount_is_skipped_silently(scenario: Scenario) -> None:
+    """X5 / M2 —— run 目录不在:不挂、stderr 为空、不建 ``current`` 桩;``current`` 被种成符号
+    链接 / 普通文件:不挂、stderr 为空、exec 成功;桩里原有的文件在有挂载的 exec 里看不见。"""
+    r = scenario(
+        f"""
+        env = {{"EXPERT_WORK_INPUTS_DIR": "/workspace/inputs/{_RUN_A}"}}
+        mkd("agents/a/inputs")
+        result["missing"] = ex("ls -A inputs", env=env)
+        result["stub_made"] = os.path.exists(AG + "/inputs/current")
+        """
+        + _plant_inputs("agents/a", _RUN_A, "LOGO-A")
+        + """
+        link("agents/a/inputs/current", "/usr/local/bin")
+        result["planted_link"] = ex("ls inputs/current | head -1; echo done", env=env)
+        os.unlink(AG + "/inputs/current")
+        put("agents/a/inputs/current", "file")
+        result["planted_file"] = ex("echo done", env=env)
+        os.unlink(AG + "/inputs/current")
+        put("agents/a/inputs/current/leftover.txt", "old")
+        result["covered"] = ex("ls inputs/current", env=env)
+        result["uncovered"] = ex("ls inputs/current")
+    """
+    )
+    assert (r["missing"]["rc"], r["missing"]["err"]) == (0, ""), r["missing"]
+    assert r["stub_made"] is False
+    for key in ("planted_link", "planted_file"):
+        assert (r[key]["rc"], r[key]["err"]) == (0, ""), r[key]
+        assert r[key]["out"].splitlines()[-1] == "done"
+    assert "leftover.txt" not in r["covered"]["out"], r["covered"]
+    assert "org_logo.png" in r["covered"]["out"], r["covered"]
+    assert r["uncovered"]["out"].split() == ["leftover.txt"], r["uncovered"]
+
+
+def test_no_inputs_env_means_no_inputs_mount(scenario: Scenario) -> None:
+    """X8 —— 没有环境变量(本轮没有 inputs、或没绑 agent)就不挂。"""
+    r = scenario(
+        _plant_inputs("agents/a", _RUN_A, "LOGO-A")
+        + """
+        run = ex("ls inputs/current 2>&1 | head -1; " + MOUNTS)
+        result["run"] = run
+        result["mounts"] = mounts_of(run)
+        result["unbound"] = ex(
+            "ls /workspace/agents/a/inputs/current 2>/dev/null | head -1; echo done",
+            env={"EXPERT_WORK_INPUTS_DIR": "/workspace/inputs/{run}"},
+            key="",
+        )
+    """.replace("{run}", _RUN_A)
+    )
+    assert r["run"]["rc"] == 0, r["run"]["err"]
+    assert "/workspace/inputs/current" not in r["mounts"], r["mounts"]
+    assert r["unbound"]["rc"] == 0, r["unbound"]["err"]
+    assert r["unbound"]["out"].splitlines() == ["done"], r["unbound"]

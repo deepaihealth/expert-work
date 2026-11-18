@@ -165,6 +165,11 @@ from orchestrator.graph_builder.figure_block import (
     figure_freshness,
     with_figure_block,
 )
+from orchestrator.graph_builder.input_literal_guard import (
+    LiteralHit,
+    find_literal,
+    literal_guard_message,
+)
 from orchestrator.graph_builder.input_url_guard import (
     GuardHit,
     UrlCandidate,
@@ -228,7 +233,7 @@ from orchestrator.tools._guards import (
     usage_total,
 )
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
-from orchestrator.tools.arg_bindings import apply_arg_bindings
+from orchestrator.tools.arg_bindings import ToolArgBindings, apply_arg_bindings
 from orchestrator.tools.artifact import (
     ARTIFACT_RECORDER_KEY,
     SAVE_ARTIFACT_TOOL_NAME,
@@ -375,6 +380,13 @@ _tool_call_total = expert_work_counter(
 #: B-272 — calls rescued by restoring a JSON-stringified top-level array /
 #: object argument (``"region": "[0,0,100,100]"``) after schema validation
 #: failed. Same ``tool`` label normalisation as ``_tool_call_total``.
+#: B-317 —— 审批通过之后,被批准的那条调用又被字面量守卫拦下的次数。守卫放在审批门之后(与
+#: 手抄 URL 守卫同一口径),这个数看人被白问了多少次,再决定要不要挪到审批门之前。
+_literal_guard_blocked_after_approval_total = expert_work_counter(
+    "expert_work_tools_literal_guard_blocked_after_approval_total",
+    "Approved tool calls the literal guard then blocked (B-317).",
+    ("tool",),
+)
 _tool_args_coerced_total = expert_work_counter(
     "expert_work_tool_args_coerced_total",
     "Tool calls dispatched after restoring a JSON-stringified array/object argument (B-272).",
@@ -564,6 +576,8 @@ def build_react_graph(
     # B-67 §七 —— 本 agent 声明为 ``trusted`` 的变量名。手抄守卫的提示只对这些变量写出
     # 链接名与模型抄的那串(那条合成消息不过 spotlight 围栏);默认空 = 一律不写。
     trusted_input_names: frozenset[str] = frozenset(),
+    # B-317 —— 本 agent 声明的全部变量名(字面量守卫认 ``$名字`` 用);默认空。
+    declared_input_names: frozenset[str] = frozenset(),
     escalated_llm_caller: LLMCaller | None = None,
     before_llm_chain: MiddlewareChain | None = None,
     after_llm_chain: MiddlewareChain | None = None,
@@ -1972,6 +1986,8 @@ def build_react_graph(
         # B-226 ⑤ — the approved ``risk_confirmation`` ``ask_for_approval`` among
         # ``answered`` (B-79): the only answer that settles a refused one.
         approved_questions: frozenset[int] = frozenset()
+        # B-317 —— 审批续跑时被人批准、这一步要派发的调用(只给「批准后被拦」计数用)。
+        approved_calls: frozenset[int] = frozenset()
         if approval_resume is not None:
             # Stream CM-8 (Mini-ADR CM-I4) — the resume re-entry skips the
             # entry chain (``aupdate_state(as_node="agent")`` lands the
@@ -2035,6 +2051,7 @@ def build_react_graph(
             approved_questions = frozenset(
                 index for index in resume_outcome.answered if asks_to_act(tool_calls[index])
             )
+            approved_calls = frozenset(range(len(resume_outcome.tool_calls))) - frozenset(answered)
             #
             # B-61 §5.3 —— 再套一遍绑定。``modify`` 拿人工给的 ``modified_args``
             # **整份替换**那条 call 的 args,于是(a)被绑参数会被人在审批面上静默
@@ -2125,6 +2142,21 @@ def build_react_graph(
         # 放在填参之后、派发之前;只影响派发(下面 ``_bounded``),不改审批门与 action
         # screening 的判定和下标语义(裁定 5)。审批续跑路径重新算一遍,判定是确定的。
         guard_hits = _guard_sandbox_calls(tool_calls, config)
+        # B-317 —— 字面量守卫:MCP / http 参数与平台工具的路径参数里不会被展开的 ``$名字``、
+        # ``$EXPERT_WORK_*``,以及交给外部服务的本地路径。同一位置、同一口径(审批门之后)。
+        literal_hits = _guard_literal_calls(
+            tool_calls, config, registry_bindings, declared_names=declared_input_names
+        )
+        for index in sorted(literal_hits.keys() & approved_calls):
+            hit_name = str(tool_calls[index].get("name", ""))
+            _literal_guard_blocked_after_approval_total.labels(
+                tool=_metric_tool_label(hit_name)
+            ).inc()
+            logger.warning(
+                "tools.literal_guard_blocked_after_approval tool=%s kind=%s",
+                hit_name,
+                literal_hits[index].kind,
+            )
         # 子代(``child_run``,只有 ``_child_config`` 会写)的 inputs 是父 run 的,本图的
         # 声明管不到它们 → 守卫提示一律按 untrusted。不看 ``inputs_run_id``:主 run 的审批
         # 续跑与复活续跑也会带它。
@@ -2220,6 +2252,9 @@ def build_react_graph(
                 return await _reject_retyped_url(
                     tc, hit, ctx_obj, audit_logger, trusted_input_names=guard_trusted_names
                 )
+            literal = literal_hits.get(index)
+            if literal is not None:
+                return await _reject_literal(tc, literal, ctx_obj, audit_logger)
             async with semaphore:
                 return await _run_call(tc, bound_args)
 
@@ -2307,6 +2342,7 @@ def build_react_graph(
             file_events.append(_file_tool_event(tool_calls[idx], tool_message))
             if not (
                 idx in guard_hits
+                or idx in literal_hits
                 or _is_refused_repeat(tool_message)
                 or (classified is not None and classified.error_class == "blocked_by_policy")
             ):
@@ -4279,6 +4315,91 @@ def _guard_sandbox_calls(
         logger.warning("tools.input_url_guard_skipped err=%s", type(exc).__name__)
         return {}
     return hits
+
+
+def _guard_literal_calls(
+    calls: Sequence[Mapping[str, Any]],
+    config: RunnableConfig,
+    bindings: Mapping[str, ToolArgBindings],
+    *,
+    declared_names: frozenset[str],
+) -> dict[int, LiteralHit]:
+    """B-317 —— 对本批调用做一次字面量检查,返回 ``{下标: 命中}``(设计 §3.3)。
+
+    变量名 = 本图声明的,并上本次 ``prompt_inputs`` 的键(子代的图不一定带父的声明,但
+    ``prompt_inputs`` 是从父带下来的)。平台绑定的参数(含固定值)不查:那里是平台填的值。
+    永不让 run 失败:出任何意外放行整批,只记异常类型。
+    """
+    configurable = config.get("configurable") or {}
+    raw_inputs = configurable.get(PROMPT_INPUTS_KEY)
+    names = set(declared_names)
+    if isinstance(raw_inputs, Mapping):
+        names.update(str(key) for key in raw_inputs)
+    hits: dict[int, LiteralHit] = {}
+    try:
+        for index, call in enumerate(calls):
+            tool = str(call.get("name", ""))
+            args = call.get("args") or {}
+            if not isinstance(args, Mapping):
+                continue
+            bound = bindings.get(tool)
+            skip = {*bound.args, *bound.fixed} if bound else set()
+            by_var = {var: param for param, var in bound.args.items()} if bound else {}
+            hit = find_literal(tool, args, names=names, skip_args=skip, bound_params=by_var)
+            if hit is not None:
+                hits[index] = hit
+    except Exception as exc:
+        logger.warning("tools.literal_guard_skipped err=%s", type(exc).__name__)
+        return {}
+    return hits
+
+
+async def _reject_literal(
+    tool_call: Mapping[str, Any],
+    hit: LiteralHit,
+    ctx: ToolContext,
+    audit_logger: AuditLogger | None,
+) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
+    """B-317 —— 字面量守卫命中:不派发,合成错误 ToolMessage(形状同手抄 URL 守卫)。
+
+    审计记的是模型传进来的原始参数(与其它 ``tool:blocked`` 行同一口径),details 只加名字:
+    变量名 / 环境变量名与参数名,不加任何值。提示里也只有名字 —— 配置与 schema 里的,不是
+    租户数据,不必围栏。
+    """
+    name = str(tool_call.get("name", ""))
+    call_id = str(tool_call.get("id", ""))
+    reason = "input_local_path_to_remote" if hit.kind == "local_path" else "input_variable_literal"
+    logger.warning(
+        "tools.input_literal_blocked tool=%s reason=%s kind=%s arg=%s",
+        name,
+        reason,
+        hit.kind,
+        hit.arg,
+    )
+    _tool_call_total.labels(tool=_metric_tool_label(name), outcome="blocked").inc()
+    await _emit_tool_audit(
+        audit_logger,
+        ctx,
+        name=name,
+        call_id=call_id,
+        args=tool_call.get("args") or {},
+        path_args=(),
+        from_skill=None,
+        action=AuditAction.TOOL_BLOCKED,
+        result=AuditResult.DENIED,
+        reason=reason,
+        duration_ms=0,
+        extra_details={"input_variable": hit.name, "argument": hit.arg},
+    )
+    message = ToolMessage(
+        content=literal_guard_message(hit),
+        tool_call_id=call_id,
+        status="error",
+        name=name,
+        additional_kwargs={"duration_ms": 0},
+    )
+    classified = classified_invalid_arguments(tool_name=name, summary=reason)
+    return message, {}, 0, classified
 
 
 async def _reject_retyped_url(

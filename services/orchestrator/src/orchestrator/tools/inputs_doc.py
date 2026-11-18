@@ -67,6 +67,40 @@ _EXT_RE = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
 _RESERVED_NAMES = frozenset({INPUTS_FILENAME, f"{INPUTS_FILENAME}.tmp"})
 
 
+#: B-317 —— 本轮输入目录的短写法(相对 exec 视图根):每次 exec 在自己的挂载命名空间里把
+#: ``inputs/<run_id>/`` 挂到这里(``exec_view``),宿主侧工具经 ``resolve_workspace_path`` 改写到
+#: 同一个 run 目录。与 ``<run_id>/``、``cache/`` 同一层:预拉建的相对链接(``../cache/…``)照常
+#: 解析,扁平的 ``inputs/<文件>`` 做不到(设计 §3.2.1)。脚本里的同名字面量由测试钉住。
+CURRENT_INPUTS_DIRNAME = "current"
+CURRENT_INPUTS_REL = f"{WORKSPACE_INPUTS_DIR}/{CURRENT_INPUTS_DIRNAME}"
+
+
+def current_input_path(link: str) -> str:
+    """一个链接名在短写法下的路径(``inputs/current/<link>``),给模型看的那种。"""
+    return f"{CURRENT_INPUTS_REL}/{link}"
+
+
+#: B-317 —— ``exec_python`` / ``bash`` 描述里讲输入变量的那一段,两个工具共用这一份。
+#: 「代码里从清单读、别手抄」这类用法说明只放在代码工具描述里,不进每轮的「本轮输入」段。
+INPUTS_CODE_NOTE = (
+    "本轮如果有输入变量，它们在 $EXPERT_WORK_INPUTS 指向的 JSON 清单里"  # noqa: RUF001
+    "（含原地址、编码、本地文件路径）；本轮没有输入变量时这个文件不存在，"  # noqa: RUF001
+    "读不到就照上文办，不必重试。"  # noqa: RUF001
+    "代码里要用到某个输入值时，从清单读，不要从上文手抄——长串抄错一位就是 404。"  # noqa: RUF001
+    "清单里 local_path 非空表示平台已把该文件下载到本地，直接用它，不必再联网下载；"  # noqa: RUF001
+    "极少数情况下（挂起很久之后续跑）该文件已被清理，"  # noqa: RUF001
+    "这时改用同一项里的原始 URL 自己下载。"
+    f"平台预先下载的文件在 {CURRENT_INPUTS_REL}/ 下"
+    "（与 $EXPERT_WORK_INPUTS_DIR 是同一个目录）："  # noqa: RUF001
+    "整个值是地址的变量叫 <变量名><扩展名>，对象字段里的叫 <变量名>.<字段名><扩展名>，"  # noqa: RUF001
+    "列表项叫 <变量名>/<下标-说明><扩展名>；"  # noqa: RUF001
+    "确切路径见清单里该项的 local_path"
+    "（值是 JSON 字符串时在 value_parsed[i].local_path）。"  # noqa: RUF001
+    "文件不在就按清单里的原地址下载。"
+    "地址一律从清单读或用这些文件，不要手抄。"  # noqa: RUF001
+)
+
+
 def inputs_rel_dir(run_id: UUID) -> str:
     """本轮 inputs 目录,相对 exec 视图根。
 
@@ -91,6 +125,47 @@ def inputs_abs_path(run_id: UUID) -> str:
 def inputs_abs_dir(run_id: UUID) -> str:
     """本轮 inputs 目录在沙箱里的绝对路径(``EXPERT_WORK_INPUTS_DIR`` 的值)。"""
     return f"{EXEC_VIEW}/{inputs_rel_dir(run_id)}"
+
+
+#: 预拉缓存文件名:``sha256(url)[:32]`` 再接扩展名(``prefetch_script.cache_digest`` /
+#: ``pick_suffix``)。只认这个形状,别的名字一律不当缓存条目。
+_CACHE_ENTRY_RE = re.compile(r"^[0-9a-f]{32}[^/]*$")
+#: 预拉缓存目录名(``prefetch_script.CACHE_DIRNAME``,沙箱侧只能写字面量)。
+INPUTS_CACHE_DIRNAME = "cache"
+
+
+def _is_canonical_uuid(text: str) -> bool:
+    try:
+        return str(UUID(text)) == text
+    except ValueError:
+        return False
+
+
+def input_link_cache_path(link_path: str, target: str) -> str | None:
+    """B-317 —— 预拉链接 → 它指向的缓存文件路径;不是平台建的那种链接就 ``None``。
+
+    ``link_path`` 是链接自身的路径(任意前缀,如 ``threads/<对话>/work/inputs/<run>/x.png``),
+    ``target`` 是 ``readlink`` 读出的原文。只认:链接位于某个 ``inputs/<规范 UUID>/`` 之下,
+    目标是相对路径,归一化后**恰好**落在同一个 ``inputs/`` 下的 ``cache/<一段文件名>``,且
+    文件名是缓存命名(32 位十六进制开头)。宿主侧直读一律 ``O_NOFOLLOW``(链接按越界拒),这里
+    是唯一放行的一种:目标仍在本工作区的缓存目录里,沙箱代码本来就读得到它。
+    """
+    parts = posixpath.normpath(link_path).split("/")
+    head = next(
+        (
+            i
+            for i in range(len(parts) - 2)
+            if parts[i] == WORKSPACE_INPUTS_DIR and _is_canonical_uuid(parts[i + 1])
+        ),
+        None,
+    )
+    if head is None or not target or target.startswith("/") or "\x00" in target:
+        return None
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(link_path), target))
+    cache_dir = "/".join([*parts[:head], WORKSPACE_INPUTS_DIR, INPUTS_CACHE_DIRNAME])
+    if posixpath.dirname(resolved) != cache_dir:
+        return None
+    return resolved if _CACHE_ENTRY_RE.match(posixpath.basename(resolved)) else None
 
 
 @dataclass(frozen=True)

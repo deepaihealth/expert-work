@@ -557,6 +557,8 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 文件路径由环境变量 `EXPERT_WORK_INPUTS` 给出。另一个环境变量 `EXPERT_WORK_INPUTS_DIR` 给出这份文件所在的目录，平台预先下载的文件在这个目录里按变量名存放（命名规则见下文）。
 
+同一个目录还有一个固定的短路径 `inputs/current/`（相对工作区根目录），指向本次 run 的这个目录。Agent 的所有工具都认这个写法，包括代码执行和读文档、看图等工具，路径里不需要带 run 的编号。
+
 每次 run 一个独立目录，同一个终端用户的多次 run 互不覆盖。Agent 没有声明模板变量，或者本次 `inputs` 里没有任何声明过的值时，这个文件不存在。
 
 这份 JSON 与平台预先下载的文件都由平台管理，不出现在 [5.6 工作区文件](./query#_5-6-工作区文件) 的列表里；知道路径时，下载接口仍然取得回它们。
@@ -654,14 +656,14 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 #### 系统提示词里的地址
 
-租户管理员在系统提示词里引用模板变量时，变量值里被识别的地址不以原地址出现，而是换成 `$EXPERT_WORK_INPUTS_DIR` 下按上文命名规则得到的本地路径。被识别的地址与预先下载用的是同一套规则，见 [哪些地址会被预先下载](#哪些地址会被预先下载)。
+租户管理员在系统提示词里引用模板变量时，变量值里被识别的地址不以原地址出现，而是换成 `inputs/current/` 下按上文命名规则得到的本地路径，例如 `inputs/current/cover_image.png`。被识别的地址与预先下载用的是同一套规则，见 [哪些地址会被预先下载](#哪些地址会被预先下载)。
 
 **替换只由地址本身决定，与下载是否成功无关。** 下载失败时这个路径上没有文件，Agent 按 `inputs.json` 里的原地址获取。
 
 | 值的形态 | 显示方式 |
 |---|---|
-| 以地址开头的字符串 | 本地路径，后接一句「文件不在时按原地址下载」的说明。地址之后的文字照原样保留 |
-| 数组或对象，以及能解析成数组或对象的 JSON 字符串，其中有被识别的地址 | 另起一行，逐个元素或字段各占一行，末尾同样附那句说明 |
+| 以地址开头的字符串 | 本地路径，后接一句说明：这是本轮输入文件，预先下载失败时文件不在。地址之后的文字照原样保留 |
+| 数组或对象，以及能解析成数组或对象的 JSON 字符串，其中有被识别的地址 | 另起一行，逐个元素或字段各占一行，末尾附同一句说明 |
 | 其它值 | 照原样显示 |
 
 逐行列出时，每一行的内容如下：
@@ -686,7 +688,7 @@ with open(os.environ["EXPERT_WORK_INPUTS"], encoding="utf-8") as handle:
     variables = json.load(handle)["variables"]
 
 cover = variables["cover_image"]
-# 通常与 os.environ["EXPERT_WORK_INPUTS_DIR"] + "/cover_image.png" 是同一个文件
+# 通常与 os.environ["EXPERT_WORK_INPUTS_DIR"] + "/cover_image.png"(即 inputs/current/cover_image.png)是同一个文件
 local_path = cover.get("local_path")
 if local_path and os.path.exists(local_path):
     # 平台已经下载好,直接读本地文件

@@ -152,8 +152,14 @@ esac
 if [ -n "$conv" ]; then
   own="$conv"
 fi
+inputs=""
+x="[0-9a-f]"
+q="$x$x$x$x"
+case "${EXPERT_WORK_INPUTS_DIR-}" in
+  /workspace/inputs/$q$q-$q-$q-$q-$q$q$q) inputs="${EXPERT_WORK_INPUTS_DIR#/workspace/inputs/}" ;;
+esac
 /usr/local/bin/python3 -I -S -c '
-import ctypes, hashlib, os, shutil, stat, sys, time
+import ctypes, hashlib, os, shutil, stat, sys, time, uuid
 
 # Every NAS path is reached by an O_NOFOLLOW openat walk and mounted by fd
 # (open_tree + move_mount, fsopen/fsmount for tmpfs): a name swapped for a
@@ -171,6 +177,8 @@ REMOUNT_BIND = 0x20 | 0x1000  # MS_REMOUNT | MS_BIND
 SEALED = RDONLY | NOSUID | NODEV | NOEXEC
 DIR = os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
 PLATFORM_DIRS = ("uploads", "inputs", ".tool_results")
+# This turn inputs/<run>/ is also seen at inputs/current/ (B-317).
+INPUTS, CURRENT = "inputs", "current"
 # What is remembered about the user, as older releases projected it at the agent root.
 MEMORY = "MEMORY.md"
 # Sandbox-local dirs every exec could write: each is replaced by a copy kept per conversation
@@ -314,7 +322,27 @@ def hide_platform(view):
         ro(attach(tmpfs((b"size", b"1k"), (b"mode", b"0500")), target), "/agent/" + d, SEALED)
 
 
-def nas_view(root, conv, own, child):
+def current_inputs(ws, run):
+    # This turn inputs/<run>/ also at inputs/current/, so every tool names its
+    # files without the run id. Skipped without a word when anything is off (no
+    # such run dir, current/ swapped for a link or a file, the bind refused):
+    # stderr is the tool output of every exec, and EXPERT_WORK_INPUTS_DIR still
+    # works. The stub is only made when the run dir is there.
+    try:
+        if str(uuid.UUID(run)) != run:
+            return
+    except ValueError:
+        return
+    try:
+        inputs = sub(ws, INPUTS, False)
+        source = sub(inputs, run, False)
+        stub = sub(inputs, CURRENT, True)
+        bind(source, stub)
+    except OSError:
+        return
+
+
+def nas_view(root, conv, own, child, run):
     nas = os.open("/mnt/workspace", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     agent = os.open("/agent", DIR)
     workspace = os.open("/workspace", DIR)
@@ -349,6 +377,8 @@ def nas_view(root, conv, own, child):
         hide_memory(view)
         if not conv:
             hide_memory(ws)
+    if run:
+        current_inputs(ws, run)
     try:
         shared = sub(nas, "shared", False)
     except FileNotFoundError:
@@ -526,19 +556,21 @@ def freeze():
             os.close(fd)
 
 
-def main(root, conv, own, name, digest, child):
+def main(root, conv, own, name, digest, child, run):
     tmp = local("/tmp")
     data = take(tmp, name, digest) if name else None
-    nas_view(root, conv, own, child == "1")
+    nas_view(root, conv, own, child == "1", run)
     local_view(tmp, root.rsplit("/", 1)[-1] if root else "", own, name, data)
     freeze()
 
 
 try:
-    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])
+    main(
+        sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7]
+    )
 except OSError as e:
     die("mount failed: " + str(e))
-' "$root" "$conv" "$own" "$code" "$sum" "$child" || { rc=$?; drop; exit "$rc"; }
+' "$root" "$conv" "$own" "$code" "$sum" "$child" "$inputs" || { rc=$?; drop; exit "$rc"; }
 cd /workspace
 PATH="$ew_path"
 HOME=/home/agent

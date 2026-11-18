@@ -71,7 +71,33 @@ def test_bound_variable_line_carries_the_binding_note() -> None:
         run_id=uuid4(),
     )
     line = next(ln for ln in gi["messages"][2].content.splitlines() if ln.startswith("- org_logo"))
-    assert line.endswith("；绑定了它的工具由平台自动填，不用手抄")  # noqa: RUF001
+    assert line.endswith("；由平台填进绑定它的工具参数")  # noqa: RUF001
+
+
+@pytest.mark.parametrize(
+    ("tools", "paths_shown"),
+    [
+        (("exec_python", "mcp__crm__upload"), True),
+        (("mcp__crm__upload", "web_search"), False),
+        ((), True),  # 测试替身没有工具表:不知道时照旧写路径
+    ],
+)
+def test_block_writes_file_paths_only_when_a_file_reading_tool_is_present(
+    tools: tuple[str, ...], paths_shown: bool
+) -> None:
+    """B-317 —— 「本轮输入」段的文件路径跟着能力走:``build_run_graph_input`` 按
+    ``built.tool_catalog`` 算开关传给 ``build_inputs_block``。"""
+    built = _jinja_built()
+    built.tool_catalog = tuple(SimpleNamespace(name=name) for name in tools)
+    gi = build_run_graph_input(
+        built,
+        input_text="x",
+        image_refs=[],
+        untrusted_content=None,
+        inputs={"org_logo": LOGO},
+        run_id=uuid4(),
+    )
+    assert ("inputs/current/" in gi["messages"][2].content) is paths_shown
 
 
 def test_jinja_run_without_run_id_still_appends_the_block_unstamped() -> None:
