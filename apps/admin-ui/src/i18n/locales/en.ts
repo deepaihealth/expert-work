@@ -1103,6 +1103,7 @@ export interface TranslationKeys {
     schema_load_failed: string;
     invalid_yaml_title: string;
     invalid_yaml_hint: string;
+    form_has_errors: string;
     search_placeholder: string;
     group_basic: string;
     group_model: string;
@@ -1715,6 +1716,7 @@ export interface TranslationKeys {
       collapse: string;
       name_invalid: string;
       name_duplicate: string;
+      name_errors_block: string;
       complex_readonly: string;
       readonly_node: string;
       readonly_depth: string;
@@ -5058,6 +5060,7 @@ const en: TranslationKeys = {
     invalid_yaml_title: "Can't switch to Form",
     invalid_yaml_hint:
       "The YAML is invalid or doesn't match the manifest schema. Fix it here first.",
+    form_has_errors: "Some fields still have errors - fix them before saving.",
     search_placeholder: "Search settings…",
     group_basic: "Basic",
     group_model: "Model & Routing",
@@ -5767,6 +5770,7 @@ const en: TranslationKeys = {
       name_invalid:
         "Field names must start with a letter or underscore, and contain only letters, numbers, and underscores.",
       name_duplicate: "Duplicate name — another field at this level already uses it",
+      name_errors_block: "Some field names are duplicated or invalid - fix them before saving. Until then, changes here are not applied.",
       complex_readonly: "Configured (complex structure) - edit it in the YAML view.",
       readonly_node: "This part uses a structure the form can't edit - change it in the YAML view.",
       readonly_depth: "More than 5 levels deep - edit it in the YAML view.",

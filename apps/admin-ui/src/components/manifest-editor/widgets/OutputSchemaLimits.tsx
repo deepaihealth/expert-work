@@ -185,7 +185,8 @@ function LimitsPanel({ node, pathKey, onChange }: PanelProps) {
           </Text>
         </div>
       )}
-      {supportsEnum(node.type) && <EnumInput node={node} pathKey={pathKey} onChange={onChange} />}
+      {/* keyed by type: a type change starts with no stale "not a number" hint */}
+      {supportsEnum(node.type) && <EnumInput key={node.type} node={node} pathKey={pathKey} onChange={onChange} />}
     </div>
   );
 }

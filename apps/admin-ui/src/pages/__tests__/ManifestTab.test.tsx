@@ -183,6 +183,41 @@ describe("ManifestTab", () => {
     expect(screen.queryByTestId("manifest-discard-btn")).toBeNull();
   });
 
+  // B-315 — a broken output-schema field name pauses the form's write-back;
+  // the editor reports it up and saving / publishing waits until it's fixed.
+  it("blocks save and publish while an output-schema field name is broken", async () => {
+    const user = userEvent.setup();
+    saveDraftMock.mockResolvedValue(sampleDetail);
+    const outputSchema = {
+      json_schema: { type: "object", properties: { a: { type: "string" }, b: { type: "string" } } },
+    };
+    const detail = withDraft({
+      spec: {
+        apiVersion: "expert_work.io/v1",
+        kind: "Agent",
+        metadata: { name: "demo-agent", version: "1.0.0" },
+        spec: { model: { provider: "anthropic", name: "claude-sonnet-4-6" }, output_schema: outputSchema },
+      },
+    });
+    renderTab(detail);
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("cfg-nav-prompt"));
+    const name = await screen.findByTestId("af-output-schema-name-1");
+    expect(screen.getByTestId("manifest-save-btn")).not.toBeDisabled();
+
+    await user.clear(name);
+    await user.type(name, "a");
+    expect(screen.getByTestId("manifest-save-btn")).toBeDisabled();
+    expect(screen.getByTestId("manifest-publish-btn")).toBeDisabled();
+
+    await user.type(name, "2");
+    expect(screen.getByTestId("manifest-save-btn")).not.toBeDisabled();
+    expect(screen.getByTestId("manifest-publish-btn")).not.toBeDisabled();
+    await user.click(screen.getByTestId("manifest-save-btn"));
+    await waitFor(() => expect(saveDraftMock).toHaveBeenCalledTimes(1));
+    expect(saveDraftMock.mock.calls[0][2].manifest_yaml).toContain("a2:");
+  });
+
   it("exposes the raw YAML escape-hatch toggle", async () => {
     renderTab();
     await screen.findByTestId("manifest-editor-edit");

@@ -8,8 +8,8 @@
  *    focus + blur never rewrites a stored value;
  *  - readonly nodes: only "required" and remove; raw kept on sibling edits;
  *    the depth-specific note;
- *  - names: duplicates, renames that collide with untouched or readonly
- *    siblings, the field renamed last yielding, a full swap;
+ *  - names: a nested duplicate (the full name rule lives in
+ *    OutputSchemaEditor.names.test.tsx);
  *  - identity: collapse state follows its field (uids), survives an
  *    external re-read by name path, and new uids never clash;
  *  - the strict-mode reminder.
@@ -17,7 +17,7 @@
  */
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "antd";
 import i18n from "../../../../i18n";
@@ -243,40 +243,6 @@ describe("OutputSchemaEditor field tree", () => {
     });
   });
 
-  it("renaming onto a readonly sibling flags the renamed row and leaves the original untouched", async () => {
-    const user = userEvent.setup();
-    const onChange = vi.fn();
-    const choice = { oneOf: [{ type: "string" }, { type: "integer" }] };
-    renderControlled(
-      withSchema({
-        type: "object",
-        properties: { a: { type: "string", description: "keep me" }, b: choice },
-        required: ["a"],
-      }),
-      onChange,
-    );
-    const name = screen.getByTestId("af-output-schema-name-0");
-    await user.clear(name);
-    await user.type(name, "b");
-    expect(name).toHaveAttribute("aria-invalid", "true");
-    expect(screen.getByText(i18n.t("agent_form.output_schema.name_duplicate"))).toBeInTheDocument();
-    // "a" is out of the write while its name collides; "b" is exactly the original.
-    expect(lastSchema(onChange)).toEqual({ type: "object", properties: { b: choice }, required: [] });
-  });
-
-  it("renaming onto a later untouched sibling flags the renamed row, the sibling keeps its subtree", async () => {
-    const user = userEvent.setup();
-    const onChange = vi.fn();
-    const b = { type: "object", properties: { x: { type: "integer" } }, required: ["x"] };
-    renderControlled(withSchema({ type: "object", properties: { a: { type: "string" }, b } }), onChange);
-    const name = screen.getByTestId("af-output-schema-name-0");
-    await user.clear(name);
-    await user.type(name, "b");
-    expect(name).toHaveAttribute("aria-invalid", "true");
-    expect(screen.getByTestId("af-output-schema-name-1")).toHaveAttribute("aria-invalid", "false");
-    expect(lastSchema(onChange)).toEqual({ type: "object", properties: { b } });
-  });
-
   it("collapse state follows its field when an earlier field is removed", async () => {
     const user = userEvent.setup();
     renderControlled(
@@ -313,6 +279,24 @@ describe("OutputSchemaEditor field tree", () => {
       </App>,
     );
     expect(screen.getByTestId("af-output-schema-name-0")).toHaveValue("fresh");
+  });
+
+  it("a type change clears a stale 'not a number' hint", async () => {
+    const user = userEvent.setup();
+    renderControlled(withSchema({ type: "object", properties: { n: { type: "integer" } } }));
+    await user.click(screen.getByTestId("af-output-schema-limits-0"));
+    const box = within(await screen.findByTestId("af-output-schema-enum-0")).getByRole("combobox");
+    await user.type(box, "x,");
+    expect(screen.getByTestId("af-output-schema-enum-rejected-0")).toBeInTheDocument();
+    await pickType("af-output-schema-type-0", "number");
+    // Picking the type closes the popover (antd keeps its last DOM while
+    // hidden); reopen it so the panel renders the current node.
+    const panel = screen.getByTestId("af-output-schema-limits-panel-0");
+    if (panel.closest(".ant-popover-hidden")) await user.click(screen.getByTestId("af-output-schema-limits-0"));
+    await waitFor(() =>
+      expect(screen.getByTestId("af-output-schema-limits-panel-0").closest(".ant-popover-hidden")).toBeNull(),
+    );
+    expect(screen.queryByTestId("af-output-schema-enum-rejected-0")).not.toBeInTheDocument();
   });
 
   describe("limit hints", () => {
@@ -356,7 +340,7 @@ describe("OutputSchemaEditor field tree", () => {
     });
   });
 
-  it("flags a duplicate name among nested siblings and leaves it out of the write", async () => {
+  it("flags both rows of a nested duplicate and writes nothing", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     renderControlled(
@@ -365,12 +349,9 @@ describe("OutputSchemaEditor field tree", () => {
     );
     await user.click(screen.getByTestId("af-output-schema-add-child-0"));
     await user.type(screen.getByTestId("af-output-schema-name-0.1"), "a");
+    expect(screen.getByTestId("af-output-schema-name-0.0")).toHaveAttribute("aria-invalid", "true");
     expect(screen.getByTestId("af-output-schema-name-0.1")).toHaveAttribute("aria-invalid", "true");
-    expect(screen.getByText(i18n.t("agent_form.output_schema.name_duplicate"))).toBeInTheDocument();
-    expect(lastSchema(onChange)).toEqual({
-      type: "object",
-      properties: { c: { type: "object", properties: { a: { type: "string" } } } },
-    });
+    expect(onChange).not.toHaveBeenCalled();
   });
 
   describe("strict-mode reminder", () => {
@@ -416,44 +397,6 @@ describe("OutputSchemaEditor field tree", () => {
     expect(screen.getByTestId("af-output-schema-readonly-0.0.0.0.0.0")).toHaveTextContent(
       i18n.t("agent_form.output_schema.readonly_depth"),
     );
-  });
-
-  describe("renames: the field renamed last yields", () => {
-    const A = { type: "string", description: "A" };
-    const B = { type: "integer", description: "B" };
-
-    async function rename(user: ReturnType<typeof userEvent.setup>, path: string, name: string) {
-      const input = screen.getByTestId(`af-output-schema-name-${path}`);
-      await user.clear(input);
-      await user.type(input, name);
-    }
-
-    it("b → a, then a → c, then c back to a: the row typed last is flagged, b's row is kept", async () => {
-      const user = userEvent.setup();
-      const onChange = vi.fn();
-      renderControlled(withSchema({ type: "object", properties: { a: A, b: B } }), onChange);
-      await rename(user, "1", "a");
-      expect(screen.getByTestId("af-output-schema-name-1")).toHaveAttribute("aria-invalid", "true");
-      await rename(user, "0", "c");
-      expect(lastSchema(onChange)).toEqual({ type: "object", properties: { c: A, a: B } });
-      await rename(user, "0", "a");
-      expect(screen.getByTestId("af-output-schema-name-0")).toHaveAttribute("aria-invalid", "true");
-      expect(screen.getByTestId("af-output-schema-name-1")).toHaveAttribute("aria-invalid", "false");
-      expect(lastSchema(onChange)).toEqual({ type: "object", properties: { a: B } });
-    });
-
-    it("swapping two names ends with both fields, names exchanged", async () => {
-      const user = userEvent.setup();
-      const onChange = vi.fn();
-      renderControlled(withSchema({ type: "object", properties: { a: A, b: B } }), onChange);
-      await rename(user, "0", "b");
-      expect(screen.getByTestId("af-output-schema-name-0")).toHaveAttribute("aria-invalid", "true");
-      await rename(user, "1", "a");
-      expect(screen.getByTestId("af-output-schema-name-0")).toHaveAttribute("aria-invalid", "false");
-      expect(screen.getByTestId("af-output-schema-name-1")).toHaveAttribute("aria-invalid", "false");
-      const written = lastSchema(onChange);
-      expect(JSON.stringify(written)).toBe(JSON.stringify({ type: "object", properties: { b: A, a: B } }));
-    });
   });
 
   describe("identity across an external re-read (uncontrolled)", () => {

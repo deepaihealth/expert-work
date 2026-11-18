@@ -18,15 +18,20 @@
  * keeps them); ``strict`` (default true) only drives the optional-field
  * reminder.
  *
- * Commit model (unchanged from the flat editor): the full tree — including
- * fields whose name is currently blank/invalid/duplicate — lives in local
- * state; every edit writes ``pruneInvalidFields(tree)`` immediately, so one
- * bad name never blocks other edits. Resync: an effect re-reads the tree when
- * ``json_schema`` in ``formData`` differs from what this widget last wrote
- * (echoes of our own writes and sibling-field edits are skipped, so an
- * in-progress invalid-name field is not lost).
+ * Commit model (B-315 name rule, see output_schema_tree.ts): the full tree
+ * lives in local state. While ANY field name is blank, invalid or duplicated
+ * (``hasNameIssues``), edits stay local only — ``formData`` keeps its last
+ * valid state, every offending row is flagged, a banner says why, and the
+ * editor reports the error up (``useReportFormErrors``) so the host blocks
+ * saving. Once every name is fixed, the next edit writes the whole tree at
+ * once. Resync: before paint (``useLayoutEffect``, so stale rows never
+ * flash), the tree is re-read when ``json_schema`` in ``formData`` differs
+ * from what this widget last wrote; our own echoes and sibling-field edits
+ * are skipped, so local edits survive them. A re-read keeps collapsed
+ * fields that are still at the same name path. An unmount (group switch,
+ * YAML view) drops local edits that were never written back.
  */
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { App, Alert, Button, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -37,11 +42,12 @@ import {
   readOutputSchemaTree,
   setOutputSchemaTree,
 } from "../form_model";
+import { useReportFormErrors } from "../form_errors";
 import {
   matchFieldUids,
   newSchemaField,
+  hasNameIssues,
   newSchemaNode,
-  pruneInvalidFields,
   updateFieldsAt,
   type SchemaField,
   type SchemaNode,
@@ -66,42 +72,40 @@ interface OutputSchemaEditorProps {
   onChange: (data: unknown) => void;
 }
 
-// Collapse keys are ``uid`` or ``uid/items[/items…]``; carry them to the new uids.
+// Collapse keys are JSON arrays: ``[uid]`` or ``[uid, "items", …]``. Carry
+// them over to the matching new uids; keys with no match are dropped.
 function remapCollapsed(keys: ReadonlySet<string>, uids: Map<string, string>): ReadonlySet<string> {
   const out = new Set<string>();
   for (const key of keys) {
-    const [uid, ...rest] = key.split("/");
+    const [uid, ...rest] = JSON.parse(key) as string[];
     const mapped = uids.get(uid);
-    if (mapped !== undefined) out.add([mapped, ...rest].join("/"));
+    if (mapped !== undefined) out.add(JSON.stringify([mapped, ...rest]));
   }
   return out;
 }
 
-// Local tree + collapse state + the field renamed last, and the commit /
-// resync logic (module doc). The tree is parsed once at mount and again
-// only when ``json_schema`` really changed from outside — never per render.
+// Local tree + collapse state, and the commit / resync logic (module doc).
+// The tree is parsed once at mount and again only when ``json_schema``
+// really changed from outside — never per render.
 function useOutputSchemaTree({ formData, onChange }: OutputSchemaEditorProps) {
   const [tree, setTree] = useState<SchemaNode | undefined>(() => readOutputSchemaTree(formData));
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
-  const [lastRenamedUid, setLastRenamedUid] = useState<string | undefined>(undefined);
-  const lastWrittenRef = useRef<string | undefined>(snapshot(formData));
+  const [mountSnapshot] = useState(() => snapshot(formData));
+  const lastWrittenRef = useRef<string | undefined>(mountSnapshot);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const current = snapshot(formData);
     if (current === lastWrittenRef.current) return;
     lastWrittenRef.current = current;
     const next = readOutputSchemaTree(formData);
-    // Keep fields collapsed when they're still at the same name path.
     setCollapsed((prev) => (tree && next ? remapCollapsed(prev, matchFieldUids(tree, next)) : new Set()));
-    setLastRenamedUid(undefined);
     setTree(next);
   }, [formData]);
 
-  const commit = (next: SchemaNode, renamedUid?: string): void => {
-    const lastRenamed = renamedUid ?? lastRenamedUid;
-    if (renamedUid !== undefined) setLastRenamedUid(renamedUid);
+  const commit = (next: SchemaNode): void => {
     setTree(next);
-    const written = setOutputSchemaTree(formData, pruneInvalidFields(next, lastRenamed));
+    if (hasNameIssues(next)) return; // paused: formData keeps its last valid state
+    const written = setOutputSchemaTree(formData, next);
     lastWrittenRef.current = snapshot(written);
     onChange(written);
   };
@@ -114,13 +118,31 @@ function useOutputSchemaTree({ formData, onChange }: OutputSchemaEditorProps) {
       return next;
     });
 
-  return { tree, commit, collapsed, toggleCollapsed, lastRenamedUid };
+  const nameErrors = tree !== undefined && hasNameIssues(tree);
+  useReportFormErrors("output_schema", nameErrors);
+  return { tree, commit, collapsed, toggleCollapsed, nameErrors };
 }
 
-function TreeTable({ ctx, fields }: { ctx: TreeContext; fields: SchemaField[] }) {
+interface TreeTableProps {
+  ctx: TreeContext;
+  fields: SchemaField[];
+  /** Some name is blank / invalid / duplicated: nothing is written back yet. */
+  nameErrors: boolean;
+}
+
+function TreeTable({ ctx, fields, nameErrors }: TreeTableProps) {
   const { t } = useTranslation();
   return (
     <>
+      {nameErrors && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 8 }}
+          data-testid="af-output-schema-name-errors"
+          message={t("agent_form.output_schema.name_errors_block")}
+        />
+      )}
       <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
         <span style={{ ...HEAD, width: 20 + COL_NAME }}>{t("agent_form.output_schema.col_name")}</span>
         <span style={{ ...HEAD, width: COL_TYPE }}>{t("agent_form.output_schema.col_type")}</span>
@@ -163,7 +185,7 @@ function OnSwitch({ on, onToggle }: { on: boolean; onToggle: (checked: boolean) 
 export function OutputSchemaEditor({ formData, onChange }: OutputSchemaEditorProps) {
   const { t } = useTranslation();
   const { modal } = App.useApp();
-  const { tree, commit, collapsed, toggleCollapsed, lastRenamedUid } = useOutputSchemaTree({
+  const { tree, commit, collapsed, toggleCollapsed, nameErrors } = useOutputSchemaTree({
     formData,
     onChange,
   });
@@ -180,14 +202,7 @@ export function OutputSchemaEditor({ formData, onChange }: OutputSchemaEditorPro
   };
 
   const strict = readOutputSchemaStrict(formData);
-  const ctx: TreeContext | undefined = root && {
-    root,
-    strict,
-    commit,
-    collapsed,
-    toggleCollapsed,
-    lastRenamedUid,
-  };
+  const ctx: TreeContext | undefined = root && { root, strict, commit, collapsed, toggleCollapsed };
 
   return (
     <section data-testid="af-output-schema" style={SECTION}>
@@ -202,7 +217,7 @@ export function OutputSchemaEditor({ formData, onChange }: OutputSchemaEditorPro
       ) : (
         <>
           <OnSwitch on={on} onToggle={handleToggle} />
-          {on && ctx && <TreeTable ctx={ctx} fields={fields} />}
+          {on && ctx && <TreeTable ctx={ctx} fields={fields} nameErrors={nameErrors} />}
         </>
       )}
     </section>

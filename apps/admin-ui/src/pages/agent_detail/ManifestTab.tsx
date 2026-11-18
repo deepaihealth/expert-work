@@ -78,6 +78,9 @@ export function ManifestTab({
   const editingSha = r.draft?.spec_sha256 ?? r.spec_sha256;
 
   const [buffer, setBuffer] = useState<string>(snapshotYaml);
+  // B-315 — a form widget holds edits it can't write back yet (e.g. a
+  // duplicated output-schema field name): saving / publishing waits.
+  const [formHasErrors, setFormHasErrors] = useState(false);
   // Bumped on Reset to remount the editor and re-seed it from the snapshot.
   const [resetNonce, setResetNonce] = useState(0);
   const [busy, setBusy] = useState<null | "draft" | "publish" | "discard">(null);
@@ -223,7 +226,7 @@ export function ManifestTab({
                   icon={<Save size={14} strokeWidth={1.75} />}
                   onClick={handleSaveDraft}
                   loading={busy === "draft"}
-                  disabled={saving || isTenantSwitched}
+                  disabled={saving || isTenantSwitched || formHasErrors}
                   data-testid="manifest-save-btn"
                 >
                   {t("manifest_tab.save_draft")}
@@ -237,7 +240,7 @@ export function ManifestTab({
                   onClick={handlePublish}
                   loading={busy === "publish"}
                   // 没有草稿就没有可发布的东西 —— 后端 409,这里不该让人点到那一步。
-                  disabled={saving || isTenantSwitched || !hasDraft}
+                  disabled={saving || isTenantSwitched || !hasDraft || formHasErrors}
                   data-testid="manifest-publish-btn"
                 >
                   {t("manifest_tab.publish")}
@@ -305,6 +308,7 @@ export function ManifestTab({
         mode="edit"
         initialYaml={snapshotYaml}
         onChange={setBuffer}
+        onValidityChange={setFormHasErrors}
         activeGroup={activeGroup}
         onActiveGroupChange={handleGroupChange}
         // 委派增强层 3 — 已保存 Agent 才有「生成委派策略」(后端读已保存

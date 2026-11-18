@@ -96,8 +96,6 @@ export interface SchemaField {
   name: string;
   required: boolean;
   node: SchemaNode;
-  /** The name as read from the original; absent for a field added here. */
-  originalName?: string;
   /** The original name fails the form's rule: keep it, but don't let it be edited. */
   nameLocked?: boolean;
 }
@@ -219,7 +217,6 @@ function parseFields(
     const field: SchemaField = {
       uid: makeFieldUid(),
       name,
-      originalName: name,
       required: required.includes(name),
       node: parseSchemaNode(props[name], depth + 1),
     };
@@ -464,6 +461,11 @@ export function updateFieldsAt(
 }
 
 // ---- field-name checks ----
+// B-315 rule (decided after three review rounds of "which clashing field
+// keeps the name" heuristics still had counter-examples): ANY name problem
+// is an error the user must fix. Every offending row is flagged (both rows of
+// a clash), and while any remains the editor writes nothing back and the
+// host blocks saving. Nothing is picked, pruned or dropped automatically.
 
 export type FieldIssue = "invalid" | "duplicate" | null;
 
@@ -471,76 +473,57 @@ export type FieldIssue = "invalid" | "duplicate" | null;
 export const isNameFixed = (f: SchemaField): boolean =>
   f.node.kind === "readonly" || f.nameLocked === true;
 
-// Still carrying the name it was read with (fixed names always are).
-const keepsOriginalName = (f: SchemaField): boolean =>
-  isNameFixed(f) || (f.originalName !== undefined && f.name === f.originalName);
-
-// Who keeps a contested name, highest first: a fixed name; then any field
-// other than the one renamed last (one still holding its read-in name
-// first); the field renamed last always yields.
-function namePriority(f: SchemaField, lastRenamedUid: string | undefined): number {
-  if (isNameFixed(f)) return 3;
-  if (f.uid === lastRenamedUid) return 0;
-  return keepsOriginalName(f) ? 2 : 1;
-}
-
 /**
- * ``"invalid"`` = fails the name rule; ``"duplicate"`` = a sibling with the
- * same name wins over this one (``namePriority``; on a tie the earlier row
- * wins). So typing over an existing name flags the row being typed in —
- * also when that row is typing back its own original name — never the
- * untouched one. Fields with a fixed name are never flagged.
+ * ``"invalid"`` = blank or breaks the name rule (a fixed name — read in that
+ * way — is exempt); ``"duplicate"`` = ANY other sibling has the same name, so
+ * both rows of a clash are flagged, fixed-name rows included.
  */
-export function fieldIssue(
-  fields: readonly SchemaField[],
-  i: number,
-  lastRenamedUid?: string,
-): FieldIssue {
+export function fieldIssue(fields: readonly SchemaField[], i: number): FieldIssue {
   const field = fields[i];
-  if (isNameFixed(field)) return null;
-  if (!isValidFieldName(field.name)) return "invalid";
-  const mine = namePriority(field, lastRenamedUid);
-  for (let j = 0; j < fields.length; j++) {
-    if (j === i || fields[j].name !== field.name) continue;
-    const theirs = namePriority(fields[j], lastRenamedUid);
-    if (theirs > mine || (theirs === mine && j < i)) return "duplicate";
-  }
-  return null;
+  if (!isNameFixed(field) && !isValidFieldName(field.name)) return "invalid";
+  return fields.some((f, j) => j !== i && f.name === field.name) ? "duplicate" : null;
 }
 
-/** Drop every field (at any depth) whose name currently has an issue. */
-export function pruneInvalidFields(node: SchemaNode, lastRenamedUid?: string): SchemaNode {
-  if (node.kind !== "editable") return node;
-  const next: EditableSchemaNode = { ...node };
-  if (node.fields) {
-    next.fields = node.fields
-      .filter((_, i) => fieldIssue(node.fields as SchemaField[], i, lastRenamedUid) === null)
-      .map((f) => ({ ...f, node: pruneInvalidFields(f.node, lastRenamedUid) }));
-  }
-  if (node.items) next.items = pruneInvalidFields(node.items, lastRenamedUid);
-  return next;
+/** Whether any field, at any depth, has a name issue. */
+export function hasNameIssues(node: SchemaNode): boolean {
+  if (node.kind !== "editable") return false;
+  const fields = node.fields ?? [];
+  if (fields.some((_, i) => fieldIssue(fields, i) !== null)) return true;
+  if (fields.some((f) => hasNameIssues(f.node))) return true;
+  return node.items !== undefined && hasNameIssues(node.items);
 }
 
 // ---- identity across a re-read ----
 
-// uid → the field's name path (``a/[]/b``; ``[]`` = a list's item).
-function namePaths(node: SchemaNode, prefix: string, out: Map<string, string>): Map<string, string> {
+// A list's item step in a name path; a number can't collide with a name.
+const ITEMS_STEP = 0;
+
+// uid → the field's name path, encoded as JSON of its steps (names, plus
+// ITEMS_STEP), so a "/" inside a name can't alias another path. A field
+// whose name currently has an issue — and its subtree — is left out.
+function namePaths(
+  node: SchemaNode,
+  prefix: readonly (string | number)[],
+  out: Map<string, string>,
+): Map<string, string> {
   if (node.kind !== "editable") return out;
-  for (const f of node.fields ?? []) {
-    const key = `${prefix}/${f.name}`;
-    out.set(f.uid, key);
-    namePaths(f.node, key, out);
-  }
-  if (node.items) namePaths(node.items, `${prefix}/[]`, out);
+  const fields = node.fields ?? [];
+  fields.forEach((f, i) => {
+    if (fieldIssue(fields, i) !== null) return;
+    const steps = [...prefix, f.name];
+    out.set(f.uid, JSON.stringify(steps));
+    namePaths(f.node, steps, out);
+  });
+  if (node.items) namePaths(node.items, [...prefix, ITEMS_STEP], out);
   return out;
 }
 
 /** Old uid → new uid for fields at the same name path in both trees. */
 export function matchFieldUids(before: SchemaNode, after: SchemaNode): Map<string, string> {
   const byPath = new Map<string, string>();
-  for (const [uid, path] of namePaths(after, "", new Map())) byPath.set(path, uid);
+  for (const [uid, path] of namePaths(after, [], new Map())) byPath.set(path, uid);
   const out = new Map<string, string>();
-  for (const [uid, path] of namePaths(before, "", new Map())) {
+  for (const [uid, path] of namePaths(before, [], new Map())) {
     const match = byPath.get(path);
     if (match !== undefined) out.set(uid, match);
   }

@@ -51,6 +51,8 @@ export function CreateAgentModal({ open, onClose, onCreated }: CreateAgentModalP
   const [buffer, setBuffer] = useState<string>(BASE_MANIFEST_YAML);
   const [initialYaml, setInitialYaml] = useState<string>(BASE_MANIFEST_YAML);
   const [submitting, setSubmitting] = useState(false);
+  // B-315 — see ManifestEditor ``onValidityChange``.
+  const [formHasErrors, setFormHasErrors] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // B-278 — the name+version clashed with a deleted / mid-purge agent.
   const [duplicateDeleted, setDuplicateDeleted] = useState<DuplicateDeletedTarget | null>(null);
@@ -152,7 +154,7 @@ export function CreateAgentModal({ open, onClose, onCreated }: CreateAgentModalP
             icon={<Plus size={14} strokeWidth={1.75} />}
             onClick={handleSubmit}
             loading={submitting}
-            disabled={submitting || blocked}
+            disabled={submitting || blocked || formHasErrors}
             data-testid="create-agent-submit"
           >
             {t("create_agent.submit")}
@@ -216,6 +218,7 @@ export function CreateAgentModal({ open, onClose, onCreated }: CreateAgentModalP
           mode="create"
           initialYaml={initialYaml}
           onChange={setBuffer}
+          onValidityChange={setFormHasErrors}
         />
       )}
       </div>

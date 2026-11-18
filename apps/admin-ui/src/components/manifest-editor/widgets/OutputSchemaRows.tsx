@@ -5,8 +5,9 @@
  * nested below it, and a list row's fixed "each item" row below it.
  *
  * Identity: React keys and the collapse state use each field's local
- * ``uid`` (an item row: its parent row's key + ``/items``), so they follow
- * the field when siblings are added or removed. Test ids use the tree path
+ * ``uid`` — row key ``JSON.stringify([uid])``; an item row appends
+ * ``"items"`` to its parent's — so they follow the field when siblings are
+ * added or removed. Test ids use the tree path
  * (``0``, ``0.items``, ``1.items.0`` …).
  *
  * A readonly node (a structure the form can't represent) renders greyed
@@ -52,11 +53,10 @@ const CELL_TEXT: CSSProperties = { width: COL_NAME, flex: "none", paddingTop: 4 
 export interface TreeContext {
   root: SchemaNode;
   strict: boolean;
-  /** ``renamedUid``: the field whose name this edit changed (it yields name clashes). */
-  commit: (next: SchemaNode, renamedUid?: string) => void;
+  commit: (next: SchemaNode) => void;
+  /** Collapsed rows, keyed by row key (JSON: ``[uid]`` / ``[uid, "items", …]``). */
   collapsed: ReadonlySet<string>;
   toggleCollapsed: (rowKey: string) => void;
-  lastRenamedUid?: string;
 }
 
 interface RowProps {
@@ -200,7 +200,8 @@ function Children({ path, rowKey, ctx, node }: RowProps & { node: SchemaNode }) 
   if (node.kind !== "editable" || ctx.collapsed.has(rowKey)) return null;
   if (node.type === "object") return <FieldRows parentPath={path} fields={node.fields ?? []} ctx={ctx} />;
   if (node.type === "array" && node.items) {
-    return <ItemsRow path={[...path, "items"]} rowKey={`${rowKey}/items`} ctx={ctx} node={node.items} />;
+    const itemsKey = JSON.stringify([...(JSON.parse(rowKey) as string[]), "items"]);
+    return <ItemsRow path={[...path, "items"]} rowKey={itemsKey} ctx={ctx} node={node.items} />;
   }
   return null;
 }
@@ -228,13 +229,31 @@ interface NameCellProps {
   onRename: (name: string) => void;
 }
 
+function IssueText({ issue }: { issue: Exclude<FieldIssue, null> }) {
+  const { t } = useTranslation();
+  return (
+    <Text type="danger" style={{ fontSize: 12, display: "block" }}>
+      {t(issue === "duplicate" ? "agent_form.output_schema.name_duplicate" : "agent_form.output_schema.name_invalid")}
+    </Text>
+  );
+}
+
+// A fixed name (readonly / locked) is text; it can still clash with a
+// sibling's name, and then it is flagged like any other row.
 function FieldNameCell({ field, issue, testKey, onRename }: NameCellProps) {
   const { t } = useTranslation();
   if (isNameFixed(field)) {
     return (
-      <Text type="secondary" style={CELL_TEXT} data-testid={`af-output-schema-name-${testKey}`}>
-        {field.name}
-      </Text>
+      <div style={{ ...CELL_TEXT }}>
+        <Text
+          type={issue ? "danger" : "secondary"}
+          aria-invalid={issue !== null}
+          data-testid={`af-output-schema-name-${testKey}`}
+        >
+          {field.name}
+        </Text>
+        {issue && <IssueText issue={issue} />}
+      </div>
     );
   }
   return (
@@ -247,11 +266,7 @@ function FieldNameCell({ field, issue, testKey, onRename }: NameCellProps) {
         aria-label={t("agent_form.output_schema.col_name")}
         onChange={(e) => onRename(e.target.value)}
       />
-      {issue && (
-        <Text type="danger" style={{ fontSize: 12, display: "block" }}>
-          {t(issue === "duplicate" ? "agent_form.output_schema.name_duplicate" : "agent_form.output_schema.name_invalid")}
-        </Text>
-      )}
+      {issue && <IssueText issue={issue} />}
     </div>
   );
 }
@@ -300,10 +315,8 @@ function FieldRow({ parentPath, fields, index, ctx }: FieldRowProps) {
   const path = [...parentPath, index];
   const key = pathKey(path);
   const patchField = (patch: Partial<SchemaField>): void =>
-    ctx.commit(
-      updateFieldsAt(ctx.root, parentPath, (fs) => fs.map((f, i) => (i === index ? { ...f, ...patch } : f))),
-      patch.name !== undefined ? field.uid : undefined,
-    );
+    ctx.commit(updateFieldsAt(ctx.root, parentPath, (fs) => fs.map((f, i) => (i === index ? { ...f, ...patch } : f))));
+  const rowKey = JSON.stringify([field.uid]);
   const remove = (): void =>
     ctx.commit(updateFieldsAt(ctx.root, parentPath, (fs) => fs.filter((_, i) => i !== index)));
   const requiredCell = (
@@ -320,13 +333,13 @@ function FieldRow({ parentPath, fields, index, ctx }: FieldRowProps) {
     </Button>
   );
   const nameCell = (
-    <FieldNameCell field={field} issue={fieldIssue(fields, index, ctx.lastRenamedUid)} testKey={key} onRename={(name) => patchField({ name })} />
+    <FieldNameCell field={field} issue={fieldIssue(fields, index)} testKey={key} onRename={(name) => patchField({ name })} />
   );
   return (
     <>
       <RowCells
         path={path}
-        rowKey={field.uid}
+        rowKey={rowKey}
         ctx={ctx}
         node={field.node}
         nameCell={nameCell}
@@ -334,7 +347,7 @@ function FieldRow({ parentPath, fields, index, ctx }: FieldRowProps) {
         trailing={removeButton}
       />
       <RowHints depth={path.length} testKey={key} node={field.node} strictOptional={ctx.strict && !field.required} />
-      <Children path={path} rowKey={field.uid} ctx={ctx} node={field.node} />
+      <Children path={path} rowKey={rowKey} ctx={ctx} node={field.node} />
     </>
   );
 }

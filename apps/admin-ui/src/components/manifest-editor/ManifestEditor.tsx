@@ -11,7 +11,7 @@
  * flat-tab row this replaces. ``onChange`` always carries the latest manifest
  * as a YAML string so the parent submits exactly what's shown.
  */
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Alert, Button, Spin } from "antd";
 import validator from "@rjsf/validator-ajv8";
 import { useTranslation } from "react-i18next";
@@ -20,6 +20,7 @@ import type { JsonSchema } from "../../api/manifest_schema";
 import { loadAgentSchema } from "./schema";
 import { dumpYaml, parseYaml } from "./yaml";
 import { normalizeForSubmit } from "./form_model";
+import { FormErrorsContext } from "./form_errors";
 import { FormView, type FormSection } from "./FormView";
 import { YamlView } from "./YamlView";
 import { GroupNav } from "./GroupNav";
@@ -119,6 +120,10 @@ interface ManifestEditorProps {
   /** 委派增强层 3 — 已保存 Agent 的身份(仅编辑页宿主 ManifestTab 传)。
    *  转发给 FormView,提示词区据此渲染「生成委派策略」按钮。 */
   agentRef?: AgentRef;
+  /** B-315 — ``true`` while some form widget holds edits it can't write back
+   *  yet (see ``form_errors.ts``); the host must block saving meanwhile.
+   *  Called on mount, on every change, and with ``false`` on unmount. */
+  onValidityChange?: (hasErrors: boolean) => void;
 }
 
 /** BUG-5 —— 编辑器主体 min-height 扣除的宿主 chrome 估算(agent 详情页
@@ -152,6 +157,7 @@ export function ManifestEditor({
   activeGroup,
   onActiveGroupChange,
   agentRef,
+  onValidityChange,
 }: ManifestEditorProps) {
   const { t } = useTranslation();
   const seed = useMemo(() => safeSeed(initialYaml), [initialYaml]);
@@ -174,6 +180,22 @@ export function ManifestEditor({
   const [yamlText, setYamlText] = useState<string>(initialYaml);
   const [yamlActive, setYamlActive] = useState(false);
   const [switchError, setSwitchError] = useState<string | null>(null);
+  // B-315 — per-widget "can't save yet" reports (form_errors.ts).
+  const [errorSources, setErrorSources] = useState<ReadonlySet<string>>(new Set());
+  const reportFormErrors = useCallback((source: string, hasErrors: boolean) => {
+    setErrorSources((prev) => {
+      if (prev.has(source) === hasErrors) return prev;
+      const next = new Set(prev);
+      if (hasErrors) next.add(source);
+      else next.delete(source);
+      return next;
+    });
+  }, []);
+  const hasFormErrors = errorSources.size > 0;
+  useEffect(() => {
+    onValidityChange?.(hasFormErrors);
+  }, [hasFormErrors, onValidityChange]);
+  useEffect(() => () => onValidityChange?.(false), [onValidityChange]);
 
   function setGroup(id: string): void {
     setInternalGroup(id);
@@ -380,6 +402,7 @@ export function ManifestEditor({
   const showLeadingPane = !yamlActive && isLeadingActive;
 
   return (
+    <FormErrorsContext.Provider value={reportFormErrors}>
     <div data-testid={`manifest-editor-${mode}`}>
       {/* BUG-5:内容按需收高时卡片停在半屏,底部整片留白 —— 编辑器主体
           拉到接近视口底,少内容分组也占满版心。 */}
@@ -467,5 +490,6 @@ export function ManifestEditor({
         </div>
       </div>
     </div>
+    </FormErrorsContext.Provider>
   );
 }

@@ -79,6 +79,10 @@ test.beforeEach(async ({ page }) => {
   await page.route(`**/v1/agents/${AGENT_NAME}/${AGENT_VERSION}`, async (route) => {
     await route.fulfill({ json: DETAIL_ENVELOPE });
   });
+  // Save = PUT .../draft; stubbed so a save never reaches a real backend.
+  await page.route(`**/v1/agents/${AGENT_NAME}/${AGENT_VERSION}/draft`, async (route) => {
+    await route.fulfill({ json: DETAIL_ENVELOPE });
+  });
 
   await page.goto("/login");
   await expect(page.getByTestId("login-card")).toBeVisible();
@@ -121,4 +125,30 @@ test("health-manager schema: messages maxItems 4 → 3 in the form shows up in Y
   expect(await yamlText()).not.toMatch(/maxItems: 4\b/);
   // Sanity: the whole schema is on screen (the last line of it rendered).
   expect(await yamlText()).toContain("minimum: 1");
+});
+
+test("a duplicated field name blocks saving until it is fixed", async ({ page }) => {
+  await page.getByTestId("cfg-nav-prompt").click();
+  const name = page.getByTestId("af-output-schema-name-0");
+  await expect(name).toHaveValue("messages");
+  const save = page.getByTestId("manifest-save-btn");
+  await expect(save).toBeEnabled();
+
+  await name.fill("media");
+  await expect(page.getByTestId("af-output-schema-name-errors")).toBeVisible();
+  await expect(name).toHaveAttribute("aria-invalid", "true");
+  await expect(page.getByTestId("af-output-schema-name-1")).toHaveAttribute("aria-invalid", "true");
+  await expect(save).toBeDisabled();
+
+  await name.fill("msgs");
+  await expect(page.getByTestId("af-output-schema-name-errors")).toHaveCount(0);
+  await expect(save).toBeEnabled();
+  const putPromise = page.waitForRequest(
+    (req) => req.method() === "PUT" && req.url().endsWith(`/v1/agents/${AGENT_NAME}/${AGENT_VERSION}/draft`),
+  );
+  await save.click();
+  const body = (await putPromise).postDataJSON() as { manifest_yaml: string };
+  expect(body.manifest_yaml).toContain("msgs:");
+  expect(body.manifest_yaml).toContain("media:");
+  expect(body.manifest_yaml).not.toContain("messages:");
 });

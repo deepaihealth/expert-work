@@ -16,7 +16,7 @@ import {
   nodeAt,
   parseSchemaNode,
   parseSchemaRoot,
-  pruneInvalidFields,
+  hasNameIssues,
   updateFieldsAt,
   updateNodeAt,
   writeSchemaNode,
@@ -35,12 +35,6 @@ const field = (name: string, node: SchemaNode = newSchemaNode("string")): Schema
   name,
   required: false,
   node,
-});
-
-// A field as if read from the original (still carrying its read-in name).
-const original = (name: string, node: SchemaNode = newSchemaNode("string")): SchemaField => ({
-  ...field(name, node),
-  originalName: name,
 });
 
 describe("constraints: read and write per type", () => {
@@ -303,15 +297,20 @@ describe("building and editing", () => {
   });
 });
 
-describe("field names", () => {
-  it("flags blank / pattern-failing names and later duplicates only", () => {
+describe("field names: any problem is an error, nothing is picked or dropped", () => {
+  const RO = { kind: "readonly", raw: { oneOf: [] }, reason: "unsupported" } as const;
+
+  it("flags blank and pattern-failing names, and BOTH rows of a duplicate", () => {
     const fields = [field("title"), field(""), field("1x"), field("title")];
-    expect(fields.map((_, i) => fieldIssue(fields, i))).toEqual([null, "invalid", "invalid", "duplicate"]);
+    expect(fields.map((_, i) => fieldIssue(fields, i))).toEqual(["duplicate", "invalid", "invalid", "duplicate"]);
   });
 
-  it("never flags a readonly field", () => {
-    const fields = [field("9odd", { kind: "readonly", raw: {}, reason: "unsupported" })];
-    expect(fieldIssue(fields, 0)).toBeNull();
+  it("a readonly or name-locked field is never 'invalid' but is flagged on a clash", () => {
+    const locked = { ...field("9odd"), nameLocked: true };
+    expect(fieldIssue([field("9odd", RO)], 0)).toBeNull();
+    expect(fieldIssue([locked], 0)).toBeNull();
+    const clash = [field("b"), field("b", RO)];
+    expect(clash.map((_, i) => fieldIssue(clash, i))).toEqual(["duplicate", "duplicate"]);
   });
 
   it("__proto__ is not a name the user may type", () => {
@@ -319,36 +318,14 @@ describe("field names", () => {
     expect(fieldIssue([field("__proto__")], 0)).toBe("invalid");
   });
 
-  it("renaming onto a readonly sibling flags the renamed field, wherever the readonly one sits", () => {
-    const fields = [{ ...original("a"), name: "b" }, original("b", { kind: "readonly", raw: { oneOf: [] }, reason: "unsupported" })];
-    expect(fieldIssue(fields, 0)).toBe("duplicate");
-    expect(fieldIssue(fields, 1)).toBeNull();
-  });
-
-  it("the field renamed last yields, even when it is typing back its own original name", () => {
-    const a = original("a");
-    const b = { ...original("b"), name: "a" };
-    expect(fieldIssue([a, b], 0, a.uid)).toBe("duplicate");
-    expect(fieldIssue([a, b], 1, a.uid)).toBeNull();
-    expect(fieldIssue([a, b], 1, b.uid)).toBe("duplicate");
-  });
-
-  it("renaming onto a later untouched sibling flags the renamed one, not the untouched one", () => {
-    const fields = [{ ...original("a"), name: "b" }, original("b", newSchemaNode("object"))];
-    expect(fieldIssue(fields, 0)).toBe("duplicate");
-    expect(fieldIssue(fields, 1)).toBeNull();
-  });
-
-  it("pruneInvalidFields drops bad names at every depth", () => {
-    const inner = { ...newSchemaNode("object"), fields: [field("ok"), field("")] };
-    const root = { ...newSchemaNode("object"), fields: [field("x", inner), field("x")] };
-    expect(writeSchemaNode(pruneInvalidFields(root))).toEqual({
-      type: "object",
-      properties: {
-        x: { type: "object", properties: { ok: { type: "string" } }, additionalProperties: false },
-      },
-      additionalProperties: false,
+  it("hasNameIssues looks at every depth, list items included", () => {
+    const deep = (inner: SchemaField[]) => ({
+      ...newSchemaNode("object"),
+      fields: [field("list", { ...newSchemaNode("array"), items: { ...newSchemaNode("object"), fields: inner } })],
     });
+    expect(hasNameIssues(deep([field("a"), field("b")]))).toBe(false);
+    expect(hasNameIssues(deep([field("a"), field("a")]))).toBe(true);
+    expect(hasNameIssues(deep([field("")]))).toBe(true);
   });
 });
 
@@ -365,6 +342,12 @@ describe("field uids", () => {
         : [...(n.fields ?? []).flatMap((f) => [f.uid, ...uids(f.node)]), ...(n.items ? uids(n.items) : [])];
     const all = [...uids(parseSchemaRoot(raw)), ...uids(parseSchemaRoot(raw)), newSchemaField().uid];
     expect(new Set(all).size).toBe(all.length);
+  });
+
+  it("matchFieldUids skips a field whose name currently has an issue (and its subtree)", () => {
+    const before = editable(parseSchemaRoot(raw));
+    const renamed = updateFieldsAt(before, [], (fs) => [...fs, { ...field("a") }]);
+    expect(matchFieldUids(renamed, parseSchemaRoot(raw)).size).toBe(0);
   });
 
   it("matchFieldUids pairs fields by name path across two reads", () => {
