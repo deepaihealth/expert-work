@@ -46,6 +46,8 @@ import {
 } from "../api/memory";
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
+import { MemberName } from "../components/MemberName";
+import { useMemberNames } from "../hooks/useMemberNames";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 import { MemoryOriginTag } from "../components/MemoryOriginTag";
 import { PageHeader } from "../components/PageHeader";
@@ -63,6 +65,8 @@ export function MemoryAdmin() {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const { scope, apiTenantScope } = useTenantScope();
+  // B-316 — memory owners shown by member name.
+  const memberNameOf = useMemberNames(apiTenantScope);
   const isSystemAdmin = useAuth().identity?.isSystemAdmin ?? false;
 
   const [data, setData] = useState<MemoryList | null>(null);
@@ -268,7 +272,11 @@ export function MemoryAdmin() {
       key: "user_id",
       width: 200,
       render: (uid: string) => (
-        <Text code style={{ fontSize: 11 }}>{uid.slice(0, 8)}…</Text>
+        <MemberName
+          id={uid}
+          nameOf={memberNameOf}
+          fallback={<Text code style={{ fontSize: 11 }}>{uid.slice(0, 8)}…</Text>}
+        />
       ),
     },
     {
@@ -313,7 +321,7 @@ export function MemoryAdmin() {
         </Space>
       ),
     },
-  ], [t, openEdit, openCorrect, onDelete, callerUserId]);
+  ], [t, openEdit, openCorrect, onDelete, callerUserId, memberNameOf]);
 
   const isCrossTenant = data?.cross_tenant ?? false;
 
@@ -429,7 +437,16 @@ export function MemoryAdmin() {
           <Space direction="vertical" style={{ width: "100%" }} size={12}>
             <div>
               <Text type="secondary" style={{ fontSize: 12 }}>{t("memory.edit_meta_user")}</Text>
-              <div><Text code style={{ fontSize: 11 }}>{editing.user_id}</Text></div>
+              <div>
+                <Text code style={{ fontSize: 11 }}>
+                  {memberNameOf(editing.user_id) === editing.user_id
+                    ? editing.user_id
+                    : t("common.name_with_id", {
+                        name: memberNameOf(editing.user_id),
+                        id: editing.user_id,
+                      })}
+                </Text>
+              </div>
             </div>
             <div>
               <Text type="secondary" style={{ fontSize: 12 }}>{t("memory.edit_meta_kind")}</Text>

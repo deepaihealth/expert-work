@@ -69,6 +69,8 @@ import { useHistoryTurns } from "../components/turn/useHistoryTurns";
 import { NON_TERMINAL_RUN_STATUSES } from "../api/runs";
 import type { LiveStep } from "./agent_detail/playground/useTokenStream";
 import { useRateBook, type ModelRef } from "./agent_detail/playground/useRateBook";
+import { MemberName } from "../components/MemberName";
+import { useMemberNames } from "../hooks/useMemberNames";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { formatCompact } from "../utils/runFormat";
 
@@ -106,6 +108,8 @@ export function ConversationDetail() {
   // "*" aggregate maps to undefined (the endpoint types tenant_id as
   // ``UUID | None`` and 422s a literal "*").
   const { apiTenantScope } = useTenantScope();
+  // B-316 — the conversation's user shown by member name.
+  const memberNameOf = useMemberNames(concreteTenantScope(apiTenantScope));
 
   const [convo, setConvo] = useState<ConversationDetailModel | null>(null);
   const [loading, setLoading] = useState(true);
@@ -692,7 +696,11 @@ export function ConversationDetail() {
         >
           <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("conversations_detail.user")}</dt>
           <dd className="mono" style={{ margin: 0 }}>
-            {convo.user_id ?? "—"}
+            {convo.user_id ? (
+              <MemberName id={convo.user_id} nameOf={memberNameOf} data-testid="conversation-user" />
+            ) : (
+              "—"
+            )}
           </dd>
           <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("conversations_page.column_runs")}</dt>
           <dd style={{ margin: 0 }}>

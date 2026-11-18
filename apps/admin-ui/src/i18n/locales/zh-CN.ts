@@ -30,6 +30,7 @@ const zhCN: TranslationKeys = {
     copied: "已复制",
     tenant_switched_readonly: "已切入租户，只读视角——写操作请切回归属租户",
     cross_tenant_readonly: "全部租户视图为只读——写操作请切入具体租户",
+    name_with_id: "{{name}}（{{id}}）",
   },
   about: {
     title: "关于 Expert Work",

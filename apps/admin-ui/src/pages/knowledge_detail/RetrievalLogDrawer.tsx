@@ -36,6 +36,8 @@ import {
   type RetrievalLogResult,
 } from "../../api/knowledge_logs";
 import { useAuth } from "../../auth/AuthContext";
+import { MemberName } from "../../components/MemberName";
+import { useMemberNames, type MemberNameOf } from "../../hooks/useMemberNames";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { HeadingPath } from "./HeadingPath";
 import { HitDocument } from "./HitDocument";
@@ -89,6 +91,8 @@ export function RetrievalLogDrawer({ baseName, logId, readScope, onClose }: Retr
   const [detail, setDetail] = useState<RetrievalLogDetail | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [live, setLive] = useState<LiveText>(undefined);
+  // B-316 — fetched once per tab (the drawer stays mounted across records).
+  const memberNameOf = useMemberNames(readScope);
   // Only the latest record's reads may land (a quick switch between rows).
   const seq = useRef(0);
 
@@ -136,7 +140,13 @@ export function RetrievalLogDrawer({ baseName, logId, readScope, onClose }: Retr
         ) : detail === null ? (
           <Skeleton active paragraph={{ rows: 8 }} />
         ) : (
-          <RecordBody baseName={baseName} detail={detail} live={live} readScope={readScope} />
+          <RecordBody
+            baseName={baseName}
+            detail={detail}
+            live={live}
+            readScope={readScope}
+            memberNameOf={memberNameOf}
+          />
         )}
       </div>
     </Drawer>
@@ -148,11 +158,13 @@ function RecordBody({
   detail,
   live,
   readScope,
+  memberNameOf,
 }: {
   baseName: string;
   detail: RetrievalLogDetail;
   live: LiveText;
   readScope: string | undefined;
+  memberNameOf: MemberNameOf;
 }) {
   const { t } = useTranslation();
   const candidates = typeof detail.flags.candidates === "number" ? detail.flags.candidates : null;
@@ -184,9 +196,12 @@ function RecordBody({
         {detail.actor_id && (
           <Descriptions.Item label={t("knowledge_retrieval.field_actor")}>
             <Space size={8} wrap>
-              <Text code data-testid="kb-log-actor">
-                {detail.actor_id}
-              </Text>
+              <MemberName
+                id={detail.actor_id}
+                nameOf={memberNameOf}
+                fallback={<Text code>{detail.actor_id}</Text>}
+                data-testid="kb-log-actor"
+              />
               <PlatformAdminTag flags={detail.flags} testId="kb-log-platform-admin" />
             </Space>
           </Descriptions.Item>

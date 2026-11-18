@@ -168,6 +168,62 @@ describe("SettingsAudit", () => {
     expect(screen.getByTestId("audit-detail-payload").textContent).toContain('"kind": "fact"');
   });
 
+  it("shows the actor's member name; the detail keeps name (id) and the filter stays id-based (B-316)", async () => {
+    const aliceSub = "6f1c2a8e-0b7d-4c55-9a3e-1d2f3a4b5c6d";
+    let lastAuditParams: Record<string, unknown> = {};
+    installAdapter([
+      {
+        match: (u) => u === "/v1/audit",
+        respond: (params) => {
+          lastAuditParams = params;
+          return {
+            items: [{ ...baseEntry, actor_id: aliceSub }],
+            next_cursor: null,
+            has_more: false,
+            applied_scope: "t1",
+          };
+        },
+      },
+      {
+        match: (u) => u === "/v1/members",
+        respond: () => ({
+          success: true,
+          error: null,
+          data: {
+            items: [
+              {
+                id: "0e1d2c3b-4a59-4687-9a6b-5c4d3e2f1a0b",
+                tenant_id: "t1",
+                email: "alice@acme.com",
+                display_name: "Alice Wang",
+                role: "admin",
+                status: "active",
+                keycloak_user_id: aliceSub,
+                subject_id: null,
+                invited_by: "seed",
+                invited_at: null,
+                activated_at: null,
+                updated_at: null,
+              },
+            ],
+            total: 1,
+          },
+        }),
+      },
+    ]);
+    const user = userEvent.setup();
+    renderAudit();
+
+    await waitFor(() => expect(screen.getByTestId("audit-actor-1")).toHaveTextContent("Alice Wang"));
+    expect(screen.queryByText(aliceSub)).toBeNull();
+
+    await user.click(screen.getByTestId("audit-row-1"));
+    expect(await screen.findByText(`user / Alice Wang (${aliceSub})`)).toBeInTheDocument();
+
+    await user.type(screen.getByTestId("audit-actor-filter"), aliceSub);
+    await waitFor(() => expect(lastAuditParams.actor_id).toBe(aliceSub));
+  });
+
   it("threads the action filter into the SDK call", async () => {
     let lastParams: Record<string, unknown> = {};
     installAdapter([

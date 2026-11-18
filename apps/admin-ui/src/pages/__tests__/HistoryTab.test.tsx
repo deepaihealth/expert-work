@@ -20,6 +20,10 @@ vi.mock("@monaco-editor/react", () => ({
 }));
 
 import * as agentsSdk from "../../api/agents";
+import { ApiError } from "../../api/client";
+import * as membersSdk from "../../api/members";
+import type { TenantMember } from "../../api/members";
+import { useMemberNames } from "../../hooks/useMemberNames";
 import { HistoryTab } from "../agent_detail/HistoryTab";
 import type { AgentDetailResponse } from "../../api/agents";
 
@@ -78,6 +82,9 @@ function snapshot(revision: number, sha: string, prompt: string) {
   };
 }
 
+/** No member names: ids render as-is (tests that are not about B-316). */
+const rawId = (id: string) => id;
+
 afterEach(() => vi.restoreAllMocks());
 
 // vitest 4 的 restore 不复位 vi.fn 的 mockReturnValue — 显式归位防串台。
@@ -90,7 +97,7 @@ describe("HistoryTab", () => {
   it("renders the revision table, marks current, hides rollback on it", async () => {
     vi.spyOn(agentsSdk, "listRevisions").mockResolvedValue({ items: summaries });
 
-    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} />);
+    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} memberNameOf={rawId} />);
 
     await waitFor(() => expect(screen.getByText("#2")).toBeInTheDocument());
     expect(screen.getByText("#1")).toBeInTheDocument();
@@ -104,7 +111,7 @@ describe("HistoryTab", () => {
   it("readOnly (deleted agent) lists revisions without any rollback button", async () => {
     vi.spyOn(agentsSdk, "listRevisions").mockResolvedValue({ items: summaries });
 
-    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} readOnly />);
+    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} memberNameOf={rawId} readOnly />);
 
     await waitFor(() => expect(screen.getByText("#1")).toBeInTheDocument());
     expect(screen.queryByTestId("history-rollback-1")).toBeNull();
@@ -116,7 +123,7 @@ describe("HistoryTab", () => {
       .spyOn(agentsSdk, "listRevisions")
       .mockResolvedValue({ items: summaries });
 
-    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} />);
+    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} memberNameOf={rawId} />);
 
     await waitFor(() => expect(listMock).toHaveBeenCalled());
     expect(listMock).toHaveBeenCalledWith("demo-agent", "1.0.0", undefined);
@@ -132,7 +139,7 @@ describe("HistoryTab", () => {
           : snapshot(2, SHA_V2, "new prompt"),
       );
 
-    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} />);
+    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} memberNameOf={rawId} />);
     await waitFor(() => expect(screen.getByText("#2")).toBeInTheDocument());
 
     const checkboxes = screen.getAllByRole("checkbox");
@@ -156,7 +163,7 @@ describe("HistoryTab", () => {
     });
     const onRolledBack = vi.fn();
 
-    render(<HistoryTab detail={detail} onRolledBack={onRolledBack} />);
+    render(<HistoryTab detail={detail} onRolledBack={onRolledBack} memberNameOf={rawId} />);
     await waitFor(() => expect(screen.getByTestId("history-rollback-1")).toBeInTheDocument());
 
     await userEvent.click(screen.getByTestId("history-rollback-1"));
@@ -174,14 +181,82 @@ describe("HistoryTab", () => {
     isTenantSwitchedMock.mockReturnValue(true);
     vi.spyOn(agentsSdk, "listRevisions").mockResolvedValue({ items: summaries });
 
-    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} />);
+    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} memberNameOf={rawId} />);
 
     expect(await screen.findByTestId("history-rollback-1")).toBeDisabled();
   });
 
   it("surfaces SDK errors in an alert", async () => {
     vi.spyOn(agentsSdk, "listRevisions").mockRejectedValue(new Error("boom"));
-    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} />);
+    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} memberNameOf={rawId} />);
     await waitFor(() => expect(screen.getByTestId("history-tab-error")).toBeInTheDocument());
+  });
+});
+
+// B-316 — the operator column shows member names. Wired exactly as the page
+// does it: the real ``useMemberNames`` over a stubbed ``listMembers``.
+describe("HistoryTab operator names", () => {
+  const ALICE_SUB = "6f1c2a8e-0b7d-4c55-9a3e-1d2f3a4b5c6d";
+  const BOB_SUB = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+  const aliceMember: TenantMember = {
+    id: "0e1d2c3b-4a59-4687-9a6b-5c4d3e2f1a0b",
+    tenant_id: "22222222-2222-2222-2222-222222222222",
+    email: "alice@acme.com",
+    display_name: "王小明",
+    role: "admin",
+    status: "active",
+    keycloak_user_id: ALICE_SUB,
+    subject_id: "7d6c5b4a-3928-4170-8f6e-5d4c3b2a1908",
+    invited_by: "seed",
+    invited_at: null,
+    activated_at: null,
+    updated_at: null,
+  };
+  const revisions = [
+    { revision: 2, spec_sha256: SHA_V2, actor_id: ALICE_SUB, created_at: "2026-06-11T01:00:00Z" },
+    { revision: 1, spec_sha256: SHA_V1, actor_id: BOB_SUB, created_at: "2026-06-11T00:00:00Z" },
+  ];
+
+  function HistoryTabOnPage() {
+    const memberNameOf = useMemberNames(undefined);
+    return <HistoryTab detail={detail} onRolledBack={vi.fn()} memberNameOf={memberNameOf} />;
+  }
+
+  it("shows the member name for a known operator, the raw id for an unknown one", async () => {
+    vi.spyOn(agentsSdk, "listRevisions").mockResolvedValue({ items: revisions });
+    vi.spyOn(membersSdk, "listMembers").mockResolvedValue({ items: [aliceMember], total: 1 });
+
+    render(<HistoryTabOnPage />);
+
+    await waitFor(() => expect(screen.getByTestId("history-actor-2")).toHaveTextContent("王小明"));
+    expect(screen.queryByText(ALICE_SUB)).toBeNull();
+    // Not a member (service account / someone removed) — shown as-is.
+    expect(screen.getByTestId("history-actor-1")).toHaveTextContent(BOB_SUB);
+  });
+
+  it("reveals the raw operator id on hover", async () => {
+    vi.spyOn(agentsSdk, "listRevisions").mockResolvedValue({ items: revisions });
+    vi.spyOn(membersSdk, "listMembers").mockResolvedValue({ items: [aliceMember], total: 1 });
+
+    render(<HistoryTabOnPage />);
+    await waitFor(() => expect(screen.getByTestId("history-actor-2")).toHaveTextContent("王小明"));
+
+    await userEvent.hover(screen.getByTestId("history-actor-2"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(ALICE_SUB);
+  });
+
+  it("falls back to the raw ids when the member list cannot be read", async () => {
+    vi.spyOn(agentsSdk, "listRevisions").mockResolvedValue({ items: revisions });
+    const listMembers = vi
+      .spyOn(membersSdk, "listMembers")
+      .mockRejectedValue(new ApiError("nope", "FORBIDDEN", 403));
+
+    render(<HistoryTabOnPage />);
+
+    await waitFor(() => expect(listMembers).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByTestId("history-actor-2")).toHaveTextContent(ALICE_SUB));
+    expect(screen.getByTestId("history-actor-1")).toHaveTextContent(BOB_SUB);
+    expect(screen.queryByText("王小明")).toBeNull();
+    expect(screen.queryByTestId("history-tab-error")).toBeNull();
   });
 });

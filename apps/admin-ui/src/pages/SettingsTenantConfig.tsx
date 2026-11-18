@@ -29,7 +29,9 @@ import { Edit3, Save, Settings2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../api/client";
+import { MemberName } from "../components/MemberName";
 import { PageHeader } from "../components/PageHeader";
+import { useMemberNames } from "../hooks/useMemberNames";
 import {
   getTenantConfig,
   retentionDecreases,
@@ -38,7 +40,7 @@ import {
   type TenantConfigRecord,
 } from "../api/tenant_config";
 import { useAuth } from "../auth/AuthContext";
-import { useTenantScope } from "../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -114,6 +116,9 @@ export function SettingsTenantConfig() {
       : typeof apiTenantScope === "string" && apiTenantScope !== "*"
         ? apiTenantScope
         : homeTenantId;
+
+  // B-316 — ``updated_by`` shown as the member name.
+  const memberNameOf = useMemberNames(concreteTenantScope(apiTenantScope));
 
   const [record, setRecord] = useState<TenantConfigRecord | null>(null);
   const [notFound, setNotFound] = useState(false);
@@ -410,7 +415,7 @@ export function SettingsTenantConfig() {
               )}
             </dd>
             <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("settings_ops.updated")}</dt>
-            <dd style={{ margin: 0 }}>{new Date(record.updated_at).toLocaleString()} ({record.updated_by})</dd>
+            <dd style={{ margin: 0 }}>{new Date(record.updated_at).toLocaleString()} (<MemberName id={record.updated_by} nameOf={memberNameOf} />)</dd>
           </dl>
         </Card>
       )}

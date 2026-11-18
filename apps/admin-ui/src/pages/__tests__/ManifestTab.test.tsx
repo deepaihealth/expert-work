@@ -90,6 +90,8 @@ const savedDetail: AgentDetailResponse = {
 } as AgentDetailResponse;
 
 const onSaved = vi.fn();
+/** B-316 — no member names in these tests: ids render as-is. */
+const rawId = (id: string) => id;
 // Re-installed in beforeEach: afterEach() runs vi.restoreAllMocks(), which would
 // otherwise permanently restore a module-level spy after the first test.
 let saveDraftMock: ReturnType<typeof vi.spyOn>;
@@ -118,7 +120,7 @@ function withDraft(overrides: Record<string, unknown> = {}): AgentDetailResponse
 function renderTab(detail: AgentDetailResponse = sampleDetail) {
   return render(
     <MemoryRouter>
-      <ManifestTab detail={detail} onSaved={onSaved} />
+      <ManifestTab detail={detail} onSaved={onSaved} memberNameOf={rawId} />
     </MemoryRouter>,
   );
 }
@@ -172,7 +174,7 @@ describe("ManifestTab", () => {
   it("readOnly (deleted agent) hides save, publish and discard", async () => {
     render(
       <MemoryRouter>
-        <ManifestTab detail={withDraft()} onSaved={onSaved} readOnly />
+        <ManifestTab detail={withDraft()} onSaved={onSaved} memberNameOf={rawId} readOnly />
       </MemoryRouter>,
     );
     await screen.findByTestId("manifest-editor-edit");
@@ -393,7 +395,7 @@ describe("ManifestTab", () => {
     // editor and reset the form position to basic/defenses.
     rerender(
       <MemoryRouter>
-        <ManifestTab detail={savedDetail} onSaved={onSaved} />
+        <ManifestTab detail={savedDetail} onSaved={onSaved} memberNameOf={rawId} />
       </MemoryRouter>,
     );
 
@@ -411,7 +413,7 @@ describe("ManifestTab", () => {
 
     rerender(
       <MemoryRouter>
-        <ManifestTab detail={savedDetail} onSaved={onSaved} />
+        <ManifestTab detail={savedDetail} onSaved={onSaved} memberNameOf={rawId} />
       </MemoryRouter>,
     );
 
@@ -434,7 +436,7 @@ describe("ManifestTab", () => {
     // the security group instead of falling back to basic.
     rerender(
       <MemoryRouter>
-        <ManifestTab key="remounted" detail={sampleDetail} onSaved={onSaved} />
+        <ManifestTab key="remounted" detail={sampleDetail} onSaved={onSaved} memberNameOf={rawId} />
       </MemoryRouter>,
     );
     await screen.findByTestId("manifest-editor-edit");

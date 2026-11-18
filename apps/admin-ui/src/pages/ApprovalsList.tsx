@@ -42,7 +42,9 @@ import {
 } from "../api/approvals";
 import { ApiError } from "../api/client";
 import { useTenantScope } from "../tenant/TenantScopeContext";
+import { MemberName } from "../components/MemberName";
 import { PageHeader } from "../components/PageHeader";
+import { useMemberNames } from "../hooks/useMemberNames";
 
 const { Text } = Typography;
 
@@ -101,6 +103,8 @@ function formatTimeLeft(
 export function ApprovalsList() {
   const { t } = useTranslation();
   const { scope, apiTenantScope } = useTenantScope();
+  // B-316 — ``decided_by`` shown as the member name (system deciders as-is).
+  const memberNameOf = useMemberNames(apiTenantScope);
   const [data, setData] = useState<ApprovalList | null>(null);
   const [loading, setLoading] = useState(false);
   const [deciding, setDeciding] = useState(false);
@@ -317,12 +321,16 @@ export function ApprovalsList() {
             </Space>
           ) : (
             <Text type="secondary" style={{ fontSize: 12 }}>
-              {record.decided_by ?? "—"}
+              {record.decided_by ? (
+                <MemberName id={record.decided_by} nameOf={memberNameOf} />
+              ) : (
+                "—"
+              )}
             </Text>
           ),
       },
     ],
-    [t, canDecide, decide, deciding],
+    [t, canDecide, decide, deciding, memberNameOf],
   );
 
   return (

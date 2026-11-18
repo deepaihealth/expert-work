@@ -58,12 +58,12 @@ import {
   type AgentList,
 } from "../api/agents";
 import { ApiError } from "../api/client";
-import { listMembers } from "../api/members";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { CreateAgentModal } from "../components/CreateAgentModal";
 import { DeleteAgentModal } from "../components/DeleteAgentModal";
 import { PageHeader } from "../components/PageHeader";
+import { useMemberNames } from "../hooks/useMemberNames";
 
 const { Text } = Typography;
 
@@ -319,33 +319,10 @@ export function AgentsList() {
   }, [refresh]);
 
   // ① 所有者列(2026-08 反馈)— ``created_by`` 是创建者 principal 的
-  // subject UUID(用户)或服务账号名:拉一次成员表把 UUID 映射成成员名
-  // (display_name,空则 email)。subject_id 是 tenant_user 主标识,但成员
-  // 行主键 id 也一并入映射兜底 —— 两者都是同一成员的 UUID,不会互撞。
-  // scope 与 listAgents 同款透传;拉不到(权限不够 / 聚合视图受限)静默
-  // 降级为原样显示,绝不因此弹错。
-  const [memberNames, setMemberNames] = useState<Record<string, string>>({});
-  useEffect(() => {
-    let cancelled = false;
-    listMembers({ tenantScope: apiTenantScope, limit: 200 }).then(
-      (result) => {
-        if (cancelled) return;
-        const names: Record<string, string> = {};
-        for (const m of result.items) {
-          const label = m.display_name || m.email;
-          if (m.subject_id) names[m.subject_id] = label;
-          names[m.id] = label;
-        }
-        setMemberNames(names);
-      },
-      () => {
-        // 静默降级 — created_by 原样显示。
-      },
-    );
-    return () => {
-      cancelled = true;
-    };
-  }, [apiTenantScope]);
+  // subject(用户)或服务账号名:拉成员表把用户编号映射成成员名
+  // (display_name,空则 email)。映射规则与降级见 useMemberNames(B-316)。
+  // scope 与 listAgents 同款透传;拉不到静默降级为原样显示,绝不因此弹错。
+  const memberNameOf = useMemberNames(apiTenantScope);
 
   const isCrossTenant = data?.cross_tenant ?? false;
 
@@ -389,7 +366,7 @@ export function AgentsList() {
         render: (owner: string) =>
           owner ? (
             <Text style={{ fontSize: 13 }} title={owner}>
-              {memberNames[owner] ?? owner}
+              {memberNameOf(owner)}
             </Text>
           ) : (
             <Text type="secondary">—</Text>
@@ -447,7 +424,7 @@ export function AgentsList() {
     );
 
     return cols;
-  }, [t, statusLabel, isCrossTenant, navigate, refresh, memberNames]);
+  }, [t, statusLabel, isCrossTenant, navigate, refresh, memberNameOf]);
 
   return (
     <div>
