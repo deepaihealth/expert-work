@@ -12,23 +12,38 @@
  * ``TenantMember.id`` is mapped too (the original AgentsList behaviour). All
  * three are UUIDs of the same member, so the keys never collide.
  *
- * Fetching never surfaces an error: no permission, a restricted aggregate
- * view or a network failure all fall back to showing the raw id. Call the
- * hook once per page and pass the resolver down to the parts that need it.
+ * Only tenant admins and system admins fetch: ``GET /v1/members`` needs
+ * ``user:read``, and a denied call writes an ``auth:login_failed`` / DENIED
+ * audit row — every page view by an operator / viewer would leave a
+ * misleading "login failed" entry. Non-admins therefore keep seeing raw ids;
+ * giving everyone names needs a separate backend endpoint that returns names
+ * only (no emails) — left as follow-up.
+ *
+ * Fetching never surfaces an error: a restricted aggregate view or a network
+ * failure falls back to showing the raw id. Call the hook once per page and
+ * pass the resolver down to the parts that need it.
  */
 import { useCallback, useEffect, useState } from "react";
 
 import type { TenantScope } from "../api/client";
 import { listMembers, type TenantMember } from "../api/members";
+import { useAuth, type AuthIdentity } from "../auth/AuthContext";
 
 /** ``GET /v1/members`` caps ``limit`` at 200 and pages by ``offset``; its
  *  ``total`` is the page length, so a short page marks the end. */
 export const MEMBER_PAGE_SIZE = 200;
 /** Paging guard (10 000 members) in case a backend ignores ``offset``. */
-const MAX_MEMBER_PAGES = 50;
+export const MAX_MEMBER_PAGES = 50;
 
 /** Returns the member's name for ``id``, or ``id`` itself when unknown. */
 export type MemberNameOf = (id: string) => string;
+
+interface LoadedNames {
+  /** The scope these names were fetched for — a different scope's names are
+   *  never shown, so a scope switch starts from raw ids. */
+  scope: TenantScope;
+  names: ReadonlyMap<string, string>;
+}
 
 export function buildMemberNameMap(members: readonly TenantMember[]): ReadonlyMap<string, string> {
   return new Map(
@@ -42,9 +57,18 @@ export function buildMemberNameMap(members: readonly TenantMember[]): ReadonlyMa
   );
 }
 
-async function fetchAllMembers(tenantScope: TenantScope): Promise<TenantMember[]> {
+function canReadMembers(identity: AuthIdentity | null): boolean {
+  return identity !== null && (identity.isSystemAdmin || identity.roles.includes("admin"));
+}
+
+/** Resolves to ``null`` when cancelled between pages. */
+async function fetchAllMembers(
+  tenantScope: TenantScope,
+  isCancelled: () => boolean,
+): Promise<TenantMember[] | null> {
   let members: TenantMember[] = [];
   for (let page = 0; page < MAX_MEMBER_PAGES; page += 1) {
+    if (isCancelled()) return null;
     const { items } = await listMembers({
       tenantScope,
       limit: MEMBER_PAGE_SIZE,
@@ -57,12 +81,17 @@ async function fetchAllMembers(tenantScope: TenantScope): Promise<TenantMember[]
 }
 
 export function useMemberNames(tenantScope: TenantScope): MemberNameOf {
-  const [names, setNames] = useState<ReadonlyMap<string, string>>(() => new Map());
+  const enabled = canReadMembers(useAuth().identity);
+  const [loaded, setLoaded] = useState<LoadedNames | null>(null);
+
   useEffect(() => {
+    if (!enabled) return;
     let cancelled = false;
-    fetchAllMembers(tenantScope).then(
+    fetchAllMembers(tenantScope, () => cancelled).then(
       (members) => {
-        if (!cancelled) setNames(buildMemberNameMap(members));
+        if (!cancelled && members !== null) {
+          setLoaded({ scope: tenantScope, names: buildMemberNameMap(members) });
+        }
       },
       () => {
         // Silent fallback — ids are shown as-is.
@@ -71,6 +100,8 @@ export function useMemberNames(tenantScope: TenantScope): MemberNameOf {
     return () => {
       cancelled = true;
     };
-  }, [tenantScope]);
-  return useCallback((id: string) => names.get(id) ?? id, [names]);
+  }, [tenantScope, enabled]);
+
+  const names = enabled && loaded !== null && loaded.scope === tenantScope ? loaded.names : null;
+  return useCallback((id: string) => names?.get(id) ?? id, [names]);
 }

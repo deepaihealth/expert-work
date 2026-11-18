@@ -43,6 +43,10 @@ vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
     tenantScopeRef,
   );
 });
+// B-316 — useMemberNames only fetches for admins; sign the harness in as one.
+vi.mock("../../auth/AuthContext", () => ({
+  useAuth: () => ({ identity: { roles: ["admin"], isSystemAdmin: false } }),
+}));
 vi.mock("../../tenant/useIsTenantSwitched", () => ({
   useIsTenantSwitched: isTenantSwitchedMock,
 }));

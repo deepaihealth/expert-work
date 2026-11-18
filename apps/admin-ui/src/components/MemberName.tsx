@@ -5,6 +5,7 @@
  */
 import type { ReactNode } from "react";
 import { Tooltip } from "antd";
+import type { TFunction } from "i18next";
 
 import type { MemberNameOf } from "../hooks/useMemberNames";
 
@@ -26,4 +27,11 @@ export function MemberName({ id, nameOf, fallback, "data-testid": testId }: Memb
       <span data-testid={testId}>{name}</span>
     </Tooltip>
   );
+}
+
+/** Plain-text form for places that need the id visible: "name (id)" for a
+ *  member, the bare id otherwise. */
+export function memberNameWithId(t: TFunction, nameOf: MemberNameOf, id: string): string {
+  const name = nameOf(id);
+  return name === id ? id : t("common.name_with_id", { name, id });
 }

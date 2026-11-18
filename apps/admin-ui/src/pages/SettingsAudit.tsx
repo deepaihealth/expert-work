@@ -47,6 +47,7 @@ import {
   type AuditResult,
   type ListAuditParams,
 } from "../api/audit";
+import { memberNameWithId } from "../components/MemberName";
 import { useMemberNames } from "../hooks/useMemberNames";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 
@@ -113,10 +114,7 @@ export function SettingsAudit() {
   const { apiTenantScope } = useTenantScope();
   // B-316 — actor ids shown as member names; the actor filter still takes ids.
   const memberNameOf = useMemberNames(apiTenantScope);
-  const withMemberName = (id: string): string => {
-    const name = memberNameOf(id);
-    return name === id ? id : t("common.name_with_id", { name, id });
-  };
+  const withMemberName = (id: string): string => memberNameWithId(t, memberNameOf, id);
 
   // Active filters — drive the query. ``cursor`` resets whenever a
   // filter changes; the user clicks "Load more" to extend.

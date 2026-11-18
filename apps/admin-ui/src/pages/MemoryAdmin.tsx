@@ -46,7 +46,7 @@ import {
 } from "../api/memory";
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
-import { MemberName } from "../components/MemberName";
+import { MemberName, memberNameWithId } from "../components/MemberName";
 import { useMemberNames } from "../hooks/useMemberNames";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 import { MemoryOriginTag } from "../components/MemoryOriginTag";
@@ -439,12 +439,7 @@ export function MemoryAdmin() {
               <Text type="secondary" style={{ fontSize: 12 }}>{t("memory.edit_meta_user")}</Text>
               <div>
                 <Text code style={{ fontSize: 11 }}>
-                  {memberNameOf(editing.user_id) === editing.user_id
-                    ? editing.user_id
-                    : t("common.name_with_id", {
-                        name: memberNameOf(editing.user_id),
-                        id: editing.user_id,
-                      })}
+                  {memberNameWithId(t, memberNameOf, editing.user_id)}
                 </Text>
               </div>
             </div>

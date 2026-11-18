@@ -695,7 +695,13 @@ export function ConversationDetail() {
           }}
         >
           <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("conversations_detail.user")}</dt>
-          <dd className="mono" style={{ margin: 0 }}>
+          {/* Raw ids stay monospace; a resolved member name reads as text. */}
+          <dd
+            className={
+              convo.user_id && memberNameOf(convo.user_id) !== convo.user_id ? undefined : "mono"
+            }
+            style={{ margin: 0 }}
+          >
             {convo.user_id ? (
               <MemberName id={convo.user_id} nameOf={memberNameOf} data-testid="conversation-user" />
             ) : (

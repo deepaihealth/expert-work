@@ -282,6 +282,21 @@ describe("AgentsList owner column member-name mapping", () => {
     expect(await screen.findByText(ownerUuid)).toBeInTheDocument();
     expect(screen.queryByTestId("agents-error")).toBeNull();
   });
+
+  it("never requests the member list as an operator (a 403 would audit as login_failed)", async () => {
+    setStoredToken(
+      jwt({ sub: "u", tenant_id: "11111111-1111-1111-1111-111111111111", roles: ["operator"] }),
+    );
+    listAgentsMock.mockResolvedValue({
+      items: [{ ...sampleRow, created_by: ownerUuid }],
+      total: 1,
+      cross_tenant: false,
+    });
+    listMembersMock.mockResolvedValue({ items: [member], total: 1 });
+    renderAgentsList();
+    expect(await screen.findByText(ownerUuid)).toBeInTheDocument();
+    expect(listMembersMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("AgentsList row actions", () => {

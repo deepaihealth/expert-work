@@ -1,13 +1,22 @@
 /**
  * useMemberNames tests — B-316.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
 
-import { ApiError } from "../../api/client";
+import { ApiError, type TenantScope } from "../../api/client";
 import * as membersSdk from "../../api/members";
-import type { TenantMember } from "../../api/members";
-import { MEMBER_PAGE_SIZE, useMemberNames } from "../useMemberNames";
+import type { MemberList, TenantMember } from "../../api/members";
+import { useAuth } from "../../auth/AuthContext";
+import { MAX_MEMBER_PAGES, MEMBER_PAGE_SIZE, useMemberNames } from "../useMemberNames";
+
+vi.mock("../../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+
+function signInAs(roles: string[], isSystemAdmin = false): void {
+  vi.mocked(useAuth).mockReturnValue({
+    identity: { roles, isSystemAdmin },
+  } as unknown as ReturnType<typeof useAuth>);
+}
 
 function member(n: number, overrides: Partial<TenantMember> = {}): TenantMember {
   const hex = n.toString(16).padStart(4, "0");
@@ -28,6 +37,20 @@ function member(n: number, overrides: Partial<TenantMember> = {}): TenantMember 
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+const fullPage = (): MemberList => ({
+  items: Array.from({ length: MEMBER_PAGE_SIZE }, (_, i) => member(i)),
+  total: MEMBER_PAGE_SIZE,
+});
+
+beforeEach(() => signInAs(["admin"]));
 afterEach(() => vi.restoreAllMocks());
 
 describe("useMemberNames", () => {
@@ -63,32 +86,20 @@ describe("useMemberNames", () => {
     expect(result.current("constructor")).toBe("constructor");
   });
 
-  it("degrades to the raw id when the member list cannot be read", async () => {
-    const listMembers = vi
-      .spyOn(membersSdk, "listMembers")
-      .mockRejectedValue(new ApiError("nope", "FORBIDDEN", 403));
-    const id = member(4).keycloak_user_id!;
-
-    const { result } = renderHook(() => useMemberNames(undefined));
-
-    await waitFor(() => expect(listMembers).toHaveBeenCalledTimes(1));
-    // Let the rejection settle before asserting nothing changed.
-    await Promise.resolve();
-    expect(result.current(id)).toBe(id);
-  });
-
   it("passes the tenant scope through and pages past the 200-member limit", async () => {
-    const firstPage = Array.from({ length: MEMBER_PAGE_SIZE }, (_, i) => member(i));
+    const page1 = fullPage();
     const last = member(MEMBER_PAGE_SIZE);
     const listMembers = vi
       .spyOn(membersSdk, "listMembers")
-      .mockResolvedValueOnce({ items: firstPage, total: MEMBER_PAGE_SIZE })
+      .mockResolvedValueOnce(page1)
       .mockResolvedValueOnce({ items: [last], total: 1 });
 
     const { result } = renderHook(() => useMemberNames("*"));
 
-    await waitFor(() => expect(result.current(last.keycloak_user_id!)).toBe(`成员${MEMBER_PAGE_SIZE}`));
-    expect(result.current(firstPage[0].keycloak_user_id!)).toBe("成员0");
+    await waitFor(() =>
+      expect(result.current(last.keycloak_user_id!)).toBe(`成员${MEMBER_PAGE_SIZE}`),
+    );
+    expect(result.current(page1.items[0].keycloak_user_id!)).toBe("成员0");
     expect(listMembers).toHaveBeenCalledTimes(2);
     expect(listMembers).toHaveBeenNthCalledWith(1, {
       tenantScope: "*",
@@ -102,6 +113,16 @@ describe("useMemberNames", () => {
     });
   });
 
+  it("stops after MAX_MEMBER_PAGES when every page comes back full", async () => {
+    const listMembers = vi.spyOn(membersSdk, "listMembers").mockImplementation(async () => fullPage());
+
+    const { result } = renderHook(() => useMemberNames(undefined));
+
+    await waitFor(() => expect(result.current(member(0).id)).toBe("成员0"));
+    expect(MAX_MEMBER_PAGES).toBe(50);
+    expect(listMembers).toHaveBeenCalledTimes(MAX_MEMBER_PAGES);
+  });
+
   it("fetches once per scope, not once per render", async () => {
     const listMembers = vi
       .spyOn(membersSdk, "listMembers")
@@ -113,5 +134,112 @@ describe("useMemberNames", () => {
     rerender();
 
     expect(listMembers).toHaveBeenCalledTimes(1);
+  });
+
+  it("refetches for a new scope", async () => {
+    const tenantA = member(6);
+    const tenantB = member(7);
+    const listMembers = vi
+      .spyOn(membersSdk, "listMembers")
+      .mockImplementation(async ({ tenantScope } = {}) => ({
+        items: [tenantScope === "tenant-b" ? tenantB : tenantA],
+        total: 1,
+      }));
+
+    const { result, rerender } = renderHook(({ scope }) => useMemberNames(scope), {
+      initialProps: { scope: "tenant-a" as TenantScope },
+    });
+    await waitFor(() => expect(result.current(tenantA.id)).toBe("成员6"));
+
+    rerender({ scope: "tenant-b" });
+
+    await waitFor(() => expect(result.current(tenantB.id)).toBe("成员7"));
+    expect(listMembers).toHaveBeenLastCalledWith(
+      expect.objectContaining({ tenantScope: "tenant-b", offset: 0 }),
+    );
+  });
+
+  it("drops the previous scope's names when the new scope's fetch fails", async () => {
+    const m = member(8);
+    const listMembers = vi
+      .spyOn(membersSdk, "listMembers")
+      .mockResolvedValueOnce({ items: [m], total: 1 })
+      .mockRejectedValueOnce(new ApiError("nope", "FORBIDDEN", 403));
+
+    const { result, rerender } = renderHook(({ scope }) => useMemberNames(scope), {
+      initialProps: { scope: "tenant-a" as TenantScope },
+    });
+    await waitFor(() => expect(result.current(m.id)).toBe("成员8"));
+
+    rerender({ scope: "tenant-b" });
+
+    await waitFor(() => expect(listMembers).toHaveBeenCalledTimes(2));
+    expect(result.current(m.id)).toBe(m.id);
+    // Still raw once the rejection has settled — no stale name comes back.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(result.current(m.id)).toBe(m.id);
+  });
+
+  it("ignores a stale fetch that lands after the scope changed", async () => {
+    const stale = member(9);
+    const firstPage = deferred<MemberList>();
+    vi.spyOn(membersSdk, "listMembers")
+      .mockReturnValueOnce(firstPage.promise)
+      .mockResolvedValueOnce({ items: [], total: 0 });
+
+    const { result, rerender } = renderHook(({ scope }) => useMemberNames(scope), {
+      initialProps: { scope: "tenant-a" as TenantScope },
+    });
+    rerender({ scope: "tenant-b" });
+    firstPage.resolve({ items: [stale], total: 1 });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(result.current(stale.id)).toBe(stale.id);
+  });
+
+  it("stops paging once unmounted", async () => {
+    const firstPage = deferred<MemberList>();
+    const listMembers = vi
+      .spyOn(membersSdk, "listMembers")
+      .mockReturnValueOnce(firstPage.promise)
+      .mockImplementation(async () => fullPage());
+
+    const { unmount } = renderHook(() => useMemberNames(undefined));
+    await waitFor(() => expect(listMembers).toHaveBeenCalledTimes(1));
+    unmount();
+    firstPage.resolve(fullPage());
+    await new Promise((r) => setTimeout(r, 0));
+
+    // A full first page would normally fetch page 2; cancelled, it does not.
+    expect(listMembers).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not call listMembers for an operator — ids stay raw", async () => {
+    signInAs(["operator"]);
+    const listMembers = vi
+      .spyOn(membersSdk, "listMembers")
+      .mockResolvedValue({ items: [member(10)], total: 1 });
+
+    const { result } = renderHook(() => useMemberNames(undefined));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(listMembers).not.toHaveBeenCalled();
+    expect(result.current(member(10).id)).toBe(member(10).id);
+  });
+
+  it("calls listMembers for an admin, and for a system admin without a tenant admin role", async () => {
+    const listMembers = vi
+      .spyOn(membersSdk, "listMembers")
+      .mockResolvedValue({ items: [member(11)], total: 1 });
+
+    const admin = renderHook(() => useMemberNames(undefined));
+    await waitFor(() => expect(admin.result.current(member(11).id)).toBe("成员11"));
+    expect(listMembers).toHaveBeenCalledTimes(1);
+    admin.unmount();
+
+    signInAs(["viewer"], true);
+    const sysAdmin = renderHook(() => useMemberNames(undefined));
+    await waitFor(() => expect(sysAdmin.result.current(member(11).id)).toBe("成员11"));
+    expect(listMembers).toHaveBeenCalledTimes(2);
   });
 });

@@ -34,6 +34,7 @@ import {
 import { ManifestEditor } from "../../components/manifest-editor";
 import { CONFIG_GROUPS } from "../../components/manifest-editor/groups";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
+import { memberNameWithId } from "../../components/MemberName";
 import type { MemberNameOf } from "../../hooks/useMemberNames";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
@@ -253,7 +254,8 @@ export function ManifestTab({
           showIcon
           message={t("manifest_tab.draft_pending")}
           description={t("manifest_tab.draft_pending_detail", {
-            who: r.draft ? memberNameOf(r.draft.updated_by) : "",
+            // B-316 — "name (id)" so the raw id stays visible.
+            who: r.draft ? memberNameWithId(t, memberNameOf, r.draft.updated_by) : "",
             when: r.draft ? new Date(r.draft.updated_at).toLocaleString() : "",
           })}
           style={{ marginBottom: 12 }}
