@@ -209,6 +209,77 @@ def _top_level_params(
     return props, req
 
 
+@dataclass(frozen=True)
+class FixedValueOption:
+    """B-318 —— 工具给一个参数声明的一个可选值:``value`` 是发出去的值,``title`` 是给人看的名字。"""
+
+    value: str
+    title: str | None = None
+
+
+def fixed_value_options(
+    input_schema: Mapping[str, Any], param: str
+) -> tuple[FixedValueOption, ...] | None:
+    """B-318 —— 工具给 ``param`` 声明的可选值;``None`` = 没有可选值,固定值不查。
+
+    与 admin-ui ``utils/mcp_param_options.ts`` 逐条同义(两边测试用例也一一对应):
+
+    * 只看参数自己那一层(``properties[param]``),按 ``enum`` → ``oneOf`` → ``anyOf`` 取
+      **第一个出现**的键;
+    * ``enum``:非空列表、每项都是字符串;
+    * ``oneOf`` / ``anyOf``:非空列表、每项是对象且 ``const`` 是字符串,``title`` 是非空
+      字符串才当标题,项里的其它键不管;
+    * 第一个出现的键形状不对 → ``None``,不退到下一个键去猜。重复值只留第一个。
+
+    schema 是第三方给的,同 :func:`_top_level_params` 只认白名单形状,不抛。固定值只收
+    字符串(协议层),所以非字符串的枚举、可空组合都当没有可选值。
+    """
+    properties = input_schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return None
+    prop = properties.get(param)
+    if not isinstance(prop, Mapping):
+        return None
+    for key in ("enum", "oneOf", "anyOf"):
+        if key in prop:
+            items = prop[key]
+            if not isinstance(items, list) or not items:
+                return None
+            options = _enum_options(items) if key == "enum" else _const_options(items)
+            return None if options is None else _dedupe(options)
+    return None
+
+
+def _enum_options(items: list[Any]) -> list[FixedValueOption] | None:
+    if not all(isinstance(v, str) for v in items):
+        return None
+    return [FixedValueOption(value=v) for v in items]
+
+
+def _const_options(items: list[Any]) -> list[FixedValueOption] | None:
+    options: list[FixedValueOption] = []
+    for item in items:
+        if not isinstance(item, Mapping) or not isinstance(item.get("const"), str):
+            return None
+        title = item.get("title")
+        options.append(
+            FixedValueOption(
+                value=item["const"], title=title if isinstance(title, str) and title else None
+            )
+        )
+    return options
+
+
+def _dedupe(options: list[FixedValueOption]) -> tuple[FixedValueOption, ...]:
+    seen: set[str] = set()
+    out: list[FixedValueOption] = []
+    for option in options:
+        if option.value not in seen:
+            seen.add(option.value)
+            out.append(option)
+    return tuple(out)
+
+
 def apply_arg_bindings(
     tool_calls: Sequence[Mapping[str, Any]],
     *,
