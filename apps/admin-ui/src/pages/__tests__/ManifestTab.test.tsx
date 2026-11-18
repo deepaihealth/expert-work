@@ -267,7 +267,7 @@ describe("ManifestTab", () => {
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
     rerender(
       <MemoryRouter>
-        <ManifestTab detail={live} onSaved={onSaved} />
+        <ManifestTab detail={live} onSaved={onSaved} memberNameOf={rawId} />
       </MemoryRouter>,
     );
     expect(screen.getByTestId("af-output-schema-name-1")).toHaveValue("b");
@@ -311,7 +311,7 @@ describe("ManifestTab", () => {
       await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
       rerender(
         <MemoryRouter>
-          <ManifestTab detail={live()} onSaved={onSaved} />
+          <ManifestTab detail={live()} onSaved={onSaved} memberNameOf={rawId} />
         </MemoryRouter>,
       );
       await user.click(screen.getByTestId("manifest-save-btn"));
@@ -370,7 +370,7 @@ describe("ManifestTab", () => {
     (refetched.record.spec.spec as Record<string, unknown>).system_prompt = "re-dumped";
     rerender(
       <MemoryRouter>
-        <ManifestTab detail={refetched} onSaved={onSaved} />
+        <ManifestTab detail={refetched} onSaved={onSaved} memberNameOf={rawId} />
       </MemoryRouter>,
     );
     expect(screen.getByTestId("af-output-schema-toggle-0")).toHaveTextContent("+");
