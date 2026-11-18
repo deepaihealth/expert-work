@@ -9,7 +9,7 @@ authors = [
     { name = "joneqian", email = "qian.qing0926@gmail.com" },
 ]
 dependencies = [
-    "pydantic>=2.7,<3",
+    "pydantic>=2.11,<3",
 ]
 
 [build-system]

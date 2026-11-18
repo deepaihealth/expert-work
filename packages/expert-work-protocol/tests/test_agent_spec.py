@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from expert_work.protocol import (
     AgentSpec,
@@ -69,6 +70,26 @@ def test_alias_apiversion_round_trips() -> None:
     dumped = spec.model_dump(by_alias=True)
     assert dumped["apiVersion"] == "expert_work.io/v1"
     assert "api_version" not in dumped
+
+
+def test_default_dump_is_the_manifest_wire_shape_even_when_nested() -> None:
+    """B-319 — API records carry the spec as a nested field and are dumped
+    without ``by_alias``; the manifest must still come out as ``apiVersion``,
+    and the same for every other model the spec's dump runs through."""
+    spec = AgentSpec.model_validate(_doc())
+
+    class _Envelope(BaseModel):
+        spec: AgentSpec
+
+    for dumped in (
+        spec.model_dump(),
+        spec.model_dump(mode="json"),
+        _Envelope(spec=spec).model_dump(mode="json")["spec"],
+        json.loads(_Envelope(spec=spec).model_dump_json())["spec"],
+    ):
+        assert list(dumped)[:1] == ["apiVersion"]
+        assert "api_version" not in dumped
+        assert AgentSpec.model_validate(dumped) == spec
 
 
 def test_fallback_chain_accepted_when_acyclic() -> None:

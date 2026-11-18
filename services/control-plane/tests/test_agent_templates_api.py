@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from jsonschema import Draft202012Validator
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
@@ -187,6 +188,23 @@ async def test_update_spec_round_trip(ctx: _Ctx) -> None:
     assert put.json()["data"]["spec"]["spec"]["system_prompt"]["template"] == (
         "you are a fixed support agent"
     )
+
+
+@pytest.mark.asyncio
+async def test_template_spec_is_handed_out_as_a_valid_manifest(ctx: _Ctx) -> None:
+    """B-319 — the template editor dumps ``spec`` into its YAML view as-is: it
+    must come back as a manifest (``apiVersion``), not the model's field names."""
+    schema = AgentSpec.model_json_schema(by_alias=True)
+    created = await ctx.client.post(_PREFIX, json=_upsert(), headers=ctx.admin_headers)
+    got = await ctx.client.get(f"{_PREFIX}/support-bot/1.0.0", headers=ctx.admin_headers)
+    listed = await ctx.client.get(_PREFIX, headers=ctx.admin_headers)
+    specs = [
+        created.json()["data"]["spec"],
+        got.json()["data"]["spec"],
+        listed.json()["data"][0]["spec"],
+    ]
+    errors = [sorted(e.message for e in Draft202012Validator(schema).iter_errors(s)) for s in specs]
+    assert errors == [[], [], []]
 
 
 @pytest.mark.asyncio
