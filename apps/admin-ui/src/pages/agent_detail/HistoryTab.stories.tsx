@@ -94,5 +94,5 @@ export default meta;
 type Story = StoryObj<typeof HistoryTab>;
 
 export const TwoRevisions: Story = {
-  args: { detail, onRolledBack: () => {} },
+  args: { detail, onRolledBack: () => {}, memberNameOf: (id: string) => id },
 };

@@ -45,6 +45,9 @@ const detail: AgentDetailResponse = {
   },
 } as AgentDetailResponse;
 
+/** B-316 — no member names in these tests: ids render as-is. */
+const rawId = (id: string) => id;
+
 function inRouter(node: React.ReactElement) {
   return render(<MemoryRouter>{node}</MemoryRouter>);
 }
@@ -84,7 +87,7 @@ describe("ConversationsTab", () => {
       cross_tenant: false,
     });
 
-    inRouter(<ConversationsTab detail={detail} />);
+    inRouter(<ConversationsTab detail={detail} memberNameOf={rawId} />);
 
     await waitFor(() => expect(screen.getByText("refund question")).toBeInTheDocument());
     // Error rollup surfaces a per-conversation error indicator.
@@ -103,7 +106,7 @@ describe("ConversationsTab", () => {
       cross_tenant: false,
     });
 
-    inRouter(<ConversationsTab detail={detail} />);
+    inRouter(<ConversationsTab detail={detail} memberNameOf={rawId} />);
 
     await waitFor(() =>
       expect(screen.getByText("No conversations for this agent yet.")).toBeInTheDocument(),
@@ -118,7 +121,7 @@ describe("ConversationsTab", () => {
     });
     const user = userEvent.setup();
 
-    inRouter(<ConversationsTab detail={detail} />);
+    inRouter(<ConversationsTab detail={detail} memberNameOf={rawId} />);
     await waitFor(() => expect(spy).toHaveBeenCalled());
     await user.type(screen.getByTestId("conversations-tab-search"), "退款");
     // q spans title AND mirrored message content server-side (IA M4);

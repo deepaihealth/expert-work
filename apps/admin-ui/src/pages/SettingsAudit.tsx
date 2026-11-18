@@ -47,6 +47,8 @@ import {
   type AuditResult,
   type ListAuditParams,
 } from "../api/audit";
+import { memberNameWithId } from "../components/MemberName";
+import { useMemberNames } from "../hooks/useMemberNames";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 
 const { Text } = Typography;
@@ -110,6 +112,9 @@ export function SettingsAudit() {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const { apiTenantScope } = useTenantScope();
+  // B-316 — actor ids shown as member names; the actor filter still takes ids.
+  const memberNameOf = useMemberNames(apiTenantScope);
+  const withMemberName = (id: string): string => memberNameWithId(t, memberNameOf, id);
 
   // Active filters — drive the query. ``cursor`` resets whenever a
   // filter changes; the user clicks "Load more" to extend.
@@ -313,9 +318,15 @@ export function SettingsAudit() {
                 {entry.occurred_at !== null ? new Date(entry.occurred_at).toLocaleString() : "—"}
               </Text>
               <Tooltip title={entry.actor_id}>
-                <Text code style={{ fontSize: 11 }}>
-                  {entry.actor_id.length > 24 ? `${entry.actor_id.slice(0, 24)}…` : entry.actor_id}
-                </Text>
+                {memberNameOf(entry.actor_id) !== entry.actor_id ? (
+                  <Text style={{ fontSize: 12 }} data-testid={`audit-actor-${entry.id ?? idx}`}>
+                    {memberNameOf(entry.actor_id)}
+                  </Text>
+                ) : (
+                  <Text code style={{ fontSize: 11 }} data-testid={`audit-actor-${entry.id ?? idx}`}>
+                    {entry.actor_id.length > 24 ? `${entry.actor_id.slice(0, 24)}…` : entry.actor_id}
+                  </Text>
+                )}
               </Tooltip>
               <Space size={6}>
                 <Text code style={{ fontSize: 12 }}>{entry.action}</Text>
@@ -372,9 +383,13 @@ export function SettingsAudit() {
               label={t("audit.detail_occurred_at")}
               value={selected.occurred_at ?? "—"}
             />
-            <DetailRow label={t("audit.detail_actor")} value={`${selected.actor_type} / ${selected.actor_id}`} mono />
+            <DetailRow label={t("audit.detail_actor")} value={`${selected.actor_type} / ${withMemberName(selected.actor_id)}`} mono />
             {selected.on_behalf_of !== null && (
-              <DetailRow label={t("audit.detail_on_behalf_of")} value={selected.on_behalf_of} mono />
+              <DetailRow
+                label={t("audit.detail_on_behalf_of")}
+                value={withMemberName(selected.on_behalf_of)}
+                mono
+              />
             )}
             <DetailRow label={t("audit.detail_action")} value={selected.action} mono />
             <DetailRow

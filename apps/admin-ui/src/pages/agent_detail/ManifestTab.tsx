@@ -34,6 +34,8 @@ import {
 import { ManifestEditor } from "../../components/manifest-editor";
 import { CONFIG_GROUPS } from "../../components/manifest-editor/groups";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
+import { memberNameWithId } from "../../components/MemberName";
+import type { MemberNameOf } from "../../hooks/useMemberNames";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text } = Typography;
@@ -46,9 +48,16 @@ interface ManifestTabProps {
   /** B-278 — a deleted version: no save / publish / discard, and no
    *  「生成委派策略」(it writes nothing but drafts against a dead agent). */
   readOnly?: boolean;
+  /** B-316 — resolves the draft's ``updated_by`` to a member name. */
+  memberNameOf: MemberNameOf;
 }
 
-export function ManifestTab({ detail, onSaved, readOnly = false }: ManifestTabProps) {
+export function ManifestTab({
+  detail,
+  onSaved,
+  readOnly = false,
+  memberNameOf,
+}: ManifestTabProps) {
   const { t } = useTranslation();
   const r = detail.record;
   // Track C W2 — 切入态只读:保存是写操作,切入目标租户后置灰。
@@ -245,7 +254,8 @@ export function ManifestTab({ detail, onSaved, readOnly = false }: ManifestTabPr
           showIcon
           message={t("manifest_tab.draft_pending")}
           description={t("manifest_tab.draft_pending_detail", {
-            who: r.draft?.updated_by ?? "",
+            // B-316 — "name (id)" so the raw id stays visible.
+            who: r.draft ? memberNameWithId(t, memberNameOf, r.draft.updated_by) : "",
             when: r.draft ? new Date(r.draft.updated_at).toLocaleString() : "",
           })}
           style={{ marginBottom: 12 }}

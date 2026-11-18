@@ -16,6 +16,7 @@ import "../../i18n";
 import { ApiError } from "../../api/client";
 import * as agentsSdk from "../../api/agents";
 import * as conversationsSdk from "../../api/conversations";
+import * as membersSdk from "../../api/members";
 import { AuthProvider } from "../../auth/AuthContext";
 import { TenantScopeProvider } from "../../tenant/TenantScopeContext";
 import { setStoredToken } from "../../api/client";
@@ -217,6 +218,46 @@ describe("ConversationsList", () => {
         expect.objectContaining({ userId: uid }),
       ),
     );
+  });
+
+  it("shows a member's name for a user_id that is the member's subject_id, raw id on hover (B-316)", async () => {
+    const uid = "66666666-6666-4666-8666-666666666666";
+    const listMembers = vi.spyOn(membersSdk, "listMembers").mockResolvedValue({
+      items: [
+        {
+          id: "0e1d2c3b-4a59-4687-9a6b-5c4d3e2f1a0b",
+          tenant_id: "22222222-2222-2222-2222-222222222222",
+          email: "ming@acme.com",
+          display_name: "王小明",
+          role: "operator",
+          status: "active",
+          keycloak_user_id: "5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d",
+          subject_id: uid,
+          invited_by: "seed",
+          invited_at: null,
+          activated_at: null,
+          updated_at: null,
+        },
+      ],
+      total: 1,
+    });
+    listConversationsMock.mockResolvedValue({
+      items: [{ ...sampleRow, user_id: uid }],
+      total: 1,
+      cross_tenant: false,
+    });
+    const user = userEvent.setup();
+    try {
+      renderPage();
+      const cell = await screen.findByTestId(`conversation-user-${uid}`);
+      await waitFor(() => expect(cell).toHaveTextContent("王小明"));
+      expect(cell).not.toHaveTextContent(uid.slice(0, 8));
+
+      await user.hover(cell);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(uid);
+    } finally {
+      listMembers.mockRestore();
+    }
   });
 
   it("errors-only checkbox flows into the hasError param", async () => {

@@ -28,7 +28,9 @@ import {
   type AgentDetailResponse,
   type RevisionSummary,
 } from "../../api/agents";
+import { MemberName } from "../../components/MemberName";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
+import type { MemberNameOf } from "../../hooks/useMemberNames";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
@@ -41,9 +43,17 @@ interface HistoryTabProps {
   onRolledBack: () => void;
   /** B-278 — a deleted version: history is viewable, rollback is hidden. */
   readOnly?: boolean;
+  /** B-316 — resolves ``actor_id`` to a member name (the page fetches the
+   *  member list once and shares it across tabs). */
+  memberNameOf: MemberNameOf;
 }
 
-export function HistoryTab({ detail, onRolledBack, readOnly = false }: HistoryTabProps) {
+export function HistoryTab({
+  detail,
+  onRolledBack,
+  readOnly = false,
+  memberNameOf,
+}: HistoryTabProps) {
   const { t } = useTranslation();
   const { name, version } = detail.record;
   // Track C W2 — 切入态读透传:revision 读接口带 ?tenant_id=(组件内直取);
@@ -168,6 +178,13 @@ export function HistoryTab({ detail, onRolledBack, readOnly = false }: HistoryTa
         title: t("history_tab.col_actor"),
         dataIndex: "actor_id",
         ellipsis: true,
+        render: (actorId: string, row: RevisionSummary) => (
+          <MemberName
+            id={actorId}
+            nameOf={memberNameOf}
+            data-testid={`history-actor-${row.revision}`}
+          />
+        ),
       },
       {
         title: t("history_tab.col_time"),
@@ -203,7 +220,7 @@ export function HistoryTab({ detail, onRolledBack, readOnly = false }: HistoryTa
           ),
       },
     ],
-    [t, currentSha, rollingBack, handleRollback, isTenantSwitched, readOnly],
+    [t, currentSha, rollingBack, handleRollback, isTenantSwitched, readOnly, memberNameOf],
   );
 
   return (

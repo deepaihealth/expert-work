@@ -19,6 +19,7 @@ import i18n from "../../../i18n";
 import LOGS_FIXTURE from "../../../api/__fixtures__/knowledge_retrieval_logs.json";
 import { ApiError } from "../../../api/client";
 import * as logsSdk from "../../../api/knowledge_logs";
+import * as membersSdk from "../../../api/members";
 import { typedFixture } from "../../../test-utils/typedFixture";
 import { RetrievalLogDrawer } from "../RetrievalLogDrawer";
 
@@ -55,6 +56,7 @@ vi.mock("../../../auth/AuthContext", async (importOriginal) => {
         serverResolved: true,
       },
       token: "t",
+      identitySettled: true,
       login: () => {},
       logout: () => {},
       refreshIdentity: async () => {},
@@ -115,6 +117,27 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("RetrievalLogDrawer — the record", () => {
+  it("fetches the member list only once a record is opened (B-316)", async () => {
+    const listMembers = vi
+      .spyOn(membersSdk, "listMembers")
+      .mockResolvedValue({ items: [], total: 0 });
+    const closed = (
+      <App>
+        <MemoryRouter>
+          <RetrievalLogDrawer baseName="support-docs" logId={null} readScope={undefined} onClose={() => {}} />
+        </MemoryRouter>
+      </App>
+    );
+    const { unmount } = render(closed);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(listMembers).not.toHaveBeenCalled();
+    unmount();
+
+    mount();
+    await screen.findByTestId("kb-log-query");
+    expect(listMembers).toHaveBeenCalledTimes(1);
+  });
+
   it("reads the record and its live text under the page's scope", async () => {
     const { getLog, getPassages } = mount({}, { readScope: FOREIGN_TENANT });
     await screen.findByTestId("kb-log-query");

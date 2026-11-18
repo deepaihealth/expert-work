@@ -17,6 +17,8 @@ import { useTranslation } from "react-i18next";
 
 import type { AgentDetailResponse } from "../../api/agents";
 import { ApiError } from "../../api/client";
+import { MemberName } from "../../components/MemberName";
+import type { MemberNameOf } from "../../hooks/useMemberNames";
 import { useTenantScope } from "../../tenant/TenantScopeContext";
 import {
   listConversations,
@@ -49,9 +51,11 @@ const PAGE_SIZE = 50;
 
 interface ConversationsTabProps {
   detail: AgentDetailResponse;
+  /** B-316 — resolves ``user_id`` to a member name. */
+  memberNameOf: MemberNameOf;
 }
 
-export function ConversationsTab({ detail }: ConversationsTabProps) {
+export function ConversationsTab({ detail, memberNameOf }: ConversationsTabProps) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
@@ -129,11 +133,17 @@ export function ConversationsTab({ detail }: ConversationsTabProps) {
         width: 130,
         render: (uid: string | null) =>
           uid ? (
-            <Tooltip title={uid}>
-              <Text code style={{ fontSize: 12 }}>
-                {uid.slice(0, 8)}…
-              </Text>
-            </Tooltip>
+            <MemberName
+              id={uid}
+              nameOf={memberNameOf}
+              fallback={
+                <Tooltip title={uid}>
+                  <Text code style={{ fontSize: 12 }}>
+                    {uid.slice(0, 8)}…
+                  </Text>
+                </Tooltip>
+              }
+            />
           ) : (
             <Text type="secondary">—</Text>
           ),
@@ -210,7 +220,7 @@ export function ConversationsTab({ detail }: ConversationsTabProps) {
           ),
       },
     ],
-    [t],
+    [t, memberNameOf],
   );
 
   return (

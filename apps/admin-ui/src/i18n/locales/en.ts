@@ -28,6 +28,8 @@ export interface TranslationKeys {
     copied: string;
     tenant_switched_readonly: string;
     cross_tenant_readonly: string;
+    /** B-316 — a member name followed by the raw id, e.g. in audit detail. */
+    name_with_id: string;
   };
   about: {
     title: string;
@@ -3846,6 +3848,7 @@ const en: TranslationKeys = {
       "Viewing another tenant (read-only) — switch back to your home tenant to make changes",
     cross_tenant_readonly:
       "The all-tenants view is read-only — switch into a specific tenant to make changes",
+    name_with_id: "{{name}} ({{id}})",
   },
   about: {
     title: "About Expert Work",

@@ -36,6 +36,7 @@ import {
   type ConversationStatus,
 } from "../api/conversations";
 import { ApiError } from "../api/client";
+import { useMemberNames } from "../hooks/useMemberNames";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 import { PageHeader } from "../components/PageHeader";
 import { formatCompact } from "../utils/runFormat";
@@ -72,6 +73,7 @@ const TIME_WINDOWS: ReadonlyArray<{ hours: number; labelKey: string }> = [
 export function ConversationsList() {
   const { t } = useTranslation();
   const { scope, apiTenantScope } = useTenantScope();
+  const memberNameOf = useMemberNames(apiTenantScope);
   const navigate = useNavigate();
   const location = useLocation();
   const [data, setData] = useState<ConversationList | null>(null);
@@ -278,10 +280,24 @@ export function ConversationsList() {
         width: 130,
         render: (uid: string | null) => {
           if (!uid) return <Text type="secondary">—</Text>;
+          // B-316 — a member shows by name; the raw id joins the hover tip.
+          const name = memberNameOf(uid);
+          const resolved = name !== uid;
           // Click filters the list to this user (URL ?user_id=…).
           // stopPropagation so it doesn't also trigger the row navigation.
           return (
-            <Tooltip title={t("conversations_page.filter_user_tip")}>
+            <Tooltip
+              title={
+                resolved ? (
+                  <>
+                    <div>{uid}</div>
+                    <div>{t("conversations_page.filter_user_tip")}</div>
+                  </>
+                ) : (
+                  t("conversations_page.filter_user_tip")
+                )
+              }
+            >
               <span
                 role="button"
                 tabIndex={0}
@@ -298,9 +314,15 @@ export function ConversationsList() {
                 }}
                 style={{ cursor: "pointer" }}
               >
-                <Text code style={{ fontSize: 12, color: "var(--ew-accent-cyan, #13c2c2)" }}>
-                  {uid.slice(0, 8)}…
-                </Text>
+                {resolved ? (
+                  <Text style={{ fontSize: 12, color: "var(--ew-accent-cyan, #13c2c2)" }}>
+                    {name}
+                  </Text>
+                ) : (
+                  <Text code style={{ fontSize: 12, color: "var(--ew-accent-cyan, #13c2c2)" }}>
+                    {uid.slice(0, 8)}…
+                  </Text>
+                )}
               </span>
             </Tooltip>
           );
@@ -384,7 +406,7 @@ export function ConversationsList() {
           ),
       },
     ],
-    [t, setUserFilter],
+    [t, setUserFilter, memberNameOf],
   );
 
   return (

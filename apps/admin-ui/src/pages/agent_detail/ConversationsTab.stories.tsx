@@ -92,7 +92,7 @@ function withStub() {
 const meta: Meta<typeof ConversationsTab> = {
   title: "AgentDetail/ConversationsTab",
   component: ConversationsTab,
-  args: { detail },
+  args: { detail, memberNameOf: (id: string) => id },
 };
 export default meta;
 

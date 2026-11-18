@@ -143,6 +143,50 @@ describe("MemoryAdmin", () => {
     });
   });
 
+  it("shows the owner's member name in the list and name (id) in the edit modal (B-316)", async () => {
+    installAdapter([
+      {
+        match: (u) => u.startsWith("/v1/memory"),
+        respond: () => ({
+          success: true,
+          data: { items: [memRow], total: 1, cross_tenant: false },
+          error: null,
+        }),
+      },
+      {
+        match: (u) => u === "/v1/members",
+        respond: () => ({
+          success: true,
+          data: {
+            items: [
+              {
+                id: "member-row-id",
+                tenant_id: "t1",
+                email: "alice@acme.com",
+                display_name: "Alice Wang",
+                role: "operator",
+                status: "active",
+                keycloak_user_id: "kc-alice",
+                subject_id: memRow.user_id,
+                invited_by: "seed",
+                invited_at: null,
+                activated_at: null,
+                updated_at: null,
+              },
+            ],
+            total: 1,
+          },
+          error: null,
+        }),
+      },
+    ]);
+    const user = userEvent.setup();
+    renderMemory();
+    expect(await screen.findByText("Alice Wang")).toBeInTheDocument();
+    await user.click(screen.getByTestId(`memory-edit-${memRow.id}`));
+    expect(await screen.findByText(`Alice Wang (${memRow.user_id})`)).toBeInTheDocument();
+  });
+
   it("Save is disabled when buffer is pristine; enabled after edit", async () => {
     installAdapter([
       {

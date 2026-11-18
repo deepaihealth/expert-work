@@ -44,11 +44,13 @@ import {
   type AgentDetailResponse,
 } from "../api/agents";
 import { ApiError } from "../api/client";
+import { MemberName } from "../components/MemberName";
 import { PageHeader } from "../components/PageHeader";
 import { readSecurity } from "../components/manifest-editor/form_model";
 import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
+import { useMemberNames, type MemberNameOf } from "../hooks/useMemberNames";
 import { ConversationsTab } from "./agent_detail/ConversationsTab";
 import { DeletedAgentBanner } from "./agent_detail/DeletedAgentBanner";
 import { UsersTab } from "./agent_detail/UsersTab";
@@ -202,6 +204,9 @@ export function AgentDetail() {
   const nav = useNavigate();
   // Track C W2 — 切入态读透传:getAgent 带 ?tenant_id=(组件内直取)。
   const { apiTenantScope } = useTenantScope();
+  // B-316 — one member-list fetch for the whole page; the tabs that show a
+  // user id (overview / manifest / history / conversations) share it.
+  const memberNameOf = useMemberNames(concreteTenantScope(apiTenantScope));
 
   const [detail, setDetail] = useState<AgentDetailResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -355,12 +360,22 @@ export function AgentDetail() {
         ]}
       />
 
-      {activeTab === "overview" && <OverviewTab detail={detail} />}
+      {activeTab === "overview" && <OverviewTab detail={detail} memberNameOf={memberNameOf} />}
       {activeTab === "manifest" && (
-        <ManifestTab detail={detail} onSaved={refreshQuietly} readOnly={isDeleted} />
+        <ManifestTab
+          detail={detail}
+          onSaved={refreshQuietly}
+          readOnly={isDeleted}
+          memberNameOf={memberNameOf}
+        />
       )}
       {activeTab === "history" && (
-        <HistoryTab detail={detail} onRolledBack={refresh} readOnly={isDeleted} />
+        <HistoryTab
+          detail={detail}
+          onRolledBack={refresh}
+          readOnly={isDeleted}
+          memberNameOf={memberNameOf}
+        />
       )}
       {activeTab === "playground" &&
         (isDeleted ? (
@@ -373,7 +388,9 @@ export function AgentDetail() {
           <PlaygroundTab detail={detail} />
         ))}
       {activeTab === "users" && <UsersTab detail={detail} />}
-      {activeTab === "conversations" && <ConversationsTab detail={detail} />}
+      {activeTab === "conversations" && (
+        <ConversationsTab detail={detail} memberNameOf={memberNameOf} />
+      )}
       {activeTab === "skills" && <SkillsTab detail={detail} />}
       {activeTab === "triggers" && <TriggersTab detail={detail} />}
       {/* The per-agent Memory tab is gone (conversation-centric IA M3):
@@ -399,7 +416,13 @@ export function AgentDetail() {
   );
 }
 
-function OverviewTab({ detail }: { detail: AgentDetailResponse }) {
+function OverviewTab({
+  detail,
+  memberNameOf,
+}: {
+  detail: AgentDetailResponse;
+  memberNameOf: MemberNameOf;
+}) {
   const { t } = useTranslation();
   const r = detail.record;
   // ``r.spec`` is the full manifest ({apiVersion, kind, metadata, spec}) —
@@ -442,7 +465,8 @@ function OverviewTab({ detail }: { detail: AgentDetailResponse }) {
             </dd>
             <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("agent_detail.field_created")}</dt>
             <dd style={{ margin: 0 }}>
-              {new Date(r.created_at).toLocaleString()} · {r.created_by}
+              {new Date(r.created_at).toLocaleString()} ·{" "}
+              <MemberName id={r.created_by} nameOf={memberNameOf} data-testid="agent-created-by" />
             </dd>
             <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("agent_detail.field_updated")}</dt>
             <dd style={{ margin: 0 }}>{new Date(r.updated_at).toLocaleString()}</dd>

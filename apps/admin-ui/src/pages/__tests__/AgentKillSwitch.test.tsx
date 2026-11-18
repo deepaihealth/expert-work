@@ -41,6 +41,8 @@ vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
     scopeRef,
   );
 });
+// B-316 — member names are not under test here (and need an AuthProvider).
+vi.mock("../../hooks/useMemberNames", () => ({ useMemberNames: () => (id: string) => id }));
 vi.mock("../../tenant/useIsTenantSwitched", () => ({
   useIsTenantSwitched: isTenantSwitchedMock,
 }));
