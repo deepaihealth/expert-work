@@ -12,9 +12,10 @@ import { MAX_MEMBER_PAGES, MEMBER_PAGE_SIZE, useMemberNames } from "../useMember
 
 vi.mock("../../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
-function signInAs(roles: string[], isSystemAdmin = false): void {
+function signInAs(roles: string[], isSystemAdmin = false, identitySettled = true): void {
   vi.mocked(useAuth).mockReturnValue({
     identity: { roles, isSystemAdmin },
+    identitySettled,
   } as unknown as ReturnType<typeof useAuth>);
 }
 
@@ -182,19 +183,23 @@ describe("useMemberNames", () => {
 
   it("ignores a stale fetch that lands after the scope changed", async () => {
     const stale = member(9);
+    const current = member(12);
     const firstPage = deferred<MemberList>();
     vi.spyOn(membersSdk, "listMembers")
       .mockReturnValueOnce(firstPage.promise)
-      .mockResolvedValueOnce({ items: [], total: 0 });
+      .mockResolvedValueOnce({ items: [current], total: 1 });
 
     const { result, rerender } = renderHook(({ scope }) => useMemberNames(scope), {
       initialProps: { scope: "tenant-a" as TenantScope },
     });
     rerender({ scope: "tenant-b" });
+    await waitFor(() => expect(result.current(current.id)).toBe("成员12"));
+
     firstPage.resolve({ items: [stale], total: 1 });
     await new Promise((r) => setTimeout(r, 0));
 
     expect(result.current(stale.id)).toBe(stale.id);
+    expect(result.current(current.id)).toBe("成员12");
   });
 
   it("stops paging once unmounted", async () => {
@@ -225,6 +230,60 @@ describe("useMemberNames", () => {
 
     expect(listMembers).not.toHaveBeenCalled();
     expect(result.current(member(10).id)).toBe(member(10).id);
+  });
+
+  it("waits for /v1/me: an unsettled identity never fetches, even with system_admin in the JWT", async () => {
+    signInAs(["system_admin"], true, false);
+    const listMembers = vi
+      .spyOn(membersSdk, "listMembers")
+      .mockResolvedValue({ items: [member(13)], total: 1 });
+
+    const { result, rerender } = renderHook(() => useMemberNames(undefined));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(listMembers).not.toHaveBeenCalled();
+    expect(result.current(member(13).id)).toBe(member(13).id);
+
+    // Settled (by /v1/me, or by a non-401 failure of it) — now it fetches.
+    signInAs(["system_admin"], true, true);
+    rerender();
+    await waitFor(() => expect(result.current(member(13).id)).toBe("成员13"));
+    expect(listMembers).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not call listMembers without an identity", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      identity: null,
+      identitySettled: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    const listMembers = vi.spyOn(membersSdk, "listMembers");
+
+    const { result } = renderHook(() => useMemberNames(undefined));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(listMembers).not.toHaveBeenCalled();
+    expect(result.current("some-id")).toBe("some-id");
+  });
+
+  it("defers the fetch while disabled and does not refetch on re-enable", async () => {
+    const listMembers = vi
+      .spyOn(membersSdk, "listMembers")
+      .mockResolvedValue({ items: [member(14)], total: 1 });
+
+    const { result, rerender } = renderHook(({ enabled }) => useMemberNames(undefined, { enabled }), {
+      initialProps: { enabled: false },
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(listMembers).not.toHaveBeenCalled();
+
+    rerender({ enabled: true });
+    await waitFor(() => expect(result.current(member(14).id)).toBe("成员14"));
+    rerender({ enabled: false });
+    rerender({ enabled: true });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(listMembers).toHaveBeenCalledTimes(1);
+    expect(result.current(member(14).id)).toBe("成员14");
   });
 
   it("calls listMembers for an admin, and for a system admin without a tenant admin role", async () => {

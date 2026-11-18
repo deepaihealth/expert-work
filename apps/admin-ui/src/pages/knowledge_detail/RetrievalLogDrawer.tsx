@@ -91,8 +91,9 @@ export function RetrievalLogDrawer({ baseName, logId, readScope, onClose }: Retr
   const [detail, setDetail] = useState<RetrievalLogDetail | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [live, setLive] = useState<LiveText>(undefined);
-  // B-316 — fetched once per tab (the drawer stays mounted across records).
-  const memberNameOf = useMemberNames(readScope);
+  // B-316 — fetched on the first opened record, then reused (the drawer stays
+  // mounted across records); a tab whose drawer is never opened fetches nothing.
+  const memberNameOf = useMemberNames(readScope, { enabled: logId !== null });
   // Only the latest record's reads may land (a quick switch between rows).
   const seq = useRef(0);
 

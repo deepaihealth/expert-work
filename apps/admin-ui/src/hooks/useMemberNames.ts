@@ -19,6 +19,12 @@
  * giving everyone names needs a separate backend endpoint that returns names
  * only (no emails) — left as follow-up.
  *
+ * The roles are only trusted once ``/v1/me`` has answered
+ * (``identitySettled``; a non-401 failure also settles it) — the optimistic
+ * JWT decode may claim roles the server does not grant. API-key sessions
+ * (``roles = ["service_account"]``, admin carried in ``scopes``) get no
+ * names either: deliberately erring towards not fetching, not an oversight.
+ *
  * Fetching never surfaces an error: a restricted aggregate view or a network
  * failure falls back to showing the raw id. Call the hook once per page and
  * pass the resolver down to the parts that need it.
@@ -80,12 +86,23 @@ async function fetchAllMembers(
   return members;
 }
 
-export function useMemberNames(tenantScope: TenantScope): MemberNameOf {
-  const enabled = canReadMembers(useAuth().identity);
+interface UseMemberNamesOptions {
+  /** ``false`` defers the fetch (e.g. a drawer that is closed); names already
+   *  loaded for the scope stay usable and are not refetched. */
+  enabled?: boolean;
+}
+
+export function useMemberNames(
+  tenantScope: TenantScope,
+  { enabled = true }: UseMemberNamesOptions = {},
+): MemberNameOf {
+  const { identity, identitySettled } = useAuth();
+  const allowed = enabled && identitySettled && canReadMembers(identity);
   const [loaded, setLoaded] = useState<LoadedNames | null>(null);
+  const loadedForScope = loaded !== null && loaded.scope === tenantScope;
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!allowed || loadedForScope) return;
     let cancelled = false;
     fetchAllMembers(tenantScope, () => cancelled).then(
       (members) => {
@@ -100,8 +117,8 @@ export function useMemberNames(tenantScope: TenantScope): MemberNameOf {
     return () => {
       cancelled = true;
     };
-  }, [tenantScope, enabled]);
+  }, [tenantScope, allowed, loadedForScope]);
 
-  const names = enabled && loaded !== null && loaded.scope === tenantScope ? loaded.names : null;
+  const names = loadedForScope ? loaded.names : null;
   return useCallback((id: string) => names?.get(id) ?? id, [names]);
 }

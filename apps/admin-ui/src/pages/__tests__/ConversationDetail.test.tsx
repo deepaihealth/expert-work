@@ -18,6 +18,7 @@ import { setStoredToken } from "../../api/client";
 import * as agentsSdk from "../../api/agents";
 import * as approvalsSdk from "../../api/approvals";
 import * as convoSdk from "../../api/conversations";
+import * as membersSdk from "../../api/members";
 import * as rateCardSdk from "../../api/rate_card";
 import type { ThreadPlan } from "../../api/plan";
 import * as runsSdk from "../../api/runs";
@@ -330,6 +331,45 @@ describe("ConversationDetail", () => {
     vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([]);
     renderPage();
     await waitFor(() => expect(spy).toHaveBeenCalledWith(THREAD_ID, undefined));
+  });
+
+  it("shows the user's member name as plain text, not monospace (B-316)", async () => {
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([]);
+    vi.spyOn(membersSdk, "listMembers").mockResolvedValue({
+      items: [
+        {
+          id: "0e1d2c3b-4a59-4687-9a6b-5c4d3e2f1a0b",
+          tenant_id: TENANT_ID,
+          email: "ming@acme.com",
+          display_name: "王小明",
+          role: "operator",
+          status: "active",
+          keycloak_user_id: null,
+          subject_id: CONVO.user_id,
+          invited_by: "seed",
+          invited_at: null,
+          activated_at: null,
+          updated_at: null,
+        },
+      ],
+      total: 1,
+    });
+    renderPage();
+    // Re-query: the cell swaps from the raw id to the tooltip-wrapped name.
+    await waitFor(() => expect(screen.getByTestId("conversation-user")).toHaveTextContent("王小明"));
+    expect(screen.getByTestId("conversation-user").closest("dd")).not.toHaveClass("mono");
+  });
+
+  it("keeps an unresolved user id monospace (B-316)", async () => {
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([]);
+    const listMembers = vi.spyOn(membersSdk, "listMembers").mockResolvedValue({ items: [], total: 0 });
+    renderPage();
+    const user = await screen.findByTestId("conversation-user");
+    await waitFor(() => expect(listMembers).toHaveBeenCalled());
+    expect(user).toHaveTextContent(CONVO.user_id!);
+    expect(user.closest("dd")).toHaveClass("mono");
   });
 
   it("renders the conversation summary + its run list", async () => {
