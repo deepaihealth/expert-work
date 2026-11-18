@@ -3,15 +3,15 @@
  *
  * Live-probes the server (``POST .../{id}/tools``) and lists every advertised
  * tool. Each tool shows its name + description and expands to its input-schema
- * parameters (name / type / required / description). A per-tool enable Switch
- * persists the platform-curated denylist via ``disabled_tools`` (default all
+ * parameters ({@link ToolParamsTable}, shared with the tenant MCP page). A
+ * per-tool enable Switch persists the platform-curated denylist via ``disabled_tools`` (default all
  * enabled); disabled tools are filtered from ``list_tools`` at runtime so no
  * tenant agent sees them. A refresh button re-probes.
  *
  * ``oauth2`` servers are not probeable platform-side (per-user token), so the
  * tab shows an explanatory note instead of a list.
  */
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   Alert,
   App,
@@ -21,11 +21,9 @@ import {
   Space,
   Spin,
   Switch,
-  Table,
   Tag,
   Typography,
 } from "antd";
-import type { ColumnsType } from "antd/es/table";
 import { RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -36,33 +34,11 @@ import {
   type McpCatalogTool,
 } from "../../api/mcp-catalog";
 import { ApiError } from "../../api/client";
+import { ToolParamsTable } from "./ToolParamsTable";
 
-const { Text, Paragraph } = Typography;
+const { Text } = Typography;
 
 type ProbeStatus = "loading" | "ok" | "unreachable" | "not_probeable";
-
-interface ParamRow {
-  name: string;
-  type: string;
-  required: boolean;
-  description: string;
-}
-
-/** Flatten a JSON-Schema ``input_schema`` into displayable parameter rows. */
-function extractParams(schema: unknown): ParamRow[] {
-  if (!schema || typeof schema !== "object") return [];
-  const obj = schema as {
-    properties?: Record<string, { type?: string; description?: string }>;
-    required?: string[];
-  };
-  const required = new Set(obj.required ?? []);
-  return Object.entries(obj.properties ?? {}).map(([name, spec]) => ({
-    name,
-    type: spec.type ?? "—",
-    required: required.has(name),
-    description: spec.description ?? "",
-  }));
-}
 
 export interface CatalogToolsTabProps {
   entry: McpCatalogEntry;
@@ -136,38 +112,6 @@ export function CatalogToolsTab({
       }
     },
     [disabled, entry.id, onUpdated, message],
-  );
-
-  const paramColumns: ColumnsType<ParamRow> = useMemo(
-    () => [
-      {
-        title: t("mcp_catalog.param_name"),
-        dataIndex: "name",
-        key: "name",
-        width: "32%",
-        render: (name: string, row) => (
-          <Text strong>
-            {name}
-            {row.required && <Text type="danger"> *</Text>}
-          </Text>
-        ),
-      },
-      {
-        title: t("mcp_catalog.param_type"),
-        dataIndex: "type",
-        key: "type",
-        width: "18%",
-        render: (type: string) => <Tag>{type}</Tag>,
-      },
-      {
-        title: t("mcp_catalog.param_desc"),
-        dataIndex: "description",
-        key: "description",
-        render: (d: string) =>
-          d || <Text type="secondary">—</Text>,
-      },
-    ],
-    [t],
   );
 
   const header = (
@@ -253,21 +197,9 @@ export function CatalogToolsTab({
               )}
             </Space>
           ),
-          children:
-            extractParams(tool.input_schema).length > 0 ? (
-              <Table<ParamRow>
-                size="small"
-                rowKey="name"
-                pagination={false}
-                columns={paramColumns}
-                dataSource={extractParams(tool.input_schema)}
-                data-testid={`ct-params-${tool.name}`}
-              />
-            ) : (
-              <Paragraph type="secondary" style={{ marginBottom: 0 }}>
-                {t("mcp_catalog.tool_no_params")}
-              </Paragraph>
-            ),
+          children: (
+            <ToolParamsTable schema={tool.input_schema} testId={`ct-params-${tool.name}`} />
+          ),
         }))}
       />
     );

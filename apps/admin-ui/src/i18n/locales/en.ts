@@ -1517,6 +1517,8 @@ export interface TranslationKeys {
     mcp_bind_fixed_input: string;
     mcp_bind_fixed_placeholder: string;
     mcp_bind_fixed_invalid: string;
+    mcp_bind_fixed_pick: string;
+    mcp_bind_fixed_not_allowed: string;
     mcp_bind_hint: string;
     mcp_bind_required: string;
     mcp_bind_no_variables: string;
@@ -2629,6 +2631,7 @@ export interface TranslationKeys {
     param_desc: string;
     tool_enable_aria: string;
     tool_no_params: string;
+    param_options: string;
   };
   mcp_oauth: {
     page_title: string;
@@ -5502,6 +5505,8 @@ const en: TranslationKeys = {
     mcp_bind_fixed_input: "Fixed value for {{param}}",
     mcp_bind_fixed_placeholder: "Sent as-is on every call",
     mcp_bind_fixed_invalid: "Enter a value with no leading or trailing spaces",
+    mcp_bind_fixed_pick: "Pick a value",
+    mcp_bind_fixed_not_allowed: "{{value}} is not a value this tool allows. Allowed: {{options}}",
     mcp_bind_hint:
       "A bound parameter is filled in by the platform from the variable's value. The model never sees it, so it cannot mistype it. A fixed value is sent as-is on every call. Unbound parameters are still filled in by the model.",
     mcp_bind_required: "This parameter is required",
@@ -6747,6 +6752,7 @@ const en: TranslationKeys = {
     param_desc: "Description",
     tool_enable_aria: "Enable tool {{name}}",
     tool_no_params: "No parameters.",
+    param_options: "Allowed: {{options}}",
   },
   mcp_oauth: {
     page_title: "My MCP Authorizations",

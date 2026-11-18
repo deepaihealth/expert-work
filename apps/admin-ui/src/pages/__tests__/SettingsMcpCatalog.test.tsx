@@ -9,9 +9,10 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { createRef } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "antd";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "../../i18n";
+import i18n from "../../i18n";
 
 import { SettingsMcpCatalog } from "../SettingsMcpCatalog";
 import { CatalogBrowser } from "../../components/mcp_catalog/CatalogBrowser";
@@ -388,5 +389,74 @@ describe("CatalogBrowser entitlement lock", () => {
       </App>,
     );
     expect(screen.getByTestId("cb-authorize-lin")).toBeInTheDocument();
+  });
+});
+
+// B-318 —— 参数表显示工具声明的可选值(与租户 MCP 页共用 ``ToolParamsTable``,
+// 那边的用例在 SettingsMcpServers.test.tsx)。
+const HANDOFF_SCHEMA = {
+  type: "object",
+  properties: {
+    this_turn: {
+      type: "string",
+      description: "本轮回不回",
+      oneOf: [
+        { const: "reply", title: "本轮回复" },
+        { const: "silent", title: "本轮不回" },
+      ],
+    },
+    note: { type: "string", description: "备注" },
+  },
+  required: ["this_turn"],
+};
+
+describe("CatalogToolsTab 参数表的可选值(B-318)", () => {
+  it("有可选值的参数在描述下列出「可选：标题 值」,没有的不列", async () => {
+    const langBefore = i18n.language;
+    await i18n.changeLanguage("zh-CN");
+    try {
+      installAdapter([
+        {
+          match: (u) => u.endsWith("/tools"),
+          respond: () => ({
+            success: true,
+            data: {
+              status: "ok",
+              tool_count: 1,
+              tools: [
+                {
+                  name: "handoff_to_human",
+                  description: "",
+                  input_schema: HANDOFF_SCHEMA,
+                  disabled: false,
+                },
+              ],
+              error: null,
+            },
+            error: null,
+          }),
+        },
+      ]);
+      const { container } = render(
+        <App>
+          <CatalogToolsTab entry={ENTRY} onUpdated={() => {}} />
+        </App>,
+      );
+      await waitFor(() => expect(screen.getByTestId("ct-list")).toBeInTheDocument());
+      fireEvent.click(container.querySelector(".ant-collapse-header") as Element);
+      const table = await screen.findByTestId("ct-params-handoff_to_human");
+      const row = (name: string) =>
+        within(table).getByText(name).closest("tr") as HTMLElement;
+      expect(row("this_turn").textContent).toContain("本轮回不回");
+      expect(
+        within(table).getByTestId("ct-params-handoff_to_human-options-this_turn").textContent,
+      ).toBe("可选：本轮回复 reply / 本轮不回 silent");
+      expect(row("note").textContent).not.toContain("可选");
+      expect(
+        within(table).queryByTestId("ct-params-handoff_to_human-options-note"),
+      ).not.toBeInTheDocument();
+    } finally {
+      await i18n.changeLanguage(langBefore);
+    }
   });
 });

@@ -14,6 +14,7 @@ import {
   Alert,
   App,
   Button,
+  Collapse,
   Popconfirm,
   Space,
   Spin,
@@ -44,6 +45,7 @@ import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { CreateMcpServerDrawer } from "../components/CreateMcpServerDrawer";
 import { AddMcpServerDrawer } from "../components/mcp_catalog/AddMcpServerDrawer";
 import { PageHeader } from "../components/PageHeader";
+import { ToolParamsTable } from "../components/mcp_catalog/ToolParamsTable";
 import { buildUnifiedRows, type UnifiedRow } from "./mcpServerRows";
 import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
@@ -527,14 +529,32 @@ export function SettingsMcpServers() {
         );
       }
       return (
+        // B-318 —— 每个工具展开是参数表,与平台目录页(CatalogToolsTab)共用同一个组件。
         <div style={{ padding: "8px 0" }} data-testid={`ms-tools-${name}`}>
-          <Space size={[4, 8]} wrap>
-            {s.tools.map((tool) => (
-              <Tooltip key={tool.name} title={tool.description || undefined}>
-                <Tag style={{ cursor: "default" }}>{tool.name}</Tag>
-              </Tooltip>
-            ))}
-          </Space>
+          <Collapse
+            size="small"
+            items={s.tools.map((tool) => ({
+              key: tool.name,
+              label: (
+                <Space size={10}>
+                  <Typography.Text strong style={{ fontFamily: "var(--ew-font-mono, monospace)" }}>
+                    {tool.name}
+                  </Typography.Text>
+                  {tool.description && (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      {tool.description}
+                    </Typography.Text>
+                  )}
+                </Space>
+              ),
+              children: (
+                <ToolParamsTable
+                  schema={tool.input_schema}
+                  testId={`ms-params-${name}-${tool.name}`}
+                />
+              ),
+            }))}
+          />
         </div>
       );
     },

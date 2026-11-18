@@ -48,7 +48,25 @@ const MCP_SERVERS_LIST = {
 const TOOLS_LIST = {
   success: true,
   data: [
-    { name: "create_issue", description: "Create a new issue" },
+    {
+      name: "create_issue",
+      description: "Create a new issue",
+      // B-318 —— 参数表(与平台目录页共用)显示可选值。
+      input_schema: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Issue title" },
+          state: {
+            type: "string",
+            oneOf: [
+              { const: "open", title: "打开" },
+              { const: "closed", title: "关闭" },
+            ],
+          },
+        },
+        required: ["title"],
+      },
+    },
     { name: "list_repos", description: "List repositories" },
   ],
   error: null,
@@ -232,4 +250,25 @@ test("(e) settings/mcp-servers passes axe", async ({ page }) => {
 
   await expect(page.getByTestId("ms-table")).toBeVisible();
   await expectNoA11yViolations(page, "settings-mcp-servers");
+});
+
+// B-318 —— 租户页展开工具是和平台目录页同一张参数表,包括「可选：…」那一行。
+test("(g) expanding a tool shows its parameter table with allowed values + axe", async ({
+  page,
+}) => {
+  await login(page);
+  await page.goto("/settings/mcp-servers");
+  await expect(page.getByTestId("ms-table")).toBeVisible();
+  await page.locator(".ant-table-row-expand-icon").first().click();
+  const tools = page.getByTestId("ms-tools-github");
+  await expect(tools).toBeVisible();
+  await tools.locator(".ant-collapse-header", { hasText: "create_issue" }).click();
+
+  const table = page.getByTestId("ms-params-github-create_issue");
+  await expect(table).toBeVisible();
+  await expect(table).toContainText("Issue title");
+  await expect(page.getByTestId("ms-params-github-create_issue-options-state")).toHaveText(
+    /(可选：|Allowed: )打开 open \/ 关闭 closed/,
+  );
+  await expectNoA11yViolations(page, "settings-mcp-servers-tool-params");
 });
