@@ -1105,3 +1105,37 @@ async def test_an_invalid_fixed_value_seen_by_two_mcp_entries_is_reported_once()
         tool_env=ToolEnv(mcp_pool=pool),
     )
     assert len(registry.invalid_fixed_values()) == 1
+
+
+async def test_an_unreachable_server_reports_no_invalid_fixed_value() -> None:
+    """拿不到 schema(服务连不上)就查不了:只记 skipped,不当错值报(11-18 定:放行 + 告警)。"""
+
+    class _Down(RecordingMCPClient):
+        async def list_tools(self) -> Any:
+            raise ExceptionGroup("tg", [ConnectionRefusedError("refused")])
+
+    pool = MCPServerPool()
+    await pool.add(_SERVER, _Down())
+    registry = await build_tool_registry(
+        [
+            MCPToolSpec(
+                servers=[_SERVER],
+                arg_bindings=[
+                    ArgBindingSpec(server=_SERVER, tool="t1", fixed={"this_turn": "slient"})
+                ],
+            )
+        ],
+        tool_env=ToolEnv(mcp_pool=pool),
+    )
+    assert registry.skipped_mcp_servers() == (_SERVER,)
+    assert registry.invalid_fixed_values() == ()
+
+
+async def test_a_fixed_param_the_tool_does_not_declare_is_absent_not_invalid() -> None:
+    """工具没声明这个参数:只报 ``params_absent``(值不发),不当「不在可选值里」报 ——
+    后者会拒绝保存,而参数缺席按 B-127 只是告警。"""
+    registry, _ = await _build_registry(tools=[_HANDOFF], fixed={"t1": {"scope": "customer"}})
+    assert registry.unmatched_arg_bindings() == (
+        UnmatchedArgBinding(server=_SERVER, tool="t1", params=("scope",), reason="params_absent"),
+    )
+    assert registry.invalid_fixed_values() == ()

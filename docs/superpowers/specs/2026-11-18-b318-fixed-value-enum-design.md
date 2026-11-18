@@ -62,7 +62,12 @@ YAML 视图和表单视图存的是同一份 `manifest_yaml`，走同一组接�
 
 ## 5. 拿不到 schema 时：放行 + 告警（推荐，与 04 §4.1 已批的写法一致）
 
-「拿不到」指保存时那台 MCP 连不上（B-294 跳过）、按用户 OAuth 连的服务（保存时 `user_id=None`，这类服务不挂）、工具不在目录里（已报「没有这个工具」）。这些情况固定值不查，保存照常，告警点名「这台服务的固定值没核对」。
+「拿不到」有三种，固定值都不查，保存照常：
+- 保存时那台 MCP 连不上（B-294 跳过）：告警点名「这台服务的固定值没核对」（`_skipped_mcp_server_warning`，本单改了文案）。
+- 按用户 OAuth 授权的服务：保存时 `user_id=None`，这类服务根本不挂载，绑定走的是既有的 `tool_missing` 告警（「no such tool in the assembled catalog」）。**本单不改它的文案**，所以这条告警不会专门提到固定值。
+- 工具不在目录里：同上，既有的 `tool_missing` 告警。
+
+另记一笔：试建抛 `PlatformNotConfiguredError`（平台缺凭据 / 缺嵌入模型）时，`_check_buildable` 直接放行 + 告警、拿不到构建结果，**固定值检查也跟着跳过**；凭据补上之后的下一次保存 / 发布才会查。
 
 理由：
 - 拒绝等于第三方服务一抖动就锁死这个智能体的所有修改，包括出事时最急的改提示词、关工具。平台对 MCP 一贯是「连不上只跳过，不卡保存」（`agents.py` `_check_buildable` docstring、B-61 §5.4、B-294），这里不破例。
@@ -81,7 +86,8 @@ YAML 视图和表单视图存的是同一份 `manifest_yaml`，走同一组接�
 | 前端租户页（`SettingsMcpServers.test.tsx` 里加） | 展开服务 → 展开工具：参数、必填 *、类型、描述、「可选：」；无参数写「无参数。」 | 删掉那一行；租户页不用 `ToolParamsTable`；去掉必填星号 |
 | e2e | `agent-mcp-picker.spec.ts` (f) 下拉 + 选值 + axe；`mcp-servers.spec.ts` (g) 租户页参数表 + 「可选：」+ axe | 一律文本框；删掉「可选：」行 |
 | 后端 `test_arg_bindings.py` | `fixed_value_options` 与前端同一组用例 | 同前端 |
-| 后端 `test_mcp_arg_bindings_wiring.py` | 错值记一条、带允许值、不带错值；对值不记；无可选值不记；服务连不上不记、记 skipped；绑定照旧下发 | 去掉记录调用；比较写反 |
+| 后端 `test_mcp_arg_bindings_wiring.py` | 错值记一条、带允许值、不带错值；对值不记；无可选值不记；服务连不上不记、记 skipped；工具没声明的参数只报 `params_absent` 不报错值；绑定照旧下发 | 去掉记录调用；比较写反；连不上时当错值报；没有可选值也当错 |
+| 前端 `ToolParamsTable.test.tsx`（审查后补） | 第三方畸形 schema 不抛：参数 spec 是 null、`required` 不是数组 / 混非字符串、`type` / `description` 不是字符串、`properties` 不是对象 | 去掉各处形状判断 |
 | 后端 `test_agents_api.py`（builder 替身） | 新建 / PUT / 发布 → 422 且文案列出允许值、没落库；存草稿 → 200 + `build_error`；对值 → 无错；连不上 → 201 + 告警含「fixed values were not checked」 | `_check_buildable` 不看新字段；草稿分支也拦 |
 | 后端 `test_agent_factory.py` | 真 builder + 假 MCP 客户端：`BuiltAgent.invalid_fixed_values` 被带出来 | factory 不传字段 |
 

@@ -26,21 +26,37 @@ interface ParamRow {
   options: ParamOption[] | null;
 }
 
-/** Flatten a JSON-Schema ``input_schema`` into displayable parameter rows. */
+const isRecord = (x: unknown): x is Record<string, unknown> =>
+  x !== null && typeof x === "object" && !Array.isArray(x);
+
+const stringOr = (x: unknown, fallback: string): string =>
+  typeof x === "string" ? x : fallback;
+
+/**
+ * Flatten a JSON-Schema ``input_schema`` into displayable parameter rows.
+ *
+ * The schema is whatever a third-party MCP server advertised: every shape is
+ * checked and a bad one degrades to "absent" — never throws (admin-ui has no
+ * ErrorBoundary, so a throw here blanks the whole console). A parameter whose
+ * spec is not an object still gets its row, with no type / description.
+ */
 function extractParams(schema: unknown): ParamRow[] {
-  if (!schema || typeof schema !== "object") return [];
-  const obj = schema as {
-    properties?: Record<string, { type?: string; description?: string }>;
-    required?: string[];
-  };
-  const required = new Set(obj.required ?? []);
-  return Object.entries(obj.properties ?? {}).map(([name, spec]) => ({
-    name,
-    type: spec.type ?? "—",
-    required: required.has(name),
-    description: spec.description ?? "",
-    options: paramOptionsOf(schema, name),
-  }));
+  if (!isRecord(schema) || !isRecord(schema.properties)) return [];
+  const required = new Set(
+    Array.isArray(schema.required)
+      ? schema.required.filter((x): x is string => typeof x === "string")
+      : [],
+  );
+  return Object.entries(schema.properties).map(([name, raw]) => {
+    const spec = isRecord(raw) ? raw : {};
+    return {
+      name,
+      type: stringOr(spec.type, "—"),
+      required: required.has(name),
+      description: stringOr(spec.description, ""),
+      options: paramOptionsOf(schema, name),
+    };
+  });
 }
 
 export interface ToolParamsTableProps {

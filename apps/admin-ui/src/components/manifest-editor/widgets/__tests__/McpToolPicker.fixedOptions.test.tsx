@@ -213,6 +213,37 @@ describe("McpToolPicker 固定值的可选值(B-318)", () => {
   });
 });
 
+describe("固定值的提示挂在控件上,读屏念得到(B-318)", () => {
+  it("下拉与文本框:有提示时 aria-invalid 且 aria-describedby 指向提示,改对后撤掉", async () => {
+    const user = await renderAndOpen([
+      {
+        server: "deepcare",
+        tool: "handoff_to_human",
+        fixed: { this_turn: "slient", note: "" },
+      },
+    ]);
+    const combobox = fixedCombobox("this_turn");
+    const hint = screen.getByTestId(HINT_ID("this_turn"));
+    expect(combobox).toHaveAttribute("aria-invalid", "true");
+    expect(hint.id).not.toBe("");
+    expect(combobox.getAttribute("aria-describedby")).toBe(hint.id);
+
+    const input = screen.getByTestId(FIXED_ID("note"));
+    const inputHint = screen.getByTestId(HINT_ID("note"));
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(input.getAttribute("aria-describedby")).toBe(inputHint.id);
+    expect(inputHint.id).not.toBe(hint.id);
+
+    await user.click(combobox);
+    await pickOption(user, "本轮回复");
+    await waitFor(() =>
+      expect(screen.queryByTestId(HINT_ID("this_turn"))).not.toBeInTheDocument(),
+    );
+    expect(fixedCombobox("this_turn")).toHaveAttribute("aria-invalid", "false");
+    expect(fixedCombobox("this_turn")).not.toHaveAttribute("aria-describedby");
+  });
+});
+
 describe.each([
   ["zh-CN", "选一个值", "当前值 slient 不在工具允许的值里，可选：本轮回复 reply / 本轮不回 silent"],
   ["en", "Pick a value", "slient is not a value this tool allows. Allowed: 本轮回复 reply / 本轮不回 silent"],

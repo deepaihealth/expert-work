@@ -34,6 +34,8 @@ export function FixedValueInput({ tool, param, value, options, onChange }: Fixed
   const testId = `af-mcp-bind-fixed-${tool}-${param}`;
   const hintId = `af-mcp-bind-fixed-hint-${tool}-${param}`;
   const ariaLabel = t("agent_form.mcp_bind_fixed_input", { param });
+  // 提示挂到控件上(aria-describedby + aria-invalid),读屏念得到「为什么标红」。
+  const describedBy = (hint: string | null) => (hint === null ? undefined : hintId);
 
   let control;
   let hint: string | null;
@@ -45,6 +47,8 @@ export function FixedValueInput({ tool, param, value, options, onChange }: Fixed
         style={{ width: 200 }}
         data-testid={testId}
         aria-label={ariaLabel}
+        aria-invalid={hint !== null}
+        aria-describedby={describedBy(hint)}
         placeholder={t("agent_form.mcp_bind_fixed_placeholder")}
         // 空值 / 首尾空格后端会拒(ArgBindingSpec),当场标红而不是等保存 422。
         status={hint === null ? undefined : "error"}
@@ -69,6 +73,8 @@ export function FixedValueInput({ tool, param, value, options, onChange }: Fixed
         style={{ width: 200 }}
         data-testid={testId}
         aria-label={ariaLabel}
+        aria-invalid={hint !== null}
+        aria-describedby={describedBy(hint)}
         placeholder={t("agent_form.mcp_bind_fixed_pick")}
         status={hint === null ? undefined : "error"}
         value={value === "" ? undefined : value}
@@ -82,7 +88,7 @@ export function FixedValueInput({ tool, param, value, options, onChange }: Fixed
     <>
       {control}
       {hint !== null && (
-        <Text type="danger" data-testid={hintId} style={{ fontSize: 12 }}>
+        <Text type="danger" id={hintId} data-testid={hintId} style={{ fontSize: 12 }}>
           {hint}
         </Text>
       )}
