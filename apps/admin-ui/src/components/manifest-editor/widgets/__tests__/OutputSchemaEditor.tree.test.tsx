@@ -102,6 +102,7 @@ describe("OutputSchemaEditor field tree", () => {
       onChange,
     );
     await user.click(screen.getByTestId("af-output-schema-add-child-0"));
+    await user.clear(screen.getByTestId("af-output-schema-name-0.0"));
     await user.type(screen.getByTestId("af-output-schema-name-0.0"), "phone");
     await user.click(screen.getByTestId("af-output-schema-required-0.0"));
     expect(lastSchema(onChange)).toEqual({
@@ -340,6 +341,24 @@ describe("OutputSchemaEditor field tree", () => {
     });
   });
 
+  it("a collapsed row stays open while a name problem sits below it", async () => {
+    const user = userEvent.setup();
+    renderControlled(
+      withSchema({ type: "object", properties: { c: { type: "object", properties: { a: { type: "string" } } } } }),
+    );
+    await user.click(screen.getByTestId("af-output-schema-add-child-0"));
+    const child = screen.getByTestId("af-output-schema-name-0.1");
+    await user.clear(child);
+    await user.type(child, "a");
+    await user.click(screen.getByTestId("af-output-schema-toggle-0"));
+    expect(screen.getByTestId("af-output-schema-name-0.1")).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByTestId("af-output-schema-toggle-0")).toHaveTextContent("-");
+
+    await user.type(screen.getByTestId("af-output-schema-name-0.1"), "2");
+    expect(screen.queryByTestId("af-output-schema-row-0.1")).not.toBeInTheDocument();
+    expect(screen.getByTestId("af-output-schema-toggle-0")).toHaveTextContent("+");
+  });
+
   it("flags both rows of a nested duplicate and writes nothing", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
@@ -348,6 +367,8 @@ describe("OutputSchemaEditor field tree", () => {
       onChange,
     );
     await user.click(screen.getByTestId("af-output-schema-add-child-0"));
+    await user.clear(screen.getByTestId("af-output-schema-name-0.1"));
+    onChange.mockClear();
     await user.type(screen.getByTestId("af-output-schema-name-0.1"), "a");
     expect(screen.getByTestId("af-output-schema-name-0.0")).toHaveAttribute("aria-invalid", "true");
     expect(screen.getByTestId("af-output-schema-name-0.1")).toHaveAttribute("aria-invalid", "true");
@@ -429,6 +450,7 @@ describe("OutputSchemaEditor field tree", () => {
       const { rerender } = mount({ type: "object", properties: { x: list("string") } });
       remount(rerender, { type: "object", properties: { y: list("string"), z: { type: "string" } } });
       await user.click(screen.getByTestId("af-output-schema-add"));
+      await user.clear(screen.getByTestId("af-output-schema-name-2"));
       await user.type(screen.getByTestId("af-output-schema-name-2"), "fresh");
       await pickType("af-output-schema-type-2", "array");
       await user.click(screen.getByTestId("af-output-schema-toggle-2"));

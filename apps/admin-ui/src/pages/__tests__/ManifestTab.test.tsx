@@ -210,6 +210,13 @@ describe("ManifestTab", () => {
     expect(screen.getByTestId("manifest-save-btn")).toBeDisabled();
     expect(screen.getByTestId("manifest-publish-btn")).toBeDisabled();
 
+    // Leaving for another group is refused (it would drop the un-applied
+    // edits); saving stays blocked.
+    await user.click(screen.getByTestId("cfg-nav-basic"));
+    expect(screen.getByTestId("manifest-switch-blocked")).toBeInTheDocument();
+    expect(screen.getByTestId("af-output-schema-name-1")).toHaveValue("a");
+    expect(screen.getByTestId("manifest-save-btn")).toBeDisabled();
+
     await user.type(name, "2");
     expect(screen.getByTestId("manifest-save-btn")).not.toBeDisabled();
     expect(screen.getByTestId("manifest-publish-btn")).not.toBeDisabled();

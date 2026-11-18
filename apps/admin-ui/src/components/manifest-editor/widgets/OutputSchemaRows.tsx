@@ -25,8 +25,10 @@ import {
   SCHEMA_NODE_TYPES,
   changeNodeType,
   fieldIssue,
+  hasNameIssues,
   isNameFixed,
   newSchemaField,
+  nextFieldName,
   updateFieldsAt,
   updateNodeAt,
   type EditableSchemaNode,
@@ -71,10 +73,15 @@ function hasChildren(node: SchemaNode): boolean {
   return node.kind === "editable" && (node.type === "object" || node.type === "array");
 }
 
+// A collapsed row stays open while a name problem sits somewhere below it,
+// so every flagged row is on screen (collapse applies again once fixed).
+const isClosed = (ctx: TreeContext, rowKey: string, node: SchemaNode): boolean =>
+  ctx.collapsed.has(rowKey) && !hasNameIssues(node);
+
 // Indent spacer + expand/collapse toggle (or a blank of the same width).
 function Lead({ path, rowKey, ctx, node }: RowProps & { node: SchemaNode }) {
   const { t } = useTranslation();
-  const closed = ctx.collapsed.has(rowKey);
+  const closed = isClosed(ctx, rowKey, node);
   return (
     <>
       <span style={{ width: (path.length - 1) * INDENT, flex: "none" }} />
@@ -137,7 +144,9 @@ function NodeExtras({ path, ctx, node }: RowProps & { node: EditableSchemaNode }
             size="small"
             disabled={!canAddChild}
             data-testid={`af-output-schema-add-child-${key}`}
-            onClick={() => ctx.commit(updateFieldsAt(ctx.root, path, (fs) => [...fs, newSchemaField()]))}
+            onClick={() =>
+              ctx.commit(updateFieldsAt(ctx.root, path, (fs) => [...fs, newSchemaField(nextFieldName(fs))]))
+            }
           >
             {t("agent_form.output_schema.add_child")}
           </Button>
@@ -197,7 +206,7 @@ function RowCells({ path, rowKey, ctx, node, nameCell, requiredCell, trailing }:
 }
 
 function Children({ path, rowKey, ctx, node }: RowProps & { node: SchemaNode }) {
-  if (node.kind !== "editable" || ctx.collapsed.has(rowKey)) return null;
+  if (node.kind !== "editable" || isClosed(ctx, rowKey, node)) return null;
   if (node.type === "object") return <FieldRows parentPath={path} fields={node.fields ?? []} ctx={ctx} />;
   if (node.type === "array" && node.items) {
     const itemsKey = JSON.stringify([...(JSON.parse(rowKey) as string[]), "items"]);

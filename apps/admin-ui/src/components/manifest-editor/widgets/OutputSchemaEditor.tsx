@@ -48,6 +48,7 @@ import {
   newSchemaField,
   hasNameIssues,
   newSchemaNode,
+  nextFieldName,
   updateFieldsAt,
   type SchemaField,
   type SchemaNode,
@@ -156,7 +157,7 @@ function TreeTable({ ctx, fields, nameErrors }: TreeTableProps) {
         type="dashed"
         size="small"
         data-testid="af-output-schema-add"
-        onClick={() => ctx.commit(updateFieldsAt(ctx.root, [], (fs) => [...fs, newSchemaField()]))}
+        onClick={() => ctx.commit(updateFieldsAt(ctx.root, [], (fs) => [...fs, newSchemaField(nextFieldName(fs))]))}
       >
         {t("agent_form.output_schema.add_field")}
       </Button>

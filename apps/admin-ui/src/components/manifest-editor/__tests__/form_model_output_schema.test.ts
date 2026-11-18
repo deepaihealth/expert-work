@@ -20,12 +20,12 @@ import {
 } from "../form_model";
 import {
   newSchemaField,
-  nodeAt,
   updateFieldsAt,
   updateNodeAt,
   type SchemaNode,
   type SchemaPath,
 } from "../output_schema_tree";
+import { nodeAt } from "./schema_tree_test_utils";
 import { parseYaml } from "../yaml";
 
 const BLANK: AgentManifest = { spec: {} };

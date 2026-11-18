@@ -13,7 +13,6 @@ import {
   matchFieldUids,
   newSchemaField,
   newSchemaNode,
-  nodeAt,
   parseSchemaNode,
   parseSchemaRoot,
   hasNameIssues,
@@ -24,6 +23,7 @@ import {
   type SchemaField,
   type SchemaNode,
 } from "../output_schema_tree";
+import { nodeAt } from "./schema_tree_test_utils";
 
 function editable(node: SchemaNode | undefined): EditableSchemaNode {
   if (node?.kind !== "editable") throw new Error(`expected editable, got ${node?.kind}`);

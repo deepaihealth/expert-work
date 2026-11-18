@@ -371,12 +371,24 @@ export function newSchemaNode(type: SchemaNodeType): EditableSchemaNode {
   return { kind: "editable", type, constraints: {} };
 }
 
-export const newSchemaField = (): SchemaField => ({
+export const newSchemaField = (name = ""): SchemaField => ({
   uid: makeFieldUid(),
-  name: "",
+  name,
   required: false,
   node: newSchemaNode("string"),
 });
+
+/**
+ * A default name for a field added next to ``fields``: ``field_1``,
+ * ``field_2`` … — the first one not taken at that level. Valid under the
+ * name rule, so adding a field never trips the "fix names first" pause.
+ */
+export function nextFieldName(fields: readonly SchemaField[]): string {
+  const taken = new Set(fields.map((f) => f.name));
+  let n = 1;
+  while (taken.has(`field_${n}`)) n += 1;
+  return `field_${n}`;
+}
 
 /**
  * Switch a node's type: drops constraints/enum/children the new type can't
@@ -415,16 +427,6 @@ export function changeNodeType(
     enum: node.enum !== undefined && enumValidFor(type, node.enum) ? node.enum : undefined,
     raw,
   };
-}
-
-/** The node at ``path`` (``undefined`` when the path doesn't resolve). */
-export function nodeAt(root: SchemaNode, path: SchemaPath): SchemaNode | undefined {
-  let cur: SchemaNode | undefined = root;
-  for (const seg of path) {
-    if (cur?.kind !== "editable") return undefined;
-    cur = seg === "items" ? cur.items : cur.fields?.[seg]?.node;
-  }
-  return cur;
 }
 
 /** Replace the editable node at ``path`` with ``fn(node)``; others untouched. */

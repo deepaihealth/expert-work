@@ -114,11 +114,13 @@ describe("OutputSchemaEditor", () => {
 
     // add field 1, name it "title", mark required
     await user.click(screen.getByTestId("af-output-schema-add"));
+    await user.clear(screen.getByTestId("af-output-schema-name-0"));
     await user.type(screen.getByTestId("af-output-schema-name-0"), "title");
     await user.click(screen.getByTestId("af-output-schema-required-0"));
 
     // add field 2, name it "count" (default type: string)
     await user.click(screen.getByTestId("af-output-schema-add"));
+    await user.clear(screen.getByTestId("af-output-schema-name-1"));
     await user.type(screen.getByTestId("af-output-schema-name-1"), "count");
 
     const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
@@ -201,6 +203,8 @@ describe("OutputSchemaEditor", () => {
       };
       renderEditor(seeded, onChange);
       await user.click(screen.getByTestId("af-output-schema-add"));
+      await user.clear(screen.getByTestId("af-output-schema-name-1"));
+      onChange.mockClear();
       await user.type(screen.getByTestId("af-output-schema-desc-0"), "hi");
       await user.click(screen.getByTestId("af-output-schema-required-0"));
       expect(onChange).not.toHaveBeenCalled();
@@ -234,10 +238,11 @@ describe("OutputSchemaEditor", () => {
       };
       const { rerender } = renderEditor(seeded, onChange);
 
-      // Add a blank row and type into its description — its name stays ""
-      // (invalid), so this row never reaches the manifest; it only lives in
-      // local overlay state.
+      // Add a row (written as field_1), then blank its name and type into its
+      // description — with the name broken, those edits stay local only.
       await user.click(screen.getByTestId("af-output-schema-add"));
+      const written = onChange.mock.calls.at(-1)?.[0] as typeof seeded;
+      await user.clear(screen.getByTestId("af-output-schema-name-1"));
       await user.type(screen.getByTestId("af-output-schema-desc-1"), "wip notes");
       expect(screen.getByTestId("af-output-schema-name-1")).toHaveValue("");
 
@@ -247,8 +252,8 @@ describe("OutputSchemaEditor", () => {
       // exactly the "any formData change" trigger that used to blow away
       // local state wholesale.
       const siblingEdited = {
-        ...seeded,
-        spec: { ...seeded.spec, description: "v2" },
+        ...written,
+        spec: { ...written.spec, description: "v2" },
       };
       rerender(
         <App>
@@ -282,6 +287,7 @@ describe("OutputSchemaEditor", () => {
 
       await user.click(screen.getByTestId("af-output-schema-add"));
       const nameInput = screen.getByTestId("af-output-schema-name-1");
+      await user.clear(nameInput);
       await user.type(nameInput, "titl");
       onChange.mockClear();
       await user.type(nameInput, "e");

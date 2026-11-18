@@ -162,6 +162,10 @@ export function ManifestTab({
     [onSaved, t],
   );
 
+  // Why Save / Publish are greyed: the tenant-switch copy wins (default
+  // title), otherwise the form-errors one.
+  const blockedTitle = isTenantSwitched ? undefined : t("manifest_editor.form_has_errors");
+
   const handleSaveDraft = useCallback(
     () =>
       runAction("draft", () =>
@@ -220,7 +224,7 @@ export function ManifestTab({
           )}
           {!readOnly && (
             <>
-              <ReadonlyTooltip on={isTenantSwitched}>
+              <ReadonlyTooltip on={isTenantSwitched || formHasErrors} title={blockedTitle}>
                 <Button
                   size="small"
                   icon={<Save size={14} strokeWidth={1.75} />}
@@ -232,7 +236,7 @@ export function ManifestTab({
                   {t("manifest_tab.save_draft")}
                 </Button>
               </ReadonlyTooltip>
-              <ReadonlyTooltip on={isTenantSwitched}>
+              <ReadonlyTooltip on={isTenantSwitched || formHasErrors} title={blockedTitle}>
                 <Button
                   size="small"
                   type="primary"

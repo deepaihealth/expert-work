@@ -1140,6 +1140,7 @@ const zhCN: TranslationKeys = {
     invalid_yaml_title: "无法切换到表单",
     invalid_yaml_hint: "当前 YAML 不合法或不符合配置清单结构，请先在此修正。",
     form_has_errors: "表单里还有错误，改好后才能保存。",
+    switch_blocked_form_errors: "结构化输出里有字段名问题，先改好再切换。",
     search_placeholder: "搜索设置…",
     group_basic: "基础",
     group_model: "模型与路由",
@@ -1822,7 +1823,8 @@ const zhCN: TranslationKeys = {
       collapse: "收起",
       name_invalid: "字段名须以字母或下划线开头，只能含字母数字下划线",
       name_duplicate: "字段名重复——同一层已有同名字段",
-      name_errors_block: "有字段名重复或不合规，改好后才能保存。改好之前，这里的修改先不生效。",
+      name_errors_block:
+        "有字段名重复或不合规，请先改好。改好之前，这里的修改先不生效，也不能保存、不能切换分组或 YAML 视图。",
       complex_readonly: "已配置（复杂结构）——请到 YAML 视图编辑",
       readonly_node: "这部分用了表单不支持的写法，请到 YAML 视图改",
       readonly_depth: "超过 5 层，请到 YAML 视图改",

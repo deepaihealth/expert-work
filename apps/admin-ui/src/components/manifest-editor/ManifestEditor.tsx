@@ -195,6 +195,17 @@ export function ManifestEditor({
   useEffect(() => {
     onValidityChange?.(hasFormErrors);
   }, [hasFormErrors, onValidityChange]);
+  // B-315 — leaving the form pane (another group / the YAML view) unmounts
+  // the widget holding the un-applied edits, so while one reports errors the
+  // switch is refused with a notice (no confirm dialog).
+  const [switchBlocked, setSwitchBlocked] = useState(false);
+  useEffect(() => {
+    if (!hasFormErrors) setSwitchBlocked(false);
+  }, [hasFormErrors]);
+  function blockedByFormErrors(): boolean {
+    if (hasFormErrors) setSwitchBlocked(true);
+    return hasFormErrors;
+  }
   useEffect(() => () => onValidityChange?.(false), [onValidityChange]);
 
   function setGroup(id: string): void {
@@ -278,6 +289,7 @@ export function ManifestEditor({
   // incomplete fallback row doesn't leak into the YAML view / submit).
   function toggleYaml(): void {
     if (!yamlActive) {
+      if (blockedByFormErrors()) return;
       const y = dumpYaml(normalizeForSubmit(manifestObject));
       setYamlText(y);
       onChange(y);
@@ -300,6 +312,7 @@ export function ManifestEditor({
       }
       return;
     }
+    if (id !== group && blockedByFormErrors()) return;
     setGroup(id);
   }
 
@@ -448,6 +461,16 @@ export function ManifestEditor({
               {t("manifest_editor.tab_yaml")}
             </Button>
           </div>
+
+          {switchBlocked && (
+            <Alert
+              type="error"
+              showIcon
+              message={t("manifest_editor.switch_blocked_form_errors")}
+              style={{ marginBottom: 12 }}
+              data-testid="manifest-switch-blocked"
+            />
+          )}
 
           {switchError !== null && (
             <Alert

@@ -150,4 +150,31 @@ describe("OutputSchemaEditor name rule", () => {
       required: ["b"],
     });
   });
+
+  it("adding a field gives it the first free default name and keeps writing back", async () => {
+    const user = userEvent.setup();
+    const { onChange, report } = renderNames({
+      type: "object",
+      properties: { field_1: A, box: { type: "object", properties: {} } },
+    });
+    await user.click(screen.getByTestId("af-output-schema-add"));
+    expect(screen.getByTestId("af-output-schema-name-2")).toHaveValue("field_2");
+    await user.click(screen.getByTestId("af-output-schema-add"));
+    expect(screen.getByTestId("af-output-schema-name-3")).toHaveValue("field_3");
+    await user.click(screen.getByTestId("af-output-schema-remove-0"));
+    await user.click(screen.getByTestId("af-output-schema-add"));
+    expect(screen.getByTestId("af-output-schema-name-3")).toHaveValue("field_1");
+    await user.click(screen.getByTestId("af-output-schema-add-child-0"));
+    expect(screen.getByTestId("af-output-schema-name-0.0")).toHaveValue("field_1");
+
+    expect(screen.queryByTestId("af-output-schema-name-errors")).not.toBeInTheDocument();
+    expect(report).not.toHaveBeenCalledWith("output_schema", true);
+    expect(onChange).toHaveBeenCalledTimes(5);
+    expect(Object.keys(written(onChange.mock.calls.at(-1) as unknown[]))).toEqual([
+      "box",
+      "field_2",
+      "field_3",
+      "field_1",
+    ]);
+  });
 });
