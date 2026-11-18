@@ -12,7 +12,7 @@
 >
 > **修订(2026-11-17,06 评审结论)**:9.10 各项按本文推荐定稿并写进工具规格 —— 提醒短编号(5.4、5.5)、一次删多条必须带「客户已确认」(5.5)、设提醒返回带星期(5.3)、查表单结束日裁到今天(M4);改档案按字段编码写。
 >
-> **修订(2026-11-17,用户 11-17 拍板)**:不做按表单的情境字段配置 —— 情境(测量时段 / 餐次 / 测量时间)由模型读字段名和字段说明、按消息时间和上下文推断,推不出才问(所有表单通用的提示词规则);三个累积字段的 `field_code` 写死在深护 MCP 代码里(3.4、5.7)。
+> **修订(2026-11-17,用户 11-17 拍板)**:不做按表单的情境字段配置 —— 情境(测量时段 / 餐次 / 测量时间)由模型读字段名和字段说明、按消息时间和上下文推断,推不出才问(所有表单通用的提示词规则);三个累积字段的 `field_code` 写死在深护 MCP 代码里(3.4、5.7)(11-18 作废,改为文字栏目通用规则,见 3.4)。
 >
 > **修订(2026-11-17,独立核对后的修正)**:`source_message_ids` 在 03 之后由数字人服务另传的 `source_msg_keys` 生成(6.16);转人工关 AI 开关时 pad id 换企微明文 id 定为 MCP 自己反查,查不到就不动开关、记告警(3.10 第 4 步);查聊天条数统一叫 `page_size`;M12 / 加固 9.5 标明不属于 B-314;若干措辞按已定事项更新。
 >
@@ -186,7 +186,7 @@
 
 | Dify 操作 | 迁移后工具 | 复用 / 新增 / 改造 | 要点 |
 |---|---|---|---|
-| 改个人档案 | `form_save_customer_values`(`form_customer_basic_info` → 档案模式) | **新增** | 只写变了的字段;不写姓名;累积字段追加;否定描述不覆盖 |
+| 改个人档案 | `form_save_customer_values`(`form_customer_basic_info` → 档案模式) | **新增** | 只写变了的字段;不写姓名;文字栏目已有内容时要说明追加还是替换(11-18 开发中定,取代累积字段名单);否定描述不覆盖 |
 | 上报健康数据 | `form_save_customer_values`(其它可写表单 → 上报模式) | **新增** | 新建提交;按来源消息去重(§3.4) |
 | 化验单 | `form_save_customer_values`(`form_analysis_report` → 按月合并模式) | **新增** | 按北京时间当月(上传月)合并;附件合并;≤ 70 字段 |
 | 新增提醒 | `reminder_create` | **新增** | 返回真实 `notify_code` 与发送时间 |
@@ -260,7 +260,7 @@
 | Dify 里的规则(出处) | 服务端怎么做 |
 |---|---|
 | 不写姓名(`1761367072328`) + 写姓名会改客户主表(项目服务 `form.service.ts:1481-1491`) | `field_real_name` 一律跳过,原因 `forbidden_field`。称呼字段照常写(「只在客户明确要求时写称呼」留在提示词) |
-| 累积字段追加(规则 9–10) | 「累积字段表」里的字段默认 `op=append`:已有内容已包含新内容 → `unchanged`;否则写成「已有内容;新内容(YYYY-MM-DD 记录)」。`op=replace` 必须带 `reason`(停药 / 痊愈 / 原信息有误)。字段表放目前用药、其他健康状况、过敏源三项,**field_code 写死在深护 MCP 代码里**(11-17 定,不做配置;具体编码实现时核对) |
+| 累积字段追加(规则 9–10) | ~~「累积字段表」里的字段默认 `op=append`……字段表放目前用药、其他健康状况、过敏源三项,field_code 写死在深护 MCP 代码里(11-17 定)~~ **作废(用户 11-18 定:按编码写死不通用)**。改成所有表单通用的「文字栏目」规则,见本表下面一段:档案和改口时文字栏目已有内容,模型必须说明 `op=append`(追加并标日期)还是 `op=replace` + `reason`,没说明的不写、返回 `op_required` 和现有值;上报类表单默认直接写,只有模型传 `op=append` 才合并已有内容(11-18 开发中定) |
 | 否定描述不覆盖(规则 11) | 已有非空值的字段,新值为「无 / 没有 / 否认 / 不详」一类时跳过,原因 `negation_ignored`;`op=replace` + `reason` 例外 |
 | Select 只能从 options 选(规则 12) | 值不在选项里 → 跳过,原因 `invalid_option`;`display_value` 由服务端按选项回填,不信模型 |
 | 出生年月只在为空时推算(类型规则 5) | 出生日期字段已有值 → 跳过,原因 `protected_field`(`op=replace` + `reason` 例外) |
@@ -268,6 +268,8 @@
 | 计算字段不写(项目服务 `:1393-1402`) | 跳过,原因 `calculated_field` |
 | 字段必须属于该表(Dify 靠模型) | 不属于 → 跳过,原因 `not_in_form` |
 | 数值字段 | Integer / Float 不能解析 → 跳过,原因 `invalid_number`(单位换算仍由模型做) |
+| 日期 / 时间字段 | 值类型 Date / DateTime 的一律换成北京时间再写(带偏移的换算,不带的当北京时间);解析不了 → 跳过,原因 `invalid_datetime`(11-18 开发中定) |
+| 同一次调用里同一字段写两次 | 只认第一次,后面的跳过,原因 `duplicate_field`(11-18 开发中定) |
 | DateTime 字段取当前时间 | 没给值的 DateTime 字段,服务端填 `measured_at` 或当前北京时间 |
 | 化验单同月合并(`1789740487772`) | 见上表;月份按**北京时间当前月**(沿用 Dify,11-17 定,9.3) |
 | `field_analysis_node_name` 写当月(规则 8) | 服务端写入 `YYYY-MM`,忽略模型给的值 |
@@ -275,6 +277,24 @@
 | 最多 70 条(规则 10、`1789743707720`) | 超出部分不写,列在 `dropped_over_limit` |
 | 至少一个实际指标(`1789742570094`) | 化验单只有附件、日期、节点名这类元数据字段 → 42200 `lab_report_no_indicator` |
 | 血糖两要素、他人数据不报(`1761367647758`) | 他人数据、假设性提问:语义判断,留在提示词。血糖时段等「数据情境」:见下面「情境字段」,服务端**不因缺情境拒收** |
+
+**文字栏目已有内容时怎么写(11-18 开发中定,取代按编码写死的累积字段名单;所有表单通用,不需要任何表或配置)**:
+
+- **哪些算文字栏目**:除下面这些以外的栏目 —— 数字(值类型 Integer / Float)、布尔或 JSON 值类型、日期(值类型 Date / DateTime,或控件是 Date / DateTime 但按字符串存的)、开关 Switch、带 options 的选项类型(Select / Radio / Checkbox / Cascader)、计算字段、上传(UploadImage / UploadFile,附件由服务端合并)。
+- **档案模式(`form_customer_basic_info`)和改口(`amend_submission_code`),化验单除外**:
+  - 现有值为空:没传 `op` 或 `op=set` → 直接写,不标日期;`op=append` → 写成「新内容(YYYY-MM-DD 记录)」,`op` 记 `append`。
+  - 现有值不为空:
+    - `op=append` → 写成「已有内容;新内容(YYYY-MM-DD 记录)」;已有内容里已经包含新内容 → `unchanged`。
+    - `op=replace` 并带非空 `reason` → 整栏换掉。
+    - 没传 `op`、`op=set`、或 `op=replace` 但没 `reason` → 不写,跳过原因 `op_required`,并带回现有值 `existing_value`(长度上限见 5.2)。
+  - 档案模式下同一字段的新值和最新值完全相同 → `unchanged`,这条优先于 `op_required`;改口不做这个比对,照样返回 `op_required`。
+- **上报模式(其它表单,每次新建一条提交)**:默认不读现有值,直接写。只有模型对某个文字栏目传了 `op=append`,才读这个字段的最新值:合并成「已有;新(日期 记录)」;最新值里已包含新内容 → `unchanged`;最新值为空 → 写成「新(日期 记录)」。
+- **日期标记统一**:只要是 append 就标日期,set 永远不标。
+- **不受这条规则影响**:化验单 `lab_monthly`(含改口)照旧按月合并 / 覆盖;否定描述 `negation_ignored`、不写姓名(`forbidden_field`)、出生日期受保护(`protected_field`)、追加后超过 65535 字节(`too_long`)都照旧。
+- **全没写成时**(看整次调用的返回):模型给的字段一个都没写成、里面有 `op_required` → 42200,`context = {reason: 'op_required', skipped}`(每条带 `existing_value`),hint 让模型看了现有内容后带上 `op` 再调一次,并且不要跟客户说「保存失败」;这时 `op_required` 优先于 `unchanged`(不让模型以为「都没变」)。写成了一部分 → 正常返回,`op_required` 放在 `skipped` 里。
+- **已知局限**:
+  - 「已包含」按子串判断:新值「糖」在已有的「低糖饮食」里,会被当成已包含 → `unchanged`。
+  - 改口时追加不会刷新那一行的时间。例:上午补记了一条用药上报,时间写成 8 点(倒填);之后客户改口,对这条提交里已有的文字栏目 append。这一行走更新、仍保留 8 点,如果这期间还有更晚的记录,它就不是最新的那一行,下次追加会接在那条更晚的记录上。
 
 **情境字段(11-17 定,所有业务表单通用)**:很多数据要带「情境」才有意义 —— 血糖是空腹还是餐后、饮食是哪一餐、血压体重是什么时候量的。
 
@@ -286,16 +306,16 @@
 
 - 业务方每轮把本批客户消息的企微 id 作为变量 `source_message_ids` 传入,平台绑定进 `form_save_customer_values`(模型看不到、改不了)。
 - MCP 写每条记录时一并存下它的来源消息 id。存在哪(提交表加一列,还是另建一张小表)是 MCP 实现细节,实现时定。
-- 判重:**同一客户、同一表单、规范化后内容相同、来源消息有重叠** → 返回第一次的结果,`status=duplicate`。规范化内容 = 各字段编码 + 规范化后的值,加上模型给的 `measured_at`;服务端自己补的当前时间不算。
+- 判重:**同一客户、同一表单、规范化后内容相同、来源消息有重叠** → 返回第一次的结果,`status=duplicate`。规范化内容 = 各字段编码 + 规范化后的值,加上模型给的 `measured_at`;服务端自己补的当前时间不算。值按**模型给的**归一化后算:不看现有值(追加后的全文随最新值变,用它算的话打断重跑时对不上)、不含 `op`(11-18 开发中定)。判重来源记录里存的返回结果不存 `existing_value`,`saved` 也只存截断后的(5.2)。
 - 重跑:合并重跑那一轮带着旧消息的 id,和已写记录重叠 → 挡住。客户在**新消息**里报了同样的数 → 没有重叠 → 照常记。
 - 判重和写入在同一把锁里做(按客户 + 表单),防同一轮里并行的两次调用都写进去。
 - 档案模式靠「与最新值比对」天然去重,化验单模式靠「同字段覆盖 + 附件去重」天然幂等;两种模式同样存来源消息 id,便于追查。
 
-**改口**:客户说「刚才血糖说错了,是 6.2」。模型带上刚才返回的 `submission_code` 作 `amend_submission_code` 再调一次,服务端在原提交上覆盖字段。限制:同一客户、同一表、由智能体写入、北京时间当天,否则 42200。
+**改口**:客户说「刚才血糖说错了,是 6.2」。模型带上刚才返回的 `submission_code` 作 `amend_submission_code` 再调一次,服务端在原提交上覆盖字段。限制:同一客户、同一表、由智能体写入、北京时间当天,否则 42200。改口时文字栏目已有内容同样要说明 `op`(规则同档案,见上面「文字栏目」;化验单改口照旧覆盖,11-18 开发中定)。
 
 **不需要确认、不设上限(11-17 定)**:写入不找客户或员工确认;不设按客户的调用 / 写入次数上限。错了靠员工撤销。
 
-**员工可撤销**:每次写入在 `t_project_operation_log` 记一行(操作人 = 绑定的员工、来源 = 请求头 `x-agent-id`(健管师与 ahp 共用一条注册,显示那条注册配的值,没配为 `unknown`,`mcp-auth.ts:47`;11-17 已接受)、字段前后值,≤ 2000 字)。撤销沿用项目服务现有的 `form/del-form-field-values`(把字段置为无效,`form.service.ts:1685-1699`);控制台有没有入口要深护确认。提醒的撤销用项目服务运营后台的 AI 提醒删除(`ai-notify.service.ts:221`)。
+**员工可撤销**:每次写入在 `t_project_operation_log` 记一行(操作人 = 绑定的员工、来源 = 请求头 `x-agent-id`(健管师与 ahp 共用一条注册,显示那条注册配的值,没配为 `unknown`,`mcp-auth.ts:47`;11-17 已接受)、字段前后值,≤ 2000 字;每项带 `op`,追加项记 `added`(这次新增的那段)而不是整段新值,便于撤销,11-18 开发中定)。撤销沿用项目服务现有的 `form/del-form-field-values`(把字段置为无效,`form.service.ts:1685-1699`);控制台有没有入口要深护确认。提醒的撤销用项目服务运营后台的 AI 提醒删除(`ai-notify.service.ts:221`)。
 
 ### 3.5 放行清单与禁用清单
 
@@ -412,7 +432,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 2. **通知同事**:按员工绑定判断走 pad 还是 pc(与到点提醒同口径,`send-notify.processor.ts:50-82`),目标取绑定行上的转人工配置,兜底规则与现在一致(§1.5)。目标是内部同事 / 内部群,所以**和现在 dk 的转人工一样,不写 AI 标记、不过人工接管检查**。
    - **pad**:用 MCP 现有的 pad 文字发送,发给转人工目标(同事 pad id,或内部群)。
    - **pc(已定 11-17)**:照数字人服务的 `enqueueReferral`(`pc-send-task.service.ts:190-225`)往 `t_project_cpwx_pc_send_task` 插 referral 任务 —— 同样用 `PcReferralResolver.pickTargets(项目, 同事 userid 列表, 群 chat_id)` 的规则选目标(`pc-referral.resolver.ts:43`),字段照搬:`task_id = referral_<uuid>:<sha1(目标)前 16 位>`、`customer_external_userid = ''`、`referral_userid`、`room_chat_id`、`texts`、`task_kind = referral`。领取时的行为(不过接管检查、不写 AI 标记、30 分钟过期、最后发放、领取时再解析同事 / 群名)全部留在数字人服务,MCP 不碰。这是 MCP 与数字人服务之间的跨服务约定,两边要有契约测试。**不走** MCP 现有 pc 发送用的 `t_machine_task`:它的收件人只能是外部联系人或群,发不了给内部同事的私聊,而且领取时会写 AI 已发标记(§1.4)。转人工状态照现在标:pad 私聊把本批客户消息标 `referral_human_status=1`(从 `source_message_ids` 取 `msg_app_info`);dk 没有状态列,referral 任务本身就是记录。
-3. **本轮不回**:`this_turn=silent` 且**不是急症**时,写现有的临时接管标志 `HUMAN_HAS_ANSWERED_{项目}_{员工}[_{群}]_{客户}`(存活 600 秒),写在数字人服务的缓存库(`CACHE_REDIS_DB_INDEX`,代码默认 0;不是提醒队列库,§9.12)。两通道的发送前检查本来就查这个键(§1.5),这一轮的回复即使生成了也会被拦下。客户再开口时这个键会被自动删掉,下一轮 AI 恢复回复。键里的 id 拼法是跨服务约定,pad 用 pad id、dk 用企微明文 id(§3.3),必须逐字一致。只写客户级的键,不写群级键(群级会挡住群里其他客户)。
+3. **本轮不回**:`this_turn=silent` 且**不是急症**时,写现有的临时接管标志 `HUMAN_HAS_ANSWERED_{项目}_{员工}[_{群}]_{客户}`(存活 600 秒),写在数字人服务的缓存库(`CACHE_REDIS_DB_INDEX`,**生产是库 1**,用户 11-18 确认;代码默认 0 不是生产值;不是提醒队列库,§9.12)。两通道的发送前检查本来就查这个键(§1.5),这一轮的回复即使生成了也会被拦下。客户再开口时这个键会被自动删掉,下一轮 AI 恢复回复。键里的 id 拼法是跨服务约定,pad 用 pad id、dk 用企微明文 id(§3.3),必须逐字一致。只写客户级的键,不写群级键(群级会挡住群里其他客户)。
 4. **之后不回**:`afterwards=stop` 时,把当前对话的 AI 开关 `is_enabled_agent_reply` 置 0:私聊改 `t_project_customer_cpwx_relation` 那一行,群里改 `t_project_cpwx_group_member` 里**这位客户**那一行。数字人服务调用前本来就查它(`invoke-agent.processor.ts:479-538`),之后这位客户在这个对话里的消息不再调智能体。两张表按企微明文 id 查(员工 `cpwx_userid`、客户 `cpwx_external_userid`、群 `chat_id`);pad 通道绑定的是 pad id,要换算 —— **v1 定为 MCP 自己反查**(按员工、客户、群查 `t_project_customer_cpwx_relation` / 群成员表等),不新增 inputs;查不到(如群里未建档的发言人)就**不动开关**,记告警日志,通知同事照常发。
 5. **返回**:告诉模型本轮怎么做 —— `reply`:「本轮只回一句稳住的话(如『我确认一下,稍后回复您』),不回答交出去的问题,不要说已转人工」;`silent`:「本轮不用写回复,输出空」。
 
@@ -470,7 +490,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | M2 | 未预料异常不回原文 | `mcp-error.ts:32-44` 改成固定文案 + `request_id`;详情只进服务端日志,日志里不打客户姓名、聊天正文 |
 | M3 | 按 `inputSchema` 校验入参 | 在 `mcp-server.service.ts:102` 前统一用 ajv 校验(含 `required`、类型、`format`),不合格回 42200。新工具必须有;旧工具建议一起上(对 Dify 有行为变化,并行期可先只对新工具开) |
 | M4 | 日期参数容错 + 改说明 | `form_get_latest_field_values` / `form_list_owner_submissions`:`start/end_submit_time` 接受 `YYYY-MM-DD`,也接受带时分秒或 ISO(只取北京日期),其它格式回 42200;结束日晚于今天时裁到今天(9.10 ⑤);说明里「服务器本地时区」改成「北京时间」 |
-| M5 | `form_save_customer_values` | 5.2;含三种模式、规则(累积字段编码写死)、按来源消息去重(存来源消息 id)、改口、操作日志 |
+| M5 | `form_save_customer_values` | 5.2;含三种模式、规则(~~累积字段编码写死~~ 文字栏目的 `op` 规则,3.4,11-18 开发中定)、按来源消息去重(存来源消息 id)、改口、操作日志 |
 | M6 | `reminder_create` / `reminder_list` / `reminder_delete` | 5.3–5.5;注册 `send-notify-queue`(显式库号) |
 | M7 | `health_plan_get_brief` | 5.6;移植 `queryCustomerHealthPlanMd` 为纯文本 |
 | M8 | `profile_get_brief` | 5.7;v1 就做(11-17 定),含现有提醒一段 |
@@ -509,7 +529,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | 40100 | auth | key 不在白名单(建连时) | — |
 | 40300 | permission | 表单不在可写清单;(加固后)该 key 不允许此工具或项目 | 不要重试,换别的说法回复客户 |
 | 40400 | not_found | 客户未建档(`customer_code` / `owner_code` 为空,或加固后不属于该项目) | 不要再调写入工具 |
-| 42200 | validation | 参数不合法、字段全部被拒、时间不合法;配置钉死的固定值不在允许值里(`invalid_fixed_value`) | 按 `context.details` 改一次;固定值错误模型改不了,如实回复、不重试 |
+| 42200 | validation | 参数不合法、字段全部被拒、时间不合法;配置钉死的固定值不在允许值里(`invalid_fixed_value`);文字栏目已有内容、一个都没写成且没说明追加还是替换(`context.reason = op_required`,11-18 开发中定,5.2) | 按 `context.details` 改一次;固定值错误模型改不了,如实回复、不重试;`op_required` 看 `context.skipped` 里的现有内容后带 `op` 再调,不跟客户说保存失败 |
 | 9999 | internal | 未预料异常(只回固定文案 + `request_id`) | 最多重试 1 次 |
 
 不设按客户的调用 / 写入上限,没有限流错误码(11-17 定)。
@@ -517,7 +537,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 ### 5.2 `form_save_customer_values`(新增,写)
 
 - **用途**:把当前客户本人明确给出的数据写进档案或健康记录表单。
-- **说明文字**(给模型,原样用):「[保存客户健康数据或档案] 把当前客户本人在对话里明确给出的数据写进表单:改个人档案(form_customer_basic_info),上报血糖、血压、体重、饮食、运动、睡眠等日常记录,保存化验单 / 体检报告里的指标(form_analysis_report)。客户是谁由系统决定,你只填表单和字段。只写客户本人的、有具体数值或内容的数据;别人的数据、假设性提问、你自己推测或建议的内容都不写。表单要求的情境(如血糖的测量时段、饮食的餐次、测量时间)先按消息时间和上下文推断,真推不出来再问客户。同一条消息里说了两遍同样的量,合成一条写,或分别带上时间。写之前先用 form_get_field_detail 查字段编码和选项。写成功了什么、跳过了什么,以返回的 saved / skipped 为准。本工具不设提醒、不改用药方案、不改健康方案。」
+- **说明文字**(给模型,原样用;「改档案或改口时……不要用 append。」一段是 11-18 开发中加的):「[保存客户健康数据或档案] 把当前客户本人在对话里明确给出的数据写进表单:改个人档案(form_customer_basic_info),上报血糖、血压、体重、饮食、运动、睡眠等日常记录,保存化验单 / 体检报告里的指标(form_analysis_report)。客户是谁由系统决定,你只填表单和字段。只写客户本人的、有具体数值或内容的数据;别人的数据、假设性提问、你自己推测或建议的内容都不写。表单要求的情境(如血糖的测量时段、饮食的餐次、测量时间)先按消息时间和上下文推断,真推不出来再问客户。同一条消息里说了两遍同样的量,合成一条写,或分别带上时间。写之前先用 form_get_field_detail 查字段编码和选项。改档案或改口时,文字类栏目已有内容必须说明追加还是替换:用药、过敏、病史这类会越攒越多的内容用 op=append;信息变了(搬家、停药、痊愈、原来记错)用 op=replace 并写 reason(会换掉整栏内容);没说明的不写,返回 op_required 和现有内容 existing_value(在 skipped 里,一个都没写成时在报错的 context.skipped 里),看了再决定。上报类表单每次新建一条记录,默认不填 op;如果这次内容是在已有清单上新增(比如又多了一种过敏),传 op=append,系统会把之前的内容带上;每次单独记的内容(饮食、运动等)不要用 append。写成功了什么、跳过了什么,以返回的 saved / skipped 为准。本工具不设提醒、不改用药方案、不改健康方案。」
 
 **入参**
 
@@ -533,7 +553,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | `measured_at` | string | 否 | 模型 | 数据对应的时间(北京时间);日常上报用作提交时间,缺省为当前时间 |
 | `amend_submission_code` | string | 否 | 模型 | 改口:覆盖本工具当天返回过的那条提交 |
 
-`fields[]`:`field_code`(string,必填);`value`(string,必填,数字也写成字符串);`display_value`(string,可选,Select 由服务端按选项回填);`op`(`set` / `append` / `replace`,可选,累积字段默认 `append`、其它默认 `set`);`reason`(string,`op=replace` 用于累积字段或受保护字段时必填)。
+`fields[]`:`field_code`(string,必填);`value`(string,必填,数字也写成字符串;实现也收 number,11-18 核代码);`display_value`(string,可选,Select 由服务端按选项回填);`op`(`set` / `append` / `replace`,可选;~~累积字段默认 `append`~~ 不传按 `set`,档案 / 改口时文字栏目已有内容必须传 `append` 或 `replace`,上报类表单只在已有清单上新增时传 `append`,数字、日期、选项类栏目不用填,3.4,11-18 开发中定);`reason`(string,`op=replace` 换掉已有内容(含出生日期)时必填)。
 
 **返回**
 
@@ -543,16 +563,20 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | `submission_code` | string / null | `unchanged` 时为 null |
 | `form_code`、`form_name` | string | |
 | `mode` | `profile` / `report` / `lab_monthly` | |
-| `saved` | `{field_code, field_name, value, display_value, op}[]` | 实际写入的(累积字段给合并后的全文) |
-| `skipped` | `{field_code, reason}[]` | `reason` 枚举:`not_in_form` `calculated_field` `forbidden_field` `protected_field` `invalid_option` `invalid_number` `empty_value` `negation_ignored` `unchanged` `too_long` |
+| `saved` | `{field_code, field_name, value, display_value, op}[]` | 实际写入的。~~累积字段给合并后的全文~~ `op=append` 时 `value` / `display_value` 过长只给末尾(含这次新增的部分),开头注明「(前面还有 N 字)」;库里写的是全文(11-18 开发中定) |
+| `skipped` | `{field_code, reason, existing_value?}[]` | `reason` 枚举共 13 个:`not_in_form` `calculated_field` `forbidden_field` `protected_field` `invalid_option` `invalid_number` `empty_value` `negation_ignored` `unchanged` `too_long` `invalid_datetime` `duplicate_field` `op_required`(后三个是 11-18 开发中加的)。`existing_value` 可选,只有 `op_required` 时才有:栏目现有内容,过长只保留末尾(最新的记录),开头注明「(前面还有 N 字)」 |
 | `dropped_over_limit` | string[] | 超过 70 被丢弃的 `field_code` |
 | `request_id`、`server_now` | string | |
 
 **其它规格**
 
-- 错误:40400(未建档)、40300(表单不可写)、42200(全部字段被拒 / 化验单无指标 / `measured_at` 不合法 / `amend_submission_code` 不合法)、9999。
-- 幂等:见 3.4「去重」(按来源消息)。`duplicate` 返回首次写入的结果(`status` 改为 `duplicate`)。
-- 不设按客户的次数上限(11-17 定)。单值 ≤ 500 字;`field_value` 列在 model 里是 `STRING`(`TProjectFormSubmissionDetail.ts:37`),长度要按真实表结构核对后再定上限(推断:可能是 255)。
+- 错误:40400(未建档)、40300(表单不可写)、42200(全部字段被拒 / 化验单无指标 / `measured_at` 不合法 / `amend_submission_code` 不合法 / 一个都没写成且有 `op_required`)、9999。
+- **`op_required` 的返回(11-18 开发中定)**:模型给的字段一个都没写成、里面有 `op_required` → 42200,`context = {reason: 'op_required', skipped}`,`skipped` 每条带 `existing_value`;hint 让模型看了现有内容后带上 `op` 再调一次,不要跟客户说「保存失败」。这时整次调用返回 `op_required`,不返回 `unchanged`。写成了一部分 → 正常返回,`op_required` 放在 `skipped` 里。
+- **长文字的长度预算(11-18 开发中定)**:现有内容预览(`existing_value`)和追加结果这两类长文字合计不超过 3000 字,每段不超过 300 字(追加的 `value`、`display_value` 各算一段;段数多时平均分),保证整个返回 ≤ 8000 字(6.5)。
+- 幂等:见 3.4「去重」(按来源消息)。`duplicate` 返回首次写入的结果(`status` 改为 `duplicate`)。判重来源记录里存的结果不含 `existing_value`,`saved` 也只存截断后的;判重用的内容按模型给的值归一化,不看现有值、不含 `op`(11-18 开发中定)。
+- 不设按客户的次数上限(11-17 定)。模型给的单个值 ≤ 500 字;~~`field_value` 列……推断:可能是 255~~ `field_value` / `display_value` 实际是 TEXT(65535 字节),追加后超过就跳过、原因 `too_long`(11-18 核表结构与代码)。
+- **上报 + 追加 + 倒填 `measured_at`(11-18 开发中定)**:提交和其它明细行照旧用 `measured_at`;只有追加那一行的明细时间记成现在,保证它是这个字段的最新值(最新值按明细行时间取,否则下次追加会接在更早的旧值上)。
+- **操作日志**:每项带 `op`;追加项记 `added`(这次新增的那段),不记整段新值(3.4 末,11-18 开发中定)。
 - 权限:两条通道都可用(3.9)。
 - 写库:事务内写提交和明细 + 操作日志;`submitter_code` = 绑定的员工编号(控制台怎么展示要深护核对);`created_by` = 默认用户。
 
@@ -591,7 +615,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 
 ### 5.3 `reminder_create`(新增,写)
 
-- **说明文字**:「[给客户设定时提醒] 让健管师的企微账号在指定时间给当前客户发一条文字提醒,可以单次,也可以按小时 / 天 / 周 / 月 / 年循环(最长 30 天)。客户说『X 点提醒我……』『每天提醒我吃药 / 测血糖 / 喝水 / 运动 / 复诊』都用本工具。它只发提醒消息,不会创建或修改用药方案。时间用北京时间;『X 分钟后』用 delay_minutes。默认比事件时间提前 10 分钟发,客户要准点就把 advance_minutes 设 0。只有返回里 status 为 created 或 duplicate 的条目才算设好,告诉客户时用返回的 first_send_at;rejected 的照 reason 如实告诉客户。」
+- **说明文字**(「循环提醒最长……如实告诉客户。」一句 11-18 开发中改):「[给客户设定时提醒] 让健管师的企微账号在指定时间给当前客户发一条文字提醒,可以单次,也可以按小时 / 天 / 周 / 月 / 年循环。循环提醒最长从首次发送起 30 天,截止到这 30 天内的最后一次发送;截止前只排得下一次的,按单次存并返回 repeat=once,以返回值为准如实告诉客户。客户说『X 点提醒我……』『每天提醒我吃药 / 测血糖 / 喝水 / 运动 / 复诊』都用本工具。它只发提醒消息,不会创建或修改用药方案。时间用北京时间;『X 分钟后』用 delay_minutes。默认比事件时间提前 10 分钟发,客户要准点就把 advance_minutes 设 0。只有返回里 status 为 created 或 duplicate 的条目才算设好,告诉客户时用返回的 first_send_at;rejected 的照 reason 如实告诉客户。」
 
 **入参**:绑定 `project_code`、`customer_code`(可为空串)、`customer_pad_userid`、`employee_code`、`employee_pad_userid`、`room_conversation_id`;模型填 `reminders`(1..5):
 
@@ -603,18 +627,20 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | `advance_minutes` | integer 0..1440 | 否 | 默认 10 |
 | `repeat` | `once` / `hour` / `day` / `week` / `month` / `year` | 否 | 默认 `once`;不支持按分钟 |
 | `repeat_interval` | integer 1..30 | 否 | 默认 1 |
-| `repeat_until` | string | 否 | 服务端截到「首次发送 + 30 天」 |
+| `repeat_until` | string | 否 | 给模型的参数说明(11-18 开发中改):「循环截止(北京时间;只给日期取当天结束);最长从首次发送起 30 天,实际截止在 30 天内的最后一次发送;早于首次发送会被拒(time_out_of_range)」 |
 
 **服务端规则**
 
 - 首次发送 = `event_time − advance_minutes`,或 `now + delay_minutes`。若提前后已过去、但事件时间还没到,改为按事件时间准点发,标 `advance_adjusted`。
 - 首次发送必须在 [now + 1 分钟, now + 366 天] 内,否则 `rejected: time_out_of_range`。
-- 循环提醒的 `end_time` 默认且最长为首次发送 + 30 天。
+- 循环提醒的 `end_time`(返回里的 `repeat_until`)= **首次发送起 30 天内的最后一次发送**(含第 30 天那一刻;客户给了更早的截止就算到截止),不是首次发送 + 30 天这个时刻 —— 数字人服务到点先发再判截止,截止不落在某次发送上就会多发一次。截止前只排得下一次时,按单次存,返回也是 `repeat=once`(11-18 开发中定;下一次正好落在「首次 + 30 天」那一刻也算排得下,所以每月提醒是不是单次要看首次在哪天,不要按循环类型预判)。客户给的 `repeat_until` 早于首次发送 → `rejected: time_out_of_range`(11-18 核代码)。
 - 写 `t_project_ai_notify`(`trigger_time` / `end_time` 存北京墙钟)→ 投 `send-notify-queue`(延迟按东八区算)→ 回写 `job_id`。投递失败就删掉刚写的表行,该条返回 `rejected: queue_unavailable`。
+- **同时写新列 `advance_minutes`(INT NULL,11-18 开发中定)**:记实际提前了几分钟,事件原时间 `event_time = trigger_time + advance_minutes`,给 5.4 / 5.7 算回事件时间用。按 `event_time` 建的写实际用的提前量;提前后已过去、改成准点发的(`advance_adjusted`)写 0;按 `delay_minutes` 建的写 0;NULL = Dify 时期的旧行(事件时间未知)。DDL 在 db-design SQL 06(同一个文件里补的列)。项目服务运营后台改提醒时间(`updateAiNotify` 改了 `trigger_time`)会把这一列清成 NULL —— 发送时间变了,这个差值就不成立了(项目服务设计文档 wecom-chat.md 决定 D-18)。
+- **拒绝原因**:`time_out_of_range`、`queue_unavailable`,外加 11-18 开发中补的 `invalid_time`(`event_time` / `delay_minutes` 两个都给或都没给、时间或 `repeat_until` 解析不了)、`invalid_content`(去掉 Markdown 后不足 2 个字)。
 
-**返回**:`results[]`,每项含 `index`、`status`(`created` / `duplicate` / `rejected`)、`notify_code`、`short_code`(如 `R3`,5.4)、`content`、`first_send_at`、`first_send_weekday`(如「周三」,模型回复写「11 月 18 日 周三」客户能当场核对,9.10 ⑥)、`repeat`、`repeat_interval`、`repeat_until`、`reason`、`advance_adjusted`;外加 `server_now`、`request_id`。全部 `rejected` 时 `isError=true`、42200,`context` 里带每条的原因。
+**返回**:`results[]`,每项含 `index`、`status`(`created` / `duplicate` / `rejected`)、`notify_code`、`short_code`(如 `R3`,5.4)、`content`、`first_send_at`、`first_send_weekday`(如「周三」,模型回复写「11 月 18 日 周三」客户能当场核对,9.10 ⑥)、`repeat`、`repeat_interval`、`repeat_until`、`reason`(`time_out_of_range` / `invalid_time` / `invalid_content` / `queue_unavailable`)、`advance_adjusted`;外加 `server_now`、`request_id`。全部 `rejected` 时 `isError=true`、42200,`context` 里带每条的原因。
 
-- 幂等:同一 `customer_pad_userid` + 同一 `room_conversation_id` + 同一首次发送时间 + 同循环方式 + 规范化后的同内容,且该提醒仍生效 → `duplicate`,返回已有编号(同一时刻的同一句提醒设两条没有意义,所以这里不需要来源消息)。
+- 幂等:同一 `customer_pad_userid` + 同一 `room_conversation_id` + ~~同一首次发送时间~~ 同一个事件(按 `event_time` 建的:库里那条的 `trigger_time + advance_minutes` 等于这次的事件时间,这样提前量窗口过去后重跑、变成准点发也认得出;按 `delay_minutes` 建的:首次发送前后 5 分钟内)+ 同循环方式 + 规范化后的同内容,且该提醒仍生效 → `duplicate`,返回已有编号(同一时刻的同一句提醒设两条没有意义,所以这里不需要来源消息;判法 11-18 按代码核对改)。
 - 不设按客户的条数上限(11-17 定);一次调用最多 5 条(参数上限)。按小时循环同样最长 30 天(沿用 Dify,11-17 定)。
 
 示例:
@@ -632,9 +658,10 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 
 ### 5.4 `reminder_list`(新增,读)
 
-- **说明文字**:「[查看客户的提醒] 列出当前客户还会发出的提醒,包括短编号(如 R1)、提醒语、事件原时间、下次发送时间、循环方式。客户问『我设了哪些提醒』,或要取消提醒前,先调本工具拿短编号。列表里的发送时间已经减去提前量,客户说的通常是事件时间。只能看到当前客户自己的提醒。」
+- **说明文字**:「[查看客户的提醒] 列出当前客户还会发出的提醒,包括短编号(如 R1)、提醒语、事件原时间、下次发送时间、循环方式。客户问『我设了哪些提醒』,或要取消提醒前,先调本工具拿短编号。列表里的发送时间已经减去提前量,客户说的通常是事件时间;旧提醒没有事件原时间,只能按发送时间说。只能看到当前客户自己的提醒。」(「旧提醒没有事件原时间……」一句 11-18 加,与 5.3 的 `advance_minutes` 配套)
 - **入参**:绑定 `project_code`、`customer_pad_userid`、`room_conversation_id`;模型可选 `scope`(`all` / `this_chat`,默认 `all`)。
 - **返回**:`reminders[]`,每项含 `short_code`、`notify_code`、`content`、`event_time`(事件原时间)、`next_send_at`、`repeat`、`repeat_interval`、`repeat_until`、`chat`(`private` / `this_group` / `other_group`);另有 `total`、`server_now`。最多 50 条,按下次发送时间升序。
+- **`event_time` 怎么来(11-18 开发中定)**:表里只有已经减过提前量的 `trigger_time`,所以按提醒表新列 `advance_minutes` 算回:`event_time = next_send_at + advance_minutes`(循环提醒按下一次发送算)。`advance_minutes` 为 NULL(Dify 时期的旧行,或运营后台改过发送时间的行,5.3)→ `event_time` 返回 null。
 - **短编号**(9.10 ①,已定):服务端按客户分配(`R1`、`R2`…),存在提醒表新加的一列,删掉后不复用;Dify 时期的旧提醒第一次被列出时补发。原始 `notify_code` 是 `notify_` + uuid(`agent-callback.service.ts:189`),模型手抄必错,所以模型只用短编号。
 - **过滤口径**与现有接口一致:未删除、未结束、下次发送时间未过(`ai-notify.service.ts:38-64`)。Dify 时期建的提醒同样能查到,因为键都是 `customer_pad_userid`。
 
@@ -667,7 +694,7 @@ Dify 还直接调了项目服务:自定义工具「表单查询接口」(GetForm
 | `basic_info` | `{text, updated_at}`;`form_customer_basic_info` 各字段最新值,「字段名:值 单位」一行一个,空值省略 |
 | `health_plan` | `{found, text, truncated}`;同 5.6,但 ≤ 3000 字 |
 | `today_food_log` | `{text, count}`;今天(北京)`form_food_log` 的记录 |
-| `reminders` | `{items, total}`;同 5.4 的口径和字段(短编号、提醒语、事件原时间、下次发送时间、循环、截止),最多 20 条,多了注明总数 |
+| `reminders` | `{items, total}`;同 5.4 的口径和字段(短编号、提醒语、事件原时间、下次发送时间、循环、截止),最多 20 条,多了注明总数;事件原时间同样按 `advance_minutes` 算回,NULL 的旧行给 null(11-18 开发中定) |
 | `writable_forms` | `{form_code, form_name, description}[]`;可写表单清单(情境字段由模型读字段说明自己认,3.4) |
 | `server_now` | |
 
@@ -852,7 +879,7 @@ spec:
 
 **6.10 队列库号对不上。** MCP 投的 job 进了另一个 Redis 库,消费端永远看不到,提醒静默不发。对策:MCP 读和项目服务同一个配置项;7 节用例 10 真等一次到点发送;上线前用 Redis 看 `bull:send-notify-queue:delayed` 有没有这条 job。
 
-**6.11 字段值长度。** 累积字段越追加越长,化验总结也长。写前按真实列长度截断,原因记 `too_long`(推断:列可能是 255,要核表结构)。
+**6.11 字段值长度。** 文字栏目越追加越长,化验总结也长。~~写前按真实列长度截断……推断:列可能是 255~~ **已核(11-18)**:`field_value` / `display_value` 是 TEXT(65535 字节),不是此前推断的 255;模型给的单个值上限 500 字,超了跳过 `too_long`;追加后超过 65535 字节也跳过 `too_long`,不截断。返回给模型的追加结果和现有值只给末尾(5.2 长度预算)。
 
 **6.12 附件链接变量。** 平台对 URL 形态的 inputs 有「渲染成本地路径 / 预拉进沙箱」的处理(B-67,`prompt_render.py:195-210`)。`attachment_urls` 只给工具用、不出现在提示词正文里;按 01 §3.3.2 / 06 §5.1 的做法传 JSON 数组,数组里的裸链接平台不预下载(`inputs_doc.py:317-352`,读代码确认),所以不会被预拉进沙箱。
 
@@ -884,7 +911,7 @@ spec:
 | 5 | 调 runs 不带 `customer_code` | HTTP 返回 | 422 `missing required input` | run 起来了,工具收到空身份 |
 | 6 | 生产 MCP 用随机 key 建连 | HTTP 返回 | 40100 | 任意 key 都能连上并调全部工具 |
 | 7 | ① 「早上空腹血糖 7.2」跑一轮;再用**同一批 id 加一条新消息**跑一轮(模拟打断合并重跑)。② 10:00、15:00 两条**不同消息**各发「喝了 300ml 水」 | 返回 `status`;表单提交表;记录上的来源消息 id | ① 第二次 `duplicate`,只有一条血糖提交;② 两条饮水记录都在 | ① 两条一样的血糖记录;② 第二次被误当重复、少记一次 |
-| 8 | 「我叫王小明」;「我现在还在吃 X 药」(档案里已有 Y 药);「我没有过敏」(档案里已有过敏源) | 返回 `skipped` / `saved`;客户主表 `real_name`;档案最新值 | 姓名跳过(`forbidden_field`)、主表不变;用药变成「Y;X(日期)」;过敏源不被清空(`negation_ignored`) | 主表姓名被昵称覆盖;用药被替换;过敏源清空 |
+| 8 | 「我叫王小明」;「我现在还在吃 X 药」(档案里已有 Y 药);「我没有过敏」(档案里已有过敏源) | 返回 `skipped` / `saved`;客户主表 `real_name`;档案最新值 | 姓名跳过(`forbidden_field`)、主表不变;用药变成「Y;X(日期)」(模型带 `op=append`;没带时先收到 `op_required` 和现有值,再带上 `op` 重调,回复里不说保存失败,11-18 开发中定);过敏源不被清空(`negation_ignored`) | 主表姓名被昵称覆盖;用药被替换;过敏源清空 |
 | 9 | 同月先后发两张化验单;下月再发一张;一张超过 70 项的 | 返回 `status`、`dropped_over_limit`;化验单提交表 | 前两张合成 1 条(`merged`),附件两张都在且不重复;下月新建;超出的列在 `dropped_over_limit` | 同月多条、附件丢失,或写入失败 |
 | 10 | 「明天早上 8 点提醒我测血糖」;「每天提醒我吃药」 | 返回;提醒表;Redis delayed 队列;到点时客户企微 | 返回 `created` + `notify_code` + `first_send_at=07:50+08:00`;表里有行、队列里有 job、到点真发出;吃药提醒走的是 `reminder_create` 而不是用药工具 | 回复说设好了但到点没发(库号不对 / 时区偏) |
 | 11 | 「昨天 8 点提醒我」(过去时间) | 返回 | `rejected: time_out_of_range`,回复如实说没设上 | 模型照样说「设好了」 |
@@ -933,7 +960,7 @@ spec:
 | Expert Work 平台代码 | 固定值下拉 + 保存时校验(§4.1) | 1 |
 | 否决项对照 | 主回复走 MCP 发(§3.11) | 不做;做的话约 +5 |
 
-素材表的建表与 41 条初始化 SQL 在 `deep-ai-health-db-design/1.5.7/project_tables/leyi/`(`2026-11-17-b314-*`) 的 `08`、`09` 两个文件,由用户在各环境执行,见 05;业务方按素材 id 查库、按类型发见 02(0.5–1 人日,计入 02)。
+素材表的建表与 41 条初始化 SQL 在 `deep-ai-health-db-design/1.5.8/project_tables/leyi/`(`2026-11-17-b314-*`;11-18 从 1.5.7 挪过来)的 `08`、`09` 两个文件,由用户在各环境执行,见 05;业务方按素材 id 查库、按类型发见 02(0.5–1 人日,计入 02)。
 
 ## 9. 待拍板
 
@@ -982,7 +1009,7 @@ spec:
 
 **9.12 Redis 库号(11-17 已核)**:
 - **提醒队列**:生产数字人服务 `QUEUE_REDIS_DB_INDEX = 15`(用户 11-17 查生产配置确认;代码默认 14 未生效)。**测试环境的库号还没核实**,上测试前按测试环境配置核一次。MCP 投提醒按 15 连(与项目服务 `ai-notify` 一致,`ai-notify.const.ts:10-12`)。
-- **临时接管标志**:不在队列库,在数字人服务的缓存库(`CACHE_REDIS_DB_INDEX`,`src/config/redis.ts:18`,代码默认 0;`app.module.ts:89`),pad 同步 / dk 存档与它同库(`human-answered.service.ts:44`)。只在转人工配成「本轮不回」时才写;健管师默认是「本轮回复」(11-17),所以默认用不到。将来要配成本轮不回之前,先按生产配置核这个库号;写错库,`silent` 会悄悄失效(6.17)。
+- **临时接管标志**:不在队列库,在数字人服务的缓存库(`CACHE_REDIS_DB_INDEX`,`src/config/redis.ts:18`;`app.module.ts:89`),pad 同步 / dk 存档与它同库(`human-answered.service.ts:44`)。**生产是库 1**(用户 11-18 确认 `CACHE_REDIS_DB_INDEX=1`);此前写的「库 0」是代码默认值,不是生产值。深护 MCP 按 1 连(`CACHE_REDIS_DB_INDEX`,默认值也设成 1)。测试环境的库号上测试前核一次。只在转人工配成「本轮不回」时才写;健管师默认是「本轮回复」(11-17),所以默认用不到;写错库,`silent` 会悄悄失效(6.17)。
 
 **9.13 AI 开关被关掉后,谁、在哪重新打开(实现前必须确认)**:读代码在项目服务找到两个接口(私聊、群成员各一个,§1.5),但员工端有没有入口在用没核实。推荐:深护确认员工后台有按钮;没有就补一个,随 M13 一起上。没有入口时不要启用 `afterwards=stop`。
 
@@ -1009,6 +1036,7 @@ spec:
 - `src/ir/confirm-token-store.ts`:未被任何工具使用。
 - `src/models/TOpenApiIdempotency.ts`(`uk_idem`)、`src/models/TProjectAiNotify.ts`、`src/models/TProjectFormSubmission(Detail).ts`、`src/models/TProjectOperationLog.ts`。
 - 工具数 45:各 `*.tool-provider.ts` 的 `name:` 计数。
+- 11-18 开发中定的各项按深护 MCP `c2cdcfe`(dev)核对:`src/modules/form-write/field-rules.ts`(文字栏目、`op` 规则、预览截断)、`form-write.const.ts`(13 个跳过原因、500 字 / 65535 字节 / 300 / 3000 字)、`form-write.service.ts`(42200 `op_required`、判重内容、追加行时间、操作日志 `added`)、`form-write.tool.ts`(说明文字);`src/modules/reminder/reminder-schedule.ts`、`reminder-write.service.ts`、`reminder-query.service.ts`(`advance_minutes`、拒绝原因、`repeat_until`、判重);`src/modules/reminder/reminder.tool.ts`(5.3 的说明文字和 `repeat_until` 参数说明;新文字已合进 dev `652b735`);`src/config/redis.ts:17-20`(缓存库默认 1)。项目服务 `ai-notify.service.ts:196-200`(改发送时间清 `advance_minutes`;项目服务设计文档 wecom-chat.md 决定 D-18)。
 
 **数字人服务**(`8dc5f3f`,确认)
 - `src/modules/agent-callback/agent-callback.controller.ts:43、54、65`;`src/modules/agent-callback-dk/agent-callback-dk.controller.ts:34、45、56`;`src/modules/ai-notify/ai-notify.controller.ts:42、53`;`src/modules/message/message.controller.ts:42`。

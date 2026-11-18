@@ -318,10 +318,10 @@
 ### 5.3 MCP 未预料异常的返回(S7,写新工具时顺手做)
 
 ```json
-{ "code": 9999, "category": "internal", "message": "服务暂时出错,请稍后再试", "error_id": "<随机编号>" }
+{ "code": 9999, "category": "internal", "message": "服务暂时出错,请稍后再试", "request_id": "<本次请求编号>" }
 ```
 
-服务端日志:`error_id` + 工具名 + 错误原文(不含客户数据)。
+字段名是 `request_id`,不是此前写的 `error_id`(11-18 按 MCP 代码 `src/mcp/mcp-error.ts` 核对;与 04 §5.1 一致)。服务端日志:`request_id` + 工具名 + 错误原文(不含客户数据)。
 
 ### 5.4 迁移代码的开发约定(11-17 定:规矩,不单列任务)
 
