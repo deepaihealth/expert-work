@@ -31,12 +31,14 @@ import { App, Alert, Button, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import {
+  hasOutputSchema,
   readOutputJsonSchema,
   readOutputSchemaStrict,
   readOutputSchemaTree,
   setOutputSchemaTree,
 } from "../form_model";
 import {
+  matchFieldUids,
   newSchemaField,
   newSchemaNode,
   pruneInvalidFields,
@@ -64,22 +66,42 @@ interface OutputSchemaEditorProps {
   onChange: (data: unknown) => void;
 }
 
-// Local tree + collapse state, and the commit / resync logic (module doc).
+// Collapse keys are ``uid`` or ``uid/items[/items…]``; carry them to the new uids.
+function remapCollapsed(keys: ReadonlySet<string>, uids: Map<string, string>): ReadonlySet<string> {
+  const out = new Set<string>();
+  for (const key of keys) {
+    const [uid, ...rest] = key.split("/");
+    const mapped = uids.get(uid);
+    if (mapped !== undefined) out.add([mapped, ...rest].join("/"));
+  }
+  return out;
+}
+
+// Local tree + collapse state + the field renamed last, and the commit /
+// resync logic (module doc). The tree is parsed once at mount and again
+// only when ``json_schema`` really changed from outside — never per render.
 function useOutputSchemaTree({ formData, onChange }: OutputSchemaEditorProps) {
   const [tree, setTree] = useState<SchemaNode | undefined>(() => readOutputSchemaTree(formData));
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  const [lastRenamedUid, setLastRenamedUid] = useState<string | undefined>(undefined);
   const lastWrittenRef = useRef<string | undefined>(snapshot(formData));
 
   useEffect(() => {
     const current = snapshot(formData);
     if (current === lastWrittenRef.current) return;
     lastWrittenRef.current = current;
-    setTree(readOutputSchemaTree(formData));
+    const next = readOutputSchemaTree(formData);
+    // Keep fields collapsed when they're still at the same name path.
+    setCollapsed((prev) => (tree && next ? remapCollapsed(prev, matchFieldUids(tree, next)) : new Set()));
+    setLastRenamedUid(undefined);
+    setTree(next);
   }, [formData]);
 
-  const commit = (next: SchemaNode): void => {
+  const commit = (next: SchemaNode, renamedUid?: string): void => {
+    const lastRenamed = renamedUid ?? lastRenamedUid;
+    if (renamedUid !== undefined) setLastRenamedUid(renamedUid);
     setTree(next);
-    const written = setOutputSchemaTree(formData, pruneInvalidFields(next));
+    const written = setOutputSchemaTree(formData, pruneInvalidFields(next, lastRenamed));
     lastWrittenRef.current = snapshot(written);
     onChange(written);
   };
@@ -92,7 +114,7 @@ function useOutputSchemaTree({ formData, onChange }: OutputSchemaEditorProps) {
       return next;
     });
 
-  return { tree, commit, collapsed, toggleCollapsed };
+  return { tree, commit, collapsed, toggleCollapsed, lastRenamedUid };
 }
 
 function TreeTable({ ctx, fields }: { ctx: TreeContext; fields: SchemaField[] }) {
@@ -120,13 +142,33 @@ function TreeTable({ ctx, fields }: { ctx: TreeContext; fields: SchemaField[] })
   );
 }
 
+function OnSwitch({ on, onToggle }: { on: boolean; onToggle: (checked: boolean) => void }) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+        <Switch
+          checked={on}
+          data-testid="af-output-schema-switch"
+          aria-label={t("agent_form.output_schema.on_label")}
+          onChange={onToggle}
+        />
+        <Text>{t("agent_form.output_schema.on_label")}</Text>
+      </div>
+      {!on && <Text type="secondary">{t("agent_form.output_schema.hint_off")}</Text>}
+    </>
+  );
+}
+
 export function OutputSchemaEditor({ formData, onChange }: OutputSchemaEditorProps) {
   const { t } = useTranslation();
   const { modal } = App.useApp();
-  const { tree, commit, collapsed, toggleCollapsed } = useOutputSchemaTree({ formData, onChange });
+  const { tree, commit, collapsed, toggleCollapsed, lastRenamedUid } = useOutputSchemaTree({
+    formData,
+    onChange,
+  });
 
-  const external = readOutputSchemaTree(formData);
-  const on = external !== undefined;
+  const on = hasOutputSchema(formData);
   const root = tree?.kind === "editable" ? tree : undefined;
   const fields = root?.fields ?? [];
 
@@ -138,12 +180,19 @@ export function OutputSchemaEditor({ formData, onChange }: OutputSchemaEditorPro
   };
 
   const strict = readOutputSchemaStrict(formData);
-  const ctx: TreeContext | undefined = root && { root, strict, commit, collapsed, toggleCollapsed };
+  const ctx: TreeContext | undefined = root && {
+    root,
+    strict,
+    commit,
+    collapsed,
+    toggleCollapsed,
+    lastRenamedUid,
+  };
 
   return (
     <section data-testid="af-output-schema" style={SECTION}>
       <h3 style={{ fontSize: 15, margin: "0 0 12px" }}>{t("agent_form.section_output_schema")}</h3>
-      {external?.kind === "readonly" ? (
+      {on && tree?.kind === "readonly" ? (
         <Alert
           type="info"
           showIcon
@@ -152,16 +201,7 @@ export function OutputSchemaEditor({ formData, onChange }: OutputSchemaEditorPro
         />
       ) : (
         <>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-            <Switch
-              checked={on}
-              data-testid="af-output-schema-switch"
-              aria-label={t("agent_form.output_schema.on_label")}
-              onChange={handleToggle}
-            />
-            <Text>{t("agent_form.output_schema.on_label")}</Text>
-          </div>
-          {!on && <Text type="secondary">{t("agent_form.output_schema.hint_off")}</Text>}
+          <OnSwitch on={on} onToggle={handleToggle} />
           {on && ctx && <TreeTable ctx={ctx} fields={fields} />}
         </>
       )}

@@ -1,12 +1,19 @@
 /**
- * OutputSchemaEditor — B-315 field-tree behaviour: add a sub-field, the
- * fixed "each item" row of a list, the Limits popover, type change clearing
- * limits that no longer apply, delete, a readonly node (only "required" and
- * remove; raw kept on sibling edits), renames that collide with untouched
- * siblings, collapse state following its field, external re-read, limit
- * hints,
- * kept on sibling edits), nested name checks and the strict-mode reminder.
- * Controlled harness throughout so the echo/resync path is exercised.
+ * OutputSchemaEditor — B-315 field-tree behaviour (top-level basics live in
+ * OutputSchemaEditor.test.tsx):
+ *  - structure: the fixed "each item" row, collapse, add sub-field, delete,
+ *    type change clearing limits that no longer apply, the depth-5 limit;
+ *  - Limits popover: editing limits / allowed values, hints (min > max,
+ *    rejected values, ``uniqueItems: false`` not counted), and that a mere
+ *    focus + blur never rewrites a stored value;
+ *  - readonly nodes: only "required" and remove; raw kept on sibling edits;
+ *    the depth-specific note;
+ *  - names: duplicates, renames that collide with untouched or readonly
+ *    siblings, the field renamed last yielding, a full swap;
+ *  - identity: collapse state follows its field (uids), survives an
+ *    external re-read by name path, and new uids never clash;
+ *  - the strict-mode reminder.
+ * Controlled harness unless noted, so the echo/resync path is exercised.
  */
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -388,5 +395,102 @@ describe("OutputSchemaEditor field tree", () => {
     renderControlled(withSchema(lvl(lvl(lvl(lvl(lvl({ type: "object", properties: {} })))))));
     expect(screen.getByTestId("af-output-schema-add-child-0.0.0.0")).toBeEnabled();
     expect(screen.getByTestId("af-output-schema-add-child-0.0.0.0.0")).toBeDisabled();
+  });
+
+  it("focusing and leaving a fractional integer bound changes nothing", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const schema = { type: "object", properties: { n: { type: "integer", minimum: 0.5, maximum: 2.5 } } };
+    renderControlled(withSchema(schema), onChange);
+    await user.click(screen.getByTestId("af-output-schema-limits-0"));
+    await user.click(await screen.findByTestId("af-output-schema-limit-maximum-0"));
+    await user.click(screen.getByTestId("af-output-schema-limit-minimum-0"));
+    await user.click(document.body);
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId("af-output-schema-limit-maximum-0")).toHaveValue("2.5");
+  });
+
+  it("a node past level 5 says so in its readonly note", () => {
+    const lvl = (inner: Record<string, unknown>) => ({ type: "object", properties: { n: inner } });
+    renderControlled(withSchema(lvl(lvl(lvl(lvl(lvl(lvl({ type: "string" }))))))));
+    expect(screen.getByTestId("af-output-schema-readonly-0.0.0.0.0.0")).toHaveTextContent(
+      i18n.t("agent_form.output_schema.readonly_depth"),
+    );
+  });
+
+  describe("renames: the field renamed last yields", () => {
+    const A = { type: "string", description: "A" };
+    const B = { type: "integer", description: "B" };
+
+    async function rename(user: ReturnType<typeof userEvent.setup>, path: string, name: string) {
+      const input = screen.getByTestId(`af-output-schema-name-${path}`);
+      await user.clear(input);
+      await user.type(input, name);
+    }
+
+    it("b → a, then a → c, then c back to a: the row typed last is flagged, b's row is kept", async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      renderControlled(withSchema({ type: "object", properties: { a: A, b: B } }), onChange);
+      await rename(user, "1", "a");
+      expect(screen.getByTestId("af-output-schema-name-1")).toHaveAttribute("aria-invalid", "true");
+      await rename(user, "0", "c");
+      expect(lastSchema(onChange)).toEqual({ type: "object", properties: { c: A, a: B } });
+      await rename(user, "0", "a");
+      expect(screen.getByTestId("af-output-schema-name-0")).toHaveAttribute("aria-invalid", "true");
+      expect(screen.getByTestId("af-output-schema-name-1")).toHaveAttribute("aria-invalid", "false");
+      expect(lastSchema(onChange)).toEqual({ type: "object", properties: { a: B } });
+    });
+
+    it("swapping two names ends with both fields, names exchanged", async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      renderControlled(withSchema({ type: "object", properties: { a: A, b: B } }), onChange);
+      await rename(user, "0", "b");
+      expect(screen.getByTestId("af-output-schema-name-0")).toHaveAttribute("aria-invalid", "true");
+      await rename(user, "1", "a");
+      expect(screen.getByTestId("af-output-schema-name-0")).toHaveAttribute("aria-invalid", "false");
+      expect(screen.getByTestId("af-output-schema-name-1")).toHaveAttribute("aria-invalid", "false");
+      const written = lastSchema(onChange);
+      expect(JSON.stringify(written)).toBe(JSON.stringify({ type: "object", properties: { b: A, a: B } }));
+    });
+  });
+
+  describe("identity across an external re-read (uncontrolled)", () => {
+    const list = (type: string) => ({ type: "array", items: { type } });
+    const mount = (schema: unknown) =>
+      render(
+        <App>
+          <OutputSchemaEditor formData={withSchema(schema)} onChange={vi.fn()} />
+        </App>,
+      );
+    const remount = (rerender: (ui: React.ReactElement) => void, schema: unknown) =>
+      rerender(
+        <App>
+          <OutputSchemaEditor formData={withSchema(schema)} onChange={vi.fn()} />
+        </App>,
+      );
+
+    it("a collapsed field stays collapsed when it is still at the same name path", async () => {
+      const user = userEvent.setup();
+      const { rerender } = mount({ type: "object", properties: { y: list("string") } });
+      await user.click(screen.getByTestId("af-output-schema-toggle-0"));
+      remount(rerender, { type: "object", properties: { w: list("string"), y: list("string") } });
+      expect(screen.getByTestId("af-output-schema-name-1")).toHaveValue("y");
+      expect(screen.queryByTestId("af-output-schema-row-1.items")).not.toBeInTheDocument();
+      expect(screen.getByTestId("af-output-schema-row-0.items")).toBeInTheDocument();
+    });
+
+    it("a field added after the re-read gets a uid of its own", async () => {
+      const user = userEvent.setup();
+      const { rerender } = mount({ type: "object", properties: { x: list("string") } });
+      remount(rerender, { type: "object", properties: { y: list("string"), z: { type: "string" } } });
+      await user.click(screen.getByTestId("af-output-schema-add"));
+      await user.type(screen.getByTestId("af-output-schema-name-2"), "fresh");
+      await pickType("af-output-schema-type-2", "array");
+      await user.click(screen.getByTestId("af-output-schema-toggle-2"));
+      expect(screen.queryByTestId("af-output-schema-row-2.items")).not.toBeInTheDocument();
+      expect(screen.getByTestId("af-output-schema-row-0.items")).toBeInTheDocument();
+    });
   });
 });

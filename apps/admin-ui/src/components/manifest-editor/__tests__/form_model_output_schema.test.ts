@@ -19,7 +19,9 @@ import {
   type AgentManifest,
 } from "../form_model";
 import {
+  newSchemaField,
   nodeAt,
+  updateFieldsAt,
   updateNodeAt,
   type SchemaNode,
   type SchemaPath,
@@ -177,7 +179,7 @@ describe("round-trip: read → write unchanged is identical (key order too)", ()
     };
     const root = rootOf(block);
     expect(kindAt(root, [0, 0, 0, 0, 0])).toBe("editable");
-    expect(nodeAt(root, [0, 0, 0, 0, 0, 0])).toEqual({ kind: "readonly", raw: deep });
+    expect(nodeAt(root, [0, 0, 0, 0, 0, 0])).toEqual({ kind: "readonly", raw: deep, reason: "depth" });
     expectIdentical(roundTrip(block), block);
   });
 
@@ -192,7 +194,7 @@ describe("round-trip: read → write unchanged is identical (key order too)", ()
       },
     };
     const root = rootOf(block);
-    expect(nodeAt(root, [0])).toEqual({ kind: "readonly", raw: choice });
+    expect(nodeAt(root, [0])).toEqual({ kind: "readonly", raw: choice, reason: "unsupported" });
     expect(kindAt(root, [1])).toBe("editable");
     expectIdentical(roundTrip(block), block);
   });
@@ -283,6 +285,22 @@ describe("setOutputSchemaTree", () => {
   it("a brand-new block writes no name/strict", () => {
     const next = setOutputSchemaTree(BLANK, rootOf({ json_schema: { type: "object" } }));
     expect(next.spec?.output_schema).toEqual({ json_schema: { type: "object" } });
+  });
+});
+
+describe("root without a type key", () => {
+  it("adding a field keeps the root type-less: { properties: { x: {type: string} } }", () => {
+    // The backend allows this: OutputSchemaSpec._check_json_schema_shape
+    // (packages/expert-work-protocol/.../agent_spec.py) only rejects an empty
+    // json_schema or a top-level ``type`` other than "object"; omitted is OK.
+    const m = manifestWith({ json_schema: {} });
+    const root = updateFieldsAt(rootOf({ json_schema: {} }), [], (fs) => [
+      ...fs,
+      { ...newSchemaField(), name: "x" },
+    ]);
+    expectIdentical(setOutputSchemaTree(m, root).spec?.output_schema, {
+      json_schema: { properties: { x: { type: "string" } } },
+    });
   });
 });
 

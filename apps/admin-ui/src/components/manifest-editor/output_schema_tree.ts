@@ -79,9 +79,13 @@ export interface EditableSchemaNode {
   raw?: Record<string, unknown>;
 }
 
+/** Why a node is readonly: nested past MAX_DEPTH, or a structure the form can't show. */
+export type ReadonlyReason = "depth" | "unsupported";
+
 export interface ReadonlySchemaNode {
   kind: "readonly";
   raw: unknown;
+  reason: ReadonlyReason;
 }
 
 export type SchemaNode = EditableSchemaNode | ReadonlySchemaNode;
@@ -192,7 +196,11 @@ export function enumValidFor(type: SchemaNodeType, values: unknown): boolean {
 
 // ---- read ----
 
-const readonlyNode = (raw: unknown): ReadonlySchemaNode => ({ kind: "readonly", raw });
+const readonlyNode = (raw: unknown, reason: ReadonlyReason = "unsupported"): ReadonlySchemaNode => ({
+  kind: "readonly",
+  raw,
+  reason,
+});
 
 function parseFields(
   raw: Record<string, unknown>,
@@ -251,7 +259,8 @@ export function parseSchemaNode(
   depth: number,
   opts: { root?: boolean } = {},
 ): SchemaNode {
-  if (depth > MAX_DEPTH || !isPlainObject(raw)) return readonlyNode(raw);
+  if (depth > MAX_DEPTH) return readonlyNode(raw, "depth");
+  if (!isPlainObject(raw)) return readonlyNode(raw);
   const typeImplicit = !("type" in raw) && opts.root === true;
   const type = typeImplicit ? "object" : raw.type;
   if (typeof type !== "string" || !SCHEMA_NODE_TYPES.includes(type as SchemaNodeType)) {
@@ -376,6 +385,7 @@ export const newSchemaField = (): SchemaField => ({
  * Switch a node's type: drops constraints/enum/children the new type can't
  * use, and the raw keys tied to the old type (``default``/``examples``,
  * pass-through keywords). ``title``/``description``/``$comment`` stay.
+ * To integer: ``minimum`` rounds up, ``maximum`` rounds down.
  */
 export function changeNodeType(
   node: EditableSchemaNode,
@@ -388,6 +398,11 @@ export function changeNodeType(
     if (node.constraints[key] !== undefined) {
       (constraints as Record<string, unknown>)[key] = node.constraints[key];
     }
+  }
+  // Switching to integer: pull fractional bounds inward to whole numbers.
+  if (type === "integer") {
+    if (constraints.minimum !== undefined) constraints.minimum = Math.ceil(constraints.minimum);
+    if (constraints.maximum !== undefined) constraints.maximum = Math.floor(constraints.maximum);
   }
   const raw = node.raw
     ? Object.fromEntries(
@@ -460,37 +475,74 @@ export const isNameFixed = (f: SchemaField): boolean =>
 const keepsOriginalName = (f: SchemaField): boolean =>
   isNameFixed(f) || (f.originalName !== undefined && f.name === f.originalName);
 
+// Who keeps a contested name, highest first: a fixed name; then any field
+// other than the one renamed last (one still holding its read-in name
+// first); the field renamed last always yields.
+function namePriority(f: SchemaField, lastRenamedUid: string | undefined): number {
+  if (isNameFixed(f)) return 3;
+  if (f.uid === lastRenamedUid) return 0;
+  return keepsOriginalName(f) ? 2 : 1;
+}
+
 /**
  * ``"invalid"`` = fails the name rule; ``"duplicate"`` = a sibling with the
- * same name wins over this one. A field still holding its original name
- * (incl. every readonly / name-locked field) always wins over one that is
- * being renamed onto it — so typing over an existing name flags the row
- * being typed in, never the untouched one. Otherwise the earlier row wins.
- * Fields with a fixed name are never flagged.
+ * same name wins over this one (``namePriority``; on a tie the earlier row
+ * wins). So typing over an existing name flags the row being typed in —
+ * also when that row is typing back its own original name — never the
+ * untouched one. Fields with a fixed name are never flagged.
  */
-export function fieldIssue(fields: readonly SchemaField[], i: number): FieldIssue {
+export function fieldIssue(
+  fields: readonly SchemaField[],
+  i: number,
+  lastRenamedUid?: string,
+): FieldIssue {
   const field = fields[i];
   if (isNameFixed(field)) return null;
   if (!isValidFieldName(field.name)) return "invalid";
-  const mine = keepsOriginalName(field);
+  const mine = namePriority(field, lastRenamedUid);
   for (let j = 0; j < fields.length; j++) {
     if (j === i || fields[j].name !== field.name) continue;
-    const theirs = keepsOriginalName(fields[j]);
-    if (theirs && !mine) return "duplicate";
-    if (theirs === mine && j < i) return "duplicate";
+    const theirs = namePriority(fields[j], lastRenamedUid);
+    if (theirs > mine || (theirs === mine && j < i)) return "duplicate";
   }
   return null;
 }
 
 /** Drop every field (at any depth) whose name currently has an issue. */
-export function pruneInvalidFields(node: SchemaNode): SchemaNode {
+export function pruneInvalidFields(node: SchemaNode, lastRenamedUid?: string): SchemaNode {
   if (node.kind !== "editable") return node;
   const next: EditableSchemaNode = { ...node };
   if (node.fields) {
     next.fields = node.fields
-      .filter((_, i) => fieldIssue(node.fields as SchemaField[], i) === null)
-      .map((f) => ({ ...f, node: pruneInvalidFields(f.node) }));
+      .filter((_, i) => fieldIssue(node.fields as SchemaField[], i, lastRenamedUid) === null)
+      .map((f) => ({ ...f, node: pruneInvalidFields(f.node, lastRenamedUid) }));
   }
-  if (node.items) next.items = pruneInvalidFields(node.items);
+  if (node.items) next.items = pruneInvalidFields(node.items, lastRenamedUid);
   return next;
+}
+
+// ---- identity across a re-read ----
+
+// uid → the field's name path (``a/[]/b``; ``[]`` = a list's item).
+function namePaths(node: SchemaNode, prefix: string, out: Map<string, string>): Map<string, string> {
+  if (node.kind !== "editable") return out;
+  for (const f of node.fields ?? []) {
+    const key = `${prefix}/${f.name}`;
+    out.set(f.uid, key);
+    namePaths(f.node, key, out);
+  }
+  if (node.items) namePaths(node.items, `${prefix}/[]`, out);
+  return out;
+}
+
+/** Old uid → new uid for fields at the same name path in both trees. */
+export function matchFieldUids(before: SchemaNode, after: SchemaNode): Map<string, string> {
+  const byPath = new Map<string, string>();
+  for (const [uid, path] of namePaths(after, "", new Map())) byPath.set(path, uid);
+  const out = new Map<string, string>();
+  for (const [uid, path] of namePaths(before, "", new Map())) {
+    const match = byPath.get(path);
+    if (match !== undefined) out.set(uid, match);
+  }
+  return out;
 }

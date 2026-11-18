@@ -10,6 +10,7 @@ import {
   fieldIssue,
   isValidFieldName,
   makeFieldUid,
+  matchFieldUids,
   newSchemaField,
   newSchemaNode,
   nodeAt,
@@ -108,7 +109,7 @@ describe("readonly triggers (only that node)", () => {
       type: "object",
       properties: { odd: raw, plain: { type: "string" } },
     });
-    expect(nodeAt(root, [0])).toEqual({ kind: "readonly", raw });
+    expect(nodeAt(root, [0])).toEqual({ kind: "readonly", raw, reason: "unsupported" });
     expect(nodeAt(root, [1])?.kind).toBe("editable");
   });
 
@@ -128,7 +129,7 @@ describe("readonly triggers (only that node)", () => {
     const raw = { type: "object", properties: { pair: { type: "array", maxItems: 2, items: tuple } } };
     const root = parseSchemaRoot(raw);
     expect(nodeAt(root, [0])?.kind).toBe("editable");
-    expect(nodeAt(root, [0, "items"])).toEqual({ kind: "readonly", raw: tuple });
+    expect(nodeAt(root, [0, "items"])).toEqual({ kind: "readonly", raw: tuple, reason: "unsupported" });
     expect(JSON.stringify(writeSchemaNode(root))).toBe(JSON.stringify(raw));
   });
 });
@@ -197,6 +198,11 @@ describe("changeNodeType", () => {
     expect(next.constraints).toEqual({});
     expect(next.enum).toBeUndefined();
     expect(writeSchemaNode(next)).toEqual({ type: "integer", title: "T", description: "d", $comment: "c" });
+  });
+
+  it("number → integer rounds minimum up and maximum down", () => {
+    const node = editable(parseSchemaNode({ type: "number", minimum: 0.5, maximum: 2.5 }, 1));
+    expect(writeSchemaNode(changeNodeType(node, "integer"))).toEqual({ type: "integer", minimum: 1, maximum: 2 });
   });
 
   it("integer → number keeps minimum/maximum and a still-valid enum", () => {
@@ -304,7 +310,7 @@ describe("field names", () => {
   });
 
   it("never flags a readonly field", () => {
-    const fields = [field("9odd", { kind: "readonly", raw: {} })];
+    const fields = [field("9odd", { kind: "readonly", raw: {}, reason: "unsupported" })];
     expect(fieldIssue(fields, 0)).toBeNull();
   });
 
@@ -314,9 +320,17 @@ describe("field names", () => {
   });
 
   it("renaming onto a readonly sibling flags the renamed field, wherever the readonly one sits", () => {
-    const fields = [{ ...original("a"), name: "b" }, original("b", { kind: "readonly", raw: { oneOf: [] } })];
+    const fields = [{ ...original("a"), name: "b" }, original("b", { kind: "readonly", raw: { oneOf: [] }, reason: "unsupported" })];
     expect(fieldIssue(fields, 0)).toBe("duplicate");
     expect(fieldIssue(fields, 1)).toBeNull();
+  });
+
+  it("the field renamed last yields, even when it is typing back its own original name", () => {
+    const a = original("a");
+    const b = { ...original("b"), name: "a" };
+    expect(fieldIssue([a, b], 0, a.uid)).toBe("duplicate");
+    expect(fieldIssue([a, b], 1, a.uid)).toBeNull();
+    expect(fieldIssue([a, b], 1, b.uid)).toBe("duplicate");
   });
 
   it("renaming onto a later untouched sibling flags the renamed one, not the untouched one", () => {
@@ -335,5 +349,35 @@ describe("field names", () => {
       },
       additionalProperties: false,
     });
+  });
+});
+
+describe("field uids", () => {
+  const raw = {
+    type: "object",
+    properties: { a: { type: "array", items: { type: "object", properties: { b: { type: "string" } } } } },
+  };
+
+  it("every parse and every new field gets fresh uids", () => {
+    const uids = (n: SchemaNode): string[] =>
+      n.kind !== "editable"
+        ? []
+        : [...(n.fields ?? []).flatMap((f) => [f.uid, ...uids(f.node)]), ...(n.items ? uids(n.items) : [])];
+    const all = [...uids(parseSchemaRoot(raw)), ...uids(parseSchemaRoot(raw)), newSchemaField().uid];
+    expect(new Set(all).size).toBe(all.length);
+  });
+
+  it("matchFieldUids pairs fields by name path across two reads", () => {
+    const before = editable(parseSchemaRoot(raw));
+    const after = editable(
+      parseSchemaRoot({ type: "object", properties: { z: { type: "string" }, ...raw.properties } }),
+    );
+    const map = matchFieldUids(before, after);
+    const beforeA = before.fields?.[0];
+    const afterA = after.fields?.[1];
+    const inner = (n: SchemaNode | undefined) => editable(editable(n).items).fields?.[0].uid;
+    expect(map.get(beforeA?.uid ?? "")).toBe(afterA?.uid);
+    expect(map.get(inner(beforeA?.node) ?? "")).toBe(inner(afterA?.node));
+    expect(map.size).toBe(2);
   });
 });

@@ -103,7 +103,9 @@ function ConstraintInput({ node, name, pathKey, onSet }: ConstraintInputProps) {
         size="small"
         style={{ width: "100%" }}
         min={COUNT_KEYS.has(name) ? 0 : undefined}
-        precision={COUNT_KEYS.has(name) || node.type === "integer" ? 0 : undefined}
+        // Counts only: a precision on minimum/maximum makes the input reformat
+        // (and write back) a stored fraction on mere focus + blur.
+        precision={COUNT_KEYS.has(name) ? 0 : undefined}
         value={node.constraints[name] as number | undefined}
         aria-label={caption}
         data-testid={testId}

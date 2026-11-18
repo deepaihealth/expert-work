@@ -1394,6 +1394,9 @@ export function readOutputSchemaTree(m: unknown): SchemaNode | undefined {
   return parseSchemaRoot(block.json_schema);
 }
 
+// Whether ``spec.output_schema`` is configured at all (cheap; no parsing).
+export const hasOutputSchema = (m: unknown): boolean => specOf(m).output_schema != null;
+
 // The block's ``json_schema`` exactly as stored (for echo detection).
 export const readOutputJsonSchema = (m: unknown): unknown =>
   specOf(m).output_schema?.json_schema;

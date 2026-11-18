@@ -1717,6 +1717,7 @@ export interface TranslationKeys {
       name_duplicate: string;
       complex_readonly: string;
       readonly_node: string;
+      readonly_depth: string;
       readonly_tag: string;
       off_confirm: string;
       limits: string;
@@ -5765,9 +5766,10 @@ const en: TranslationKeys = {
       collapse: "Collapse",
       name_invalid:
         "Field names must start with a letter or underscore, and contain only letters, numbers, and underscores.",
-      name_duplicate: "Duplicate field name - a field above already uses this name.",
+      name_duplicate: "Duplicate name — another field at this level already uses it",
       complex_readonly: "Configured (complex structure) - edit it in the YAML view.",
       readonly_node: "This part uses a structure the form can't edit - change it in the YAML view.",
+      readonly_depth: "More than 5 levels deep - edit it in the YAML view.",
       readonly_tag: "Read-only",
       off_confirm: "Turning this off will clear the reply template you've defined. Continue?",
       limits: "Limits",

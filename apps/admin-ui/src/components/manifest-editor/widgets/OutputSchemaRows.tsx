@@ -30,6 +30,7 @@ import {
   updateNodeAt,
   type EditableSchemaNode,
   type FieldIssue,
+  type ReadonlySchemaNode,
   type SchemaField,
   type SchemaNode,
   type SchemaNodeType,
@@ -51,9 +52,11 @@ const CELL_TEXT: CSSProperties = { width: COL_NAME, flex: "none", paddingTop: 4 
 export interface TreeContext {
   root: SchemaNode;
   strict: boolean;
-  commit: (next: SchemaNode) => void;
+  /** ``renamedUid``: the field whose name this edit changed (it yields name clashes). */
+  commit: (next: SchemaNode, renamedUid?: string) => void;
   collapsed: ReadonlySet<string>;
   toggleCollapsed: (rowKey: string) => void;
+  lastRenamedUid?: string;
 }
 
 interface RowProps {
@@ -153,15 +156,16 @@ function ReadonlyTag() {
   );
 }
 
-function ReadonlyNote({ path }: { path: SchemaPath }) {
+function ReadonlyNote({ path, node }: { path: SchemaPath; node: ReadonlySchemaNode }) {
   const { t } = useTranslation();
+  const note = node.reason === "depth" ? "readonly_depth" : "readonly_node";
   return (
     <Text
       type="secondary"
       style={{ flex: 1, fontSize: 12, paddingTop: 6 }}
       data-testid={`af-output-schema-readonly-${pathKey(path)}`}
     >
-      {t("agent_form.output_schema.readonly_node")}
+      {t(`agent_form.output_schema.${note}`)}
     </Text>
   );
 }
@@ -185,7 +189,7 @@ function RowCells({ path, rowKey, ctx, node, nameCell, requiredCell, trailing }:
       {node.kind === "editable" ? (
         <NodeExtras path={path} rowKey={rowKey} ctx={ctx} node={node} />
       ) : (
-        <ReadonlyNote path={path} />
+        <ReadonlyNote path={path} node={node} />
       )}
       {trailing}
     </div>
@@ -296,7 +300,10 @@ function FieldRow({ parentPath, fields, index, ctx }: FieldRowProps) {
   const path = [...parentPath, index];
   const key = pathKey(path);
   const patchField = (patch: Partial<SchemaField>): void =>
-    ctx.commit(updateFieldsAt(ctx.root, parentPath, (fs) => fs.map((f, i) => (i === index ? { ...f, ...patch } : f))));
+    ctx.commit(
+      updateFieldsAt(ctx.root, parentPath, (fs) => fs.map((f, i) => (i === index ? { ...f, ...patch } : f))),
+      patch.name !== undefined ? field.uid : undefined,
+    );
   const remove = (): void =>
     ctx.commit(updateFieldsAt(ctx.root, parentPath, (fs) => fs.filter((_, i) => i !== index)));
   const requiredCell = (
@@ -313,7 +320,7 @@ function FieldRow({ parentPath, fields, index, ctx }: FieldRowProps) {
     </Button>
   );
   const nameCell = (
-    <FieldNameCell field={field} issue={fieldIssue(fields, index)} testKey={key} onRename={(name) => patchField({ name })} />
+    <FieldNameCell field={field} issue={fieldIssue(fields, index, ctx.lastRenamedUid)} testKey={key} onRename={(name) => patchField({ name })} />
   );
   return (
     <>
