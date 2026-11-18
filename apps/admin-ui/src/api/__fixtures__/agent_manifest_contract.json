@@ -1,0 +1,377 @@
+{
+  "_comment": "B-319 — a real GET /v1/agents/{name}/{version} response (data) and the root contract of GET /v1/agents/schema. Kept in step by services/control-plane/tests/test_agent_manifest_wire_shape.py; regenerate from that test's _YAML when the wire shape changes.",
+  "schema_root": {
+    "type": "object",
+    "required": [
+      "apiVersion",
+      "kind",
+      "metadata",
+      "spec"
+    ],
+    "additionalProperties": false,
+    "properties": {
+      "apiVersion": {
+        "type": "string"
+      },
+      "kind": {
+        "type": "string"
+      },
+      "metadata": {
+        "type": "object"
+      },
+      "spec": {
+        "type": "object"
+      }
+    }
+  },
+  "detail": {
+    "record": {
+      "id": "054519e4-1b12-4549-890d-0fe96bb5fffa",
+      "tenant_id": "00000000-0000-0000-0000-000000000000",
+      "name": "code-reviewer",
+      "version": "1.0.0",
+      "spec": {
+        "apiVersion": "expert_work.io/v1",
+        "kind": "Agent",
+        "metadata": {
+          "name": "code-reviewer",
+          "version": "1.0.0",
+          "tenant": "platform-eng",
+          "labels": {}
+        },
+        "spec": {
+          "description": "",
+          "display_name": "",
+          "extends": null,
+          "tenant_config": {
+            "compliance_pack": null,
+            "pii_fields": [],
+            "isolation_level": "shared",
+            "audit_retention_days": 90,
+            "data_residency": null
+          },
+          "model": {
+            "provider": "anthropic",
+            "name": "claude-sonnet-4-6",
+            "temperature": 0.2,
+            "rate_limit_rpm": 60,
+            "api_key_ref": null,
+            "base_url": null,
+            "azure_deployment": null,
+            "azure_api_version": null,
+            "fallback": [],
+            "supports_vision": false,
+            "cache_enabled": true,
+            "context_window": null,
+            "effort": null,
+            "adaptive_thinking": false,
+            "thinking_enabled": null
+          },
+          "system_prompt": {
+            "template": "you are a reviewer",
+            "jinja": false,
+            "variables": []
+          },
+          "dynamic_context": {
+            "inject_memory": true,
+            "inject_current_date": true,
+            "custom_reminders": []
+          },
+          "defenses": {
+            "prompt_injection": "spotlight",
+            "output_screen": "block",
+            "output_judge": "off",
+            "output_judge_on_error": "open",
+            "action_screen": "off",
+            "action_screen_on_error": "open",
+            "output_dlp": "off"
+          },
+          "tools": [],
+          "subagents": [],
+          "dynamic_workers": {
+            "enabled": true,
+            "model": null,
+            "max_iterations": null,
+            "max_concurrent": null,
+            "max_per_run": null
+          },
+          "sandbox": {
+            "runtime": "gvisor",
+            "image": null,
+            "image_build": null,
+            "image_variant": null,
+            "resources": {
+              "cpu": "1.0",
+              "memory": "1Gi",
+              "pids": 256,
+              "timeout_s": 600
+            },
+            "network": {
+              "egress": "proxy",
+              "allowlist": [
+                "api.anthropic.com"
+              ],
+              "denylist": []
+            },
+            "filesystem": {
+              "readonly_root": true,
+              "writable": [
+                "/workspace"
+              ],
+              "mounts": [],
+              "persistent_workspace": false
+            }
+          },
+          "memory": null,
+          "reflection": null,
+          "routing": null,
+          "knowledge": null,
+          "vision": null,
+          "skills": [],
+          "auto_attach_evolved_skills": false,
+          "triggers": [],
+          "workflow": {
+            "type": "react",
+            "execution_mode": "standard",
+            "max_iterations": 30,
+            "early_stop": {},
+            "builder": null
+          },
+          "output_schema": null,
+          "cache": {
+            "enabled": true
+          },
+          "stream_deadline_s": 180,
+          "idle_timeout_s": 45,
+          "policies": {
+            "rate_limit": {},
+            "pii": {},
+            "safety": {},
+            "context_compression": {
+              "enabled": true,
+              "threshold_pct": 0.7,
+              "head_keep": 4,
+              "tail_keep": 6,
+              "flush_before_compaction": true,
+              "max_passes": 3,
+              "max_turns": null,
+              "max_tokens": null,
+              "pressure_feedback": true,
+              "pressure_warn_pct": 0.75
+            },
+            "working_memory": {
+              "enabled": true,
+              "threshold_pct": 0.7,
+              "max_recent_turns": 20,
+              "keep_first_turn": true
+            },
+            "tool_result_prune": {
+              "enabled": true,
+              "threshold_pct": 0.7,
+              "recent_tool_results_kept": 4
+            },
+            "tool_output_budget": {
+              "enabled": true
+            },
+            "memory_consolidation": {
+              "enabled": true,
+              "aux_model": null
+            },
+            "trajectory_recording": true,
+            "run_deadline_s": 0,
+            "token_budget": 0,
+            "max_no_progress": 0,
+            "approval_required_tools": [],
+            "approval_timeout_s": 86400,
+            "clarification_timeout_s": 3600,
+            "tool_use_enforcement": "auto"
+          },
+          "code": null,
+          "hooks": {},
+          "observability": {
+            "trace": "opentelemetry",
+            "log_level": "info",
+            "redact_fields": []
+          }
+        }
+      },
+      "spec_sha256": "b35f1b0c1609cb0c93f7242afd988e3d73a7d81dc801366efa14cf557ed31b77",
+      "status": "active",
+      "created_by": "dev-user",
+      "created_at": "2026-11-18T09:20:46.290132Z",
+      "updated_at": "2026-11-18T09:20:46.290132Z",
+      "draft": {
+        "spec": {
+          "apiVersion": "expert_work.io/v1",
+          "kind": "Agent",
+          "metadata": {
+            "name": "code-reviewer",
+            "version": "1.0.0",
+            "tenant": "platform-eng",
+            "labels": {}
+          },
+          "spec": {
+            "description": "",
+            "display_name": "",
+            "extends": null,
+            "tenant_config": {
+              "compliance_pack": null,
+              "pii_fields": [],
+              "isolation_level": "shared",
+              "audit_retention_days": 90,
+              "data_residency": null
+            },
+            "model": {
+              "provider": "anthropic",
+              "name": "claude-sonnet-4-6",
+              "temperature": 0.2,
+              "rate_limit_rpm": 60,
+              "api_key_ref": null,
+              "base_url": null,
+              "azure_deployment": null,
+              "azure_api_version": null,
+              "fallback": [],
+              "supports_vision": false,
+              "cache_enabled": true,
+              "context_window": null,
+              "effort": null,
+              "adaptive_thinking": false,
+              "thinking_enabled": null
+            },
+            "system_prompt": {
+              "template": "you are a careful reviewer",
+              "jinja": false,
+              "variables": []
+            },
+            "dynamic_context": {
+              "inject_memory": true,
+              "inject_current_date": true,
+              "custom_reminders": []
+            },
+            "defenses": {
+              "prompt_injection": "spotlight",
+              "output_screen": "block",
+              "output_judge": "off",
+              "output_judge_on_error": "open",
+              "action_screen": "off",
+              "action_screen_on_error": "open",
+              "output_dlp": "off"
+            },
+            "tools": [],
+            "subagents": [],
+            "dynamic_workers": {
+              "enabled": true,
+              "model": null,
+              "max_iterations": null,
+              "max_concurrent": null,
+              "max_per_run": null
+            },
+            "sandbox": {
+              "runtime": "gvisor",
+              "image": null,
+              "image_build": null,
+              "image_variant": null,
+              "resources": {
+                "cpu": "1.0",
+                "memory": "1Gi",
+                "pids": 256,
+                "timeout_s": 600
+              },
+              "network": {
+                "egress": "proxy",
+                "allowlist": [
+                  "api.anthropic.com"
+                ],
+                "denylist": []
+              },
+              "filesystem": {
+                "readonly_root": true,
+                "writable": [
+                  "/workspace"
+                ],
+                "mounts": [],
+                "persistent_workspace": false
+              }
+            },
+            "memory": null,
+            "reflection": null,
+            "routing": null,
+            "knowledge": null,
+            "vision": null,
+            "skills": [],
+            "auto_attach_evolved_skills": false,
+            "triggers": [],
+            "workflow": {
+              "type": "react",
+              "execution_mode": "standard",
+              "max_iterations": 30,
+              "early_stop": {},
+              "builder": null
+            },
+            "output_schema": null,
+            "cache": {
+              "enabled": true
+            },
+            "stream_deadline_s": 180,
+            "idle_timeout_s": 45,
+            "policies": {
+              "rate_limit": {},
+              "pii": {},
+              "safety": {},
+              "context_compression": {
+                "enabled": true,
+                "threshold_pct": 0.7,
+                "head_keep": 4,
+                "tail_keep": 6,
+                "flush_before_compaction": true,
+                "max_passes": 3,
+                "max_turns": null,
+                "max_tokens": null,
+                "pressure_feedback": true,
+                "pressure_warn_pct": 0.75
+              },
+              "working_memory": {
+                "enabled": true,
+                "threshold_pct": 0.7,
+                "max_recent_turns": 20,
+                "keep_first_turn": true
+              },
+              "tool_result_prune": {
+                "enabled": true,
+                "threshold_pct": 0.7,
+                "recent_tool_results_kept": 4
+              },
+              "tool_output_budget": {
+                "enabled": true
+              },
+              "memory_consolidation": {
+                "enabled": true,
+                "aux_model": null
+              },
+              "trajectory_recording": true,
+              "run_deadline_s": 0,
+              "token_budget": 0,
+              "max_no_progress": 0,
+              "approval_required_tools": [],
+              "approval_timeout_s": 86400,
+              "clarification_timeout_s": 3600,
+              "tool_use_enforcement": "auto"
+            },
+            "code": null,
+            "hooks": {},
+            "observability": {
+              "trace": "opentelemetry",
+              "log_level": "info",
+              "redact_fields": []
+            }
+          }
+        },
+        "spec_sha256": "8cd7c0f01be34fb51fa1127eba098ba3b233de4d0df78c89f320baa854ec504c",
+        "updated_by": "dev-user",
+        "updated_at": "2026-11-18T09:20:46.297731Z"
+      }
+    },
+    "disabled": false,
+    "disable": null
+  }
+}
