@@ -146,6 +146,27 @@ describe("pass-through keywords and root annotations", () => {
     expect(JSON.stringify(writeSchemaNode(root))).toBe(JSON.stringify(raw));
   });
 
+  it("number → integer keeps multipleOf and the exclusive bounds, rounded to admit the same integers", () => {
+    const price = editable(
+      parseSchemaNode({ type: "number", multipleOf: 1.5, exclusiveMinimum: 0.5, exclusiveMaximum: 9.5, title: "P" }, 1),
+    );
+    // > 0.5 ⇔ > 0 and < 9.5 ⇔ < 10 for integers; a fractional multipleOf stays
+    // (valid on an integer, same accepted integers: multiples of 3).
+    expect(JSON.stringify(writeSchemaNode(changeNodeType(price, "integer")))).toBe(
+      JSON.stringify({ type: "integer", multipleOf: 1.5, exclusiveMinimum: 0, exclusiveMaximum: 10, title: "P" }),
+    );
+  });
+
+  it("integer → number keeps multipleOf and the exclusive bounds as they are", () => {
+    const count = editable(parseSchemaNode({ type: "integer", multipleOf: 2, exclusiveMinimum: 0, exclusiveMaximum: 9 }, 1));
+    expect(writeSchemaNode(changeNodeType(count, "number"))).toEqual({
+      type: "number",
+      multipleOf: 2,
+      exclusiveMinimum: 0,
+      exclusiveMaximum: 9,
+    });
+  });
+
   it("a type change drops format / multipleOf / exclusive bounds", () => {
     const email = editable(parseSchemaNode({ type: "string", format: "email" }, 1));
     expect(writeSchemaNode(changeNodeType(email, "integer"))).toEqual({ type: "integer" });

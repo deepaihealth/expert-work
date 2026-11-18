@@ -17,7 +17,7 @@
  */
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "antd";
 import i18n from "../../../../i18n";
@@ -57,6 +57,26 @@ async function pickType(testId: string, typeKey: string): Promise<void> {
   const label = i18n.t(`agent_form.output_schema.type_${typeKey}`);
   const options = await screen.findAllByText(label, { selector: ".ant-select-item-option-content" });
   await userEvent.click(options[options.length - 1]);
+}
+
+// Confirm one allowed value with Enter. (user.type's "{Enter}" never reaches
+// rc-select's tags path under jsdom; opening the dropdown, setting the search
+// text and pressing Enter does — same as a real browser, checked in e2e.)
+async function enterTag(testId: string, value: string): Promise<void> {
+  const select = screen.getByTestId(testId);
+  const box = within(select).getByRole("combobox");
+  // Start from a closed dropdown every time (a second Enter on a dropdown
+  // left open by the first one is ignored under jsdom).
+  fireEvent.blur(box);
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+  fireEvent.mouseDown(select.querySelector(".ant-select-selector") ?? select);
+  fireEvent.change(box, { target: { value } });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+  fireEvent.keyDown(box, { key: "Enter", code: "Enter", keyCode: 13, which: 13 });
 }
 
 const HEALTH = {
@@ -139,15 +159,26 @@ describe("OutputSchemaEditor field tree", () => {
     await user.click(screen.getByTestId("af-output-schema-limits-0"));
     await user.type(await screen.findByTestId("af-output-schema-limit-minLength-0"), "2");
     await user.type(screen.getByTestId("af-output-schema-limit-pattern-0"), "^\\w+$");
-    const enumBox = within(screen.getByTestId("af-output-schema-enum-0")).getByRole("combobox");
-    // Comma separates values (Enter also works in a real browser — checked in
-    // Chromium — but rc-select's Enter path doesn't fire under jsdom).
-    await user.type(enumBox, "low,high,");
+    await enterTag("af-output-schema-enum-0", "low");
+    await enterTag("af-output-schema-enum-0", "high");
     expect(lastSchema(onChange)).toEqual({
       type: "object",
       properties: { level: { type: "string", minLength: 2, pattern: "^\\w+$", enum: ["low", "high"] } },
     });
     expect(screen.getByTestId("af-output-schema-limits-0")).toHaveTextContent("(3)");
+  });
+
+  it("a text allowed value may contain commas: Enter confirms it, a comma doesn't split", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderControlled(withSchema({ type: "object", properties: { s: { type: "string" } } }), onChange);
+    await user.click(screen.getByTestId("af-output-schema-limits-0"));
+    const box = within(await screen.findByTestId("af-output-schema-enum-0")).getByRole("combobox");
+    await user.type(box, "x,y,");
+    expect(onChange).not.toHaveBeenCalled();
+    await user.clear(box);
+    await enterTag("af-output-schema-enum-0", "a,b");
+    expect(lastSchema(onChange)).toEqual({ type: "object", properties: { s: { type: "string", enum: ["a,b"] } } });
   });
 
   it("changing a type clears limits the new type can't use", async () => {

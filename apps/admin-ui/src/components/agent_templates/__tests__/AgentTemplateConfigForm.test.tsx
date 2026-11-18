@@ -6,7 +6,7 @@
  */
 import { createRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "antd";
 import i18n from "../../../i18n";
@@ -86,8 +86,9 @@ describe("AgentTemplateConfigForm submit with form errors", () => {
     );
     await user.click(await screen.findByTestId("cfg-nav-prompt"));
     const name = await screen.findByTestId("af-output-schema-name-1");
-    await user.clear(name);
-    await user.type(name, "a");
+    // One change event each (no per-keystroke typing): this suite mounts the
+    // whole editor, and typing was what pushed it past 5 s under full-suite load.
+    fireEvent.change(name, { target: { value: "a" } });
 
     await act(() => ref.current!.submit());
     expect(createAgentTemplate).not.toHaveBeenCalled();
@@ -95,9 +96,9 @@ describe("AgentTemplateConfigForm submit with form errors", () => {
     expect(updateTemplateSpec).not.toHaveBeenCalled();
     expect(await screen.findByText(i18n.t("manifest_editor.form_has_errors"))).toBeInTheDocument();
 
-    await user.type(name, "2");
+    fireEvent.change(name, { target: { value: "a2" } });
     await act(() => ref.current!.submit());
     await waitFor(() => expect(updateTemplateSpec).toHaveBeenCalledTimes(1));
     expect(onSaved).toHaveBeenCalledTimes(1);
-  });
+  }, 15_000);
 });

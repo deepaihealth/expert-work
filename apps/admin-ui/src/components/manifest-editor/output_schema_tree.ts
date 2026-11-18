@@ -390,10 +390,42 @@ export function nextFieldName(fields: readonly SchemaField[]): string {
   return `field_${n}`;
 }
 
+const isNumeric = (t: SchemaNodeType): boolean => t === "number" || t === "integer";
+
+// Raw keys kept across a type change: managed keys (re-emitted or dropped by
+// the writer), title / $comment, and — number ↔ integer only — the numeric
+// pass-through keywords. To integer, exclusive bounds round to the integer
+// bound that admits the same integers (exclusiveMinimum down, exclusiveMaximum
+// up); a fractional multipleOf is kept as-is (still valid on an integer, and
+// it keeps exactly the same integers — rounding it would change the rule).
+function keptRawOnTypeChange(
+  raw: Record<string, unknown>,
+  from: SchemaNodeType,
+  to: SchemaNodeType,
+): Record<string, unknown> {
+  const keepNumeric = isNumeric(from) && isNumeric(to);
+  const entries = Object.entries(raw).filter(
+    ([k]) =>
+      KEY_ORDER.includes(k) ||
+      KEEP_ON_TYPE_CHANGE.includes(k) ||
+      (keepNumeric && NUMERIC_PASS_THROUGH.includes(k)),
+  );
+  return Object.fromEntries(
+    entries.map(([k, v]) => {
+      if (to !== "integer" || typeof v !== "number") return [k, v];
+      if (k === "exclusiveMinimum") return [k, Math.floor(v)];
+      if (k === "exclusiveMaximum") return [k, Math.ceil(v)];
+      return [k, v];
+    }),
+  );
+}
+
 /**
  * Switch a node's type: drops constraints/enum/children the new type can't
  * use, and the raw keys tied to the old type (``default``/``examples``,
- * pass-through keywords). ``title``/``description``/``$comment`` stay.
+ * pass-through keywords — except number ↔ integer, which keeps
+ * ``multipleOf``/``exclusiveMinimum``/``exclusiveMaximum``, see
+ * ``keptRawOnTypeChange``). ``title``/``description``/``$comment`` stay.
  * To integer: ``minimum`` rounds up, ``maximum`` rounds down.
  */
 export function changeNodeType(
@@ -413,13 +445,7 @@ export function changeNodeType(
     if (constraints.minimum !== undefined) constraints.minimum = Math.ceil(constraints.minimum);
     if (constraints.maximum !== undefined) constraints.maximum = Math.floor(constraints.maximum);
   }
-  const raw = node.raw
-    ? Object.fromEntries(
-        Object.entries(node.raw).filter(
-          ([k]) => KEY_ORDER.includes(k) || KEEP_ON_TYPE_CHANGE.includes(k),
-        ),
-      )
-    : undefined;
+  const raw = node.raw ? keptRawOnTypeChange(node.raw, node.type, type) : undefined;
   return {
     ...fresh,
     constraints,

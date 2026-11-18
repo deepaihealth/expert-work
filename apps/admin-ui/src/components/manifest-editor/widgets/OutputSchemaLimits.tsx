@@ -142,7 +142,9 @@ function EnumInput({ node, pathKey, onChange }: EnumInputProps) {
         mode="tags"
         size="small"
         style={{ width: "100%" }}
-        tokenSeparators={[","]}
+        // Numbers split on commas; text values may contain commas, so a text
+        // value is confirmed with Enter only.
+        tokenSeparators={node.type === "string" ? undefined : [","]}
         placeholder={t("agent_form.output_schema.enum_placeholder")}
         value={(node.enum ?? []).map(String)}
         aria-label={label}

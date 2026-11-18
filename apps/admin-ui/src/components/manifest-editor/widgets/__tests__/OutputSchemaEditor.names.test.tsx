@@ -177,4 +177,29 @@ describe("OutputSchemaEditor name rule", () => {
       "field_1",
     ]);
   });
+
+  it("a manifest adopted from outside replaces paused edits even when its json_schema content is the same", async () => {
+    // e.g. "discard draft" where draft and live share the schema: ManifestEditor
+    // adopts a freshly parsed manifest — a new json_schema object, same content.
+    const user = userEvent.setup();
+    const report = vi.fn<(source: string, hasErrors: boolean) => void>();
+    const schema = { type: "object", properties: { a: A, b: B } };
+    const fresh = () => ({ spec: { output_schema: { json_schema: structuredClone(schema) } } });
+    const ui = (formData: unknown) => (
+      <FormErrorsContext.Provider value={report}>
+        <App>
+          <OutputSchemaEditor formData={formData} onChange={vi.fn()} />
+        </App>
+      </FormErrorsContext.Provider>
+    );
+    const { rerender } = render(ui(fresh()));
+    await rename(user, "1", "a");
+    expect(lastReport(report)).toBe(true);
+
+    rerender(ui(fresh()));
+    expect(screen.getByTestId("af-output-schema-name-1")).toHaveValue("b");
+    expect(invalid("1")).toBe("false");
+    expect(screen.queryByTestId("af-output-schema-name-errors")).not.toBeInTheDocument();
+    expect(lastReport(report)).toBe(false);
+  });
 });

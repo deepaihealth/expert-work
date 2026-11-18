@@ -25,9 +25,14 @@
  * editor reports the error up (``useReportFormErrors``) so the host blocks
  * saving. Once every name is fixed, the next edit writes the whole tree at
  * once. Resync: before paint (``useLayoutEffect``, so stale rows never
- * flash), the tree is re-read when ``json_schema`` in ``formData`` differs
- * from what this widget last wrote; our own echoes and sibling-field edits
- * are skipped, so local edits survive them. A re-read keeps collapsed
+ * flash), the tree is re-read when the ``json_schema`` OBJECT in
+ * ``formData`` is not the one this widget last wrote / was mounted with.
+ * Identity, not content: every form writer patches the manifest shallowly
+ * (``patchSpec``), so a sibling-field edit keeps this object and local edits
+ * survive it; while a manifest the editor adopts from outside (discard
+ * draft, post-save refetch, Reset) is a fresh object even when its content
+ * equals ours, and replaces paused local edits instead of being mistaken
+ * for our own echo. A re-read keeps collapsed
  * fields that are still at the same name path. An unmount (group switch,
  * YAML view) drops local edits that were never written back.
  */
@@ -66,8 +71,6 @@ const { Text } = Typography;
 const SECTION: CSSProperties = { marginBottom: 24 };
 const HEAD: CSSProperties = { fontSize: 12, color: "var(--ew-text-tertiary, #888)", flex: "none" };
 
-const snapshot = (m: unknown): string | undefined => JSON.stringify(readOutputJsonSchema(m));
-
 interface OutputSchemaEditorProps {
   formData: unknown;
   onChange: (data: unknown) => void;
@@ -91,11 +94,11 @@ function remapCollapsed(keys: ReadonlySet<string>, uids: Map<string, string>): R
 function useOutputSchemaTree({ formData, onChange }: OutputSchemaEditorProps) {
   const [tree, setTree] = useState<SchemaNode | undefined>(() => readOutputSchemaTree(formData));
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
-  const [mountSnapshot] = useState(() => snapshot(formData));
-  const lastWrittenRef = useRef<string | undefined>(mountSnapshot);
+  // The json_schema object last written / mounted with (compared by identity).
+  const lastWrittenRef = useRef<unknown>(readOutputJsonSchema(formData));
 
   useLayoutEffect(() => {
-    const current = snapshot(formData);
+    const current = readOutputJsonSchema(formData);
     if (current === lastWrittenRef.current) return;
     lastWrittenRef.current = current;
     const next = readOutputSchemaTree(formData);
@@ -107,7 +110,7 @@ function useOutputSchemaTree({ formData, onChange }: OutputSchemaEditorProps) {
     setTree(next);
     if (hasNameIssues(next)) return; // paused: formData keeps its last valid state
     const written = setOutputSchemaTree(formData, next);
-    lastWrittenRef.current = snapshot(written);
+    lastWrittenRef.current = readOutputJsonSchema(written);
     onChange(written);
   };
 
