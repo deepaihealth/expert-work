@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
+import { load as yamlLoad } from "js-yaml";
 import "../../i18n";
 
 vi.mock("@monaco-editor/react", () => {
@@ -51,6 +52,8 @@ import { __resetSchemaCacheForTest } from "../../components/manifest-editor/sche
 import { __resetCatalogCacheForTest } from "../../components/manifest-editor/catalog";
 import { ManifestTab } from "../agent_detail/ManifestTab";
 import type { AgentDetailResponse } from "../../api/agents";
+import MANIFEST_CONTRACT from "../../api/__fixtures__/agent_manifest_contract.json";
+import { typedFixture } from "../../test-utils/typedFixture";
 
 const sampleDetail: AgentDetailResponse = {
   record: {
@@ -649,5 +652,42 @@ describe("ManifestTab", () => {
     );
     await screen.findByTestId("manifest-editor-edit");
     expect(await screen.findByTestId("security-section")).toBeInTheDocument();
+  });
+});
+
+// B-319 — the hand-written records above spell the root key ``apiVersion``;
+// the real API once sent ``api_version`` and every agent's YAML → form switch
+// failed with no edit at all. This fixture is a real GET response, kept in
+// step with the backend by test_agent_manifest_wire_shape.py, validated
+// against the schema's real root contract (required + no extra keys).
+describe("ManifestTab — YAML ↔ form on the record the API really returns (B-319)", () => {
+  const realDetail = typedFixture<AgentDetailResponse>(MANIFEST_CONTRACT.detail);
+  const withoutDraft: AgentDetailResponse = {
+    ...realDetail,
+    record: { ...realDetail.record, draft: null },
+  };
+
+  beforeEach(() => {
+    vi.spyOn(schemaSdk, "fetchAgentSchema").mockResolvedValue(MANIFEST_CONTRACT.schema_root);
+  });
+
+  it.each([
+    ["the live spec", withoutDraft],
+    ["a pending draft", realDetail],
+  ])("switches to YAML and back to the form with no edits (%s)", async (_label, detail) => {
+    const user = userEvent.setup();
+    renderTab(detail);
+    await screen.findByTestId("manifest-editor-edit");
+
+    await user.click(screen.getByTestId("cfg-yaml-toggle"));
+    const copied = (screen.getByTestId("monaco-stub") as HTMLTextAreaElement).value;
+    // What a person copies to create this agent elsewhere: a manifest root.
+    expect(Object.keys(yamlLoad(copied) as Record<string, unknown>).sort()).toEqual(
+      [...MANIFEST_CONTRACT.schema_root.required].sort(),
+    );
+
+    await user.click(screen.getByTestId("cfg-yaml-toggle"));
+    expect(screen.queryByTestId("manifest-switch-error")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("monaco-stub")).not.toBeInTheDocument();
   });
 });

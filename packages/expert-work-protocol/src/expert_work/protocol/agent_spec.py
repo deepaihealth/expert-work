@@ -1768,9 +1768,15 @@ class AgentSpecBody(BaseModel):
 
 class AgentSpec(BaseModel):
     """Top-level Pydantic root. Aliased ``apiVersion`` because the YAML
-    uses camelCase per Kubernetes-style convention."""
+    uses camelCase per Kubernetes-style convention.
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    ``serialize_by_alias`` (B-319): every dump — including the API records that
+    nest this model and are dumped without ``by_alias`` — emits ``apiVersion``,
+    the only spelling the manifest schema allows. Without it the console's
+    YAML view showed ``api_version`` and refused to switch back to the form.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, serialize_by_alias=True)
 
     api_version: str = Field(alias="apiVersion", min_length=1)
     kind: Literal["Agent"]
