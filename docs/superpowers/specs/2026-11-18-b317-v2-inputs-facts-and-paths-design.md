@@ -19,6 +19,11 @@
 | 实现复审 L2 / L3 | 别名豁免先去首尾空白;`list_dir` 只在 `inputs/<run>/` 底下读链接、复用已开的目录 fd;`ask_image` 只对 `inputs/` 路径问存储 | — |
 | 实现复审 存疑 | 守卫拦下的调用不进 B-302 文件账。核实:账本只对 `edit_file` 的 `COUNTED_EDIT_FAILURES` 计数、只记成功的改动,被拦调用无 `failure_kind`,原先也不影响阈值;改了是为口径一致 | `builder.py` 文件账 |
 | 安全复审 S1 | `current` 被换成符号链接 / 普通文件时 `unlink`(不跟随)后重建再挂;删不掉照旧静默跳过 | `exec_view.current_inputs`(两份字面量) |
+| 第三轮复审 L1 + 存疑 | 写 `inputs/current/<x>` 或 `inputs/<run>/<x>` 的调用失败且这个文件不在时,宿主侧列出别的轮次里同名的 `inputs/*/<x>`(新的在前、最多 5 个)接在报错后面:不靠回执里那句(可能被上下文裁剪删掉),也不让模型手抄 36 位 run id。本轮有输入、但文件属于前一轮的,同样列 | `tools/inputs_candidates.py`、`builder._inputs_candidates_hint` |
+| 第三轮复审 L2 | 规则 3 认任一轮的 `inputs/<规范 UUID>/`(之后的轮次模型照回执用前一轮的);本轮有输入**或智能体声明了变量**时查,两者都没有照旧不查 | `input_literal_guard._LOCAL_INPUT_RE` |
+| 第三轮复审 L3 | 外部服务参数里的 `$EXPERT_WORK_*` 只在整段像路径时拦(以它开头,或整段没有空白);脚本、SKILL.md 正文里提到它放行。路径参数不变 | `input_literal_guard._path_shaped` |
+| 第三轮复审 L4–L6 | 补「工具报告失败不补那句」的测试;「之后的轮次」那句只回显链接名形状的路径(`[\w./-]`,≤240 字);`ask_image.image_ref` 填工作区路径时补那句、守卫也查 | `builder._with_later_turns_path`、`PATH_ARGS` |
+| 第三轮安全复审 | 内核测试补 `current` 被种成 FIFO / 硬链接;符号链接那条改成指向工作区里有内容的目录并断言内容不变 | `test_exec_view_kernel.py` X5 |
 | 审查 M1 | 不加 `$7`,exec 视图脚本从已下发的环境变量 `EXPERT_WORK_INPUTS_DIR` 取 run id | §3.2.3 重写 |
 | 审查 M2 | run 目录不在时挂载阶段静默跳过,不写 stderr;run 目录在才建 `current` 桩 | §3.2.3 |
 | 审查 M3 | MCP / http 的字符串叶子整段是 `inputs/…` 本地路径时也拦 | §3.3.1 |

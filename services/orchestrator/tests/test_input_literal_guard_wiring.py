@@ -298,8 +298,12 @@ async def test_factory_hands_the_graph_every_declared_variable_name(
     assert captured["declared_input_names"] == frozenset({"org_logo", "materials"})
 
 
-async def test_without_inputs_a_remote_services_own_inputs_path_passes() -> None:
-    """L1 —— 本轮没有输入时规则 3 不查:别的服务的 ``inputs/…`` 是它自己的路径。"""
+@pytest.mark.parametrize(("declared", "runs"), [(frozenset(), True), (_DECLARED, False)])
+async def test_without_inputs_only_agents_that_declare_variables_check_local_paths(
+    declared: frozenset[str], runs: bool
+) -> None:
+    """L1 —— 既没输入也没声明变量:别的服务的 ``inputs/…`` 是它自己的路径,放行。复审 L2 ——
+    声明了变量的智能体在没传输入的一轮里,前几轮的输入文件照样是本地路径,拦。"""
     tool = _Remote()
     llm = _ScriptedLLM(
         [
@@ -309,8 +313,8 @@ async def test_without_inputs_a_remote_services_own_inputs_path_passes() -> None
             AIMessage(content="done"),
         ]
     )
-    await _run(llm, _registry(tool), inputs={}, audit=_RecordingAuditLogger(), declared=_DECLARED)
-    assert len(tool.calls) == 1
+    await _run(llm, _registry(tool), inputs={}, audit=_RecordingAuditLogger(), declared=declared)
+    assert (len(tool.calls) == 1) is runs
 
 
 @dataclass

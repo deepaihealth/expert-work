@@ -97,20 +97,41 @@ def test_a_whole_local_input_path_sent_to_a_remote_service_is_caught(value: str)
     [
         "inputs/cache/train.json",
         "inputs/cache/" + "a" * 32 + ".png",
-        "inputs/1f1e2d3c-4b5a-4968-8776-655443322111/a.png",  # 别的 run
+        "inputs/1F1E2D3C-4B5A-4968-8776-655443322111/a.png",  # 不是规范写法(大写)
+        "inputs/1f1e2d3c4b5a49688776655443322111/a.png",  # 不是规范写法(无连字符)
         "inputs/data.csv",
     ],
 )
 def test_other_inputs_paths_are_the_remote_services_own(value: str) -> None:
     """L1 —— 仓库类 MCP 的 ``get_file_contents(path="inputs/cache/train.json")`` 是对方自己的
-    路径:只认本轮的 ``inputs/current/`` 与 ``inputs/<本轮 run>/``。"""
+    路径:只认 ``inputs/current/`` 与 ``inputs/<规范 UUID>/``。"""
     assert _hit("mcp__github__get_file_contents", {"path": value}, inputs_run=RUN) is None
 
 
+OTHER_RUN = "1f1e2d3c-4b5a-4968-8776-655443322111"
+
+
+@pytest.mark.parametrize(
+    "value", [f"inputs/{OTHER_RUN}/a.png", f"/workspace/inputs/{OTHER_RUN}/m/0"]
+)
+def test_a_previous_turns_input_path_sent_to_a_remote_service_is_caught(value: str) -> None:
+    """复审 L2 —— 之后的轮次模型会照回执用 ``inputs/<上一轮 run>/x``,同样不能交给外部服务。"""
+    hit = _hit(MCP, {"attachments": [value]}, inputs_run=RUN)
+    assert hit is not None and hit.kind == "local_path"
+
+
+@pytest.mark.parametrize("value", ["inputs/current/a.png", f"inputs/{OTHER_RUN}/a.png"])
+def test_an_agent_that_declares_variables_is_checked_in_a_turn_without_inputs(value: str) -> None:
+    """复审 L2 —— 本轮没传输入、但智能体声明了变量:前几轮的输入文件照样是本地路径。"""
+    hit = _hit(MCP, {"path": value})
+    assert hit is not None and hit.kind == "local_path"
+
+
 @pytest.mark.parametrize("value", ["inputs/current/a.png", f"inputs/{RUN}/a.png"])
-def test_without_inputs_this_turn_local_paths_are_not_checked(value: str) -> None:
-    """L1 —— 没有输入的智能体(或本轮没传)不查规则 3。"""
-    assert _hit("mcp__github__get_file_contents", {"path": value}) is None
+def test_without_inputs_or_variables_local_paths_are_not_checked(value: str) -> None:
+    """L1 —— 没有输入也没声明变量的智能体不查规则 3。"""
+    hit = find_literal("mcp__github__get_file_contents", {"path": value}, names=frozenset())
+    assert hit is None
 
 
 def test_env_names_are_checked_even_without_inputs() -> None:
@@ -119,10 +140,46 @@ def test_env_names_are_checked_even_without_inputs() -> None:
     assert hit is not None and hit.kind == "env"
 
 
-@pytest.mark.parametrize("env", ["$EXPERT_WORK_INPUTS_DIR/x.png", "${EXPERT_WORK_INPUTS}"])
+@pytest.mark.parametrize(
+    "env",
+    [
+        "$EXPERT_WORK_INPUTS_DIR/x.png",
+        "${EXPERT_WORK_INPUTS}",
+        "  $EXPERT_WORK_INPUTS_DIR/x.png ",
+        "file=$EXPERT_WORK_INPUTS_DIR/x.png",
+        "./$EXPERT_WORK_SKILLS_DIR/a",
+    ],
+)
 def test_platform_env_names_in_a_remote_call_are_caught(env: str) -> None:
     hit = _hit(MCP, {"a": env})
     assert hit is not None and hit.kind == "env"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "#!/bin/sh\npython $EXPERT_WORK_SKILLS_DIR/pptx/gen.py out.pptx\n",
+        "运行 $EXPERT_WORK_SKILLS_DIR/x/run.sh 之后再看结果",
+        "---\nname: report\n---\n读 ${EXPERT_WORK_SKILLS_DIR}/report/SKILL.md",
+    ],
+)
+def test_long_remote_text_that_mentions_a_platform_env_name_passes(text: str) -> None:
+    """复审 L3 —— 交给外部服务的脚本、SKILL.md 正文里提到 ``$EXPERT_WORK_SKILLS_DIR`` 是正文,
+    不是被当成路径的那串字;只有整段像路径(以它开头,或整段没有空白)才拦。"""
+    assert _hit(MCP, {"body": text}) is None
+    assert _hit("http", {"body": {"content": text}}) is None
+
+
+def test_long_text_in_a_platform_path_argument_is_still_caught() -> None:
+    """复审 L3 —— 路径参数不放宽:那里没有「正文」。"""
+    hit = _hit("read_file", {"path": "notes $EXPERT_WORK_SKILLS_DIR/a.md"})
+    assert hit is not None and hit.kind == "env"
+
+
+def test_a_declared_variable_in_long_remote_text_is_still_caught() -> None:
+    """复审 L3 只放宽 ``$EXPERT_WORK_*``;声明过的 ``$变量名`` 在正文里照样拦。"""
+    hit = _hit(MCP, {"body": "附件见 $attachment_urls ,请查收"})
+    assert hit is not None and hit.kind == "variable"
 
 
 def test_bound_parameters_are_not_checked() -> None:
@@ -149,7 +206,7 @@ def test_a_variable_bound_to_this_tool_names_the_bound_parameter() -> None:
 
 def test_the_path_table_is_explicit() -> None:
     assert PATH_ARGS["save_artifact"] == ("path",)
-    assert PATH_ARGS["ask_image"] == ("path",)
+    assert PATH_ARGS["ask_image"] == ("path", "image_ref")
     assert "search_files" not in PATH_ARGS
 
 
@@ -224,6 +281,21 @@ def test_other_env_or_variable_uses_in_a_path_are_caught(path: str) -> None:
 
 def test_a_local_path_is_fine_for_a_platform_tool() -> None:
     assert _hit("ask_image", {"path": "inputs/current/x.png"}) is None
+    assert _hit("ask_image", {"image_ref": "inputs/current/x.png"}) is None
+
+
+@pytest.mark.parametrize(
+    ("ref", "kind"),
+    [("$org_logo", "variable"), ("$EXPERT_WORK_SKILLS_DIR/a.png", "env")],
+)
+def test_ask_image_image_ref_is_checked_like_its_path(ref: str, kind: str) -> None:
+    """复审 L6 —— ``image_ref`` 填工作区路径时按 ``path`` 处理(B-250),守卫也一样查。"""
+    hit = _hit("ask_image", {"image_ref": ref, "question": "?"})
+    assert hit is not None and (hit.arg, hit.kind) == ("image_ref", kind)
+
+
+def test_an_uploaded_image_ref_passes() -> None:
+    assert _hit("ask_image", {"image_ref": "expert_work://image/t/u/a.png"}) is None
 
 
 # --- 提示文案(设计 §4.5)--------------------------------------------------------------

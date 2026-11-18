@@ -66,6 +66,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -261,6 +262,7 @@ from orchestrator.tools.figure_lookup import figure_run_ids
 from orchestrator.tools.figure_reads import stamp_step
 from orchestrator.tools.file_ops import EditFileMismatchError
 from orchestrator.tools.find_tools import promotion_events
+from orchestrator.tools.inputs_candidates import candidates_note, input_candidates
 from orchestrator.tools.knowledge_probe import (
     KnowledgeProbe,
     ProbeOutcome,
@@ -2242,6 +2244,7 @@ def build_react_graph(
                     spotlight_nonce=spotlight_nonce,
                     budget_enabled=tool_output_budget_enabled,
                     bound_args=bound_args,
+                    inputs_store=workspace_store,
                 )
             )
 
@@ -4035,6 +4038,7 @@ async def _dispatch_tool(
     spotlight_nonce: str | None = None,
     budget_enabled: bool = True,
     bound_args: Sequence[str] = (),
+    inputs_store: WorkspaceStore | None = None,
 ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
     """Dispatch one tool call.
 
@@ -4090,6 +4094,7 @@ async def _dispatch_tool(
                 overflow_writer=overflow_writer,
                 spotlight_nonce=spotlight_nonce,
                 budget_enabled=budget_enabled,
+                inputs_store=inputs_store,
             )
             _record_tool_io(span, args, outcome[0].content)
             if outcome[0].status == "error":
@@ -4329,26 +4334,57 @@ def _guard_sandbox_calls(
     return hits
 
 
+#: B-317 复审 L5 —— 「之后的轮次」那句在围栏外,只回显链接名形状的路径:链接名只由变量名、
+#: slug(``[\w-]``)、``.`` / ``/`` 与扩展名组成(``inputs_doc.link_names``),整段有长度上界。
+#: 模型写的带空白、标点的长文本不在围栏外原样回显。
+_LINK_SHAPED_PATH_RE = re.compile(r"[\w./-]{1,240}")
+
+
+def _path_arg(name: str, args: Mapping[str, Any]) -> str | None:
+    """这次调用的工作区路径参数(守卫那张表里的第一个字符串值)。``ask_image.image_ref`` 填的是
+    上传图的 ``expert_work://`` 引用时不算路径(复审 L6)。"""
+    for key in PATH_ARGS.get(name, ()):
+        raw = args.get(key)
+        if isinstance(raw, str) and not raw.strip().startswith("expert_work://"):
+            return raw
+    return None
+
+
 def _with_later_turns_path(
     result: ToolResult, name: str, args: Mapping[str, Any], ctx: ToolContext
 ) -> ToolResult:
     """B-317 —— 路径参数用的是短路径(或别名)时,在平台 notice(围栏外)里补一句真实路径。
 
-    只看守卫那张「工具名 → 路径参数」表里的工具;解析不了、写法本来就是真实路径、调用失败,都
-    原样返回。真实路径是平台目录名加 run id,不含租户数据。
+    只看守卫那张「工具名 → 路径参数」表里的工具;解析不了、写法本来就是真实路径、调用失败、
+    路径不是链接名形状(复审 L5),都原样返回。真实路径是平台目录名加 run id 加链接名。
     """
-    keys = PATH_ARGS.get(name)
-    raw = args.get(keys[0]) if keys else None
-    if not isinstance(raw, str) or result.failed:
+    raw = _path_arg(name, args)
+    if raw is None or result.failed:
         return result
     try:
         target = resolve_workspace_path(raw, view=ctx.workspace_view, tool=name)
     except ValueError:
         return result
-    if target.display == target.path:
+    if target.display == target.path or not _LINK_SHAPED_PATH_RE.fullmatch(target.path):
         return result
     note = f"（之后的轮次请用 {target.path}）"  # noqa: RUF001
     return replace(result, notice=f"{result.notice}\n{note}" if result.notice else note)
+
+
+async def _inputs_candidates_hint(
+    store: WorkspaceStore | None, name: str, args: Mapping[str, Any], ctx: ToolContext
+) -> str:
+    """B-317 复审 L1 —— 失败的调用写的是某一轮输入目录下的文件、而它不在:接一句别的轮次里同名
+    的文件(宿主侧列出,模型不必手抄长 run id)。没有候选、没接存储、出任何意外都是空串。"""
+    raw = _path_arg(name, args)
+    if store is None or raw is None:
+        return ""
+    try:
+        note = candidates_note(await input_candidates(store, ctx, raw))
+    except Exception as exc:
+        logger.warning("tools.inputs_candidates_skipped err=%s", type(exc).__name__)
+        return ""
+    return f"\n{note}" if note else ""
 
 
 def _guard_literal_calls(
@@ -5043,6 +5079,7 @@ async def _invoke_tool(
     overflow_writer: WorkspaceFileWriter | None = None,
     spotlight_nonce: str | None = None,
     budget_enabled: bool = True,
+    inputs_store: WorkspaceStore | None = None,
 ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
     # B2 — 让工具知道自己服务的 tool_call id(worker 帧挂前端工具卡用)。
     ctx = replace(ctx, tool_call_id=call_id)
@@ -5084,9 +5121,10 @@ async def _invoke_tool(
         # B-302 PR 3 —— the kind of an ``edit_file`` mismatch rides the (model-invisible)
         # artifact, for the tools node's per-file consecutive-failure count.
         kind = exc.kind if isinstance(exc, EditFileMismatchError) else None
+        hint = await _inputs_candidates_hint(inputs_store, tool.spec.name, args, ctx)
         return (
             ToolMessage(
-                content=_format_error(exc),
+                content=_format_error(exc) + hint,
                 tool_call_id=call_id,
                 status="error",
                 name=tool.spec.name,

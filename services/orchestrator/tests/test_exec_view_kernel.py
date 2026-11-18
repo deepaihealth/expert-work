@@ -1170,9 +1170,14 @@ def test_inputs_mount_is_skipped_silently(scenario: Scenario) -> None:
         """
         + _plant_inputs("agents/a", _RUN_A, "LOGO-A")
         + """
-        link("agents/a/inputs/current", "/usr/local/bin")
+        put("agents/a/keep/keep.txt", "KEEP")
+        link("agents/a/inputs/current", AG + "/keep")
         result["planted_link"] = ex("ls inputs/current; echo done", env=env)
-        result["link_target_kept"] = os.path.isdir("/usr/local/bin")
+        # 链接指向的工作区目录与其中的文件原样不动(unlink 不跟随链接)。
+        result["link_target_kept"] = (
+            sorted(os.listdir(AG + "/keep")),
+            open(AG + "/keep/keep.txt").read(),
+        )
         result["repaired_link"] = not os.path.islink(AG + "/inputs/current")
         os.rmdir(AG + "/inputs/current")
         put("agents/a/inputs/current", "file")
@@ -1190,11 +1195,42 @@ def test_inputs_mount_is_skipped_silently(scenario: Scenario) -> None:
         assert (r[key]["rc"], r[key]["err"]) == (0, ""), r[key]
         assert r[key]["out"].splitlines()[-1] == "done"
         assert "org_logo.png" in r[key]["out"].split(), r[key]  # 修好之后挂上了本轮目录
-    assert r["link_target_kept"] is True
+    assert r["link_target_kept"] == [["keep.txt"], "KEEP"], r["link_target_kept"]
     assert r["repaired_link"] is True and r["repaired_file"] is True
     assert "leftover.txt" not in r["covered"]["out"], r["covered"]
     assert "org_logo.png" in r["covered"]["out"], r["covered"]
     assert r["uncovered"]["out"].split() == ["leftover.txt"], r["uncovered"]
+
+
+def test_a_fifo_or_hardlink_planted_at_inputs_current_is_replaced(scenario: Scenario) -> None:
+    """安全复审 —— ``current`` 被种成 FIFO:exec 不会卡住(``O_PATH`` 打开不等对端),删掉重建后
+    照常挂上;被种成指向工作区另一个文件的硬链接:只删 ``current`` 这个名字,另一个名字的内容
+    不变、链接数回到 1,本轮目录照常挂上。"""
+    r = scenario(
+        _plant_inputs("agents/a", _RUN_A, "LOGO-A")
+        + f"""
+        env = {{"EXPERT_WORK_INPUTS_DIR": "/workspace/inputs/{_RUN_A}"}}
+        os.mkfifo(AG + "/inputs/current")
+        result["fifo"] = ex("cat inputs/current/org_logo.png; echo; echo done", env=env)
+        result["fifo_repaired"] = os.path.isdir(AG + "/inputs/current")
+        os.rmdir(AG + "/inputs/current")
+        put("agents/a/notes.txt", "NOTES")
+        os.link(AG + "/notes.txt", AG + "/inputs/current")
+        result["nlink_before"] = os.stat(AG + "/notes.txt").st_nlink
+        result["hardlink"] = ex("cat inputs/current/org_logo.png; echo; echo done", env=env)
+        result["hardlink_repaired"] = os.path.isdir(AG + "/inputs/current")
+        result["other_name"] = (
+            open(AG + "/notes.txt").read(),
+            os.stat(AG + "/notes.txt").st_nlink,
+        )
+    """
+    )
+    for key in ("fifo", "hardlink"):
+        assert (r[key]["rc"], r[key]["err"]) == (0, ""), r[key]
+        assert r[key]["out"].splitlines() == ["LOGO-A", "done"], r[key]
+    assert r["fifo_repaired"] is True and r["hardlink_repaired"] is True
+    assert r["nlink_before"] == 2
+    assert r["other_name"] == ["NOTES", 1], r["other_name"]
 
 
 def test_no_inputs_env_means_no_inputs_mount(scenario: Scenario) -> None:
