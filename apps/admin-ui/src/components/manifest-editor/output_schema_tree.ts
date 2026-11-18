@@ -403,8 +403,9 @@ const roundDown = (n: number): number => Math.floor(n) + 0;
 // bound that admits the same integers (exclusiveMinimum down, exclusiveMaximum
 // up); a fractional multipleOf is kept as-is (still valid on an integer, and
 // it keeps exactly the same integers — rounding it would change the rule).
-// A non-numeric exclusive bound (draft-04's boolean form) is dropped on the
-// way to integer, as any type change did before.
+// draft-04's boolean exclusive bounds never pass the platform build anyway
+// (agent_factory runs check_schema against 2020-12), so on the way to
+// integer they are simply dropped.
 function keptRawOnTypeChange(
   raw: Record<string, unknown>,
   from: SchemaNodeType,
@@ -420,7 +421,9 @@ function keptRawOnTypeChange(
   return Object.fromEntries(
     entries.flatMap(([k, v]): [string, unknown][] => {
       if (to !== "integer" || (k !== "exclusiveMinimum" && k !== "exclusiveMaximum")) return [[k, v]];
-      // A non-numeric bound (draft-04 boolean form) is dropped, as before.
+      // draft-04's boolean exclusive bounds never pass the platform build anyway
+      // (agent_factory runs check_schema against 2020-12), so on the way to
+      // integer they are simply dropped.
       if (typeof v !== "number") return [];
       return [[k, k === "exclusiveMinimum" ? roundDown(v) : roundUp(v)]];
     }),

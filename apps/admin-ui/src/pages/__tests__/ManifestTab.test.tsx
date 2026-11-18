@@ -275,6 +275,69 @@ describe("ManifestTab", () => {
     expect(screen.getByTestId("manifest-save-btn")).not.toBeDisabled();
   });
 
+  // B-315 — what the post-discard reset must and must not do, with draft ==
+  // live (the refetch then changes nothing the editor can see).
+  describe("discard with a draft identical to live", () => {
+    const sameSpec = () => ({
+      apiVersion: "expert_work.io/v1",
+      kind: "Agent",
+      metadata: { name: "demo-agent", version: "1.0.0" },
+      spec: { model: { provider: "anthropic", name: "claude-sonnet-4-6" }, system_prompt: "same" },
+    });
+    const live = () =>
+      ({ ...sampleDetail, record: { ...sampleDetail.record, spec: sameSpec() } }) as AgentDetailResponse;
+    const drafted = () =>
+      ({
+        ...live(),
+        record: { ...live().record, draft: { ...withDraft().record.draft, spec: sameSpec() } },
+      }) as AgentDetailResponse;
+
+    async function editInYaml(user: ReturnType<typeof userEvent.setup>) {
+      await screen.findByTestId("manifest-editor-edit");
+      await user.click(screen.getByTestId("cfg-yaml-toggle"));
+      const ta = screen.getByTestId("monaco-stub") as HTMLTextAreaElement;
+      await user.clear(ta);
+      await user.type(ta, "EDITED: yaml");
+    }
+
+    it("a successful discard drops the buffer: a later save carries no discarded edit", async () => {
+      const user = userEvent.setup();
+      discardMock.mockResolvedValue(live());
+      saveDraftMock.mockResolvedValue(live());
+      const { rerender } = renderTab(drafted());
+      await editInYaml(user);
+
+      await user.click(screen.getByTestId("manifest-discard-btn"));
+      await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+      rerender(
+        <MemoryRouter>
+          <ManifestTab detail={live()} onSaved={onSaved} />
+        </MemoryRouter>,
+      );
+      await user.click(screen.getByTestId("manifest-save-btn"));
+      await waitFor(() => expect(saveDraftMock).toHaveBeenCalledTimes(1));
+      expect(saveDraftMock.mock.calls[0][2].manifest_yaml).not.toContain("EDITED");
+    });
+
+    it("a failed discard keeps the edits and the YAML view; a later save carries them", async () => {
+      const user = userEvent.setup();
+      discardMock.mockRejectedValue(new ApiError("boom", "INTERNAL", 500));
+      saveDraftMock.mockResolvedValue(drafted());
+      renderTab(drafted());
+      await editInYaml(user);
+
+      await user.click(screen.getByTestId("manifest-discard-btn"));
+      await screen.findByTestId("manifest-error");
+      expect(onSaved).not.toHaveBeenCalled();
+      expect(screen.getByTestId("manifest-yaml-view")).toBeInTheDocument();
+      expect(screen.getByTestId("monaco-stub")).toHaveValue("EDITED: yaml");
+
+      await user.click(screen.getByTestId("manifest-save-btn"));
+      await waitFor(() => expect(saveDraftMock).toHaveBeenCalledTimes(1));
+      expect(saveDraftMock.mock.calls[0][2].manifest_yaml).toContain("EDITED");
+    });
+  });
+
   // B-315 M-1 — after a save the refetched manifest is re-read (new
   // objects); the group and the output-schema collapse state stay put.
   it("keeps the group and collapsed output-schema rows across a save + refetch", async () => {
