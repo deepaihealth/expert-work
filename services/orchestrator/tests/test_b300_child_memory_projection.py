@@ -333,6 +333,9 @@ _SRC = Path(__file__).resolve().parents[1] / "src" / "orchestrator"
 _RESOLVER_CALLERS = {
     # B-317 —— 工具回执补「之后的轮次请用 …」:按本次调用的 ``ctx.workspace_view`` 解析。
     "graph_builder/builder.py",
+    # B-317 复审 L1 —— 输入文件不在时列别的轮次:``ctx.workspace_view`` 的副本(只换 ``inputs_run``,
+    # 子代标记原样带着)。
+    "tools/inputs_candidates.py",
     "tools/artifact.py",
     "tools/file_ops.py",
     "tools/read_page.py",
