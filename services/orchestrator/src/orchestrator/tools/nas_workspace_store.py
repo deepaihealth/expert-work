@@ -176,7 +176,7 @@ from expert_work.persistence.workspace.layout import (
     WORKSPACE_SEED_MARKER,
     WORKSPACE_THREADS_DIR,
 )
-from orchestrator.tools.inputs_doc import input_link_cache_path
+from orchestrator.tools.inputs_doc import in_inputs_run_dir, input_link_cache_path
 from orchestrator.tools.sandbox import (
     SandboxSupervisorError,
     WorkspaceFileChangedError,
@@ -1165,10 +1165,26 @@ class NasWorkspaceStore:
         return input_link_cache_path(relpath, target)
 
     def _input_link_size(
-        self, tenant_id: UUID, user_id: UUID, dir_rel: str, name: str, fallback: int | None
+        self,
+        tenant_id: UUID,
+        user_id: UUID,
+        listing: tuple[int, str],
+        name: str,
+        fallback: int | None,
     ) -> int | None:
+        """列目录时一条链接的大小:平台建的预拉链接报缓存文件的大小,其余报 ``fallback``。
+
+        ``listing`` 是被列目录已经握着的 fd 与它的用户根相对路径:``readlink`` 直接在这个 fd
+        上做(不重走路径);缓存文件仍按 ``O_NOFOLLOW`` 的逐段打开去 ``lstat``。
+        """
+        dfd_listed, dir_rel = listing
+        try:
+            raw = os.readlink(name, dir_fd=dfd_listed)
+        except OSError:
+            return fallback
         link = f"{dir_rel}/{name}" if dir_rel not in ("", ".") else name
-        target = self._input_link_target(tenant_id, user_id, link)
+        relpath, _parts = normalize_workspace_path(link)
+        target = input_link_cache_path(relpath, raw)
         if target is None:
             return fallback
         try:
@@ -1343,6 +1359,8 @@ class NasWorkspaceStore:
                     # 的 ``threads/``),与 ``scoped_path`` 拒绝寻址它同一个口径。
                     names = [n for n in names if n not in scope_hidden_heads(scope)]
                 truncated = len(names) > max_entries
+                # B-317 —— 只有列的是 ``inputs/<run>/`` 或它的子目录时才看链接指向哪里。
+                links_resolved = in_inputs_run_dir(rel)
                 for name in names[:max_entries]:
                     try:
                         info = os.lstat(name, dir_fd=dfd)
@@ -1354,10 +1372,10 @@ class NasWorkspaceStore:
                         continue
                     is_dir = stat.S_ISDIR(info.st_mode)
                     size = None if is_dir else info.st_size
-                    if stat.S_ISLNK(info.st_mode):
+                    if links_resolved and stat.S_ISLNK(info.st_mode):
                         # B-317 —— ``inputs/current/`` 里是预拉链接,lstat 大小只有几十字节,
                         # 模型会当成坏文件。只对平台建的那种链接报缓存文件的大小。
-                        size = self._input_link_size(tenant_id, user_id, rel, name, size)
+                        size = self._input_link_size(tenant_id, user_id, (dfd, rel), name, size)
                     entries.append(
                         WorkspaceDirEntry(
                             name=name,

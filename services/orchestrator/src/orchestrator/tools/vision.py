@@ -1513,6 +1513,8 @@ class AskImageTool:
 
     async def _input_link_target(self, rel: str, *, ctx: ToolContext) -> str:
         """用户根相对的 ``rel`` 若是预拉链接,换成缓存文件路径;存储不支持或不是链接就原样。"""
+        if f"{WORKSPACE_INPUTS_DIR}/" not in rel:
+            return rel
         resolver = getattr(self.workspace_store, "resolve_input_link", None)
         if resolver is None or ctx.tenant_id is None or ctx.user_id is None:
             return rel

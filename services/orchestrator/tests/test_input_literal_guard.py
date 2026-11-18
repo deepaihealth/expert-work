@@ -84,13 +84,39 @@ def test_remote_text_that_is_not_a_literal_passes(value: str) -> None:
         "  inputs/current/a.png ",
         f"/workspace/inputs/{RUN}/a.png",
         f"inputs/{RUN}/m/0-x.mp4",
-        "inputs/cache/" + "a" * 32 + ".png",
     ],
 )
 def test_a_whole_local_input_path_sent_to_a_remote_service_is_caught(value: str) -> None:
-    hit = _hit(MCP, {"attachments": [value]})
+    hit = _hit(MCP, {"attachments": [value]}, inputs_run=RUN)
     assert hit is not None
     assert (hit.kind, hit.arg, hit.name) == ("local_path", "attachments", "")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "inputs/cache/train.json",
+        "inputs/cache/" + "a" * 32 + ".png",
+        "inputs/1f1e2d3c-4b5a-4968-8776-655443322111/a.png",  # 别的 run
+        "inputs/data.csv",
+    ],
+)
+def test_other_inputs_paths_are_the_remote_services_own(value: str) -> None:
+    """L1 —— 仓库类 MCP 的 ``get_file_contents(path="inputs/cache/train.json")`` 是对方自己的
+    路径:只认本轮的 ``inputs/current/`` 与 ``inputs/<本轮 run>/``。"""
+    assert _hit("mcp__github__get_file_contents", {"path": value}, inputs_run=RUN) is None
+
+
+@pytest.mark.parametrize("value", ["inputs/current/a.png", f"inputs/{RUN}/a.png"])
+def test_without_inputs_this_turn_local_paths_are_not_checked(value: str) -> None:
+    """L1 —— 没有输入的智能体(或本轮没传)不查规则 3。"""
+    assert _hit("mcp__github__get_file_contents", {"path": value}) is None
+
+
+def test_env_names_are_checked_even_without_inputs() -> None:
+    """规则 2 不看本轮有没有输入:``$EXPERT_WORK_`` 前缀归平台,外部服务里没有合法的字面用途。"""
+    hit = _hit(MCP, {"a": "$EXPERT_WORK_SKILLS_DIR/x"})
+    assert hit is not None and hit.kind == "env"
 
 
 @pytest.mark.parametrize("env", ["$EXPERT_WORK_INPUTS_DIR/x.png", "${EXPERT_WORK_INPUTS}"])
@@ -177,8 +203,10 @@ def test_a_file_tools_path_is_checked_even_when_its_content_is_not() -> None:
     "path", ["$EXPERT_WORK_INPUTS_DIR/x.png", "${EXPERT_WORK_INPUTS_DIR}/m/0-a.mp4"]
 )
 def test_the_inputs_dir_alias_at_the_start_of_a_path_is_left_to_the_resolver(path: str) -> None:
-    assert _hit("ask_image", {"path": path}) is None
-    assert _hit("read_document", {"path": path}) is None
+    for written in (path, f"  {path}", f"\t{path} "):
+        # L2 —— 与 ``resolve_workspace_path`` 同一个口径:先去首尾空白再认别名。
+        assert _hit("ask_image", {"path": written}) is None
+        assert _hit("read_document", {"path": written}) is None
 
 
 @pytest.mark.parametrize(
@@ -249,3 +277,19 @@ def test_remote_messages_never_point_at_a_local_path() -> None:
     for kind, name in (("variable", "org_logo"), ("env", "EXPERT_WORK_INPUTS_DIR")):
         hit = LiteralHit(MCP, "a", kind, name, remote=True)  # type: ignore[arg-type]
         assert "inputs/current" not in literal_guard_message(hit)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "见 inputs/current/a.png",
+        "./inputs/current/a.png",
+        "file:///workspace/inputs/current/a.png",
+        "![](inputs/current/a.png)",
+        '{"img": "inputs/current/a.png"}',
+        "inputs/current/a.png 和 inputs/current/b.png",
+    ],
+)
+def test_a_path_inside_a_sentence_is_not_a_local_path(value: str) -> None:
+    """规则 3 只认整段(设计 §六 列出的已知漏拦写法,接受),本轮有输入时也一样。"""
+    assert _hit(MCP, {"text": value}, inputs_run=RUN) is None

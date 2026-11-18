@@ -7,7 +7,9 @@
 **只查白名单里的三处**(设计 §3.3.1,用户 11-18 定):
 
 1. MCP 工具(``mcp__`` 开头)与 ``http`` 工具:参数里全部字符串叶子(平台绑定填进去的参数除外
-   —— 那是租户数据);另外整段是 ``inputs/…`` 本地路径的也拦(对方读不到沙箱里的文件)。
+   —— 那是租户数据);**本轮有输入时**,整段是本轮输入的本地路径(``inputs/current/…`` 或
+   ``inputs/<本轮 run>/…``)也拦(对方读不到沙箱里的文件)。没有输入的智能体不查这一条:别的
+   服务完全可能有自己的 ``inputs/…`` 路径(仓库类 MCP 的 ``get_file_contents``),拦了绕不开。
 2. 平台工具的工作区路径参数:本模块自己维护的 :data:`PATH_ARGS` 表。**不用**
    ``ToolSpec.path_args``:那是调度器的冲突键,``save_artifact`` 的是产物名 ``name``,真正的
    路径参数是 ``path``。
@@ -51,10 +53,13 @@ _INPUTS_DIR_ENV = "EXPERT_WORK_INPUTS_DIR"
 _SKILLS_DIR_ENV = "EXPERT_WORK_SKILLS_DIR"
 #: 路径参数开头的这两种写法由 ``resolve_workspace_path`` 当别名认(会话历史里的旧段、租户模板)。
 _ALIAS_PREFIXES = (f"${_INPUTS_DIR_ENV}/", f"${{{_INPUTS_DIR_ENV}}}/")
-#: 整段是本地输入路径(规则 3):``inputs/current/``、``inputs/<UUID>/``、``inputs/cache/`` 开头,
-#: 可带 ``/workspace/``,整段不含空白。
-_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-_LOCAL_INPUT_RE = re.compile(rf"(?:/workspace/)?inputs/(?:current|cache|{_UUID})/\S+")
+
+
+def _local_input_re(inputs_run: str) -> re.Pattern[str]:
+    """整段是本轮输入的本地路径(规则 3):``inputs/current/`` 或 ``inputs/<本轮 run>/`` 开头,
+    可带 ``/workspace/``,整段不含空白。不认 ``inputs/cache/`` 与别的 run。"""
+    return re.compile(rf"(?:/workspace/)?inputs/(?:current|{re.escape(inputs_run)})/\S+")
+
 
 Kind = Literal["variable", "env", "local_path"]
 
@@ -85,9 +90,12 @@ def _strings(value: Any) -> Iterator[str]:
 
 
 def _dollar_hit(text: str, names: Collection[str], *, path_arg: bool) -> tuple[Kind, str] | None:
+    # 解析函数先 ``strip()`` 再认别名(``resolve_workspace_path``),这里同一个口径。
+    lead = len(text) - len(text.lstrip())
+    aliased = path_arg and text[lead:].startswith(_ALIAS_PREFIXES)
     for match in _DOLLAR_RE.finditer(text):
         name = match.group(2)
-        if path_arg and match.start() == 0 and text.startswith(_ALIAS_PREFIXES):
+        if aliased and match.start() == lead:
             continue
         if name.startswith(_ENV_PREFIX):
             return "env", name
@@ -103,12 +111,19 @@ def find_literal(
     names: Collection[str],
     skip_args: Collection[str] = (),
     bound_params: Mapping[str, str] | None = None,
+    inputs_run: str | None = None,
 ) -> LiteralHit | None:
     """一次调用里第一处命中(按参数顺序、深度优先);不在受检面上或没有命中是 ``None``。
 
     ``names`` 是声明过的变量名;``skip_args`` 是这次被平台绑定填过的参数;``bound_params`` 是
-    本工具的「变量名 → 绑定参数名」,只用来把提示说具体。
+    本工具的「变量名 → 绑定参数名」,只用来把提示说具体;``inputs_run`` 是本轮输入目录的 run
+    (``None`` = 本轮没有输入,规则 3 不查)。
+
+    规则 2(``$EXPERT_WORK_*``)不看本轮有没有输入:这个前缀归平台所有,外部服务与路径参数里
+    出现它只可能是模型照抄了沙箱环境变量,没有合法的字面用途;``$EXPERT_WORK_SKILLS_DIR`` 的
+    提示也要对没声明变量的智能体成立。
     """
+    local_input = _local_input_re(inputs_run) if inputs_run else None
     remote = tool.startswith(_MCP_PREFIX) or tool == _HTTP_TOOL
     if remote:
         checked = [(arg, value) for arg, value in args.items() if arg not in skip_args]
@@ -123,7 +138,7 @@ def find_literal(
                 kind, name = dollar
                 bound = (bound_params or {}).get(name) if kind == "variable" else None
                 return LiteralHit(tool, arg, kind, name, remote, bound)
-            if remote and _LOCAL_INPUT_RE.fullmatch(text.strip()):
+            if remote and local_input is not None and local_input.fullmatch(text.strip()):
                 return LiteralHit(tool, arg, "local_path", "", remote)
     return None
 

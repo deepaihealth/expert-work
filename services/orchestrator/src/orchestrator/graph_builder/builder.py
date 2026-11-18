@@ -166,6 +166,7 @@ from orchestrator.graph_builder.figure_block import (
     with_figure_block,
 )
 from orchestrator.graph_builder.input_literal_guard import (
+    PATH_ARGS,
     LiteralHit,
     find_literal,
     literal_guard_message,
@@ -296,7 +297,11 @@ from orchestrator.tools.registry import (
 )
 from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
-from orchestrator.tools.workspace_paths import WorkspaceView, conversation_work_prefix
+from orchestrator.tools.workspace_paths import (
+    WorkspaceView,
+    conversation_work_prefix,
+    resolve_workspace_path,
+)
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.tools.workspace_tree import workspace_prompt_block
 from orchestrator.usage_metering import without_served_by
@@ -2142,21 +2147,6 @@ def build_react_graph(
         # 放在填参之后、派发之前;只影响派发(下面 ``_bounded``),不改审批门与 action
         # screening 的判定和下标语义(裁定 5)。审批续跑路径重新算一遍,判定是确定的。
         guard_hits = _guard_sandbox_calls(tool_calls, config)
-        # B-317 —— 字面量守卫:MCP / http 参数与平台工具的路径参数里不会被展开的 ``$名字``、
-        # ``$EXPERT_WORK_*``,以及交给外部服务的本地路径。同一位置、同一口径(审批门之后)。
-        literal_hits = _guard_literal_calls(
-            tool_calls, config, registry_bindings, declared_names=declared_input_names
-        )
-        for index in sorted(literal_hits.keys() & approved_calls):
-            hit_name = str(tool_calls[index].get("name", ""))
-            _literal_guard_blocked_after_approval_total.labels(
-                tool=_metric_tool_label(hit_name)
-            ).inc()
-            logger.warning(
-                "tools.literal_guard_blocked_after_approval tool=%s kind=%s",
-                hit_name,
-                literal_hits[index].kind,
-            )
         # 子代(``child_run``,只有 ``_child_config`` 会写)的 inputs 是父 run 的,本图的
         # 声明管不到它们 → 守卫提示一律按 untrusted。不看 ``inputs_run_id``:主 run 的审批
         # 续跑与复活续跑也会带它。
@@ -2179,6 +2169,26 @@ def build_react_graph(
             edit_file_history=state.get("edit_file_history"),
             figure_view_steps=figure_view_steps,
         )
+        # B-317 —— 字面量守卫:MCP / http 参数与平台工具的路径参数里不会被展开的 ``$名字``、
+        # ``$EXPERT_WORK_*``,以及交给外部服务的本轮本地路径。与手抄守卫同一口径(审批门之后、
+        # 只影响派发);在建好 ``ctx_obj`` 之后算,本轮输入目录的 run 与工具解析路径用同一个值。
+        literal_hits = _guard_literal_calls(
+            tool_calls,
+            config,
+            registry_bindings,
+            declared_names=declared_input_names,
+            inputs_run=ctx_obj.workspace_view.inputs_run,
+        )
+        for index in sorted(literal_hits.keys() & approved_calls):
+            hit_name = str(tool_calls[index].get("name", ""))
+            _literal_guard_blocked_after_approval_total.labels(
+                tool=_metric_tool_label(hit_name)
+            ).inc()
+            logger.warning(
+                "tools.literal_guard_blocked_after_approval tool=%s kind=%s",
+                hit_name,
+                literal_hits[index].kind,
+            )
         # Stream TE-2 — per-tool-call audit sink (may be None on the dev /
         # unit-test path; ``_dispatch_tool`` treats the emit as best-effort).
         audit_logger = audit_logger_from_config(config)
@@ -2339,7 +2349,9 @@ def build_react_graph(
                 if idx in approved_questions:
                     batch_outcomes.append((_ledger_key(tool_calls[idx], tool_message, None), None))
                 continue
-            file_events.append(_file_tool_event(tool_calls[idx], tool_message))
+            # B-317 —— 守卫拦下、没执行的调用不进 B-302 的文件账(与下面 ``ran_calls`` 同一个条件)。
+            if not (idx in guard_hits or idx in literal_hits):
+                file_events.append(_file_tool_event(tool_calls[idx], tool_message))
             if not (
                 idx in guard_hits
                 or idx in literal_hits
@@ -4317,12 +4329,35 @@ def _guard_sandbox_calls(
     return hits
 
 
+def _with_later_turns_path(
+    result: ToolResult, name: str, args: Mapping[str, Any], ctx: ToolContext
+) -> ToolResult:
+    """B-317 —— 路径参数用的是短路径(或别名)时,在平台 notice(围栏外)里补一句真实路径。
+
+    只看守卫那张「工具名 → 路径参数」表里的工具;解析不了、写法本来就是真实路径、调用失败,都
+    原样返回。真实路径是平台目录名加 run id,不含租户数据。
+    """
+    keys = PATH_ARGS.get(name)
+    raw = args.get(keys[0]) if keys else None
+    if not isinstance(raw, str) or result.failed:
+        return result
+    try:
+        target = resolve_workspace_path(raw, view=ctx.workspace_view, tool=name)
+    except ValueError:
+        return result
+    if target.display == target.path:
+        return result
+    note = f"（之后的轮次请用 {target.path}）"  # noqa: RUF001
+    return replace(result, notice=f"{result.notice}\n{note}" if result.notice else note)
+
+
 def _guard_literal_calls(
     calls: Sequence[Mapping[str, Any]],
     config: RunnableConfig,
     bindings: Mapping[str, ToolArgBindings],
     *,
     declared_names: frozenset[str],
+    inputs_run: UUID | None,
 ) -> dict[int, LiteralHit]:
     """B-317 —— 对本批调用做一次字面量检查,返回 ``{下标: 命中}``(设计 §3.3)。
 
@@ -4335,6 +4370,7 @@ def _guard_literal_calls(
     names = set(declared_names)
     if isinstance(raw_inputs, Mapping):
         names.update(str(key) for key in raw_inputs)
+    run = str(inputs_run) if inputs_run is not None else None
     hits: dict[int, LiteralHit] = {}
     try:
         for index, call in enumerate(calls):
@@ -4345,7 +4381,9 @@ def _guard_literal_calls(
             bound = bindings.get(tool)
             skip = {*bound.args, *bound.fixed} if bound else set()
             by_var = {var: param for param, var in bound.args.items()} if bound else {}
-            hit = find_literal(tool, args, names=names, skip_args=skip, bound_params=by_var)
+            hit = find_literal(
+                tool, args, names=names, skip_args=skip, bound_params=by_var, inputs_run=run
+            )
             if hit is not None:
                 hits[index] = hit
     except Exception as exc:
@@ -5058,6 +5096,9 @@ async def _invoke_tool(
             0,
             classified,
         )
+    # B-317 —— 这一次用短路径(``inputs/current/…``)读的文件,回执末尾说一次真实路径:
+    # 下一轮 ``inputs/current/`` 指向别的一轮(或本轮没有输入),模型要接着用就得有它。
+    result = _with_later_turns_path(result, tool.spec.name, args, ctx)
     # Stream CM-5 — recoverable compression: save an oversized result to the
     # workspace and let the LLM see a recoverable reference (the tool's own
     # truncated body, or a head+tail preview for tools that didn't pre-truncate)

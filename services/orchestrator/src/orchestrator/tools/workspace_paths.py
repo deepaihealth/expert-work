@@ -328,7 +328,9 @@ def _current_inputs_parts(
         msg = (
             f"{tool}: {CURRENT_INPUTS_REL}/ 是本轮输入文件的目录；"  # noqa: RUF001
             "本轮没有输入变量，里面没有文件。"  # noqa: RUF001
-            f"之前几轮的文件用当时工具结果或渲染页段里给出的路径: {raw!r}"
+            f"之前几轮的输入文件在 {WORKSPACE_INPUTS_DIR}/<那一轮的编号>/ 下，"  # noqa: RUF001
+            "路径见当时工具回执末尾的「之后的轮次请用 …」，"  # noqa: RUF001
+            f"或用 list_dir 查看 {WORKSPACE_INPUTS_DIR}/: {raw!r}"
         )
         raise ValueError(msg)
     return (WORKSPACE_INPUTS_DIR, str(view.inputs_run), *parts[2:]), "/".join(parts)

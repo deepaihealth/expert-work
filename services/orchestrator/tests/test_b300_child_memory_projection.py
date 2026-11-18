@@ -331,6 +331,8 @@ _SRC = Path(__file__).resolve().parents[1] / "src" / "orchestrator"
 #: 调用 ``resolve_workspace_path`` 的模块。设计 §13.2 数的五个文件里 ``workspace_scope`` 只在
 #: 文档字符串里提到它(没有调用),由下面那条「只在这里建视图」守住。
 _RESOLVER_CALLERS = {
+    # B-317 —— 工具回执补「之后的轮次请用 …」:按本次调用的 ``ctx.workspace_view`` 解析。
+    "graph_builder/builder.py",
     "tools/artifact.py",
     "tools/file_ops.py",
     "tools/read_page.py",

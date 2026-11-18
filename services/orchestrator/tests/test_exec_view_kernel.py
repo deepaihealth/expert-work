@@ -1158,8 +1158,9 @@ def test_two_runs_in_one_workspace_each_see_their_own_inputs(scenario: Scenario)
 
 
 def test_inputs_mount_is_skipped_silently(scenario: Scenario) -> None:
-    """X5 / M2 —— run 目录不在:不挂、stderr 为空、不建 ``current`` 桩;``current`` 被种成符号
-    链接 / 普通文件:不挂、stderr 为空、exec 成功;桩里原有的文件在有挂载的 exec 里看不见。"""
+    """X5 / M2 / S1 —— run 目录不在:不挂、stderr 为空、不建 ``current`` 桩;``current`` 被种成
+    符号链接 / 普通文件:删掉重建后照常挂上(链接指向的东西不动)、stderr 为空;桩里原有的文件
+    在有挂载的 exec 里看不见。"""
     r = scenario(
         f"""
         env = {{"EXPERT_WORK_INPUTS_DIR": "/workspace/inputs/{_RUN_A}"}}
@@ -1170,11 +1171,14 @@ def test_inputs_mount_is_skipped_silently(scenario: Scenario) -> None:
         + _plant_inputs("agents/a", _RUN_A, "LOGO-A")
         + """
         link("agents/a/inputs/current", "/usr/local/bin")
-        result["planted_link"] = ex("ls inputs/current | head -1; echo done", env=env)
-        os.unlink(AG + "/inputs/current")
+        result["planted_link"] = ex("ls inputs/current; echo done", env=env)
+        result["link_target_kept"] = os.path.isdir("/usr/local/bin")
+        result["repaired_link"] = not os.path.islink(AG + "/inputs/current")
+        os.rmdir(AG + "/inputs/current")
         put("agents/a/inputs/current", "file")
-        result["planted_file"] = ex("echo done", env=env)
-        os.unlink(AG + "/inputs/current")
+        result["planted_file"] = ex("ls inputs/current; echo done", env=env)
+        result["repaired_file"] = os.path.isdir(AG + "/inputs/current")
+        os.rmdir(AG + "/inputs/current")
         put("agents/a/inputs/current/leftover.txt", "old")
         result["covered"] = ex("ls inputs/current", env=env)
         result["uncovered"] = ex("ls inputs/current")
@@ -1185,6 +1189,9 @@ def test_inputs_mount_is_skipped_silently(scenario: Scenario) -> None:
     for key in ("planted_link", "planted_file"):
         assert (r[key]["rc"], r[key]["err"]) == (0, ""), r[key]
         assert r[key]["out"].splitlines()[-1] == "done"
+        assert "org_logo.png" in r[key]["out"].split(), r[key]  # 修好之后挂上了本轮目录
+    assert r["link_target_kept"] is True
+    assert r["repaired_link"] is True and r["repaired_file"] is True
     assert "leftover.txt" not in r["covered"]["out"], r["covered"]
     assert "org_logo.png" in r["covered"]["out"], r["covered"]
     assert r["uncovered"]["out"].split() == ["leftover.txt"], r["uncovered"]

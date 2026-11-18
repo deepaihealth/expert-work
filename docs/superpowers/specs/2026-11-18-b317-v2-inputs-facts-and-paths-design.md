@@ -14,6 +14,11 @@
 | 用户定 6 | 守卫仍在审批门之后;加计数「已批准后被字面量守卫拦下」 | §3.3.2 |
 | 审查 L1 | 协调方已实测证实,`resolve_input_link` 必做;探针作为正式测试提交进仓库 | §1.2、§9.5 |
 | 复审 LOW ×9 | 环境变量注入口径、挂载异常与 run id 双重校验、保留期措辞、场景 o / p、受检面 ② 用自维护的表、审计措辞、补测试、M3 已知漏拦 | §3.2、§3.3、§五、§六、§七、§九 |
+| 实现复审 M1 | 用短路径(或别名)调用路径类工具成功时,平台 notice(围栏外)补一句「（之后的轮次请用 inputs/<run>/…）」;「本轮没有输入」的报错改成指向这句与 `list_dir` 看 `inputs/`,不再说渲染页段里有路径 | `builder._with_later_turns_path`、`workspace_paths._current_inputs_parts` |
+| 实现复审 L1 | 守卫规则 3 只在本轮有输入时查,只认 `inputs/current/` 与本轮 run 的 `inputs/<run>/`,不认 `inputs/cache/` 与别的 run;规则 2 照旧对所有智能体生效(前缀归平台,外部服务与路径参数里没有合法的字面用途) | `input_literal_guard.find_literal` |
+| 实现复审 L2 / L3 | 别名豁免先去首尾空白;`list_dir` 只在 `inputs/<run>/` 底下读链接、复用已开的目录 fd;`ask_image` 只对 `inputs/` 路径问存储 | — |
+| 实现复审 存疑 | 守卫拦下的调用不进 B-302 文件账。核实:账本只对 `edit_file` 的 `COUNTED_EDIT_FAILURES` 计数、只记成功的改动,被拦调用无 `failure_kind`,原先也不影响阈值;改了是为口径一致 | `builder.py` 文件账 |
+| 安全复审 S1 | `current` 被换成符号链接 / 普通文件时 `unlink`(不跟随)后重建再挂;删不掉照旧静默跳过 | `exec_view.current_inputs`(两份字面量) |
 | 审查 M1 | 不加 `$7`,exec 视图脚本从已下发的环境变量 `EXPERT_WORK_INPUTS_DIR` 取 run id | §3.2.3 重写 |
 | 审查 M2 | run 目录不在时挂载阶段静默跳过,不写 stderr;run 目录在才建 `current` 桩 | §3.2.3 |
 | 审查 M3 | MCP / http 的字符串叶子整段是 `inputs/…` 本地路径时也拦 | §3.3.1 |

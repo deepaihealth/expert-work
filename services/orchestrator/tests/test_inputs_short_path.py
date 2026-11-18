@@ -67,7 +67,8 @@ def test_conversation_view_places_the_run_dir_under_the_conversation() -> None:
 def test_without_inputs_this_turn_the_short_path_is_refused(view: WorkspaceView) -> None:
     with pytest.raises(ValueError, match="本轮没有输入变量") as info:
         resolve_workspace_path("inputs/current/x.png", view=view, tool="ask_image")
-    assert "渲染页段" in str(info.value)
+    assert "回执末尾的「之后的轮次请用 …」" in str(info.value)
+    assert "list_dir 查看 inputs/" in str(info.value)
 
 
 def test_legacy_agent_spelling_is_refused_with_the_right_spelling() -> None:

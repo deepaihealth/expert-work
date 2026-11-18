@@ -277,9 +277,10 @@ def hide_platform(view):
 def current_inputs(ws, run):
     # This turn inputs/<run>/ also at inputs/current/, so every tool names its
     # files without the run id. Skipped without a word when anything is off (no
-    # such run dir, current/ swapped for a link or a file, the bind refused):
-    # stderr is the tool output of every exec, and EXPERT_WORK_INPUTS_DIR still
-    # works. The stub is only made when the run dir is there.
+    # such run dir, the bind refused): stderr is the tool output of every exec,
+    # and EXPERT_WORK_INPUTS_DIR still works. The stub is only made when the run
+    # dir is there. The name current is the platform own: a link or a file put
+    # there is removed (unlink never follows it) and the stub made again.
     try:
         if str(uuid.UUID(run)) != run:
             return
@@ -288,7 +289,11 @@ def current_inputs(ws, run):
     try:
         inputs = sub(ws, INPUTS, False)
         source = sub(inputs, run, False)
-        stub = sub(inputs, CURRENT, True)
+        try:
+            stub = sub(inputs, CURRENT, True)
+        except OSError:
+            os.unlink(CURRENT, dir_fd=inputs)
+            stub = sub(inputs, CURRENT, True)
         bind(source, stub)
     except OSError:
         return

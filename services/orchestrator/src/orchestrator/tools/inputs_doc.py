@@ -141,6 +141,23 @@ def _is_canonical_uuid(text: str) -> bool:
         return False
 
 
+def _inputs_run_head(parts: Sequence[str], *, below: int) -> int | None:
+    """``parts`` 里第一个 ``inputs/<规范 UUID>`` 的下标;``below`` 要求其后至少还有几段。"""
+    return next(
+        (
+            i
+            for i in range(len(parts) - 1 - below)
+            if parts[i] == WORKSPACE_INPUTS_DIR and _is_canonical_uuid(parts[i + 1])
+        ),
+        None,
+    )
+
+
+def in_inputs_run_dir(dir_path: str) -> bool:
+    """``dir_path`` 是某个 ``inputs/<规范 UUID>/`` 或它的子目录吗(列目录时才解析链接)。"""
+    return _inputs_run_head(posixpath.normpath(dir_path).split("/"), below=0) is not None
+
+
 def input_link_cache_path(link_path: str, target: str) -> str | None:
     """B-317 —— 预拉链接 → 它指向的缓存文件路径;不是平台建的那种链接就 ``None``。
 
@@ -151,14 +168,7 @@ def input_link_cache_path(link_path: str, target: str) -> str | None:
     是唯一放行的一种:目标仍在本工作区的缓存目录里,沙箱代码本来就读得到它。
     """
     parts = posixpath.normpath(link_path).split("/")
-    head = next(
-        (
-            i
-            for i in range(len(parts) - 2)
-            if parts[i] == WORKSPACE_INPUTS_DIR and _is_canonical_uuid(parts[i + 1])
-        ),
-        None,
-    )
+    head = _inputs_run_head(parts, below=1)
     if head is None or not target or target.startswith("/") or "\x00" in target:
         return None
     resolved = posixpath.normpath(posixpath.join(posixpath.dirname(link_path), target))

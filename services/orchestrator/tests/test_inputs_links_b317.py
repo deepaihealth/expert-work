@@ -241,3 +241,51 @@ def test_a_document_read_by_short_path_is_found_again_next_turn(
     assert _document_path(doc_sha, {doc_sha: recorded}, turn2) == f"inputs/{_RUN}/report.pdf"
     # 对照:当初若记的是短路径,下一轮要么核对不上,要么指向另一轮的同名文档。
     assert _document_path(doc_sha, {doc_sha: "inputs/current/report.pdf"}, turn2) is None
+
+
+# --- L3:只在 inputs/<run>/ 底下才去读链接 -----------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_list_dir_reads_links_only_under_an_inputs_run_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import orchestrator.tools.nas_workspace_store as nas
+
+    store = NasWorkspaceStore(root=str(tmp_path))
+    _plant(tmp_path, link=f"inputs/{_RUN}/ok.png", target=f"../cache/{_DIGEST}.png")
+    _plant(tmp_path, link="crops/l.png", target=f"../inputs/cache/{_DIGEST}.png")
+    calls: list[str] = []
+    real = nas.os.readlink
+
+    def _spy(name: Any, *args: Any, **kwargs: Any) -> str:
+        calls.append(str(name))
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(nas.os, "readlink", _spy)
+    await store.list_dir(tenant_id=_TENANT, user_id=_USER, path=f"agents/{_AGENT}/crops")
+    assert calls == []
+    await store.list_dir(tenant_id=_TENANT, user_id=_USER, path=f"agents/{_AGENT}/inputs/{_RUN}")
+    assert calls == ["ok.png"]
+
+
+@pytest.mark.anyio
+async def test_ask_image_asks_the_store_about_links_only_for_inputs_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _user_root(tmp_path) / "agents" / _AGENT / "crops"
+    root.mkdir(parents=True)
+    (root / "a.png").write_bytes(_PNG)
+    tool = _tool(tmp_path, _VL())
+    asked: list[str] = []
+    store = tool.workspace_store
+    assert isinstance(store, NasWorkspaceStore)
+    real = store.resolve_input_link
+
+    async def _spy(*, tenant_id: UUID, user_id: UUID, path: str) -> str:
+        asked.append(path)
+        return await real(tenant_id=tenant_id, user_id=user_id, path=path)
+
+    monkeypatch.setattr(store, "resolve_input_link", _spy)
+    await tool.call({"path": "crops/a.png", "question": "?"}, ctx=_ctx())
+    assert asked == []

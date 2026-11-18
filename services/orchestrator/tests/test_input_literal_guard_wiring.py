@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from prometheus_client import REGISTRY
 
@@ -78,6 +78,7 @@ def _config(inputs: Mapping[str, Any], audit: Any, **extra: Any) -> RunnableConf
             "run_id": str(uuid4()),
             PROMPT_INPUTS_KEY: dict(inputs),
             AUDIT_LOGGER_KEY: audit,
+            "agent_key": "health-aaaaaaaa",
             **extra,
         }
     }
@@ -295,3 +296,67 @@ async def test_factory_hands_the_graph_every_declared_variable_name(
             provider_key_resolver=_key_resolver,
         )
     assert captured["declared_input_names"] == frozenset({"org_logo", "materials"})
+
+
+async def test_without_inputs_a_remote_services_own_inputs_path_passes() -> None:
+    """L1 —— 本轮没有输入时规则 3 不查:别的服务的 ``inputs/…`` 是它自己的路径。"""
+    tool = _Remote()
+    llm = _ScriptedLLM(
+        [
+            AIMessage(
+                content="", tool_calls=[_tc(MCP, {"pics": ["inputs/current/lab.jpg"]}, "tc-1")]
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    await _run(llm, _registry(tool), inputs={}, audit=_RecordingAuditLogger(), declared=_DECLARED)
+    assert len(tool.calls) == 1
+
+
+@dataclass
+class _FileTool:
+    name: str = "edit_file"
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=self.name, description="d", is_read_only=False)
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        del ctx
+        self.calls.append(dict(args))
+        return ToolResult(content="edited")
+
+
+async def test_a_blocked_file_call_stays_out_of_the_file_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """守卫拦下、没执行的 ``edit_file`` 不进 B-302 的文件账(与 ``ran_calls`` 同一个条件)。"""
+    from orchestrator.graph_builder import builder
+
+    seen: list[str] = []
+    real = builder._file_tool_event
+
+    def _spy(tool_call: dict[str, Any], tool_message: ToolMessage) -> Any:
+        seen.append(str(tool_call.get("id")))
+        return real(tool_call, tool_message)
+
+    monkeypatch.setattr(builder, "_file_tool_event", _spy)
+    tool = _FileTool()
+    registry = ToolRegistry()
+    registry.register(tool)
+    llm = _ScriptedLLM(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _tc("edit_file", {"path": "$customer_code", "old_string": "a"}, "tc-bad"),
+                    _tc("edit_file", {"path": "notes.md", "old_string": "a"}, "tc-ok"),
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    await _run(llm, registry, inputs=_INPUTS, audit=_RecordingAuditLogger(), declared=_DECLARED)
+    assert [c["path"] for c in tool.calls] == ["notes.md"]
+    assert seen == ["tc-ok"]

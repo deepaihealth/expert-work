@@ -801,22 +801,46 @@ def test_current_inputs_without_the_run_dir_is_silent_and_makes_no_stub(
 
 
 @pytest.mark.parametrize("planted", ["symlink", "file", "dangling"])
-def test_current_inputs_skips_a_planted_stub_silently(
+def test_current_inputs_repairs_a_planted_stub_and_binds(
     tmp_path: Path, planted: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """S1 —— ``current`` 这个名字归平台:被换成符号链接 / 普通文件时删掉它(``unlink`` 不跟随)、
+    重建目录再挂;链接指向的东西不动。"""
     run_dir = tmp_path / "inputs" / _INPUTS_RUN
     run_dir.mkdir(parents=True)
     stub = tmp_path / "inputs" / "current"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep.txt").write_text("k")
     if planted == "symlink":
-        (tmp_path / "elsewhere").mkdir()
-        stub.symlink_to(tmp_path / "elsewhere")
+        stub.symlink_to(elsewhere)
     elif planted == "file":
         stub.write_text("x")
     else:
         stub.symlink_to(tmp_path / "nowhere")
     binds: list[tuple[int, int]] = []
     _run_current_inputs(tmp_path, _INPUTS_RUN, _current_inputs_ns(binds))
+    assert len(binds) == 1
+    assert stub.is_dir() and not stub.is_symlink()
+    assert (elsewhere / "keep.txt").read_text() == "k"
+    assert capsys.readouterr().err == ""
+
+
+def test_current_inputs_skips_silently_when_the_planted_stub_cannot_be_removed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """删不掉(目录不可写)就照旧静默跳过,exec 照常。"""
+    inputs = tmp_path / "inputs"
+    (inputs / _INPUTS_RUN).mkdir(parents=True)
+    (inputs / "current").write_text("x")
+    inputs.chmod(0o500)
+    try:
+        binds: list[tuple[int, int]] = []
+        _run_current_inputs(tmp_path, _INPUTS_RUN, _current_inputs_ns(binds))
+    finally:
+        inputs.chmod(0o700)
     assert binds == []
+    assert (inputs / "current").is_file()
     assert capsys.readouterr().err == ""
 
 
