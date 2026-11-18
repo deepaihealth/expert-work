@@ -81,7 +81,7 @@ def _uuid_or_none(raw: object) -> UUID | None:
 
 
 if TYPE_CHECKING:
-    from orchestrator.tools.arg_bindings import ToolArgBindings
+    from orchestrator.tools.arg_bindings import FixedValueOption, ToolArgBindings
 
 #: Stream TE-1 — a tool's effect on the world. Descriptive metadata only in
 #: TE-1; intended to drive the side-effect-aware scheduler / approval gate
@@ -253,6 +253,21 @@ class UnmatchedArgBinding:
     #: 落空的参数名。``tool_missing`` / ``name_collision`` 时是这条绑定的全部参数。
     params: tuple[str, ...]
     reason: UnmatchedReason
+
+
+@dataclass(frozen=True)
+class InvalidFixedValue:
+    """B-318 —— 一个固定值不在工具给这个参数声明的可选值里。
+
+    保存时的试建据此拒绝(``control_plane.api.agents._check_buildable``)。只带名字和
+    **允许的值**(来自工具 schema),不带配置里写的那个值 —— 同 :class:`UnmatchedArgBinding`,
+    这条记录也会进运行期日志。
+    """
+
+    server: str
+    tool: str
+    param: str
+    allowed: tuple[FixedValueOption, ...]
 
 
 @dataclass(frozen=True)
@@ -656,6 +671,8 @@ class ToolRegistry:
         self._landed_arg_bindings: dict[tuple[str, str], str] = {}
         #: B-294 —— 本次构建因连不上而跳过的 MCP 服务(按首次出现的顺序、不重复)。
         self._skipped_mcp_servers: list[str] = []
+        #: B-318 —— 不在工具可选值里的固定值(按首次出现的顺序、不重复)。
+        self._invalid_fixed_values: list[InvalidFixedValue] = []
 
     def register(self, tool: Tool, *, deferred: bool = False, source: str | None = None) -> None:
         """Register a tool by its spec ``name``. Re-registering replaces.
@@ -767,6 +784,16 @@ class ToolRegistry:
     def unmatched_arg_bindings(self) -> tuple[UnmatchedArgBinding, ...]:
         """本次构建里落空的绑定(整条没匹配上的 + 参数漂移的)。"""
         return tuple(self._unmatched_arg_bindings)
+
+    def note_invalid_fixed_value(self, record: InvalidFixedValue) -> None:
+        """B-318 —— 记一条不在可选值里的固定值。多个 ``mcp`` 条目会各注册一遍同一台服务器,
+        同一条只记一次(同 :meth:`note_unmatched_arg_binding`)。"""
+        if record not in self._invalid_fixed_values:
+            self._invalid_fixed_values.append(record)
+
+    def invalid_fixed_values(self) -> tuple[InvalidFixedValue, ...]:
+        """B-318 —— 本次构建里不在工具可选值里的固定值。"""
+        return tuple(self._invalid_fixed_values)
 
     def note_landed_arg_binding(self, server: str, tool: str, wire_name: str) -> None:
         """B-61 §5.4 — 这条绑定落在了一个真实注册的工具上,落在 ``wire_name`` 这个键下。

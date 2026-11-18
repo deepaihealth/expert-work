@@ -26,7 +26,11 @@ if TYPE_CHECKING:
     # Type-only so this module stays a leaf (no runtime edge into
     # orchestrator.tools). The dataclass field annotation stays a string
     # (``from __future__ import annotations``) and is never resolved.
-    from orchestrator.tools.registry import ToolCatalogEntry, UnmatchedArgBinding
+    from orchestrator.tools.registry import (
+        InvalidFixedValue,
+        ToolCatalogEntry,
+        UnmatchedArgBinding,
+    )
 
 
 @dataclass(frozen=True)
@@ -123,3 +127,6 @@ class BuiltAgent:
     #: 非空时控制面的构建缓存只留这份 60 秒(``build_cache_ttl_s``):留满 TTL,服务恢复后
     #: 整个 TTL 里还是没有它的工具;过了 60 秒下一次构建由池里的客户端自己重连(B-177)。
     skipped_mcp_servers: tuple[str, ...] = ()
+    #: B-318 —— 不在工具可选值里的固定值(``ToolRegistry.invalid_fixed_values``)。保存时的
+    #: 试建据此拒绝;运行期不看(调用前的 schema 校验照样拦)。带默认值,存量构造点不用改。
+    invalid_fixed_values: tuple[InvalidFixedValue, ...] = ()

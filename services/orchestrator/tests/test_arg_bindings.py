@@ -7,9 +7,11 @@ from typing import Any
 
 from expert_work.protocol import ArgBindingSpec, BuiltinToolSpec, MCPToolSpec
 from orchestrator.tools.arg_bindings import (
+    FixedValueOption,
     ToolArgBindings,
     apply_arg_bindings,
     bindings_by_tool,
+    fixed_value_options,
     manifest_bindings,
     strip_bound_params,
 )
@@ -358,3 +360,90 @@ def test_apply_fills_variables_and_fixed_values_together() -> None:
     )
     assert filled[0]["args"] == {"project_code": "PRJ001", "detail_level": "brief"}
     assert names == ["project_code", "detail_level"]
+
+
+# ---------------------------------------------------------------------------
+# B-318 —— 固定值的可选值。与 admin-ui ``utils/mcp_param_options.ts`` 同一套规则、
+# 同一组用例(``__tests__/mcp_param_options.test.ts``),改一边就要改另一边。
+# ---------------------------------------------------------------------------
+
+_HANDOFF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "this_turn": {
+            "type": "string",
+            "oneOf": [
+                {"const": "reply", "title": "本轮回复"},
+                {"const": "silent", "title": "本轮不回"},
+            ],
+        },
+        "level": {"type": "string", "enum": ["brief", "full"]},
+        "mode": {"anyOf": [{"type": "string", "const": "a"}, {"const": "b", "title": ""}]},
+        "keyword": {"type": "string"},
+    },
+}
+
+
+def test_one_of_consts_with_titles_are_the_options() -> None:
+    assert fixed_value_options(_HANDOFF_SCHEMA, "this_turn") == (
+        FixedValueOption(value="reply", title="本轮回复"),
+        FixedValueOption(value="silent", title="本轮不回"),
+    )
+
+
+def test_a_string_enum_gives_options_without_titles() -> None:
+    assert fixed_value_options(_HANDOFF_SCHEMA, "level") == (
+        FixedValueOption(value="brief"),
+        FixedValueOption(value="full"),
+    )
+
+
+def test_any_of_consts_count_and_an_empty_title_is_no_title() -> None:
+    assert fixed_value_options(_HANDOFF_SCHEMA, "mode") == (
+        FixedValueOption(value="a"),
+        FixedValueOption(value="b"),
+    )
+
+
+def test_a_plain_param_or_a_missing_param_has_no_options() -> None:
+    assert fixed_value_options(_HANDOFF_SCHEMA, "keyword") is None
+    assert fixed_value_options(_HANDOFF_SCHEMA, "nope") is None
+
+
+def test_duplicate_values_are_listed_once_in_order() -> None:
+    schema = {"properties": {"p": {"enum": ["b", "a", "b"]}}}
+    assert fixed_value_options(schema, "p") == (
+        FixedValueOption(value="b"),
+        FixedValueOption(value="a"),
+    )
+
+
+def test_the_first_present_key_decides_and_a_bad_shape_means_no_options() -> None:
+    """``enum`` 在但形状不对时不退到 ``oneOf`` 去猜:主约束看不懂就不查。"""
+    schema = {
+        "properties": {
+            "p": {"enum": ["a", 1], "oneOf": [{"const": "a"}]},
+        }
+    }
+    assert fixed_value_options(schema, "p") is None
+
+
+def test_shapes_off_the_whitelist_have_no_options() -> None:
+    bad_props: list[Any] = [
+        {"enum": []},
+        {"enum": ["a", 1]},
+        {"enum": "a"},
+        {"enum": ["a", None]},
+        {"oneOf": [{"const": "a"}, {"type": "null"}]},
+        {"oneOf": [{"const": 1}]},
+        {"oneOf": ["a"]},
+        {"oneOf": []},
+        {"anyOf": {"const": "a"}},
+        {"const": "a"},
+        ["a"],
+        "a",
+    ]
+    for prop in bad_props:
+        assert fixed_value_options({"properties": {"p": prop}}, "p") is None, prop
+    assert fixed_value_options({"properties": ["p"]}, "p") is None
+    assert fixed_value_options({}, "p") is None

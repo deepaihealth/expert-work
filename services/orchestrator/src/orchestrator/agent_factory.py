@@ -1454,6 +1454,8 @@ async def build_agent(
         knowledge_catalog_fingerprint=knowledge_fingerprint,
         # B-294 —— 连不上而跳过的 MCP 服务;非空时控制面只缓存这次构建 60 秒。
         skipped_mcp_servers=registry.skipped_mcp_servers(),
+        # B-318 —— 不在工具可选值里的固定值;保存时的试建据此拒绝。
+        invalid_fixed_values=registry.invalid_fixed_values(),
     )
 
 

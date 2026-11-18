@@ -47,8 +47,8 @@ from orchestrator.tools import (
     build_tool_registry,
 )
 from orchestrator.tools._child_run import _child_config
-from orchestrator.tools.arg_bindings import ToolArgBindings
-from orchestrator.tools.registry import UnmatchedArgBinding
+from orchestrator.tools.arg_bindings import FixedValueOption, ToolArgBindings
+from orchestrator.tools.registry import InvalidFixedValue, UnmatchedArgBinding
 
 pytestmark = pytest.mark.asyncio
 
@@ -1032,3 +1032,110 @@ async def test_a_delegated_child_gets_the_fixed_value_with_no_inputs_at_all(
     await harness.run_turn_with_tool_call(_WIRE, {"keyword": "k"}, config=child_cfg)
     _, sent_args = harness.client.calls[-1]
     assert sent_args["detail_level"] == "brief"
+
+
+# ---------------------------------------------------------------------------
+# B-318 —— 固定值不在工具声明的可选值里:登记出来(保存时据此拒绝),运行期行为不变。
+# ---------------------------------------------------------------------------
+
+_HANDOFF = {
+    "name": "t1",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "this_turn": {
+                "type": "string",
+                "oneOf": [
+                    {"const": "reply", "title": "本轮回复"},
+                    {"const": "silent", "title": "本轮不回"},
+                ],
+            },
+            "note": {"type": "string"},
+        },
+        "required": ["this_turn"],
+    },
+}
+
+
+async def test_a_fixed_value_off_the_tools_options_is_reported_with_the_allowed_ones(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    registry, _ = await _build_registry(tools=[_HANDOFF], fixed={"t1": {"this_turn": "slient"}})
+    assert registry.invalid_fixed_values() == (
+        InvalidFixedValue(
+            server=_SERVER,
+            tool="t1",
+            param="this_turn",
+            allowed=(
+                FixedValueOption(value="reply", title="本轮回复"),
+                FixedValueOption(value="silent", title="本轮不回"),
+            ),
+        ),
+    )
+    # 运行期不变:绑定照旧下发(调用前的 schema 校验照样拦),也不当「落空」报。
+    assert registry.arg_bindings()[_WIRE].fixed == {"this_turn": "slient"}
+    assert registry.unmatched_arg_bindings() == ()
+    # 告警只有名字,不带配置里写的那个值。
+    logged = [r.getMessage() for r in caplog.records if "fixed_value_not_allowed" in r.getMessage()]
+    assert logged
+    assert all("slient" not in m for m in logged)
+
+
+async def test_a_fixed_value_among_the_options_is_not_reported() -> None:
+    registry, _ = await _build_registry(tools=[_HANDOFF], fixed={"t1": {"this_turn": "silent"}})
+    assert registry.invalid_fixed_values() == ()
+
+
+async def test_a_fixed_value_on_a_param_without_options_is_not_checked() -> None:
+    registry, _ = await _build_registry(tools=[_HANDOFF], fixed={"t1": {"note": "anything"}})
+    assert registry.invalid_fixed_values() == ()
+
+
+async def test_an_invalid_fixed_value_seen_by_two_mcp_entries_is_reported_once() -> None:
+    client = RecordingMCPClient(tools=(_tool_def("t1", _HANDOFF["input_schema"]),))
+    pool = MCPServerPool()
+    await pool.add(_SERVER, client)
+    binding = ArgBindingSpec(server=_SERVER, tool="t1", fixed={"this_turn": "slient"})
+    registry = await build_tool_registry(
+        [
+            MCPToolSpec(servers=[_SERVER], arg_bindings=[binding]),
+            MCPToolSpec(servers=[_SERVER]),
+        ],
+        tool_env=ToolEnv(mcp_pool=pool),
+    )
+    assert len(registry.invalid_fixed_values()) == 1
+
+
+async def test_an_unreachable_server_reports_no_invalid_fixed_value() -> None:
+    """拿不到 schema(服务连不上)就查不了:只记 skipped,不当错值报(11-18 定:放行 + 告警)。"""
+
+    class _Down(RecordingMCPClient):
+        async def list_tools(self) -> Any:
+            raise ExceptionGroup("tg", [ConnectionRefusedError("refused")])
+
+    pool = MCPServerPool()
+    await pool.add(_SERVER, _Down())
+    registry = await build_tool_registry(
+        [
+            MCPToolSpec(
+                servers=[_SERVER],
+                arg_bindings=[
+                    ArgBindingSpec(server=_SERVER, tool="t1", fixed={"this_turn": "slient"})
+                ],
+            )
+        ],
+        tool_env=ToolEnv(mcp_pool=pool),
+    )
+    assert registry.skipped_mcp_servers() == (_SERVER,)
+    assert registry.invalid_fixed_values() == ()
+
+
+async def test_a_fixed_param_the_tool_does_not_declare_is_absent_not_invalid() -> None:
+    """工具没声明这个参数:只报 ``params_absent``(值不发),不当「不在可选值里」报 ——
+    后者会拒绝保存,而参数缺席按 B-127 只是告警。"""
+    registry, _ = await _build_registry(tools=[_HANDOFF], fixed={"t1": {"scope": "customer"}})
+    assert registry.unmatched_arg_bindings() == (
+        UnmatchedArgBinding(server=_SERVER, tool="t1", params=("scope",), reason="params_absent"),
+    )
+    assert registry.invalid_fixed_values() == ()

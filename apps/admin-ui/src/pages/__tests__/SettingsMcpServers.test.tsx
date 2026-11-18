@@ -305,3 +305,63 @@ describe("SettingsMcpServers — cross-tenant W4 aggregate", () => {
     );
   });
 });
+
+// B-318 —— 租户页展开一行也显示同一张参数表(与平台目录页共用 ``ToolParamsTable``),
+// 包括「可选：…」那一行。
+describe("SettingsMcpServers 工具参数表(B-318)", () => {
+  it("展开自定义服务器:每个工具列出参数、必填、类型、描述和可选值", async () => {
+    listMock.mockResolvedValue([custom]);
+    availMock.mockResolvedValue([]);
+    toolsMock.mockResolvedValue([
+      {
+        name: "handoff_to_human",
+        description: "转人工",
+        input_schema: {
+          type: "object",
+          properties: {
+            this_turn: {
+              type: "string",
+              description: "本轮回不回",
+              oneOf: [
+                { const: "reply", title: "本轮回复" },
+                { const: "silent", title: "本轮不回" },
+              ],
+            },
+            note: { type: "string", description: "备注" },
+          },
+          required: ["this_turn"],
+        },
+      },
+    ]);
+    const { container } = renderPage();
+    await screen.findByTestId("ms-test-my-custom");
+    fireEvent.click(container.querySelector(".ant-table-row-expand-icon") as Element);
+    const tools = await screen.findByTestId("ms-tools-my-custom");
+    expect(tools.textContent).toContain("handoff_to_human");
+    fireEvent.click(tools.querySelector(".ant-collapse-header") as Element);
+    const table = await screen.findByTestId("ms-params-my-custom-handoff_to_human");
+    const row = (name: string) =>
+      Array.from(table.querySelectorAll("tr")).find((tr) =>
+        tr.textContent?.startsWith(name),
+      ) as HTMLElement;
+    expect(row("this_turn").textContent).toContain("*");
+    expect(row("this_turn").textContent).toContain("string");
+    expect(row("this_turn").textContent).toContain("本轮回不回");
+    expect(
+      screen.getByTestId("ms-params-my-custom-handoff_to_human-options-this_turn").textContent,
+    ).toBe("可选：本轮回复 reply / 本轮不回 silent");
+    expect(row("note").textContent).not.toContain("可选");
+  });
+
+  it("没有参数的工具写「无参数。」(同平台目录页)", async () => {
+    listMock.mockResolvedValue([custom]);
+    availMock.mockResolvedValue([]);
+    toolsMock.mockResolvedValue([{ name: "ping", description: "", input_schema: {} }]);
+    const { container } = renderPage();
+    await screen.findByTestId("ms-test-my-custom");
+    fireEvent.click(container.querySelector(".ant-table-row-expand-icon") as Element);
+    const tools = await screen.findByTestId("ms-tools-my-custom");
+    fireEvent.click(tools.querySelector(".ant-collapse-header") as Element);
+    await waitFor(() => expect(tools.textContent).toContain("无参数。"));
+  });
+});

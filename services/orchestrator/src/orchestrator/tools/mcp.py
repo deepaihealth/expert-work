@@ -64,10 +64,12 @@ from expert_work.common.uplift_metrics import (
 )
 from orchestrator.tools.arg_bindings import (
     ToolArgBindings,
+    fixed_value_options,
     strip_bound_params,
     unbindable_params,
 )
 from orchestrator.tools.registry import (
+    InvalidFixedValue,
     ToolContext,
     ToolNotFoundError,
     ToolRegistry,
@@ -1547,6 +1549,27 @@ class MCPServerPool:
 # ---------------------------------------------------------------------------
 
 
+def _note_invalid_fixed_values(
+    registry: ToolRegistry, server_name: str, tool_def: MCPToolDef, fixed: Mapping[str, str]
+) -> None:
+    """B-318 —— 固定值不在工具给这个参数声明的可选值里:记到 registry(保存时的试建据此拒绝)
+    并告警。**绑定照旧下发、运行期行为不变**:调用前的 schema 校验照样拦下错值。告警只打
+    名字,不打值。"""
+    for param, value in fixed.items():
+        options = fixed_value_options(tool_def.input_schema, param)
+        if options is None or value in {o.value for o in options}:
+            continue
+        logger.warning(
+            "mcp.fixed_value_not_allowed server=%s tool=%r param=%r",
+            server_name,
+            tool_def.name,
+            param,
+        )
+        registry.note_invalid_fixed_value(
+            InvalidFixedValue(server=server_name, tool=tool_def.name, param=param, allowed=options)
+        )
+
+
 async def register_mcp_tools(
     *,
     server_name: str,
@@ -1660,6 +1683,7 @@ async def register_mcp_tools(
                     server_name, tool_def.name, tuple(absent), reason="params_absent"
                 )
                 bound = bound.without(absent)
+            _note_invalid_fixed_values(registry, server_name, tool_def, bound.fixed)
         if bound:
             # 剥之前的那份是服务端的合同,dispatch 前的校验要对着它。
             dispatch_schema = tool_def.input_schema

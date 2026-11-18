@@ -485,6 +485,47 @@ async def test_build_agent_carries_the_manifest_arg_bindings() -> None:
 
 
 @pytest.mark.asyncio
+async def test_build_agent_carries_fixed_values_the_tool_does_not_allow() -> None:
+    """B-318 —— 固定值不在工具声明的可选值里:``BuiltAgent.invalid_fixed_values`` 带出去,
+    保存时的试建据此拒绝。只带参数名和允许值,不带写错的那个值。"""
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["tools"] = [
+        {
+            "type": "mcp",
+            "servers": ["deepcare"],
+            "arg_bindings": [
+                {"server": "deepcare", "tool": "t1", "fixed": {"this_turn": "slient"}}
+            ],
+        }
+    ]
+    schema = {
+        "type": "object",
+        "properties": {
+            "this_turn": {"oneOf": [{"const": "reply", "title": "本轮回复"}, {"const": "silent"}]}
+        },
+    }
+    pool = MCPServerPool()
+    await pool.add(
+        "deepcare",
+        RecordingMCPClient(tools=(MCPToolDef(name="t1", description="t1", input_schema=schema),)),
+    )
+    async with make_checkpointer("memory") as cp:
+        built = await _build(
+            AgentSpec.model_validate(doc),
+            secret_store=_secret_store(),
+            checkpointer=cp,
+            tool_env=ToolEnv(mcp_pool=pool),
+        )
+    assert [(i.server, i.tool, i.param) for i in built.invalid_fixed_values] == [
+        ("deepcare", "t1", "this_turn")
+    ]
+    assert [(o.value, o.title) for o in built.invalid_fixed_values[0].allowed] == [
+        ("reply", "本轮回复"),
+        ("silent", None),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_build_agent_skips_an_unreachable_mcp_server_and_says_so() -> None:
     """B-294 —— 池里的服务连不上:构建照样成功(以前整个抛出、run 入口 500),
     ``BuiltAgent.skipped_mcp_servers`` 报出它,控制面据此只短暂缓存这次构建。"""

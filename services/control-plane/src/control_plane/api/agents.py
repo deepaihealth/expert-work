@@ -1126,12 +1126,45 @@ async def _check_buildable(
             rejected=_envelope_error("MANIFEST_UNBUILDABLE", message, 422),
             error=message,
         )
-    record_manifest_build_check(outcome="ok")
-    logger.info("manifest.build_check_ok ms=%.0f", (time.monotonic() - started) * 1000)
     warnings = [
         w for w in (_skipped_mcp_server_warning(built), _unmatched_binding_warning(built)) if w
     ]
-    return _BuildCheck(warning=" ".join(warnings) or None)
+    warning = " ".join(warnings) or None
+    # B-318 —— 固定值不在工具声明的可选值里:人能改、不改就调不通,按「建不出来」拒绝
+    # (草稿照存,发布 / 新建 / PUT 拒)。拿不到 schema 的服务不在这里,只在上面的告警里。
+    invalid_fixed = _invalid_fixed_value_error(built)
+    if invalid_fixed is not None:
+        record_manifest_build_check(outcome="rejected")
+        logger.info(
+            "manifest.build_check_rejected name=%s version=%s exc_type=invalid_fixed_value",
+            spec.metadata.name,
+            spec.metadata.version,
+        )
+        return _BuildCheck(
+            rejected=_envelope_error("MANIFEST_UNBUILDABLE", invalid_fixed, 422),
+            error=invalid_fixed,
+            warning=warning,
+        )
+    record_manifest_build_check(outcome="ok")
+    logger.info("manifest.build_check_ok ms=%.0f", (time.monotonic() - started) * 1000)
+    return _BuildCheck(warning=warning)
+
+
+def _invalid_fixed_value_error(built: Any) -> str | None:
+    """B-318 —— 不在工具可选值里的固定值,一句人话:哪个参数、允许哪些值(有标题带标题)。
+
+    不回显配置里写的那个值(11-18 定,同 B-127「绑定记录不带值」);错值在表单里标红可见。
+    ``getattr`` 兜底同 :func:`_unmatched_binding_warning`。
+    """
+    invalid = getattr(built, "invalid_fixed_values", ()) or ()
+    if not invalid:
+        return None
+    parts = [
+        f"{i.server}/{i.tool} {i.param} — allowed: "
+        + ", ".join(f"{o.value} ({o.title})" if o.title else o.value for o in i.allowed)
+        for i in invalid
+    ]
+    return "fixed value is not one the tool allows: " + "; ".join(parts)
 
 
 def _skipped_mcp_server_warning(built: Any) -> str | None:
@@ -1142,8 +1175,8 @@ def _skipped_mcp_server_warning(built: Any) -> str | None:
     if not skipped:
         return None
     return (
-        "MCP server(s) could not be reached during this save check, so their tools and "
-        "arg_bindings were not checked: " + ", ".join(skipped) + "."
+        "MCP server(s) could not be reached during this save check, so their tools, "
+        "arg_bindings and fixed values were not checked: " + ", ".join(skipped) + "."
     )
 
 

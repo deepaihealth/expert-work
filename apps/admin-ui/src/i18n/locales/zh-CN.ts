@@ -1564,6 +1564,8 @@ const zhCN: TranslationKeys = {
     mcp_bind_fixed_input: "{{param}} 的固定值",
     mcp_bind_fixed_placeholder: "每次调用都原样发送这个值",
     mcp_bind_fixed_invalid: "填写一个值，首尾不能有空格",
+    mcp_bind_fixed_pick: "选一个值",
+    mcp_bind_fixed_not_allowed: "当前值 {{value}} 不在工具允许的值里，可选：{{options}}",
     mcp_bind_hint:
       "绑定后，这个参数由平台按变量的值填写：模型看不到它，也就不会把长串抄错。固定值则每次调用都原样发送。不绑定的参数仍由模型自己填。",
     mcp_bind_required: "这个参数是必填的",
@@ -2768,6 +2770,7 @@ const zhCN: TranslationKeys = {
     param_desc: "描述",
     tool_enable_aria: "启用工具 {{name}}",
     tool_no_params: "无参数。",
+    param_options: "可选：{{options}}",
   },
   mcp_oauth: {
     page_title: "我的 MCP 授权",

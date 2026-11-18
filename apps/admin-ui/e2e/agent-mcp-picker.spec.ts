@@ -30,6 +30,8 @@
  * POST requests and calls ``route.fallback()`` for everything else so the
  * fixture's broader glob still handles the GET list.
  */
+import AxeBuilder from "@axe-core/playwright";
+
 import { test, expect, expectNoA11yViolations, SAMPLE_JWT } from "./fixtures";
 
 // ── Stub data ─────────────────────────────────────────────────────────────
@@ -91,7 +93,19 @@ const GITHUB_TOOLS = {
       description: "Create a new GitHub issue",
       input_schema: {
         type: "object",
-        properties: { repo: {}, title: {}, body: {} },
+        properties: {
+          repo: {},
+          title: {},
+          body: {},
+          // B-318 —— 声明了可选值的参数:固定值是下拉。
+          state: {
+            type: "string",
+            oneOf: [
+              { const: "open", title: "打开" },
+              { const: "closed", title: "关闭" },
+            ],
+          },
+        },
         required: ["repo", "title"],
       },
     },
@@ -464,4 +478,48 @@ test("(e) the bound-variable row stays readable — the note gets its own line",
   expect.soft(shortNoteBox.y).toBeGreaterThanOrEqual(
     nameBoxAfter.y + nameBoxAfter.height - 1,
   );
+});
+
+// B-318 —— 工具给参数声明了可选值时,「固定值」是下拉(显示标题、写回值)。这一层
+// markup(Select + 错误提示)也让 axe 真扫一遍。
+test("(f) a fixed value with declared options is a dropdown and passes axe", async ({
+  page,
+}) => {
+  await page.getByTestId("agents-create").click();
+  await expect(page.getByTestId("manifest-form-view")).toBeVisible();
+  await page.getByTestId("cfg-nav-capabilities").click();
+  await page.getByRole("tab", { name: "MCP" }).click();
+  await page.getByTestId("af-mcp-server-github").click();
+  await page.getByTestId("af-mcp-choose-github").click();
+  await expect(page.getByTestId("af-mcp-tool-create_issue")).toBeVisible();
+  await page.getByTestId("af-mcp-bind-toggle-create_issue").click();
+
+  const openDropdown = page.locator(".ant-select-dropdown:not(.ant-select-dropdown-hidden)");
+  await page.getByTestId("af-mcp-bind-row-create_issue-state").locator(".ant-select").first().click();
+  await openDropdown.locator(".ant-select-item-option-content", { hasText: /^(固定值|Fixed value)$/ }).click();
+
+  // 还没选:标红 + 提示。等左边那个下拉收起来再扫。
+  const fixed = page.getByTestId("af-mcp-bind-fixed-create_issue-state");
+  await expect(fixed).toHaveClass(/ant-select-status-error/);
+  await expect(page.getByTestId("af-mcp-bind-fixed-hint-create_issue-state")).toBeVisible();
+  await expect(openDropdown).toHaveCount(0);
+  // 只扫这一行(新加的下拉 + 提示)。整页扫会撞上一个早就有的问题:有绑定时「参数绑定 ·
+  // 已绑 1 个」按钮的 aria-label 不含可见文字(label-content-name-mismatch),不属本单。
+  const results = await new AxeBuilder({ page })
+    .include('[data-testid="af-mcp-bind-row-create_issue-state"]')
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+    .disableRules(["color-contrast"])
+    .analyze();
+  expect(
+    results.violations
+      .filter((v) => v.impact === "serious" || v.impact === "critical")
+      .map((v) => v.id),
+  ).toEqual([]);
+
+  await fixed.click();
+  const labels = openDropdown.locator(".ant-select-item-option-content");
+  await expect(labels).toHaveText(["打开", "关闭"]);
+  await labels.filter({ hasText: /^关闭$/ }).click();
+  await expect(fixed).not.toHaveClass(/ant-select-status-error/);
+  await expect(page.getByTestId("af-mcp-bind-fixed-hint-create_issue-state")).toHaveCount(0);
 });

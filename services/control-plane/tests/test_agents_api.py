@@ -21,7 +21,8 @@ from expert_work.protocol import AuditAction, AuditQuery, Role, TriggerRecord
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
 from orchestrator import AgentFactoryError
 from orchestrator.errors import SkillNotFoundError
-from orchestrator.tools.registry import UnmatchedArgBinding
+from orchestrator.tools.arg_bindings import FixedValueOption
+from orchestrator.tools.registry import InvalidFixedValue, UnmatchedArgBinding
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -1191,8 +1192,8 @@ async def test_a_server_unreachable_at_save_time_is_named_in_the_warning(
     warning = resp.json()["data"]["build_warning"]
     assert warning is not None
     assert (
-        "MCP server(s) could not be reached during this save check, so their tools and "
-        "arg_bindings were not checked: deepcare"
+        "MCP server(s) could not be reached during this save check, so their tools, "
+        "arg_bindings and fixed values were not checked: deepcare"
     ) in warning
     assert "no such tool in the assembled catalog: records/fetch" in warning
 
@@ -1564,3 +1565,147 @@ async def test_draft_endpoints_require_if_match(b5_app_client) -> None:
     for resp in (blind_save, blind_discard, blind_publish):
         assert resp.status_code == 428, resp.text
         assert resp.json()["error"]["code"] == "MANIFEST_IF_MATCH_REQUIRED"
+
+
+# ---------------------------------------------------------------------------
+# B-318 —— 固定值不在工具声明的可选值里:新建 / PUT / 发布拒绝,存草稿照存但报出来;
+# 保存时连不上那台服务就放行 + 告警(查不了)。
+# ---------------------------------------------------------------------------
+
+_SLIENT = InvalidFixedValue(
+    server="deepcare",
+    tool="handoff_to_human",
+    param="this_turn",
+    allowed=(
+        FixedValueOption(value="reply", title="本轮回复"),
+        FixedValueOption(value="silent", title="本轮不回"),
+    ),
+)
+_SLIENT_MESSAGE = (
+    "fixed value is not one the tool allows: deepcare/handoff_to_human this_turn — "
+    "allowed: reply (本轮回复), silent (本轮不回)"
+)
+
+
+async def _built_with_invalid_fixed(spec, *, tenant_id=None, user_id=None):
+    return SimpleNamespace(invalid_fixed_values=(_SLIENT,))
+
+
+@pytest.mark.asyncio
+async def test_create_refuses_a_fixed_value_the_tool_does_not_allow(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _built_with_invalid_fixed  # type: ignore[attr-defined]
+
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert resp.status_code == 422, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "MANIFEST_UNBUILDABLE"
+    assert _SLIENT_MESSAGE in error["message"]
+    listed = await client.get("/v1/agents")
+    assert all(i["name"] != "code-reviewer" for i in listed.json()["data"]["items"])
+
+
+@pytest.mark.asyncio
+async def test_update_refuses_a_fixed_value_the_tool_does_not_allow(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    live_sha = await _create(client)
+    app.state.agent_runtime.agent_builder = _built_with_invalid_fixed  # type: ignore[attr-defined]
+
+    resp = await client.put(
+        "/v1/agents/code-reviewer/1.0.0",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": live_sha},
+    )
+    assert resp.status_code == 422, resp.text
+    assert _SLIENT_MESSAGE in resp.json()["error"]["message"]
+    detail = (await client.get("/v1/agents/code-reviewer/1.0.0")).json()["data"]["record"]
+    assert detail["spec_sha256"] == live_sha
+
+
+@pytest.mark.asyncio
+async def test_draft_reports_and_publish_refuses_a_fixed_value_the_tool_does_not_allow(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    live_sha = await _create(client)
+    app.state.agent_runtime.agent_builder = _built_with_invalid_fixed  # type: ignore[attr-defined]
+
+    saved = await client.put(
+        "/v1/agents/code-reviewer/1.0.0/draft",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": live_sha},
+    )
+    assert saved.status_code == 200, "草稿不拦"
+    assert _SLIENT_MESSAGE in saved.json()["data"]["build_error"]
+
+    published = await client.post(
+        "/v1/agents/code-reviewer/1.0.0/publish", headers={"If-Match": live_sha}
+    )
+    assert published.status_code == 422, published.text
+    assert _SLIENT_MESSAGE in published.json()["error"]["message"]
+    detail = (await client.get("/v1/agents/code-reviewer/1.0.0")).json()["data"]["record"]
+    assert detail["spec_sha256"] == live_sha
+
+
+@pytest.mark.asyncio
+async def test_two_bad_fixed_values_are_both_named(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    app, client = b5_app_client
+    other = InvalidFixedValue(
+        server="deepcare",
+        tool="handoff_to_human",
+        param="afterwards",
+        allowed=(FixedValueOption(value="continue"), FixedValueOption(value="stop")),
+    )
+
+    async def _built(spec, *, tenant_id=None, user_id=None):
+        return SimpleNamespace(invalid_fixed_values=(_SLIENT, other))
+
+    app.state.agent_runtime.agent_builder = _built  # type: ignore[attr-defined]
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert resp.status_code == 422, resp.text
+    message = resp.json()["error"]["message"]
+    assert _SLIENT_MESSAGE in message
+    assert "deepcare/handoff_to_human afterwards — allowed: continue, stop" in message
+
+
+@pytest.mark.asyncio
+async def test_fixed_values_the_tool_allows_save_cleanly(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    app, client = b5_app_client
+
+    async def _built(spec, *, tenant_id=None, user_id=None):
+        return SimpleNamespace(invalid_fixed_values=())
+
+    app.state.agent_runtime.agent_builder = _built  # type: ignore[attr-defined]
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["data"]["build_warning"] is None
+
+
+@pytest.mark.asyncio
+async def test_fixed_values_on_an_unreachable_server_save_with_a_warning(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    """拿不到 schema(服务连不上)就查不了:放行,告警里点名固定值没核对(11-18 定)。"""
+    app, client = b5_app_client
+
+    async def _built(spec, *, tenant_id=None, user_id=None):
+        return SimpleNamespace(skipped_mcp_servers=("deepcare",), invalid_fixed_values=())
+
+    app.state.agent_runtime.agent_builder = _built  # type: ignore[attr-defined]
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert resp.status_code == 201, resp.text
+    warning = resp.json()["data"]["build_warning"]
+    assert (
+        "MCP server(s) could not be reached during this save check, so their tools, "
+        "arg_bindings and fixed values were not checked: deepcare"
+    ) in warning
