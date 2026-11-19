@@ -55,6 +55,7 @@ from langchain_core.messages import (
 
 from expert_work.common.uplift_metrics import record_anthropic_cache_anchor
 from expert_work.protocol import StructuredOutputSpec
+from expert_work.protocol.model_catalog import ThinkingOffType
 from expert_work.runtime.middleware import (
     LLMClientError,
     LLMError,
@@ -606,7 +607,7 @@ class AnthropicProvider:
     always_thinking: bool = False
     #: B-320 —— catalog ``thinking_off_type``: the ``thinking.type`` an
     #: "off" call sends (Sonnet 5.5 rejects ``disabled``, takes ``between_tools``).
-    thinking_off_type: str = "disabled"
+    thinking_off_type: ThinkingOffType = "disabled"
     #: B-320 —— catalog ``forced_tool_choice``: ``False`` when the model
     #: rejects ``tool_choice`` ``any`` / ``tool`` — the structured-output
     #: call then sends ``auto`` and the router's validation retry covers a
@@ -622,11 +623,15 @@ class AnthropicProvider:
         self, *, structured: bool
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """The ``(thinking, output_config)`` pair one request sends (``None`` = omitted)."""
-        if structured or self.thinking_enabled is False:
+        if (structured and self.forced_tool_choice) or self.thinking_enabled is False:
             # Stream RT-1 — the API rejects a forced ``tool_choice`` when
             # (extended/adaptive) thinking is active, and 4.6+ models may
             # think by default when the field is omitted. Pin thinking off
-            # for structured calls. Stream Thinking-Toggle — explicit off.
+            # for structured calls that force the schema tool. B-320 — a
+            # structured call on a model that can't be forced sends
+            # ``auto``, which works with thinking on: it keeps the agent's
+            # own controls (no mid-conversation switch to ``between_tools``,
+            # no silent drop to low effort). Stream Thinking-Toggle — off.
             return self._thinking_off_controls()
         thinking_payload = {"type": "adaptive"} if self.adaptive_thinking else None
         output_config = {"effort": self.effort} if self.effort is not None else None

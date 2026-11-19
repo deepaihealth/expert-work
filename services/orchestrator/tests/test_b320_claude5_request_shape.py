@@ -11,8 +11,12 @@
 * 四个都不收采样参数(Sonnet / Haiku 只收默认值,平台一律不发)。
 
 用真工厂(``_build_provider``,目录闸门全在)+ 假 HTTP 传输抓下真正发出去的请求体。没配输出上限
-时 Anthropic 发默认 4096。``effort`` 不高于 high 这一条:关思考时平台不发 effort,用的是厂商
+时 Claude 5 四个发 16000(目录 ``default_max_tokens``:思考默认开,4096 会被思考吃满),旧模型
+与目录外模型仍发 4096。``effort`` 不高于 high 这一条:关思考时平台不发 effort,用的是厂商
 默认档(Sonnet 5.5 high、Haiku 5.5 medium),都在可收范围内。
+
+结构化输出:能强制调工具的(Haiku 5.5、旧模型)照旧强制 + 关思考;不能强制的三个发 ``auto``,
+思考 / 档位与这个智能体的普通调用相同。
 """
 
 from __future__ import annotations
@@ -25,8 +29,9 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from expert_work.protocol import ModelSpec, StructuredOutputSpec
-from orchestrator.agent_factory import _build_provider
+from orchestrator.agent_factory import _build_provider, _escalated_model
 from orchestrator.llm import AnthropicProvider
+from orchestrator.llm.truncation import effective_output_cap
 
 _VERDICT = StructuredOutputSpec(
     name="verdict",
@@ -46,10 +51,16 @@ _SONNET55 = "claude-sonnet-5-5"
 _HAIKU55 = "claude-haiku-5-5"
 _OPUS48 = "claude-opus-4-8"
 
-_DEFAULT_CAP = {"max_tokens": 4096}
+_OFF_CATALOG = "claude-custom-gw"
+
+#: 没配输出上限时发的值:Claude 5 四个按目录 ``default_max_tokens``(思考默认开,4096 会被
+#: 思考吃满);旧模型与目录外模型仍是 4096。
+_DEFAULT_CAP = {"max_tokens": 16_000}
+_OLD_CAP = {"max_tokens": 4096}
 _LOW = {**_DEFAULT_CAP, "output_config": {"effort": "low"}}
 _BETWEEN_TOOLS = {**_DEFAULT_CAP, "thinking": {"type": "between_tools"}}
 _DISABLED = {**_DEFAULT_CAP, "thinking": {"type": "disabled"}}
+_OLD_DISABLED = {**_OLD_CAP, "thinking": {"type": "disabled"}}
 _AUTO = {"tool_choice": {"type": "auto"}}
 _FORCED = {"tool_choice": {"type": "tool", "name": "verdict"}}
 
@@ -185,8 +196,12 @@ def _controls(body: dict[str, Any]) -> dict[str, Any]:
             {"adaptive_thinking": True, "max_tokens": 128_000},
             {"max_tokens": 128_000, "thinking": {"type": "adaptive"}},
         ),
-        # —— 旧模型不变:Opus 4.8 关思考仍是 disabled。
-        (_OPUS48, _OFF, _DISABLED),
+        # —— 旧模型不变:Opus 4.8 关思考仍是 disabled、上限 4096。
+        (_OPUS48, _OFF, _OLD_DISABLED),
+        (_OPUS48, {}, _OLD_CAP),
+        # —— 目录外模型(自建网关)不变:disabled、4096、照发温度。
+        (_OFF_CATALOG, _OFF, {**_OLD_DISABLED, "temperature": 0.2}),
+        (_OFF_CATALOG, {}, {**_OLD_CAP, "temperature": 0.2}),
     ],
 )
 @pytest.mark.asyncio
@@ -201,14 +216,27 @@ async def test_chat_call_request_body(
 @pytest.mark.parametrize(
     ("name", "overrides", "expected"),
     [
-        # 不收强制调工具的三个:tool_choice=auto,关思考的方式与上面「关思考」相同。
-        (_FABLE, {}, {**_LOW, **_AUTO}),
-        (_OPUS55, {"effort": "high"}, {**_LOW, **_AUTO}),
-        (_SONNET55, {}, {**_BETWEEN_TOOLS, **_AUTO}),
-        (_SONNET55, {"thinking_enabled": True, "effort": "max"}, {**_BETWEEN_TOOLS, **_AUTO}),
-        # Haiku 5.5 收强制调工具 + disabled:与旧模型同一条线。
+        # 不收强制调工具的三个:tool_choice=auto,思考 / 档位与这个智能体的普通调用**完全
+        # 相同**(不为结构化调用单独关思考:Sonnet 5.5 半路换 between_tools 会改档位,
+        # Fable / Opus 5.5 会悄悄降到 low)。
+        (_FABLE, {}, {**_DEFAULT_CAP, **_AUTO}),
+        (_FABLE, _OFF, {**_LOW, **_AUTO}),
+        (
+            _OPUS55,
+            {"effort": "high"},
+            {**_DEFAULT_CAP, "output_config": {"effort": "high"}, **_AUTO},
+        ),
+        (_SONNET55, {}, {**_DEFAULT_CAP, **_AUTO}),
+        (
+            _SONNET55,
+            {"thinking_enabled": True, "effort": "max"},
+            {**_DEFAULT_CAP, "output_config": {"effort": "max"}, **_AUTO},
+        ),
+        (_SONNET55, _OFF, {**_BETWEEN_TOOLS, **_AUTO}),
+        # Haiku 5.5 收强制调工具 + disabled:与旧模型同一条线(强制调工具时思考必须关)。
         (_HAIKU55, {"effort": "max"}, {**_DISABLED, **_FORCED}),
-        (_OPUS48, {}, {**_DISABLED, **_FORCED}),
+        (_OPUS48, {}, {**_OLD_DISABLED, **_FORCED}),
+        (_OFF_CATALOG, {}, {**_OLD_DISABLED, "temperature": 0.2, **_FORCED}),
     ],
 )
 @pytest.mark.asyncio
@@ -251,10 +279,80 @@ async def test_streaming_call_sends_the_same_controls() -> None:
 @pytest.mark.asyncio
 async def test_recorded_request_params_match_the_wire(name: str) -> None:
     """Langfuse 记的参数(``request_params``)与真正发出去的一致(B-187 同一条线)。"""
-    for structured in (False, True):
-        model = ModelSpec.model_validate({"provider": "anthropic", "name": name, **_OFF})
-        provider = _build_provider(model, "k")
-        assert isinstance(provider, AnthropicProvider)
-        body, _ = await _send(name, _OFF, structured=structured)
-        sent = {k: v for k, v in _controls(body).items() if k != "tool_choice"}
-        assert provider.request_params(structured=structured, stream=False) == sent
+    for overrides in ({}, _OFF, {"thinking_enabled": True, "effort": "high"}):
+        for structured in (False, True):
+            model = ModelSpec.model_validate({"provider": "anthropic", "name": name, **overrides})
+            provider = _build_provider(model, "k")
+            assert isinstance(provider, AnthropicProvider)
+            body, _ = await _send(name, overrides, structured=structured)
+            sent = {k: v for k, v in _controls(body).items() if k != "tool_choice"}
+            assert provider.request_params(structured=structured, stream=False) == sent
+
+
+# --- 思考升档(``_escalated_model``)-------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "escalates"),
+    [
+        # Sonnet 5.5 关思考是 between_tools:升档 = 这一轮开思考 + medium(比它默认的 high
+        # 还低),下一轮又回到 between_tools,档位在对话中途来回变 —— 不升。
+        (_SONNET55, False),
+        # 其余照旧:关思考的升一档就是开思考 + medium。
+        (_FABLE, True),
+        (_OPUS55, True),
+        (_HAIKU55, True),
+        (_OPUS48, True),
+    ],
+)
+def test_thinking_off_escalation(name: str, escalates: bool) -> None:
+    model = ModelSpec.model_validate(
+        {"provider": "anthropic", "name": name, "thinking_enabled": False}
+    )
+    escalated = _escalated_model(model)
+    if escalates:
+        assert escalated is not None
+        assert (escalated.thinking_enabled, escalated.effort) == (True, "medium")
+    else:
+        assert escalated is None
+
+
+def test_sonnet_55_with_thinking_on_still_escalates() -> None:
+    """只有「关思考」的 Sonnet 5.5 不升;开着思考的照常按档位升。"""
+    model = ModelSpec.model_validate(
+        {"provider": "anthropic", "name": _SONNET55, "thinking_enabled": True, "effort": "medium"}
+    )
+    escalated = _escalated_model(model)
+    assert escalated is not None and escalated.effort == "high"
+
+
+# --- 没配输出上限时的默认值 ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "max_tokens", "expected"),
+    [
+        # Claude 5 四个:目录 default_max_tokens(16000)。
+        (_FABLE, None, 16_000),
+        (_OPUS55, None, 16_000),
+        (_SONNET55, None, 16_000),
+        (_HAIKU55, None, 16_000),
+        # 旧模型与目录外模型一个字节不变:4096。
+        (_OPUS48, None, 4096),
+        ("claude-sonnet-4-6", None, 4096),
+        ("claude-haiku-4-5", None, 4096),
+        (_OFF_CATALOG, None, 4096),
+        # 清单写了就用清单的。
+        (_FABLE, 2048, 2048),
+        (_OPUS48, 8000, 8000),
+    ],
+)
+def test_default_output_cap(name: str, max_tokens: int | None, expected: int) -> None:
+    """发出去的上限与截断报错里说的上限是同一个数(``effective_output_cap``)。"""
+    model = ModelSpec.model_validate(
+        {"provider": "anthropic", "name": name, "max_tokens": max_tokens}
+    )
+    provider = _build_provider(model, "k")
+    assert isinstance(provider, AnthropicProvider)
+    assert provider.max_tokens == expected
+    assert effective_output_cap(model) == expected

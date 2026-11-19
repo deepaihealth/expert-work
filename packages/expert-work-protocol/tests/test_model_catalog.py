@@ -857,7 +857,26 @@ def test_b320_new_fields_default_to_the_pre_b320_wire() -> None:
     entry = ModelEntry(name="x")
     assert entry.thinking_off_type == "disabled"
     assert entry.forced_tool_choice is True
+    assert entry.default_max_tokens is None
     for name in ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"):
         old = _e("anthropic", name)
         bits = (old.always_thinking, old.thinking_off_type, old.forced_tool_choice)
         assert bits == (False, "disabled", True)
+        assert old.default_max_tokens is None
+
+
+def test_b320_default_max_tokens_only_on_claude5() -> None:
+    """清单没配输出上限时 Anthropic 必须发一个:Claude 5 四个思考默认开,4096 会被思考吃满、
+    回复为空,所以目录给 16000;别的条目都不声明(旧模型仍发 4096)。"""
+    declared = {
+        (provider, e.name): e.default_max_tokens
+        for provider, entries in MODEL_CATALOG.items()
+        for e in entries
+        if e.default_max_tokens is not None
+    }
+    assert declared == {("anthropic", name): 16_000 for name in _CLAUDE5}
+    for name in _CLAUDE5:
+        entry = _e("anthropic", name)
+        assert entry.max_output_tokens is not None
+        assert entry.default_max_tokens is not None
+        assert entry.default_max_tokens <= entry.max_output_tokens

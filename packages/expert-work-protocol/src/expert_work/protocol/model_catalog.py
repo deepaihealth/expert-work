@@ -45,6 +45,9 @@ from expert_work.protocol.provider_catalog import PROVIDER_CATALOG, Provider
 #: 默认 "token" 是保守的一侧:按字符的上限被误标成 token,字节截只会更短,不会超限。
 LengthUnit = Literal["token", "char"]
 
+#: B-320 —— Anthropic 关思考发的 ``thinking.type``(见 ``ModelEntry.thinking_off_type``)。
+ThinkingOffType = Literal["disabled", "between_tools"]
+
 #: B-206 K-7 —— 重排请求的形状(见 ``RerankCaps.rerank_api``)。
 RerankApi = Literal["dashscope", "cohere_style", "vertex", "bedrock", "llm"]
 
@@ -281,11 +284,15 @@ class ModelEntry(BaseModel):
     # B-320 —— Anthropic 关思考(及结构化输出调用)发的 ``thinking.type``。默认 "disabled";
     # Sonnet 5.5 不收 disabled(400),关思考要发 "between_tools"(不带别的字段)。只有
     # anthropic 读;``always_thinking`` 的模型不发 thinking,这里不起作用。
-    thinking_off_type: Literal["disabled", "between_tools"] = "disabled"
+    thinking_off_type: ThinkingOffType = "disabled"
     # B-320 —— 收不收强制调工具(Anthropic ``tool_choice`` 的 ``any`` / ``tool``)。结构化输出
     # 靠强制调那个带 schema 的工具;False 的模型(Fable 5.2 / Opus 5.5 / Sonnet 5.5 发了 400)
     # 改发 ``auto``,模型没调工具时由路由的校验重试兜底。只有 anthropic 读。
     forced_tool_choice: bool = True
+    # B-320 —— 清单没配输出上限时 Anthropic 发的值(Anthropic 必须带 ``max_tokens``)。None =
+    # 平台一直用的 4096。思考默认开的 Claude 5 四个声明 16000:思考算在上限里,4096 会被思考
+    # 吃满、回复为空。只有 anthropic 读(发请求与截断报错用同一个数)。
+    default_max_tokens: int | None = None
     sampling: bool = True
     # B-33 — the model accepts exactly ONE ``temperature`` value (vendor 400
     # on anything else). The agent factory clamps the manifest value to it
@@ -381,7 +388,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         #   * Haiku 5.5 —— ``disabled`` 照收(effort 不高于 high,厂商默认 medium);强制
         #     tool_choice 照收。
         # tool_disclosure:与旗舰同为 native_search(Haiku 照 Haiku 4.5 留 None);beta 被拒时
-        # provider 自动退回应用层(HX-J4),不会因此失败。
+        # provider 自动退回应用层(HX-J4),不会因此失败。default_max_tokens=16000:思考默认开,
+        # 旧默认 4096 会被思考吃满(见字段说明)。
         ModelEntry(
             name="claude-fable-5-2",
             vision=True,
@@ -394,6 +402,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             tool_disclosure="native_search",
             output_cap_field="max_tokens",
             max_output_tokens=128_000,
+            default_max_tokens=16_000,
         ),
         ModelEntry(
             name="claude-opus-5-5",
@@ -407,6 +416,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             tool_disclosure="native_search",
             output_cap_field="max_tokens",
             max_output_tokens=128_000,
+            default_max_tokens=16_000,
         ),
         ModelEntry(
             name="claude-sonnet-5-5",
@@ -420,6 +430,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             tool_disclosure="native_search",
             output_cap_field="max_tokens",
             max_output_tokens=128_000,
+            default_max_tokens=16_000,
         ),
         ModelEntry(
             name="claude-haiku-5-5",
@@ -430,6 +441,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             sampling=False,
             output_cap_field="max_tokens",
             max_output_tokens=128_000,
+            default_max_tokens=16_000,
         ),
         # CM-9: opus-4-8 dropped sampling params (4.7+ removal); haiku has
         # no effort support — verified against the Anthropic docs 2026-07.

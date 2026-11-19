@@ -65,6 +65,8 @@ def test_seeded_prices_are_the_usd_list_prices_times_the_one_rate() -> None:
     assert module._CNY_PER_USD == Decimal("6.7132")
     seeded = {f"{p}/{m}": (i, o, c, r) for p, m, i, o, c, r in module._PRICES}
     assert seeded == _expected()
+    # 一个写死的字面值,不经同一套换算:Fable 5.2 输入 8 美元 = 53.7056 元。
+    assert seeded["anthropic/claude-fable-5-2"][0] == 53_705_600
     for prices in module._PRICES:
         assert all(isinstance(v, int) and v > 0 for v in prices[2:])
 
