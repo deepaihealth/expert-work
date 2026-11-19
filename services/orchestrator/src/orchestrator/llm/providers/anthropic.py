@@ -84,6 +84,15 @@ logger = logging.getLogger(__name__)
 #: Stream HX-13 — Anthropic server-side tool-search beta opt-in.
 _TOOL_SEARCH_BETA = "tool-search-tool-2025-10-19"
 
+#: B-320 — the effort an always-thinking model (no disable form) runs at
+#: when thinking is switched off: the lowest level, as for kimi-k3 / glm-5.3.
+_ALWAYS_THINKING_OFF_EFFORT = "low"
+
+#: Stream RT-1 — the schema tool's description.
+_STRUCTURED_TOOL_DESCRIPTION = "Return the final structured output for this request."
+#: B-320 — appended when the tool cannot be forced (``tool_choice: auto``).
+_STRUCTURED_TOOL_UNFORCED_HINT = " Always call this tool to answer; do not answer in text."
+
 
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
 _DEFAULT_MESSAGES_PATH = "/v1/messages"
@@ -590,6 +599,19 @@ class AnthropicProvider:
     #: ``True`` / ``None`` keep the CM-9 ``effort`` + ``adaptive_thinking``
     #: behaviour (anthropic's untouched default is already dynamic thinking).
     thinking_enabled: bool | None = None
+    #: B-320 —— catalog ``always_thinking``: the model rejects every
+    #: ``thinking`` disable form (Fable 5.2 / Opus 5.5). "Off" (and the
+    #: structured-output call) then omits ``thinking`` and floors
+    #: ``output_config.effort`` at ``"low"`` instead.
+    always_thinking: bool = False
+    #: B-320 —— catalog ``thinking_off_type``: the ``thinking.type`` an
+    #: "off" call sends (Sonnet 5.5 rejects ``disabled``, takes ``between_tools``).
+    thinking_off_type: str = "disabled"
+    #: B-320 —— catalog ``forced_tool_choice``: ``False`` when the model
+    #: rejects ``tool_choice`` ``any`` / ``tool`` — the structured-output
+    #: call then sends ``auto`` and the router's validation retry covers a
+    #: reply that skips the schema tool.
+    forced_tool_choice: bool = True
     #: Stream HX-13 (Mini-ADR HX-J4) — set after the tool-search beta is
     #: rejected once: this provider instance falls back to the application
     #: tier (no defer markers, no beta header) for its remaining lifetime.
@@ -600,18 +622,28 @@ class AnthropicProvider:
         self, *, structured: bool
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """The ``(thinking, output_config)`` pair one request sends (``None`` = omitted)."""
-        if structured:
+        if structured or self.thinking_enabled is False:
             # Stream RT-1 — the API rejects a forced ``tool_choice`` when
             # (extended/adaptive) thinking is active, and 4.6+ models may
             # think by default when the field is omitted. Pin thinking off
-            # for structured calls; effort is moot once disabled.
-            return {"type": "disabled"}, None
-        if self.thinking_enabled is False:
-            # Stream Thinking-Toggle — explicit off; effort is moot once disabled.
-            return {"type": "disabled"}, None
+            # for structured calls. Stream Thinking-Toggle — explicit off.
+            return self._thinking_off_controls()
         thinking_payload = {"type": "adaptive"} if self.adaptive_thinking else None
         output_config = {"effort": self.effort} if self.effort is not None else None
         return thinking_payload, output_config
+
+    def _thinking_off_controls(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Thinking "off" as this model accepts it (B-320, catalog-driven).
+
+        The configured effort is never sent: once off it is moot, and the
+        disable forms that have an effort limit (Sonnet 5.5 ``between_tools``,
+        Haiku 5.5 ``disabled``: high or below) then run at the model's
+        default level, which is within it. A model that cannot turn thinking
+        off at all thinks at the lowest level instead.
+        """
+        if self.always_thinking:
+            return None, {"effort": _ALWAYS_THINKING_OFF_EFFORT}
+        return {"type": self.thinking_off_type}, None
 
     def request_params(self, *, structured: bool, stream: bool) -> dict[str, Any]:
         """B-187 — the request fields one call sends beyond the structural ones
@@ -669,8 +701,16 @@ class AnthropicProvider:
             # Stream RT-1 (RT-ADR-2 tool_call path) — one forced tool
             # carries the schema; any regular tools are superseded for
             # this call (the schema tool is the only valid response).
-            tool_payload: list[dict[str, Any]] | None = [_structured_output_tool(output_schema)]
-            tool_choice = {"type": "tool", "name": output_schema.name}
+            # B-320 — a model that rejects forced tool use gets ``auto`` and a
+            # tool description that asks for the call instead.
+            tool_payload: list[dict[str, Any]] | None = [
+                _structured_output_tool(output_schema, forced=self.forced_tool_choice)
+            ]
+            tool_choice = (
+                {"type": "tool", "name": output_schema.name}
+                if self.forced_tool_choice
+                else {"type": "auto"}
+            )
         else:
             tool_payload = [_to_anthropic_tool(spec) for spec in tools] if tools else None
 
@@ -1016,11 +1056,16 @@ async def _human_content(
     return blocks
 
 
-def _structured_output_tool(spec: StructuredOutputSpec) -> dict[str, Any]:
-    """Stream RT-1 — the single forced tool that carries the schema."""
+def _structured_output_tool(spec: StructuredOutputSpec, *, forced: bool) -> dict[str, Any]:
+    """Stream RT-1 — the single tool that carries the schema. B-320 — when it
+    cannot be forced (``tool_choice: auto``), its description asks for the
+    call; the forced wording stays byte-identical for every other model."""
+    description = _STRUCTURED_TOOL_DESCRIPTION
+    if not forced:
+        description += _STRUCTURED_TOOL_UNFORCED_HINT
     return {
         "name": spec.name,
-        "description": "Return the final structured output for this request.",
+        "description": description,
         "input_schema": dict(spec.schema),
     }
 

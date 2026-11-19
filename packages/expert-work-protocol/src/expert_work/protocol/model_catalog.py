@@ -10,7 +10,9 @@ provider's official docs — do NOT carry stale names. Mark retired models
 ``deprecated=True`` so they stay referenceable but drop out of the dropdown
 (``models_for_provider``).
 
-Last verified: 2026-11-17 (qwen4-max: vendor model page only — modalities, context
+Last verified: 2026-11-19 (Claude 5 family, B-320: Anthropic API reference cached
+2026-11-03 — not probed, no Anthropic key on the test stack) /
+2026-11-17 (qwen4-max: vendor model page only — modalities, context
 window and prices; thinking / output-cap fields copied from qwen3.8-max, not probed) /
 2026-11 (qwen3.8-max-0902 / doubao-seed-2-1-pro-260915: image input,
 thinking on/off and the thinking / output-cap parameters probed; context window
@@ -273,8 +275,17 @@ class ModelEntry(BaseModel):
     # form) — "off" degrades to the lowest effort tier instead, and the UI
     # shows the not-fully-off hint. First case: glm-5.3-flash (thinking.type
     # 仅支持 enabled per bigmodel docs 2026-08); kimi-k3 predates the field
-    # and keeps its provider-branch handling.
+    # and keeps its provider-branch handling. B-320 —— Anthropic 也读它:不发
+    # ``thinking``、``output_config.effort`` 压到 "low"(Fable 5.2 / Opus 5.5)。
     always_thinking: bool = False
+    # B-320 —— Anthropic 关思考(及结构化输出调用)发的 ``thinking.type``。默认 "disabled";
+    # Sonnet 5.5 不收 disabled(400),关思考要发 "between_tools"(不带别的字段)。只有
+    # anthropic 读;``always_thinking`` 的模型不发 thinking,这里不起作用。
+    thinking_off_type: Literal["disabled", "between_tools"] = "disabled"
+    # B-320 —— 收不收强制调工具(Anthropic ``tool_choice`` 的 ``any`` / ``tool``)。结构化输出
+    # 靠强制调那个带 schema 的工具;False 的模型(Fable 5.2 / Opus 5.5 / Sonnet 5.5 发了 400)
+    # 改发 ``auto``,模型没调工具时由路由的校验重试兜底。只有 anthropic 读。
+    forced_tool_choice: bool = True
     sampling: bool = True
     # B-33 — the model accepts exactly ONE ``temperature`` value (vendor 400
     # on anything else). The agent factory clamps the manifest value to it
@@ -357,6 +368,69 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # context-1m beta; our client sends no 1M header and still gets 1M. Haiku 4.5
     # stays 200K.
     "anthropic": (
+        # B-320 —— Claude 5 四个型号(Anthropic 官方接口文档,2026-11-03 版;没有实调:测试
+        # 环境没有 Anthropic key)。四个都是 1M 上下文、128K 输出(max_tokens 合计含思考)、
+        # 能看图、不收 assistant 预填;思考默认开(不发 thinking 即 adaptive),深度用
+        # ``output_config.effort``;``budget_tokens`` 400;采样参数 400(Sonnet / Haiku 只收
+        # 默认值,平台不发)。各自不同的三处:
+        #   * Fable 5.2 / Opus 5.5 —— ``thinking: disabled`` 在任何档位都 400 → always_thinking,
+        #     关思考不发 thinking、effort 压到 low;强制 tool_choice(any / tool)400。Fable 5.2
+        #     还要求 30 天数据保留(零保留的组织调用 400,平台没法替用户绕开)。
+        #   * Sonnet 5.5 —— ``disabled`` 400,关思考发 ``between_tools``(effort 不高于 high;
+        #     平台关思考时不发 effort,厂商默认 high);强制 tool_choice 400。
+        #   * Haiku 5.5 —— ``disabled`` 照收(effort 不高于 high,厂商默认 medium);强制
+        #     tool_choice 照收。
+        # tool_disclosure:与旗舰同为 native_search(Haiku 照 Haiku 4.5 留 None);beta 被拒时
+        # provider 自动退回应用层(HX-J4),不会因此失败。
+        ModelEntry(
+            name="claude-fable-5-2",
+            vision=True,
+            context_window=1_000_000,
+            thinking="effort",
+            thinking_default=True,
+            always_thinking=True,
+            sampling=False,
+            forced_tool_choice=False,
+            tool_disclosure="native_search",
+            output_cap_field="max_tokens",
+            max_output_tokens=128_000,
+        ),
+        ModelEntry(
+            name="claude-opus-5-5",
+            vision=True,
+            context_window=1_000_000,
+            thinking="effort",
+            thinking_default=True,
+            always_thinking=True,
+            sampling=False,
+            forced_tool_choice=False,
+            tool_disclosure="native_search",
+            output_cap_field="max_tokens",
+            max_output_tokens=128_000,
+        ),
+        ModelEntry(
+            name="claude-sonnet-5-5",
+            vision=True,
+            context_window=1_000_000,
+            thinking="effort",
+            thinking_default=True,
+            thinking_off_type="between_tools",
+            sampling=False,
+            forced_tool_choice=False,
+            tool_disclosure="native_search",
+            output_cap_field="max_tokens",
+            max_output_tokens=128_000,
+        ),
+        ModelEntry(
+            name="claude-haiku-5-5",
+            vision=True,
+            context_window=1_000_000,
+            thinking="effort",
+            thinking_default=True,
+            sampling=False,
+            output_cap_field="max_tokens",
+            max_output_tokens=128_000,
+        ),
         # CM-9: opus-4-8 dropped sampling params (4.7+ removal); haiku has
         # no effort support — verified against the Anthropic docs 2026-07.
         ModelEntry(

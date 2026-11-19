@@ -3237,6 +3237,19 @@ def _constrained_temperature(model: ModelSpec, entry: ModelEntry | None) -> floa
     return entry.temperature_fixed
 
 
+def _anthropic_wire_bits(entry: ModelEntry | None) -> dict[str, Any]:
+    """B-320 — the catalog bits :class:`AnthropicProvider` shapes "thinking
+    off" and the structured-output call with. ``{}`` (provider defaults: send
+    ``disabled``, force the schema tool) for off-catalog models."""
+    if entry is None:
+        return {}
+    return {
+        "always_thinking": entry.always_thinking,
+        "thinking_off_type": entry.thinking_off_type,
+        "forced_tool_choice": entry.forced_tool_choice,
+    }
+
+
 def build_provider(
     model: ModelSpec,
     api_key: str,
@@ -3370,6 +3383,9 @@ def _build_provider(
             adaptive_thinking=model.adaptive_thinking,
             # Stream Thinking-Toggle — tri-state on/off override.
             thinking_enabled=model.thinking_enabled,
+            # B-320 — how this model takes "off" and structured output;
+            # off-catalog models keep the pre-B-320 wire.
+            **_anthropic_wire_bits(entry),
         )
     # Stream CM-10 (Mini-ADR CM-L3/L5) — the same build-time gate for the
     # OpenAI-compatible vendors, plus the pre-translated thinking payload.
