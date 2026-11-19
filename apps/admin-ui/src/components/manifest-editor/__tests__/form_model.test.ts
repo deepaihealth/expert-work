@@ -1015,6 +1015,28 @@ describe("vision fallback (Stream J.6 Path B — vision block)", () => {
     expect(cleared.spec?.vision).toBeUndefined();
   });
 
+  // A saved manifest comes back with ``fallbacks: []`` filled in by the
+  // backend; clearing must still drop the whole block — a ``vision`` block
+  // without ``model`` fails validation and the agent can't be saved.
+  it.each([
+    ["empty fallbacks (as saved by the backend)", []],
+    ["hand-added fallbacks", [{ provider: "zhipu", name: "glm-4v" }]],
+  ])("clearing drops the whole vision block with %s", (_label, fallbacks) => {
+    const base = {
+      ...seed,
+      spec: {
+        ...seed.spec,
+        vision: {
+          model: { provider: "qwen", name: "qwen4-max" },
+          fallbacks,
+        },
+      },
+    };
+    const cleared = setVisionModel(base, null);
+    expect(cleared.spec?.vision).toBeUndefined();
+    expect(readVisionOn(cleared)).toBe(false);
+  });
+
   it("preserves hand-added fallbacks when changing the model", () => {
     const base = {
       ...seed,

@@ -867,8 +867,10 @@ function setRouteModel(
 }
 
 // Stream J.6 Path B — set / clear the VL fallback model. ``null`` (or an empty
-// pick) removes the whole ``vision`` block so a text-only agent stays clean.
-// ``fallbacks`` (advanced, multi-VL chain) is preserved if hand-added in YAML.
+// pick) removes the whole ``vision`` block: ``model`` is required, so a block
+// left with only ``fallbacks`` (the backend fills ``fallbacks: []`` on every
+// save) fails validation and the agent can't be saved. ``fallbacks``
+// (advanced, multi-VL chain) is preserved when changing the model.
 export function setVisionModel(
   m: unknown,
   model: ModelFields | null,
@@ -876,13 +878,10 @@ export function setVisionModel(
   const keep =
     model !== null &&
     (model.provider !== undefined || model.name !== undefined);
-  const existing = specOf(m).vision ?? {};
   if (!keep) {
-    const { model: _dropped, ...rest } = existing;
-    return patchSpec(m, {
-      vision: Object.keys(rest).length > 0 ? rest : undefined,
-    });
+    return patchSpec(m, { vision: undefined });
   }
+  const existing = specOf(m).vision ?? {};
   return patchSpec(m, { vision: { ...existing, model } });
 }
 
@@ -1309,7 +1308,8 @@ export function disablePlanFirst(m: unknown): AgentManifest {
 // fallback chain — the backend validator rejects one). ``null`` / an empty
 // pick clears back to inherit, dropping the whole block when nothing else
 // (e.g. ``enabled:false``) remains — same shape discipline as
-// ``setVisionModel``/``setDynamicWorkersOn``.
+// ``setDynamicWorkersOn``. (``setVisionModel`` differs: its ``model`` is
+// required, so clearing drops the whole ``vision`` block.)
 export const readWorkerModel = (m: unknown): ModelFields | undefined =>
   specOf(m).dynamic_workers?.model ?? undefined;
 
