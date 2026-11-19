@@ -34,6 +34,10 @@ export interface CatalogModel {
   // included), null = no known ceiling. Drives the output-cap input's
   // placeholder + max.
   max_output_tokens?: number | null;
+  // B-320 — Anthropic only: the max_tokens sent when the manifest leaves
+  // the cap empty (null = the platform's 4096). Drives the anthropic
+  // placeholder so it names what is actually sent.
+  default_max_tokens?: number | null;
   // B-105 — whether this model has a REAL thinking-length hard cap (vs. only
   // discrete effort/toggle levels). Gates the thinking-length-cap input —
   // the backend rejects thinking_max_tokens on a model where this is false.

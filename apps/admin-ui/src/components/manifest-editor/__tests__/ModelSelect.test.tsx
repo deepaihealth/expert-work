@@ -50,6 +50,16 @@ const CATALOG: ModelCatalog = {
           thinking: "toggle",
           thinking_default: true,
         },
+        {
+          name: "claude-opus-5-5",
+          vision: true,
+          embeddings: false,
+          context_window: 1000000,
+          deprecated: false,
+          thinking: "effort",
+          thinking_default: true,
+          default_max_tokens: 16000,
+        },
       ],
     },
     {
@@ -879,6 +889,16 @@ describe("ModelSelect", () => {
     await openAdvanced(user);
     const input = screen.getByLabelText("Max output (incl. thinking)");
     expect(input.getAttribute("placeholder")).toBe("Default 4096");
+  });
+
+  // B-320 — Claude 5 declares a catalog default (16000); the placeholder must
+  // name that, not the platform-wide 4096.
+  it("output cap placeholder for an anthropic model with a catalog default names that default", async () => {
+    const user = userEvent.setup();
+    renderSelect({ provider: "anthropic", name: "claude-opus-5-5" });
+    await openAdvanced(user);
+    const input = screen.getByLabelText("Max output (incl. thinking)");
+    expect(input.getAttribute("placeholder")).toBe("Default 16000");
   });
 
   // B-105 — a stored thinking cap on a model without a real cap (e.g. from

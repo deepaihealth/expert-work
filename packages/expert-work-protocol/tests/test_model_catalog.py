@@ -801,3 +801,82 @@ def test_qwen4_max_mirrors_the_qwen_flagship() -> None:
     qwen = [e.name for e in models_for_provider("qwen")]
     assert qwen[0] == "qwen4-max"
     assert {"qwen3.8-max", "qwen3.8-max-0902"} <= set(qwen)
+
+
+# --- B-320 —— Claude 5 四个型号 ----------------------------------------------
+
+_CLAUDE5 = ("claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
+
+
+def test_b320_claude5_models_are_selectable_and_old_ones_stay() -> None:
+    """配了 Anthropic 密钥只出来三个模型(B-320):Claude 5 四个型号补进下拉,排在旧的前面;
+    旧的三个照样可选(已有的智能体还在用),不标下架。"""
+    names = [e.name for e in models_for_provider("anthropic")]
+    assert names[:4] == list(_CLAUDE5)
+    assert {"claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"} <= set(names)
+
+
+@pytest.mark.parametrize("name", _CLAUDE5)
+def test_b320_claude5_shared_capabilities(name: str) -> None:
+    """Anthropic 官方接口文档(2026-11-03 版):四个都是 1M 上下文、128K 输出、能看图、思考默认开、
+    用 ``output_config.effort`` 调深度;采样参数(temperature / top_p / top_k)发了就 400(Sonnet /
+    Haiku 只收默认值,平台一律不发)。"""
+    entry = _e("anthropic", name)
+    assert entry.vision is True
+    assert entry.context_window == 1_000_000
+    assert entry.max_output_tokens == 128_000
+    assert entry.output_cap_field == "max_tokens"
+    assert (entry.thinking, entry.thinking_default) == ("effort", True)
+    assert entry.sampling is False
+    assert entry.thinking_cap is False
+    assert entry.deprecated is False
+
+
+def test_b320_claude5_thinking_off_and_forced_tool_bits() -> None:
+    """关思考的线格式、能不能强制调工具,四个各不相同(官方文档 2026-11-03):
+
+    * Fable 5.2 / Opus 5.5:思考关不掉(``disabled`` 与 ``budget_tokens`` 都 400)
+      → ``always_thinking``,关思考落到最低档;强制 ``tool_choice``(any / tool)400。
+    * Sonnet 5.5:``disabled`` 400,关思考要发 ``between_tools``;强制 ``tool_choice`` 400。
+    * Haiku 5.5:``disabled`` 照收(effort 不高于 high);强制 ``tool_choice`` 照收。
+    """
+    bits = {}
+    for name in _CLAUDE5:
+        entry = _e("anthropic", name)
+        bits[name] = (entry.always_thinking, entry.thinking_off_type, entry.forced_tool_choice)
+    assert bits == {
+        "claude-fable-5-2": (True, "disabled", False),
+        "claude-opus-5-5": (True, "disabled", False),
+        "claude-sonnet-5-5": (False, "between_tools", False),
+        "claude-haiku-5-5": (False, "disabled", True),
+    }
+
+
+def test_b320_new_fields_default_to_the_pre_b320_wire() -> None:
+    """不声明就是 B-320 之前的线格式:关思考发 ``disabled``、结构化输出强制调工具。旧模型都不变。"""
+    entry = ModelEntry(name="x")
+    assert entry.thinking_off_type == "disabled"
+    assert entry.forced_tool_choice is True
+    assert entry.default_max_tokens is None
+    for name in ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"):
+        old = _e("anthropic", name)
+        bits = (old.always_thinking, old.thinking_off_type, old.forced_tool_choice)
+        assert bits == (False, "disabled", True)
+        assert old.default_max_tokens is None
+
+
+def test_b320_default_max_tokens_only_on_claude5() -> None:
+    """清单没配输出上限时 Anthropic 必须发一个:Claude 5 四个思考默认开,4096 会被思考吃满、
+    回复为空,所以目录给 16000;别的条目都不声明(旧模型仍发 4096)。"""
+    declared = {
+        (provider, e.name): e.default_max_tokens
+        for provider, entries in MODEL_CATALOG.items()
+        for e in entries
+        if e.default_max_tokens is not None
+    }
+    assert declared == {("anthropic", name): 16_000 for name in _CLAUDE5}
+    for name in _CLAUDE5:
+        entry = _e("anthropic", name)
+        assert entry.max_output_tokens is not None
+        assert entry.default_max_tokens is not None
+        assert entry.default_max_tokens <= entry.max_output_tokens

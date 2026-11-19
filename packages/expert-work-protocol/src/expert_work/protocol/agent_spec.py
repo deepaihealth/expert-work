@@ -117,7 +117,8 @@ class ModelSpec(BaseModel):
     name: str = Field(min_length=1)
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     #: B-105 —— 单次输出上限,**含思考**(平台语义:思考 + 回答合计)。``None`` = 请求里
-    #: 不带上限、用厂商默认;Anthropic 必须带上限,为空时发 4096。按目录 ``output_cap_field``
+    #: 不带上限、用厂商默认;Anthropic 必须带上限,为空时发目录 ``default_max_tokens``(B-320:
+    #: Claude 5 为 16000),没声明则 4096。按目录 ``output_cap_field``
     #: 发到该厂商真正表示合计的字段。注意:非 Anthropic 模型上的 4096 在加载时归一成空
     #: (旧默认值被表单写回、从未生效,与「没设」分不出来);需要这个数请填 4095 / 4097。
     max_tokens: int | None = Field(default=None, gt=0)
