@@ -150,7 +150,7 @@ from orchestrator.llm import (
 )
 from orchestrator.llm.endpoints import OFFICIAL_BASE_URLS, ProviderKey, endpoint_for
 from orchestrator.llm.failover import breaker_key_for
-from orchestrator.llm.truncation import ANTHROPIC_DEFAULT_MAX_TOKENS, served_output_cap
+from orchestrator.llm.truncation import anthropic_default_max_tokens, served_output_cap
 from orchestrator.middleware_assembly import MiddlewareEnv, build_middleware_chains
 from orchestrator.multimodal import ImageResolver
 from orchestrator.output_judge import ActionJudge, OutputJudge
@@ -2719,6 +2719,11 @@ def _escalated_model(model: ModelSpec) -> ModelSpec | None:
     # the escalated caller forces thinking back ON for one turn (ephemeral, the
     # stored manifest is untouched). "off → on at one step up."
     if model.thinking_enabled is False:
+        # B-320 — Sonnet 5.5's off form (``between_tools``) runs at the model's
+        # default effort (high); one escalated turn at "medium" with thinking
+        # on and then back would change effort mid-conversation. Don't.
+        if entry.thinking_off_type == "between_tools":
+            return None
         if entry.thinking == "toggle":
             return model.model_copy(update={"thinking_enabled": True, "effort": "high"})
         next_level = _EFFORT_LADDER.get(model.effort)  # effort is typically None → "medium"
@@ -3237,6 +3242,19 @@ def _constrained_temperature(model: ModelSpec, entry: ModelEntry | None) -> floa
     return entry.temperature_fixed
 
 
+def _anthropic_wire_bits(entry: ModelEntry | None) -> dict[str, Any]:
+    """B-320 — the catalog bits :class:`AnthropicProvider` shapes "thinking
+    off" and the structured-output call with. ``{}`` (provider defaults: send
+    ``disabled``, force the schema tool) for off-catalog models."""
+    if entry is None:
+        return {}
+    return {
+        "always_thinking": entry.always_thinking,
+        "thinking_off_type": entry.thinking_off_type,
+        "forced_tool_choice": entry.forced_tool_choice,
+    }
+
+
 def build_provider(
     model: ModelSpec,
     api_key: str,
@@ -3360,7 +3378,10 @@ def _build_provider(
         return AnthropicProvider(
             client=_anthropic_client(api_key, base_url, timeout_s=timeout_eff, http=http_client),
             model=model.name,
-            max_tokens=model.max_tokens or ANTHROPIC_DEFAULT_MAX_TOKENS,
+            # B-320 — the empty-manifest default comes from the catalog
+            # (16000 for Claude 5, 4096 otherwise); same value the
+            # truncation error reports.
+            max_tokens=model.max_tokens or anthropic_default_max_tokens(model.name),
             temperature=temperature,
             image_resolver=image_resolver,
             # Stream L.L1 — propagate the manifest's per-model cache flag.
@@ -3370,6 +3391,9 @@ def _build_provider(
             adaptive_thinking=model.adaptive_thinking,
             # Stream Thinking-Toggle — tri-state on/off override.
             thinking_enabled=model.thinking_enabled,
+            # B-320 — how this model takes "off" and structured output;
+            # off-catalog models keep the pre-B-320 wire.
+            **_anthropic_wire_bits(entry),
         )
     # Stream CM-10 (Mini-ADR CM-L3/L5) — the same build-time gate for the
     # OpenAI-compatible vendors, plus the pre-translated thinking payload.

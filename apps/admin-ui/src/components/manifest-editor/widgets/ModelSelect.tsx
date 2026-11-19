@@ -19,8 +19,9 @@ import {
   thinkingCannotFullyDisable,
 } from "../catalog";
 
-// B-105 — Anthropic requires max_tokens; an empty cap is sent as 4096
-// (agent_factory / truncation ANTHROPIC_DEFAULT_MAX_TOKENS), not a vendor default.
+// B-105 — Anthropic requires max_tokens; an empty cap is sent as the catalog
+// ``default_max_tokens`` (B-320: 16000 on Claude 5), else 4096 (truncation
+// ``anthropic_default_max_tokens``), not a vendor default.
 const ANTHROPIC_DEFAULT_MAX_TOKENS = 4096;
 
 interface ModelSelectProps {
@@ -223,7 +224,9 @@ export function ModelSelect({
                         placeholder={
                           value.provider === "anthropic"
                             ? t("model_select.max_tokens_placeholder_anthropic", {
-                                n: ANTHROPIC_DEFAULT_MAX_TOKENS,
+                                n:
+                                  currentEntry?.default_max_tokens ??
+                                  ANTHROPIC_DEFAULT_MAX_TOKENS,
                               })
                             : currentEntry?.max_output_tokens != null
                             ? t("model_select.max_tokens_placeholder_max", {

@@ -13,15 +13,26 @@ from typing import TYPE_CHECKING
 from langchain_core.messages import AIMessage
 
 from expert_work.common.observability.metrics import expert_work_counter
+from expert_work.protocol.model_catalog import catalog_entry
 from orchestrator.llm.structured_output import _message_text
 from orchestrator.usage_metering import ServedModelResolver, chain_models
 
 if TYPE_CHECKING:
     from expert_work.protocol import ModelSpec
 
-#: Anthropic 必须带 ``max_tokens``;清单没设时沿用一直生效的 4096(构建 provider 与报错
-#: 文案同一个数)。
+#: Anthropic 必须带 ``max_tokens``;清单没设、目录也没声明 ``default_max_tokens`` 时沿用一直
+#: 生效的 4096(构建 provider 与报错文案同一个数,都经 :func:`anthropic_default_max_tokens`)。
 ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
+
+
+def anthropic_default_max_tokens(name: str) -> int:
+    """B-320 —— 清单没配输出上限时发给 Anthropic 的值:目录 ``default_max_tokens``(思考默认开的
+    Claude 5 四个是 16000),没声明的(旧模型、目录外模型)仍是 4096。"""
+    entry = catalog_entry("anthropic", name)
+    if entry is not None and entry.default_max_tokens is not None:
+        return entry.default_max_tokens
+    return ANTHROPIC_DEFAULT_MAX_TOKENS
+
 
 _TRUNCATED = {("finish_reason", "length"), ("stop_reason", "max_tokens")}
 
@@ -78,9 +89,10 @@ class ServedOutputCap:
 
 
 def effective_output_cap(model: ModelSpec) -> int | None:
-    """实际发出的输出上限:清单值;Anthropic 为空时是 4096;其余为空 = 厂商默认(``None``)。"""
+    """实际发出的输出上限:清单值;Anthropic 为空时按 :func:`anthropic_default_max_tokens`;
+    其余为空 = 厂商默认(``None``)。"""
     if model.max_tokens is None and model.provider == "anthropic":
-        return ANTHROPIC_DEFAULT_MAX_TOKENS
+        return anthropic_default_max_tokens(model.name)
     return model.max_tokens
 
 
