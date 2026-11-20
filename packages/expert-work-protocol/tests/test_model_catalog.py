@@ -155,6 +155,9 @@ def test_current_context_windows() -> None:
         ("qwen", "qwen3.8-max-0902"): 1_000_000,
         # 2026-11-17 厂商模型页:Qwen4-Max 上下文 1M。
         ("qwen", "qwen4-max"): 1_000_000,
+        # 2026-11-20 厂商模型列表文档:Seed 2.1 turbo 256K、lite 1024K。
+        ("doubao", "doubao-seed-2-1-turbo-260628"): 256_000,
+        ("doubao", "doubao-seed-2-1-lite-260915"): 1_024_000,
     }
     for (provider, name), window in expected.items():
         entry = catalog_entry(provider, name)
@@ -776,7 +779,8 @@ def test_2026_11_dated_ids_mirror_their_predecessors() -> None:
     # 260628 让位给 260915:不进下拉,已经写了它的 manifest 照样能解析。
     assert d_old.deprecated is True and d_new.deprecated is False
     doubao = [e.name for e in models_for_provider("doubao")]
-    assert doubao == ["doubao-seed-2-1-pro-260915"]
+    assert doubao[0] == "doubao-seed-2-1-pro-260915"
+    assert "doubao-seed-2-1-pro-260628" not in doubao
     # qwen3.8-max 是不带日期的别名,仍在售:两个名字都可选,别名排在前面。
     qwen = [e.name for e in models_for_provider("qwen")]
     assert q_old.deprecated is False
@@ -880,3 +884,32 @@ def test_b320_default_max_tokens_only_on_claude5() -> None:
         assert entry.max_output_tokens is not None
         assert entry.default_max_tokens is not None
         assert entry.default_max_tokens <= entry.max_output_tokens
+
+
+def test_doubao_seed_21_turbo_and_lite_mirror_pro() -> None:
+    """2026-11-20 —— Seed 2.1 turbo / lite 上架。实调(平台豆包 key):能看图、关思考思考为 0、
+    reasoning_effort 五档都收、开思考 + 合计上限 300 回 length;合计上限传 1,000 万回 400
+    「<= 262144」。上下文按厂商模型列表文档:turbo 256K、lite 1024K。其余字段同 pro 260915。"""
+    pro = _e("doubao", "doubao-seed-2-1-pro-260915")
+    expected_windows = {
+        "doubao-seed-2-1-turbo-260628": 256_000,
+        "doubao-seed-2-1-lite-260915": 1_024_000,
+    }
+    for name, window in expected_windows.items():
+        e = _e("doubao", name)
+        assert e.vision is True
+        assert (e.thinking, e.thinking_default) == ("effort", True)
+        assert e.output_cap_field == "max_completion_tokens"
+        assert e.max_output_tokens == 262_144
+        assert e.effort_map == {"max": "high"}
+        assert e.context_window == window
+        assert e.deprecated is False
+        differs = {"name", "context_window"}
+        assert e.model_dump(exclude=differs) == pro.model_dump(exclude=differs)
+    # pro 仍排第一(不是新档的默认),新的两档在下拉里可选。
+    doubao = [e.name for e in models_for_provider("doubao")]
+    assert doubao == [
+        "doubao-seed-2-1-pro-260915",
+        "doubao-seed-2-1-turbo-260628",
+        "doubao-seed-2-1-lite-260915",
+    ]
