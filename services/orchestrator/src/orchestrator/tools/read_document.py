@@ -30,6 +30,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from expert_work.runtime.tokens import CharTokenEstimator, TokenEstimator
 from orchestrator.tools.document_figures import (
     SUPPORTED_EXTENSIONS,
     build_figure_inventory_wrapper,
@@ -40,6 +41,11 @@ from orchestrator.tools.file_ops import (
     _require_path,
     _snippet,
     run_scoped_read,
+)
+from orchestrator.tools.overflow import (
+    RESULT_ENVELOPE_RESERVE_TOKENS,
+    fit_prefix,
+    sent_token_counter,
 )
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import (
@@ -185,6 +191,23 @@ def build_read_document_wrapper(
     )
 
 
+def _budget_notice(*, shown: int, total: object, saved: int) -> str:
+    """B-328 —— 按单条预算截了正文。全文交给 builder 落盘;路径由写盘成功后追加的 footer
+    给出(工具这时还不知道写没写成,CM-F5),所以这里只说给了多少、没有 footer 时怎么办。"""
+    of_total = f" of {total:,}" if isinstance(total, int) else ""
+    capped = (
+        f" The saved copy holds the first {saved:,} characters."
+        if isinstance(total, int) and total > saved
+        else ""
+    )
+    return (
+        f"[read_document: showing the first {shown:,}{of_total} characters of the "
+        "extracted text (this agent's per-result budget). If a note below names a saved "
+        "copy of the full text, page through it with read_file (offset / limit); "
+        f"otherwise extract the part you need with exec_python or bash.{capped}]"
+    )
+
+
 def _truncation_notice(*, shown: int, total: object) -> str:
     """B-136 —— 截断这件事要让模型读得到(``meta`` 它看不到)。
 
@@ -209,6 +232,10 @@ class ReadDocumentTool:
     output_char_cap: int = _DOC_OUTPUT_CHAR_CAP
     #: skill-runtime §5.1 — activated skill files seeded under /opt/skills/<agent_key>/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
+    #: B-328 —— 单条预算 R(token,按发给模型的样子量)。超过时正文截到 R,解析出的全文
+    #: 交给 builder 存进工作区(``ToolResult.full_content``)。``None`` = 不限。
+    result_budget_tokens: int | None = None
+    estimator: TokenEstimator | None = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -282,13 +309,20 @@ class ReadDocumentTool:
         prefix = render_figure_map(fig_env)
         body = str(env.get("content", ""))
         truncated = bool(env.get("truncated"))
+        notice = _truncation_notice(shown=len(body), total=env.get("chars")) if truncated else None
+        full_content: str | None = None
+        shown = self._budgeted_length(prefix, body, env.get("chars"))
+        if shown < len(body):
+            full_content, body, truncated = body, body[:shown], True
+            notice = _budget_notice(shown=shown, total=env.get("chars"), saved=len(full_content))
         return ToolResult(
             content=prefix + body,
-            notice=_truncation_notice(shown=len(body), total=env.get("chars"))
-            if truncated
-            else None,
+            notice=notice,
+            full_content=full_content,
             meta={
                 "path": rel,
+                # B-328 —— 真实路径(B-317 ``ResolvedPath.path``):跨轮的找回说明用它。
+                "source_path": target.path,
                 "format": env.get("format"),
                 "chars": env.get("chars"),
                 "truncated": truncated,
@@ -296,3 +330,13 @@ class ReadDocumentTool:
                 "figures_state": fig_env.get("state"),
             },
         )
+
+    def _budgeted_length(self, prefix: str, body: str, total: object) -> int:
+        """B-328 —— 正文给前多少字:整条结果(图清单 + 正文 + notice + 围栏 / footer 余量)
+        按发给模型的样子不超过 R。没设 R 或放得下 → 全给。"""
+        if self.result_budget_tokens is None:
+            return len(body)
+        count = sent_token_counter(self.estimator or CharTokenEstimator())
+        notice = _budget_notice(shown=len(body), total=total, saved=len(body))
+        budget = self.result_budget_tokens - RESULT_ENVELOPE_RESERVE_TOKENS - count(notice)
+        return fit_prefix(body, lambda head: prefix + head, budget, count)

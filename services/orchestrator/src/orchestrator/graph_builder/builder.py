@@ -5291,7 +5291,9 @@ async def _externalize_tool_overflow(
     (:data:`EXEMPT_TOOLS`) are skipped — their source is cheaply re-readable, so
     externalizing them would just create a persist→read→persist loop (CM-F3).
     """
-    if writer is None or tool.spec.name in EXEMPT_TOOLS:
+    # B-328 —— 免的是「按大小外置」;工具自己交出的全文(``read_document`` 按单条预算截了正文)
+    # 照常走 CM-5 落盘 + footer。
+    if writer is None or (tool.spec.name in EXEMPT_TOOLS and result.full_content is None):
         return None, None, None
 
     budget_on = budget_enabled
