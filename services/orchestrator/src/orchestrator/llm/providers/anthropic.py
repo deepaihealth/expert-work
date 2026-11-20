@@ -78,6 +78,7 @@ from orchestrator.multimodal import (
     ImageResolver,
     resolve_message_images,
     split_human_content,
+    split_human_views,
 )
 from orchestrator.tools.registry import ToolSpec
 
@@ -1047,7 +1048,8 @@ async def _human_content(
     blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
     # B-64 Task 7 / B-283 —— 工作区图读不出来、上传图的字节不在了时
     # ``resolve_message_images`` 给一段文字顶替。
-    for item in await resolve_message_images(image_refs, resolver):
+    views = split_human_views(msg.content)  # B-322 —— 提示词视图里横 / 倒的图带 ``view``
+    for item in await resolve_message_images(image_refs, resolver, views):
         if isinstance(item, str):
             blocks.append({"type": "text", "text": item})
             continue

@@ -100,6 +100,7 @@ from orchestrator.graph_builder._config import (
     FAILOVER_SINK_KEY,
     TOKEN_SINK_KEY,
 )
+from orchestrator.image_views import release_run_views
 from orchestrator.run_retry import (
     MAX_RUN_RETRIES,
     is_transient_run_error,
@@ -1186,6 +1187,9 @@ async def run_agent(
         )
         _dispatch_skill_run_usage(skill_run_usage_recorder, record, outcome="failed")
     finally:
+        # B-322 PR ① —— 本 run 的转正小副本与「这张图这个 run 降到哪一级」一并释放(正常结束、
+        # 出错、被取消都走这里;同步调用,取消的收尾路径上也安全)。
+        release_run_views(run_id)
         # 二期 PR3 — sentinel(None)tells the background persist writer to
         # flush its tail and exit. Synchronous put — safe even on the
         # asyncio.CancelledError teardown path above (no await). QueueFull

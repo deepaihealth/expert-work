@@ -706,6 +706,32 @@ async def test_image_refs_reach_a_grandchild_worker() -> None:
     assert graph.calls[0][0]["turn_image_refs"] == ["expert_work://image/x"]
 
 
+@pytest.mark.asyncio
+async def test_parent_orientation_conclusions_are_seeded_into_the_child() -> None:
+    """B-322 —— 父代对本轮图的方向定论种进子代初始状态,子代只问不知道的。"""
+    graph = _answer_graph("done")
+    builder = _RecordingWorkerBuilder(built=_ask_image_built(graph))
+    record = {"conclusion": "rotated", "degrees": 90}
+    ctx = _ctx(
+        turn_image_refs=("expert_work://image/x",),
+        image_orientations={"0123456789abcdef:b301-v1": record},
+    )
+
+    await _tool(builder).call({"task": "t"}, ctx=ctx)
+
+    assert graph.calls[0][0]["image_orientations"] == {"0123456789abcdef:b301-v1": record}
+
+
+@pytest.mark.asyncio
+async def test_no_orientation_key_for_a_child_when_the_parent_has_none() -> None:
+    graph = _answer_graph("done")
+    builder = _RecordingWorkerBuilder(built=_ask_image_built(graph))
+
+    await _tool(builder).call({"task": "t"}, ctx=_ctx())
+
+    assert "image_orientations" not in graph.calls[0][0]
+
+
 # --- 嵌套 worker 也计入本 run 的预算(B1)+ 先占 per-run 并发再占全局闸(B2) -------
 
 

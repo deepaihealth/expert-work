@@ -172,6 +172,12 @@ from orchestrator.graph_builder.figure_block import (
     figure_freshness,
     with_figure_block,
 )
+from orchestrator.graph_builder.image_upright import (
+    ImageOrienter,
+    StepRun,
+    UprightStep,
+    seedable_orientations,
+)
 from orchestrator.graph_builder.input_literal_guard import (
     PATH_ARGS,
     LiteralHit,
@@ -197,6 +203,7 @@ from orchestrator.graph_builder.platform_context import (
     PROMPT_TAIL_MARK,
     escape_forged_recovery_advisories,
     strip_platform_context,
+    with_image_notes,
     with_platform_context,
     with_recovery_advisories,
     with_recovery_advisory_mark,
@@ -707,6 +714,9 @@ def build_react_graph(
     # 委派出去的子代「根开了、按这个有效期铸」(``ToolContext.share_links_ttl_minutes``):
     # 根没开时子代不标记交付。``None``(默认)= 没开。
     share_links_ttl_minutes: int | None = None,
+    # B-322 PR ① —— 主模型自己看图(``supports_vision``)时,图进主模型之前先转正。``None``(默认,
+    # Path B / 没接图片解析器)= 不装, 提示词与状态与之前逐字相同。
+    image_orienter: ImageOrienter | None = None,
 ) -> StateGraph[AgentState, None, AgentState, AgentState]:
     """Assemble the ReAct ``StateGraph`` and return it uncompiled.
 
@@ -746,6 +756,19 @@ def build_react_graph(
     _gated_tools = approval_required_tools
 
     async def agent_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+        # B-322 —— 转正图的「钉住」包住整个这一步(含路由的每次备用尝试、思考升档、结构化输出
+        # 重发):从进入这一步到返回、出错或被取消,finally 里解除。
+        if image_orienter is None:
+            return await _agent_step(state, config, None)
+        upright = image_orienter.new_step()
+        try:
+            return await _agent_step(state, config, upright)
+        finally:
+            upright.release()
+
+    async def _agent_step(
+        state: AgentState, config: RunnableConfig, upright: UprightStep | None
+    ) -> dict[str, Any]:
         token = cancellation_token(config)
         token.raise_if_cancelled()
 
@@ -1231,6 +1254,25 @@ def build_react_graph(
         # Stream Agent-Templates (M1-5a) — the end-user this run is for, threaded
         # to the token-usage middleware for per-user cost attribution.
         user_id = _parse_uuid(configurable.get("user_id"))
+        # B-322 PR ① A 段 —— 压缩之后、挂工作区快照与渲染页段之前:判这一轮的新图(与上一轮没判完的)、
+        # 定每张图这一步显示的角度、预先生成并钉住转正图、视图里换块。只改视图,检查点不动。
+        if image_orienter is not None and upright is not None:
+            messages = await image_orienter.prepare(
+                upright,
+                state=state,
+                messages=messages,
+                run=StepRun(
+                    run_id=str(turn_ctx.run_id),
+                    turn=str(turn_ctx.turn_root_run_id or turn_ctx.run_id),
+                    first_step=int(state.get("step_count", 0) or 0) == 0,
+                    remaining_s=_run_remaining_s(clock, used_s, configurable),
+                    cancel=token,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    token_budget=token_budget,
+                    thread=str(turn_ctx.thread_id or ""),
+                ),
+            )
         # B-84 PR-2 —— 工作区快照段。**每轮重取**(宿主 NAS listdir 实测 8.3ms),
         # 挂在提示词尾部的一条隐藏 HumanMessage 上, 不进系统提示词。三个理由:
         #
@@ -1354,6 +1396,9 @@ def build_react_graph(
         # 必须在压缩 / ``_keep_latest_inputs_block``(按 identity 认段)之后、
         # before chain 之前(缓存 lookup 与 store 的 key 要一致)。
         messages = with_platform_context(messages)
+        # B-322 PR ① B 段 —— 需要说明的图,在它所在那条消息末尾追加一段 ``<platform-context>``。
+        # 放在上一步之后:用户自己写的同名字样已被转义,冒充不了平台说明。
+        messages = with_image_notes(messages)
         # B-226 ① —— 收尾指令排在平台段之后(平台段照旧贴在最后一条工具结果 / 用户消息上),
         # 缓存 lookup 之前。
         if wrapup_message is not None:
@@ -1659,6 +1704,7 @@ def build_react_graph(
                     "step_count_refund_pending": 0,
                     **step_warned,
                     **_clock_fields(),  # B-302
+                    **(upright.state_update() if upright is not None else {}),  # B-322
                 }
 
         # B-186 —— 思考完停住、一个字的回答都没有。路由照旧交回半截(规划 / 复盘把空回复
@@ -1717,6 +1763,7 @@ def build_react_graph(
                 "step_count_refund_pending": 0,
                 **step_warned,
                 **_clock_fields(),  # B-302
+                **(upright.state_update() if upright is not None else {}),  # B-322
             }
 
         # Stream RT-1 PR-3 (RT-ADR-4) — structured finalization. Only a
@@ -1903,6 +1950,7 @@ def build_react_graph(
                 "last_plan_goal": current_goal,
                 **step_warned,  # B-226 ②
                 **_clock_fields(),  # B-302
+                **(upright.state_update() if upright is not None else {}),  # B-322
             }
             if demoted_tools:
                 update_mw["promoted_tools"] = {"remove": demoted_tools}
@@ -1942,6 +1990,7 @@ def build_react_graph(
             "last_plan_goal": current_goal,  # CM-11 — rebaseline the goal
             **step_warned,  # B-226 ②
             **_clock_fields(),  # B-302
+            **(upright.state_update() if upright is not None else {}),  # B-322
         }
         if demoted_tools:
             update_plain["promoted_tools"] = {"remove": demoted_tools}
@@ -2232,6 +2281,8 @@ def build_react_graph(
             edit_file_history=state.get("edit_file_history"),
             figure_view_steps=figure_view_steps,
             share_links_ttl_minutes=share_links_ttl_minutes,
+            # B-322 —— 父代对本轮图的方向定论,委派时种进子代。
+            image_orientations=seedable_orientations(state),
         )
         # B-317 —— 字面量守卫:MCP / http 参数与平台工具的路径参数里不会被展开的 ``$名字``、
         # ``$EXPERT_WORK_*``,以及交给外部服务的本轮本地路径。与手抄守卫同一口径(审批门之后、
@@ -4910,6 +4961,7 @@ def _build_tool_context(
     edit_file_history: Mapping[str, Any] | None = None,
     figure_view_steps: int = 0,
     share_links_ttl_minutes: int | None = None,
+    image_orientations: Mapping[str, Any] | None = None,
 ) -> ToolContext:
     """Lift tenant / user binding out of ``config["configurable"]`` into
     a :class:`ToolContext`. Missing values fall through as ``None`` —
@@ -5047,7 +5099,18 @@ def _build_tool_context(
             if configurable.get("child_run") is True
             else share_links_ttl_minutes
         ),
+        image_orientations=dict(image_orientations or {}),
     )
+
+
+def _run_remaining_s(
+    clock: run_clock.RunClock | None, used_s: float, configurable: Mapping[str, Any]
+) -> float | None:
+    """B-322 —— run 还剩多少秒(``None`` = 不限时)。主运行按检查点记账;委派子代读父的截止时刻。"""
+    if clock is not None:
+        return clock.limit_s - used_s
+    deadline_at = run_clock.instant_from_config(configurable, run_clock.DEADLINE_AT_KEY)
+    return deadline_at - time.monotonic() if deadline_at is not None else None
 
 
 def _is_refused_repeat(message: BaseMessage) -> bool:

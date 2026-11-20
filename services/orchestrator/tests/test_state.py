@@ -85,6 +85,10 @@ def test_required_keys_present() -> None:
         "seed_skipped_dirs",
         "seed_quota_blocked",
         "seed_skipped_more",
+        # B-322 PR ① —— 主模型自己看图时的转正
+        "conversation_images",
+        "image_orientations",
+        "shown_image_angles",
     }
 
 

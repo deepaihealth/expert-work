@@ -40,10 +40,27 @@ one CPU; sampled every 5 ms with VmSize and VmRSS read from the same
   page). The figure worker is counted at its own ceiling, not at a measured
   peak.
 
-Shipped (2026-10-23: 4Gi, one parse worker at 2400 MiB, the figure worker at
-1536 MiB): 1,366 + (2,400 - 650) + (1,536 - 654) = 3,998 MiB of 4,096 — 98 MiB
-to spare. Raising either ingestion budget, the worker ceilings or the worker
-count eats into that first.
+* B-322 (2026-11-20) adds :data:`B322_UPRIGHT_MIB` to the server process — the
+  memory of B-322's OWN image work for vision main models (JPEG only): the
+  decodes it starts itself (one full-resolution upright copy, or the
+  orientation candidates /
+  ~1.5 MP copies sharing the two host decode slots) are held to
+  ``orchestrator.image_views.FULL_COPY_PEAK_BYTES`` = 110 MiB, estimated from
+  the file header before decoding (in-pod on the test control-plane, Pillow
+  13.0.0: 4032 x 3024 turned 90 degrees +94 MiB; 8064 x 6048 drafted to
+  4032 x 3024 +93 MiB); the copy caches 32 + 4 MiB; the lent orientation
+  candidates, capped process-wide at 16 MiB. **Not covered:** ``ask_image``'s
+  own crops (Path B, B-266) are not estimated or bounded by this — a crop of a
+  very large PNG can take hundreds of MiB (pre-existing; separate follow-up).
+* :data:`HEADROOM_MIB` — the shipped overlays must leave at least this much of
+  the pod limit unused.
+
+Shipped (2026-11-20: 4Gi, one parse worker at 2280 MiB, the figure worker at
+1536 MiB): (1,366 + 162) + (2,280 - 650) + (1,536 - 654) = 4,040 MiB of 4,096
+— 56 MiB to spare, at least :data:`HEADROOM_MIB` (2026-10-23 had 98 MiB spare at
+2400 MiB; B-322 took 162 and the parse worker gave back 120). Raising either
+ingestion budget, the worker ceilings, the worker count or the B-322 budget
+needs the pod limit raised first.
 """
 
 from __future__ import annotations
@@ -63,7 +80,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _K8S = _REPO_ROOT / "infra" / "k8s"
 _CONTAINER = "control-plane"
 
-MAIN_PROCESS_MIB = 614 + 752
+#: B-322 (2026-11-20): B-322's own decodes (``FULL_COPY_PEAK_BYTES``, 110 MiB; in-pod 12 MP
+#: measured +94 MiB) + the upright-copy caches (32 MiB full + 4 MiB low-res) + the lent orientation
+#: candidates (``LENT_CANDIDATES_CAP_BYTES``, 16 MiB). Not ``ask_image``'s own crops (see above).
+B322_UPRIGHT_MIB = 110 + 32 + 4 + 16
+#: The shipped overlays leave at least this much of the pod limit unused (2026-11-20, user).
+HEADROOM_MIB = 50
+MAIN_PROCESS_MIB = 614 + 752 + B322_UPRIGHT_MIB
 PARSE_WORKER_NEVER_RESIDENT_MIB = 650
 FIGURE_WORKER_NEVER_RESIDENT_MIB = 654
 
@@ -80,7 +103,8 @@ def worst_case_mib(*, workers: int, cap_mib: int, figure_cap_mib: int) -> int:
 
 
 def largest_cap_mib(*, limit_mib: int, workers: int, figure_cap_mib: int) -> int:
-    """The largest parse-worker ceiling that still fits ``limit_mib``."""
+    """The largest parse-worker ceiling that still fits ``limit_mib`` (pass the limit less the
+    headroom to keep :data:`HEADROOM_MIB` free)."""
     figure = figure_cap_mib - FIGURE_WORKER_NEVER_RESIDENT_MIB
     return (limit_mib - MAIN_PROCESS_MIB - figure) // workers + PARSE_WORKER_NEVER_RESIDENT_MIB
 
@@ -141,13 +165,16 @@ def _problem(docs: list[dict[str, Any]]) -> str | None:
     if cap <= PARSE_WORKER_NEVER_RESIDENT_MIB or figure_cap <= FIGURE_WORKER_NEVER_RESIDENT_MIB:
         return "no usable worker memory ceiling is configured"
     needed = worst_case_mib(workers=workers, cap_mib=cap, figure_cap_mib=figure_cap)
-    if needed <= limit:
+    if needed + HEADROOM_MIB <= limit:
         return None
-    largest = largest_cap_mib(limit_mib=limit, workers=workers, figure_cap_mib=figure_cap)
+    largest = largest_cap_mib(
+        limit_mib=limit - HEADROOM_MIB, workers=workers, figure_cap_mib=figure_cap
+    )
     return (
         f"{workers} parse workers at {cap} MiB + the figure worker at {figure_cap} MiB need up to "
-        f"{needed} MiB with the server, but the container may use {limit} MiB "
-        f"(the largest parse-worker ceiling that fits is {largest} MiB)"
+        f"{needed} MiB with the server, but the container may use {limit} MiB less "
+        f"{HEADROOM_MIB} MiB headroom (the largest parse-worker ceiling that fits is "
+        f"{largest} MiB)"
     )
 
 
@@ -243,10 +270,11 @@ def test_the_config_map_and_a_container_env_override_are_both_read(tmp_path: Pat
 @pytest.mark.parametrize(
     ("limit_mib", "workers", "cap_mib", "figure_cap_mib", "fits"),
     [
-        (4096, 2, 2400, 1536, False),  # two workers at 2400: 1652 MiB over
-        (4096, 2, 1574, 1536, True),  # the largest ceiling two workers fit 4Gi at
-        (4096, 2, 1575, 1536, False),
-        (4096, 1, 2400, 1536, True),  # shipped (2026-10-23): one parse worker, 98 MiB spare
+        (4096, 2, 2400, 1536, False),  # two workers at 2400: 1814 MiB over
+        (4096, 2, 1493, 1536, True),  # the largest ceiling two workers fit 4Gi at (B-322)
+        (4096, 2, 1494, 1536, False),
+        (4096, 1, 2280, 1536, True),  # shipped (2026-11-20): one parse worker, 56 MiB spare
+        (4096, 1, 2400, 1536, False),  # the 2026-10-23 ceiling no longer fits with B-322
         (6144, 2, 2400, 1536, True),
         (2048, 2, 1800, 1536, False),
     ],
@@ -277,3 +305,22 @@ def test_ci_fails_rather_than_skips_without_a_renderer(monkeypatch: pytest.Monke
         monkeypatch.setenv(name, "true")
         assert outcome() is pytest.fail.Exception
         monkeypatch.delenv(name)
+
+
+def test_the_shipped_ceiling_leaves_the_headroom() -> None:
+    # 2026-11-20 (B-322, user): >= 50 MiB of the 4Gi pod stays unused at the shipped 2280 MiB;
+    # 2287 would leave 49.
+    def spare(cap: int) -> int:
+        return 4096 - worst_case_mib(workers=1, cap_mib=cap, figure_cap_mib=1536)
+
+    assert spare(2280) == 56
+    assert spare(2286) >= HEADROOM_MIB
+    assert spare(2287) < HEADROOM_MIB
+
+
+def test_an_overlay_eating_into_the_headroom_is_caught(tmp_path: Path) -> None:
+    # 2300 MiB still fits 4Gi (4,060 MiB) but leaves only 36 MiB: the check must fail it.
+    eating = {"cap-patch.yaml": _env_patch(**{_CAP: 2300})}
+    problem = _problem(_render(_prod_with(tmp_path, eating)))
+    assert problem is not None
+    assert "headroom" in problem

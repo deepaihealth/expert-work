@@ -370,6 +370,181 @@ def _crop_open_image(
     return crops
 
 
+def upright_whole(image: Image.Image, degrees: int, max_pixels: int | None = None) -> Image.Image:
+    """B-322 —— 整张 JPEG 按方向标记转正、再顺时针转 ``degrees`` 度(不按框裁;方向表与
+    :func:`crop_upright` 同一份,逐像素相同)。B-322 只转 JPEG(设计 §8.1 第 5 条五细化)。
+
+    缩不缩、怎么缩只看 :func:`budget_size`(设计 §8.1 第 5 条再细化 / 三细化,2026-11-20):
+    ``max_pixels`` 是这个模型的单图预算;原图像素**超过**它才缩,不超过的一律不缩。超过时优先用
+    「解码时就缩」(``draft``:1/2、1/4、1/8),结果落在 [95% 预算, 预算] 里就**直接用,不再缩一次**
+    (48~50 MP 的照片按一半读);落不进去才最后一次 LANCZOS 缩到预算(内存贵,调用方先按
+    :func:`upright_peak_bytes` 估过才会走到这里)。都在转之前做。
+
+    省内存(审查 H1):每做完一步就关掉上一份;不缩、不转时不复制,原样返回 ``image``(已解码)。
+    所以调用方之后只能用返回值,不能再用 ``image``。
+
+    解码前先看像素数:超过 :data:`MAX_DECODE_PIXELS` 抛 :class:`RegionImageError`。同步、吃 CPU。"""
+    width, height = image.size
+    if width * height > MAX_DECODE_PIXELS:
+        msg = f"the image is {width}x{height} pixels, over the {MAX_DECODE_PIXELS}-pixel limit"
+        raise RegionImageError(msg)
+    # 方向标记在缩之前读:缩出来的新图不带 EXIF。
+    method = _UPRIGHT_METHODS.get(turned_orientation(_orientation(image), degrees))
+    plan = budget_size(width, height, max_pixels)
+    current = image
+    if plan is not None:
+        if plan.draft > 1:
+            current.draft(current.mode, _draft_request((width, height), plan.draft))
+        current.load()
+        if plan.resize and current.width * current.height > plan.max_pixels:
+            current = _replaced(current, current.resize(plan.target, Image.Resampling.LANCZOS))
+    if method is None:
+        current.load()
+        return current
+    return _replaced(current, current.transpose(method))
+
+
+#: B-322 —— 按单图预算缩时,结果最低可以到预算的这么多(设计 §8.1 第 5 条三细化,2026-11-20):
+#: 让 48~50 MP 的照片能按一半解码(省内存),不必先整张解开再缩。
+BUDGET_FLOOR: Final = 0.95
+
+
+@dataclass(frozen=True)
+class BudgetPlan:
+    """原图超过单图预算时怎么缩(:func:`budget_size` 定)。"""
+
+    max_pixels: int
+    #: 需要一次 LANCZOS 时缩到的尺寸(等比、向下取整,不超过预算)。
+    target: tuple[int, int]
+    #: 解码时就缩的倍数(JPEG ``draft``;1 = 不用)。
+    draft: int = 1
+
+    @property
+    def resize(self) -> bool:
+        """解码时缩落不进 [95%, 100%] 预算,还要一次 LANCZOS。"""
+        return self.draft == 1
+
+
+def budget_size(width: int, height: int, max_pixels: int | None) -> BudgetPlan | None:
+    """B-322 —— **转正图唯一的缩放判定点**(只有 JPEG 走到这里)。不超过单图预算(或预算未知)→
+    ``None``:不缩。超过时先找一档 ``draft``(1/2、1/4、1/8),结果落在
+    [:data:`BUDGET_FLOOR` x 预算, 预算] 里就用它、不再缩;没有才 LANCZOS 缩到 ``target``。"""
+    if max_pixels is None or width * height <= max_pixels:
+        return None
+    factor = math.sqrt(max_pixels / (width * height))
+    target = max(1, math.floor(width * factor)), max(1, math.floor(height * factor))
+    for scale in _JPEG_DRAFT_SCALES:
+        if _in_window(_scaled((width, height), scale), max_pixels):
+            return BudgetPlan(max_pixels, target, draft=scale)
+    return BudgetPlan(max_pixels, target)
+
+
+def _scaled(size: tuple[int, int], scale: int) -> tuple[int, int]:
+    """JPEG ``draft`` 按 ``scale`` 缩之后的尺寸(向上取整)。"""
+    return -(-size[0] // scale), -(-size[1] // scale)
+
+
+def _draft_request(size: tuple[int, int], scale: int) -> tuple[int, int]:
+    """让 Pillow 的 ``draft`` 正好选 ``scale`` 那一档的请求尺寸:它按 ``原尺寸 // 请求尺寸`` 选,
+    所以请求要向下取整(B-322 复审)。"""
+    return max(1, size[0] // scale), max(1, size[1] // scale)
+
+
+def _in_window(size: tuple[int, int], max_pixels: int) -> bool:
+    pixels = size[0] * size[1]
+    return max_pixels * BUDGET_FLOOR <= pixels <= max_pixels
+
+
+#: 每个像素在内存里占几个字节(Pillow 的存法:RGB / CMYK 都是 4 字节一像素)。只列 B-322 转正支持的
+#: JPEG 颜色模式(``orchestrator.image_views.UPRIGHT_MODES``)。
+_BYTES_PER_PIXEL: Final = {"L": 1, "RGB": 4, "CMYK": 4}
+#: B-322 第六轮校准(审查方法:新进程、读文件、调一次、``ru_maxrss`` 的增量;本机 macOS 与控制面
+#: 镜像里的 Linux 各量一遍,取大的)::func:`crop_peak_bytes` 数的那几份像素之外,分配器没还回去的
+#: 与编解码的缓冲,每个解码像素约这么多字节。
+CROP_OVERHEAD_PER_PIXEL: Final = 2.5
+#: 全分辨率转正图同样的余量(固定一份,字节)。
+FULL_COPY_OVERHEAD_BYTES: Final = 2 * 1024 * 1024
+#: 候选图 / 小副本的估算在校准之后再乘的安全系数(复审第五轮 M1)。
+PEAK_SAFETY: Final = 1.2
+#: 全分辨率转正图的估算再乘的安全系数(复审第六轮 L1:奇数尺寸 12 MP 估 98.2 实 103.7、方向标记 6
+#: 估 98.2 实 101.1、灰度估 28.2 实 31.3)。灰度的差在每像素上(1.05 盖不住),所以另加每个像素
+#: :data:`FULL_COPY_OVERHEAD_PER_PIXEL` 字节。
+FULL_COPY_SAFETY: Final = 1.05
+FULL_COPY_OVERHEAD_PER_PIXEL: Final = 0.25
+
+
+def crop_peak_bytes(
+    width: int, height: int, mode: str, max_pixels: int = REGION_TARGET_PIXELS
+) -> int:
+    """B-322 —— 解码之前估 :func:`crop_image` 对一张 JPEG 整张框(问方向的候选 / 小副本)的峰值内存,
+    按它现在(与 main 逐字节相同)的做法:按 ``draft`` 缩小解码 —— 请求尺寸向上取整,Pillow 按
+    ``原尺寸 // 请求尺寸`` 选档,宽高不是倍数时会大一档(9487 宽请求 1/4、实际按 1/2)。解开的那份
+    一直在,之后三段各自最多同时有:
+
+    * 裁、转:解开的 + 裁下的 + 转好的(都是原颜色模式);
+    * 转 RGB:解开的 + 转好的 + 一份 RGB;
+    * 缩到约 150 万像素(LANCZOS 两遍):解开的 + RGB + 中间那份(``输出宽 x 原高``,RGB)+ 输出。
+
+    取三段里最大的,加上每个解码像素 :data:`CROP_OVERHEAD_PER_PIXEL` 字节,再乘
+    :data:`PEAK_SAFETY`。实测(第六轮,设计 §4.1.5):12 MP RGB 实 41.3 MiB、估 53.3;20 MP RGB
+    实 64.2、估 83.6;12 MP 灰度实 35.0、估 42.8。"""
+    bpp = _BYTES_PER_PIXEL[mode]
+    scale = 1
+    wanted = _draft_scale((width, height), [(0, 0, REGION_SCALE, REGION_SCALE)], max_pixels)
+    if wanted > 1:
+        scale = _pillow_draft_scale((width, height), _scaled((width, height), wanted))
+    sw, sh = _scaled((width, height), scale)
+    pixels = sw * sh
+    source = pixels * bpp
+    rgb = pixels * 4
+    phases = [3 * source, 2 * source + rgb]
+    ow, oh = _capped(sw, sh, max_pixels)
+    if (ow, oh) != (sw, sh):
+        # 转 90 / 270 度时宽高对调:中间那份取两种里大的。
+        middle = max(ow * sh, oh * sw) * 4
+        phases.append(source + rgb + middle + ow * oh * 4)
+    calibrated = max(phases) + CROP_OVERHEAD_PER_PIXEL * pixels
+    return math.ceil(calibrated * PEAK_SAFETY)
+
+
+def _pillow_draft_scale(size: tuple[int, int], requested: tuple[int, int]) -> int:
+    """Pillow 的 JPEG ``draft`` 对这个请求实际选哪一档(它的选法:``原尺寸 // 请求尺寸`` 以内最大的
+    1、2、4、8)。"""
+    scale = min(size[0] // max(1, requested[0]), size[1] // max(1, requested[1]))
+    return max(a for a in (1, 2, 4, 8) if scale >= a)
+
+
+def upright_peak_bytes(
+    width: int, height: int, mode: str, max_pixels: int | None, *, encoded_bytes: int
+) -> int:
+    """B-322 审查 H-new —— 解码**之前**估一张 JPEG 全分辨率转正图的峰值内存:解开的那份 + 同时还在的
+    另一份(转,或 LANCZOS 的两遍)+ 编码出来的字节 + :data:`FULL_COPY_OVERHEAD_BYTES`。只看文件头
+    (尺寸、颜色模式)与 :func:`budget_size` 的缩法。实测(第六轮):12 MP RGB 转 90 度实 95.8 MiB、
+    估 96.3,再乘 :data:`FULL_COPY_SAFETY`(1.05;审查量到奇数尺寸 12 MP 实 103.7、灰度实 31.3,
+    都不超过乘后的估算)。它占两个解图名额、单独在算,上限 110 MiB。"""
+    bpp = _BYTES_PER_PIXEL[mode]
+    plan = budget_size(width, height, max_pixels)
+    fixed = encoded_bytes + FULL_COPY_OVERHEAD_BYTES
+    if plan is None:
+        pixels = width * height
+        raw = 2 * pixels * bpp
+    else:
+        dw, dh = _scaled((width, height), plan.draft)
+        pixels = dw * dh
+        if plan.resize:
+            tw, th = plan.target
+            raw = pixels * bpp + tw * dh * bpp + tw * th * bpp
+        else:
+            raw = 2 * pixels * bpp
+    return math.ceil((raw + fixed + FULL_COPY_OVERHEAD_PER_PIXEL * pixels) * FULL_COPY_SAFETY)
+
+
+def _replaced(old: Image.Image, new: Image.Image) -> Image.Image:
+    """换成新的一份,马上关掉旧的(放掉那份像素)。"""
+    old.close()
+    return new
+
+
 def _orientation(image: Image.Image) -> int:
     value = image.getexif().get(ExifTags.Base.Orientation, 1)
     return value if isinstance(value, int) and value in _UPRIGHT_METHODS else 1

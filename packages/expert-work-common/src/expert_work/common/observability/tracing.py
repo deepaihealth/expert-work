@@ -95,6 +95,9 @@ LLM_SPAN_PURPOSES: dict[str, str] = {
     _llm_span_name(ExpertWorkComponent.ORCHESTRATOR, "judge_action"): "judge",
     _llm_span_name(ExpertWorkComponent.ORCHESTRATOR, "vision"): "vision",
     _llm_span_name(ExpertWorkComponent.ORCHESTRATOR, "rerank"): "rerank",
+    # B-322 —— 主模型自己看图时,图进主模型之前问它「主要文字是正的吗」
+    # (orchestrator graph_builder/image_upright)。
+    _llm_span_name(ExpertWorkComponent.ORCHESTRATOR, "orientation_check"): "image_orientation",
     # 委派增强层 3 — 配置页「生成委派策略」端点的辅助 LLM 起草调用
     # (control-plane api/agents.py::generate_delegation_policy)。
     _llm_span_name(ExpertWorkComponent.CONTROL_PLANE, "delegation_policy"): "delegation_policy",

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal, get_args
 
@@ -208,6 +208,112 @@ def _checked_models(raw: object) -> dict[str, str | None] | None:
     if not all(isinstance(k, str) and (v is None or isinstance(v, str)) for k, v in raw.items()):
         return None
     return dict(raw)
+
+
+# ---------------------------------------------------------------------------
+# B-322 PR ① —— 主模型自己看图(Path A)时的问方向。问法与两步判定原样用上面 B-301 的;
+# 下面只放 PR ① 自己的部分:问法版本、紧急开关、按回答重新归类(多 pending / unjudged)与计数器。
+# 设计 ``docs/superpowers/specs/2026-11-19-b322-pathA-vision-parity-design.md`` §4.1。
+# ---------------------------------------------------------------------------
+
+#: 问法版本:结论按「图哈希 + 问法版本」记。改了 :data:`ORIENTATION_QUESTION` 或两步判定就改它,
+#: 所有图重问。
+ORIENTATION_QUESTION_VERSION: Final = "b301-v1"
+#: 主模型问方向的运维紧急开关(默认开,只用来关;与 B-301 同一套解析)。关掉后不判、也不显示任何
+#: 结论,一切与没有这个功能时逐字节相同。不复用 :data:`ORIENTATION_ENV`:那个关的是 ``ask_image``。
+MAIN_MODEL_ORIENTATION_ENV: Final = "EXPERT_WORK_MAIN_MODEL_IMAGE_ORIENTATION"
+
+MainConclusion = Literal["upright", "no_text", "rotated", "undetermined", "pending", "unjudged"]
+#: 定论:之后不再判(撤销的除外,见 ``graph_builder.image_upright``)。
+DEFINITIVE_CONCLUSIONS: Final[frozenset[str]] = frozenset(
+    {"upright", "no_text", "rotated", "undetermined"}
+)
+MAIN_CONCLUSIONS: Final[frozenset[str]] = frozenset(get_args(MainConclusion))
+
+
+@dataclass(frozen=True)
+class MainModelConclusion:
+    conclusion: MainConclusion
+    #: 顺时针转多少度显示;只有 ``rotated`` 不是 0。
+    degrees: int = 0
+    #: 有回答出自没核实的模型(被当作没答成)。
+    unverified_answer: bool = False
+
+
+def classify_main_model_answers(
+    answers: Mapping[str, Answer],
+    models: Mapping[str, str | None],
+    *,
+    trusted: Callable[[str | None], bool],
+    final: bool = False,
+) -> MainModelConclusion:
+    """按回答归类(设计 §4.1.3):只采信 ``trusted(应答模型)`` 为真的回答,其余当没答成。
+
+    第 0 度没答成 → ``unjudged``;yes / none → ``upright`` / ``no_text``;no 之后三个角度里有任何
+    一个没答成(或根本没问到)→ ``pending``(``final``:这已经是它唯一那次再判 → ``undetermined``);
+    三个都答成 → 照 B-301 的「恰好一个 yes」(:func:`turned_conclusion`)。
+    """
+    unverified = False
+
+    def answered(angle: str) -> Answer | None:
+        nonlocal unverified
+        answer = answers.get(angle)
+        if answer is None:
+            return None
+        if not trusted(models.get(angle)):
+            unverified = True
+            return None
+        return answer
+
+    first = answered("0")
+    if first not in _WORDS:
+        return MainModelConclusion("unjudged", unverified_answer=unverified)
+    if first == "yes":
+        return MainModelConclusion("upright", unverified_answer=unverified)
+    if first == "none":
+        return MainModelConclusion("no_text", unverified_answer=unverified)
+    by_turn: dict[int, Answer] = {}
+    for turn in TURNS:
+        answer = answered(str(turn))
+        if answer is not None:
+            by_turn[turn] = answer
+    if any(by_turn.get(turn) not in _WORDS for turn in TURNS):
+        return MainModelConclusion(
+            "undetermined" if final else "pending", unverified_answer=unverified
+        )
+    conclusion, degrees = turned_conclusion(by_turn)
+    return MainModelConclusion(conclusion, degrees, unverified_answer=unverified)  # type: ignore[arg-type]
+
+
+def main_model_orientation_switch_on() -> bool:
+    """B-322 紧急开关:默认开;``0`` / ``false`` / ``off`` / ``no``(不分大小写)为关。"""
+    return os.environ.get(MAIN_MODEL_ORIENTATION_ENV, "").strip().lower() not in _OFF_VALUES
+
+
+main_model_image_orientation_total = expert_work_counter(
+    "expert_work_main_model_image_orientation_total",
+    "B-322 orientation checks of images the main model looks at itself (Path A), by conclusion "
+    "and the clockwise degrees shown. Counted once per check actually asked.",
+    ("conclusion", "degrees"),
+)
+main_model_image_orientation_skipped_total = expert_work_counter(
+    "expert_work_main_model_image_orientation_skipped_total",
+    "B-322 Path A images not checked or not shown upright, by reason (switch_off, "
+    "model_not_verified, answer_from_unverified_model, unreadable, tiny, deadline, "
+    "copy_too_large, pin_over_cap).",
+    ("reason",),
+)
+main_model_image_orientation_revoked_total = expert_work_counter(
+    "expert_work_main_model_image_orientation_revoked_total",
+    "B-322 conclusions treated as unjudged when shown, because a model that gave them is in "
+    "ORIENTATION_REVOKED_MODELS.",
+)
+main_model_image_orientation_retry_total = expert_work_counter(
+    "expert_work_main_model_image_orientation_retry_total",
+    "B-322 re-checks of pending / unjudged images at the first step of a later turn, by the "
+    "conclusion they started from and the result.",
+    ("from", "result"),
+)
 
 
 def orientation_switch_on() -> bool:

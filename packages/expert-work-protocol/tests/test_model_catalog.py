@@ -800,7 +800,9 @@ def test_qwen4_max_mirrors_the_qwen_flagship() -> None:
     assert new.thinking_cap is True
     # 合计上限字段;厂商页的最大输出 131K / 思考模式 262K 是分开报的,合计范围没有实调过,不校验。
     assert new.max_output_tokens is None
-    assert new.model_dump(exclude={"name"}) == flagship.model_dump(exclude={"name"})
+    # B-322 —— 单图预算与方向核实只在 qwen4-max 上量过 / 体检过,其余逐项与旗舰相同。
+    skip = {"name", "max_image_pixels", "orientation_verified"}
+    assert new.model_dump(exclude=skip) == flagship.model_dump(exclude=skip)
     # 新的旗舰排在通义下拉第一个;旧的旗舰照样可选。
     qwen = [e.name for e in models_for_provider("qwen")]
     assert qwen[0] == "qwen4-max"

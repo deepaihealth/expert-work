@@ -16,6 +16,7 @@ name lands. One test per span name:
     expert_work.orchestrator.judge_action — action (tool-call) judge
     expert_work.orchestrator.vision       — vision tool VL round-trip
     expert_work.orchestrator.rerank       — knowledge LLM reranker
+    expert_work.orchestrator.orientation_check — B-322 main-model orientation question
 
 Each test also asserts the emitted name is a key in
 ``LLM_SPAN_PURPOSES`` — the facade's single source of truth — so a
@@ -43,7 +44,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 from expert_work.common.observability import LLM_SPAN_PURPOSES, init_tracing
 from expert_work.common.user_input import user_input_kwargs
 from expert_work.persistence import InMemoryMemoryStore
-from expert_work.protocol import MemoryItem, StructuredOutputSpec
+from expert_work.protocol import MemoryItem, ModelSpec, StructuredOutputSpec
 from expert_work.protocol.multimodal import ImageRef
 from expert_work.runtime.cancellation import CancellationToken
 from orchestrator import (
@@ -358,6 +359,39 @@ async def test_vision_emits_named_span(exporter: InMemorySpanExporter) -> None:
     assert result.content == "a red apple on a desk"
     assert "expert_work.orchestrator.vision" in _names(exporter)
     assert "expert_work.orchestrator.vision" in LLM_SPAN_PURPOSES
+
+
+@pytest.mark.asyncio
+async def test_main_model_orientation_check_emits_named_span(
+    exporter: InMemorySpanExporter,
+) -> None:
+    """B-322 —— 主模型自己看图时问方向的那次调用。"""
+    from orchestrator.graph_builder.image_upright import (
+        ImageOrienter,
+        OrientationJudge,
+        StepRun,
+    )
+    from orchestrator.usage_metering import UsageIdentity
+
+    spec = ModelSpec.model_validate({"provider": "qwen", "name": "qwen4-max"})
+    orienter = ImageOrienter(
+        image_resolver=InMemoryImageResolver(images={}),
+        configured_model="qwen/qwen4-max",
+        judge=OrientationJudge(
+            caller=_ScriptedLLM(responses=[AIMessage(content="yes")]),
+            meter=UsageIdentity(None, "a", "1", "conversation").meter(
+                default=("qwen", "qwen4-max")
+            ),
+            model=spec,
+        ),
+    )
+    run = StepRun(
+        run_id="r", turn="r", first_step=True, remaining_s=None, cancel=CancellationToken()
+    )
+    block = {"type": "image_ref", "ref": "x", "view": {"degrees": 0, "variant": "candidate"}}
+    assert await orienter._ask_once(block, 5.0, run) == ("yes", "qwen/qwen4-max")
+    assert "expert_work.orchestrator.orientation_check" in _names(exporter)
+    assert "expert_work.orchestrator.orientation_check" in LLM_SPAN_PURPOSES
 
 
 @pytest.mark.asyncio
