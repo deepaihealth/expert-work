@@ -601,7 +601,7 @@ async def test_a_queued_turn_finished_elsewhere_ends_with_a_valid_link(ctx: _Ctx
         json={"user_id": "u-123", "session_id": str(session_id), "input": "next"},
         headers=ctx.headers,
     )
-    await finisher
+    await asyncio.gather(finisher)
     assert resp.status_code == 200, resp.text
     assert "event: queued" in resp.text
     [fresh] = _end(resp.text)["artifacts"]

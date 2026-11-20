@@ -3204,7 +3204,7 @@ async def test_probed_end_hides_share_links_from_cross_tenant_audit(
     finisher = asyncio.create_task(finish())
     renewing_view.clear()  # the seeding run's own live end went through it too
     body = await _events(runs_client, thread_id, run_id, cross_tenant=cross_tenant)
-    await finisher
+    await asyncio.gather(finisher)
     assert _end_artifacts(body) == ([_UNMARKED_VIEW] if cross_tenant else [_SAME_TENANT_VIEW])
     assert renewing_view == ([] if cross_tenant else [[_MARKED]])
 

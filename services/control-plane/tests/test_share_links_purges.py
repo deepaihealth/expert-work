@@ -105,8 +105,6 @@ async def test_purging_an_agent_keeps_links_of_users_whose_files_were_kept(
 ) -> None:
     """Round-6 L-5 —— 某个用户的 NAS 目录没删掉(``keep_users``):他的产物这次留着,
     分享链接也留着;别的用户照删。"""
-    import control_plane.purge.agent_purge as agent_purge_mod
-
     world, _ = await _world()
     links = InMemoryArtifactShareLinkStore()
     kept_user, gone_user = uuid4(), uuid4()
@@ -117,7 +115,7 @@ async def test_purging_an_agent_keeps_links_of_users_whose_files_were_kept(
     async def _nas_failed_for(*_args: object, **_kwargs: object) -> set[UUID]:
         return {kept_user}
 
-    monkeypatch.setattr(agent_purge_mod, "purge_nas", _nas_failed_for)
+    monkeypatch.setattr("control_plane.purge.agent_purge.purge_nas", _nas_failed_for)
     summary = await purge_agent(deps, tenant_id=world.t1, name=_X)
 
     assert summary.deleted["artifact_share_links"] == 1
