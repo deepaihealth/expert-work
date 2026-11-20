@@ -164,7 +164,8 @@ class _Judge:
     ``served`` 按角度报「实际应答的模型」(``provider:name``,盖在响应上)。"""
 
     resolver: InMemoryImageResolver
-    reply: Reply = _honest
+    # default_factory 放到实例上:类属性上的函数会被 CodeQL 当成方法(py/call/wrong-arguments)。
+    reply: Reply = field(default_factory=lambda: _honest)
     served: Callable[[int], str] | None = None
     calls: list[int] = field(default_factory=list)
 
@@ -1160,7 +1161,6 @@ async def test_both_regions_full_shows_as_stored_for_the_rest_of_the_run(
 
 async def test_low_copies_are_released_at_run_end() -> None:
     cache = image_views.UPRIGHT_VIEWS
-    s = _setup({_ref(): _stored(90)})
     key = (image_views.image_digest(_stored(90)), 90)
     copy = image_views.low_res_copy(_stored(90), 90)
     assert cache.hold_low("run-x", [image_views.PreparedView(key, *copy)], 10**12)
@@ -1168,7 +1168,6 @@ async def test_low_copies_are_released_at_run_end() -> None:
     image_views.release_run_views("run-x")
     assert cache.low_bytes == 0
     assert cache.run_mode("run-x", key[0]) is None
-    del s
 
 
 def test_question_constants_are_b301s() -> None:

@@ -35,7 +35,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Final, Literal, get_args
+from typing import Any, Final, Literal, get_args
 
 from PIL import Image
 
@@ -656,7 +656,7 @@ async def _run_in_slots[T](
     held = await _acquire(gate, slots, wait_s)
     task = asyncio.ensure_future(asyncio.to_thread(call))
 
-    def finished(done: asyncio.Future[T]) -> None:
+    def finished(done: asyncio.Future[Any]) -> None:
         for _ in range(held):
             gate.release()
         if done.cancelled() or done.exception() is not None:
