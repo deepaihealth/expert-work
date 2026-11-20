@@ -26,15 +26,15 @@ def test_orientation_verified_defaults_false() -> None:
     assert ModelEntry(name="x").orientation_verified is False
 
 
-def test_no_model_is_verified_yet() -> None:
-    """PR ① 合并时没有任何模型过了 §6.2 E 组:设核实要先跑体检、过线、再在这里改。"""
+def test_only_qwen4_max_is_verified() -> None:
+    """qwen4-max 过了 §6.2 E 组(2026-11-20:136 张,S3 0/0,W 0,H 1/430);别的没体检过,不设核实。"""
     verified = [
         f"{provider}/{entry.name}"
         for provider, entries in MODEL_CATALOG.items()
         for entry in entries
         if entry.orientation_verified
     ]
-    assert verified == []
+    assert verified == ["qwen/qwen4-max"]
 
 
 def _mark_verified(monkeypatch: pytest.MonkeyPatch, provider: Provider, name: str) -> None:
@@ -57,9 +57,10 @@ def test_label_is_provider_slash_name() -> None:
 
 
 def test_judge_allowed_needs_the_verified_flag(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert orientation_judge_allowed("qwen", "qwen4-max") is False
-    _mark_verified(monkeypatch, "qwen", "qwen4-max")
     assert orientation_judge_allowed("qwen", "qwen4-max") is True
+    assert orientation_judge_allowed("qwen", "qwen3.8-max") is False
+    _mark_verified(monkeypatch, "qwen", "qwen3.8-max")
+    assert orientation_judge_allowed("qwen", "qwen3.8-max") is True
 
 
 def test_off_catalog_model_is_never_allowed() -> None:

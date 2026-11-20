@@ -824,6 +824,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             # B-322 单图预算:2026-11-19 实测单图封顶约 12.3k token、每 1,024 像素约 1 token
             # → 12,300 x 1,024 = 12,595,200 像素。实测,未核厂商文档(B-322 设计 §4.2.5 表)。
             max_image_pixels=12_595_200,
+            # B-322 方向体检(设计 §6.2 E 组)2026-11-20:136 张图,S3 0/0,W 0,H 1/430,¥7.006,
+            # 脚本 tools/eval/b322_pathA.py,报价 9e9f9b506183。过线,核实。
+            orientation_verified=True,
         ),
         ModelEntry(
             name="qwen3.8-max",
