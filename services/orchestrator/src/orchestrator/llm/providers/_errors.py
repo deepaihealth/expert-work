@@ -15,6 +15,8 @@ same provider before falling through to the next provider:
   (B-297, matching the official SDKs).
 - **other 4xx** → :class:`LLMClientError`. Malformed request — fail-fast, the
   router does not fall back (a bad request fails identically everywhere).
+  B-328: a body saying the input is too long → :class:`LLMContextTooLongError`
+  (same no-fallback semantics; ``agent_node`` shrinks once and retries).
 - **5xx** → :class:`LLMServerError`. Vendor-side, retryable / next provider.
 
 Vendors overload HTTP 429 for *both* rate-limits and quota-exhaustion, and 403
@@ -33,6 +35,7 @@ from collections.abc import Mapping
 
 from expert_work.runtime.middleware import (
     LLMClientError,
+    LLMContextTooLongError,
     LLMError,
     LLMKeyUnavailableError,
     LLMNetworkError,
@@ -62,6 +65,31 @@ _KEY_DEAD_MARKERS: tuple[str, ...] = (
 def _looks_account_dead(body: str) -> bool:
     low = body.lower()
     return any(marker in low for marker in _KEY_DEAD_MARKERS)
+
+
+# B-328 PR R —— 「输入太长」要**同时**有一个说输入的词和一个说长度的词(不认厂商名)。不收
+# ``messages``:OpenAI / Anthropic 的 400 正文常以 ``messages.0.content.1.image…`` 这种 JSON
+# 路径开头,收了它「图片超过 5 MB」也会命中。核过的厂商原话见 ``test_b328_vendor_too_long``。
+_INPUT_WORDS: tuple[str, ...] = ("context", "prompt", "input", "上下文", "输入", "提示")
+_LENGTH_WORDS: tuple[str, ...] = (
+    "length",
+    "too long",
+    "tokens",
+    "maximum",
+    "exceed",
+    "长度",
+    "超过",
+    "超出",
+)
+
+
+def looks_context_too_long(body: str) -> bool:
+    """B-328 PR R —— 厂商这句话是不是在说「输入太长 / 超过上下文」。
+
+    只在 4xx 的通用分支(401 / 402 / 408 / 409 / 429 / 403 都已先分走,限流到不了这里)和
+    两个流式适配器的错误事件默认分支之前用。"""
+    low = body.lower()
+    return any(word in low for word in _INPUT_WORDS) and any(word in low for word in _LENGTH_WORDS)
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:
@@ -141,7 +169,11 @@ def _classify(status: int, body: str, detail: str) -> LLMError:
     if status == 403 and _looks_account_dead(body):
         return LLMKeyUnavailableError(detail)
     if 400 <= status < 500:
-        client_error = LLMClientError(detail)
+        client_error = (
+            LLMContextTooLongError(detail)
+            if looks_context_too_long(body)
+            else LLMClientError(detail)
+        )
         client_error.status = status
         return client_error
     return LLMServerError(detail)

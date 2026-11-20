@@ -85,6 +85,9 @@ from expert_work.runtime.middleware.llm_error_handling import (
     LLMClientError as LLMClientError,
 )
 from expert_work.runtime.middleware.llm_error_handling import (
+    LLMContextTooLongError as LLMContextTooLongError,
+)
+from expert_work.runtime.middleware.llm_error_handling import (
     LLMError as LLMError,
 )
 from expert_work.runtime.middleware.llm_error_handling import (
@@ -171,6 +174,7 @@ __all__ = [
     "LLMCacheLookupMiddleware",
     "LLMCacheStoreMiddleware",
     "LLMClientError",
+    "LLMContextTooLongError",
     "LLMError",
     "LLMErrorHandlingMiddleware",
     "LLMKeyUnavailableError",

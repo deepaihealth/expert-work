@@ -58,13 +58,14 @@ from expert_work.protocol import StructuredOutputSpec
 from expert_work.protocol.model_catalog import ThinkingOffType
 from expert_work.runtime.middleware import (
     LLMClientError,
+    LLMContextTooLongError,
     LLMError,
     LLMNetworkError,
     LLMServerError,
 )
 from orchestrator.llm.coalesce import coalesce_system_messages
 from orchestrator.llm.endpoints import Endpoint, redact_endpoint
-from orchestrator.llm.providers._errors import classify_http_error
+from orchestrator.llm.providers._errors import classify_http_error, looks_context_too_long
 from orchestrator.llm.providers._http import client_for
 from orchestrator.llm.providers._metrics import disclosure_fallback_total
 from orchestrator.llm.providers._streaming import (
@@ -187,6 +188,8 @@ def _classify_anthropic_stream_error(event: Mapping[str, Any]) -> LLMError:
     etype = str(err.get("type") or "")
     if "rate_limit" in etype:
         return classify_http_error("anthropic", 429, message)
+    if looks_context_too_long(message):  # B-328 PR R —— 不是 5xx:重试 / 换备用都一样长
+        return LLMContextTooLongError(f"anthropic stream error: {etype}: {message}")
     return LLMServerError(f"anthropic stream error: {etype}: {message}")
 
 

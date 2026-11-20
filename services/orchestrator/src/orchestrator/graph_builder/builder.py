@@ -115,6 +115,7 @@ from expert_work.runtime.audit.redactor import DEFAULT_PATTERNS, PII_PATTERNS, D
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from expert_work.runtime.middleware import (
     LOOP_REMINDER_MARK,
+    LLMContextTooLongError,
     LLMOutputValidationError,
     MiddlewareChain,
     MiddlewareContext,
@@ -202,6 +203,7 @@ from orchestrator.graph_builder.platform_context import (
 )
 from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
+from orchestrator.graph_builder.vendor_too_long import retry_after_too_long
 from orchestrator.llm import LLMCaller
 from orchestrator.llm.empty_reply import (
     ContentFilteredError,
@@ -1365,6 +1367,8 @@ def build_react_graph(
                 budget=context_budget,
                 skip_deferred=tool_disclosure == "native_search",
             )
+        # B-328 PR R —— 厂商说太长时从这一份(before chain 之前)狠缩重来。
+        pre_chain_messages = messages
         # B-66 — ``:regenerate`` 的 run:本轮不查响应缓存(写入照常)。
         cache_bypass = configurable.get(LLM_CACHE_BYPASS_KEY) is True
 
@@ -1524,29 +1528,46 @@ def build_react_graph(
                 screen=output_screen,
                 judge_enabled=output_judge is not None,
             )
+
             # Wrap the LLM call so a cancel mid-call interrupts the
             # in-flight await rather than waiting it out (E.15).
             # 10.1 — one ``expert_work.orchestrator.llm_call`` child span per
             # provider call, attached under the session root span.
             # B-297 PR2 — a switch to a backup model during this call shows up
             # as a console-only ``llm_failover`` frame for this step.
-            with (
-                expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "llm_call"),
-                failover_frames(step_count + 1, failover_sink_from_config(config)),
-            ):
+            async def _main_call(prompt: list[BaseMessage]) -> AIMessage:
                 if _token_sink is not None:
                     # Only pass ``on_delta`` when a sink is actually wired
                     # (子项目 2 streaming path) — omitting the kwarg otherwise
                     # keeps every non-streaming ``LLMCaller`` implementation
                     # (including fixtures predating the ``on_delta`` addition
                     # to the Protocol) byte-identical to before this change.
-                    response = await token.run_cancellable(
-                        active_caller(messages=messages, tools=tools, on_delta=_token_sink)
+                    return await token.run_cancellable(
+                        active_caller(messages=prompt, tools=tools, on_delta=_token_sink)
                     )
-                else:
-                    response = await token.run_cancellable(
-                        active_caller(messages=messages, tools=tools)
+                return await token.run_cancellable(active_caller(messages=prompt, tools=tools))
+
+            with (
+                expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "llm_call"),
+                failover_frames(step_count + 1, failover_sink_from_config(config)),
+            ):
+                try:
+                    response = await _main_call(messages)
+                except LLMContextTooLongError as rejected:
+                    # B-328 PR R —— 狠缩一次、重走 before chain、重试一次;缩后的提示词替换
+                    # ``messages``(之后的计费、写缓存、结构化重发都用它)。
+                    messages, response, retry_hit = await retry_after_too_long(
+                        rejected,
+                        pre_chain_messages=pre_chain_messages,
+                        tools=tools,
+                        call=_main_call,
+                        before_llm_chain=before_llm_chain,
+                        chain_payload={"tenant_id": tenant_id, "llm_cache_bypass": cache_bypass},
+                        estimator=(context_budget.estimator if context_budget is not None else None)
+                        or token_estimator,
                     )
+                    if retry_hit:
+                        cache_hit_response = response
             if _token_sink is not None:
                 await _token_sink.flush()
 
