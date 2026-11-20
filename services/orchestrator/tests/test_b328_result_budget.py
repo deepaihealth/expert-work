@@ -120,6 +120,7 @@ async def _run(
     budget: ContextBudget | None,
     compressor: ContextCompressor | None = None,
     tools: Sequence[Any] = (),
+    configurable: dict[str, Any] | None = None,
     **graph_kwargs: Any,
 ) -> dict[str, Any]:
     registry = ToolRegistry()
@@ -136,7 +137,7 @@ async def _run(
                 **graph_kwargs,
             )
         )
-        cfg: RunnableConfig = {"configurable": {"thread_id": str(uuid4())}}
+        cfg: RunnableConfig = {"configurable": {"thread_id": str(uuid4()), **(configurable or {})}}
         await compiled.ainvoke({"messages": history, "step_count": 0, "max_steps": 10}, config=cfg)
         snapshot = await compiled.aget_state(cfg)
     return dict(snapshot.values)
@@ -251,6 +252,65 @@ async def test_a1_summary_from_the_first_pass_is_written_back() -> None:
     summary = state.get("context_summary") or {}
     assert summary.get("through_id") == "m4"
     assert "BIG-SUMMARY" in summary.get("text", "")
+
+
+@dataclass
+class _BrokenSummariser:
+    calls: int = 0
+
+    async def __call__(
+        self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]
+    ) -> AIMessage:
+        del messages, tools
+        self.calls += 1
+        raise RuntimeError("summariser upstream down")
+
+
+def _over_threshold_history() -> list[BaseMessage]:
+    return [HumanMessage(content="q"), *[AIMessage(content="m" * 400) for _ in range(8)]]
+
+
+@pytest.mark.asyncio
+async def test_a1_breaker_stops_the_summariser_for_the_rest_of_the_run() -> None:
+    """D3 熔断:连续失败 3 次后,这次 run 余下的调用不再找摘要模型(照发,只计一次);
+    下一次 run 重新试一次。"""
+    summariser = _BrokenSummariser()
+    compressor = ContextCompressor(
+        llm_caller=summariser, context_window=1_000, absolute_cap_tokens=100, head_keep=1
+    )
+    msgs = _over_threshold_history()
+    before = _counter(
+        "expert_work_cm_compressor_over_threshold_total", {"cause": "summariser_failing"}
+    )
+    for _ in range(6):
+        assert await compressor.compress(msgs, streak_key="t", breaker_key="run-1") == msgs
+    assert summariser.calls == 3
+    assert (
+        _counter("expert_work_cm_compressor_over_threshold_total", {"cause": "summariser_failing"})
+        == before + 1
+    )
+    assert await compressor.compress(msgs, streak_key="t", breaker_key="run-2") == msgs
+    assert summariser.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_a1_breaker_is_wired_per_run_in_agent_node() -> None:
+    """agent_node 按本次 run 的 id 熔断:6 步里摘要模型只被调 3 次,第 4 步起不再调,照常答完。"""
+    summariser = _BrokenSummariser()
+    compressor = ContextCompressor(
+        llm_caller=summariser, context_window=1_000, absolute_cap_tokens=100, head_keep=1
+    )
+    llm = _LLM(script=[*[_call("echo", f"e{i}") for i in range(5)], AIMessage(content="done")])
+    await _run(
+        _over_threshold_history(),
+        llm=llm,
+        budget=ContextBudget(window_tokens=100_000, result_tokens=4_000),
+        compressor=compressor,
+        tools=[_EchoTool()],
+        configurable={"run_id": str(uuid4())},
+    )
+    assert len(llm.prompts) == 6
+    assert summariser.calls == 3
 
 
 # ------------------------------------------------------------------------- A②

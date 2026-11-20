@@ -1190,6 +1190,8 @@ def build_react_graph(
                     cached_summary=cached,
                     on_summary=new_summary.append,
                     on_cache_hit=lambda: cache_hit_marks.append(True),
+                    # B-328 D3 —— 熔断按 run:连续失败到上限后这次 run 不再调摘要模型。
+                    breaker_key=str(turn_ctx.run_id) if turn_ctx.run_id else None,
                 )
                 compression_span.set_attribute("cm.summary.reused", bool(cache_hit_marks))
             if new_summary:

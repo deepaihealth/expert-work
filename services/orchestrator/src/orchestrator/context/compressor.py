@@ -721,6 +721,24 @@ class _FailureStreaks:
         self.counts.pop(key, None)
 
 
+@dataclass
+class _OpenBreakers:
+    """B-328 D3 —— 熔断:一次 run 里摘要模型连续失败到上限后,这次 run 余下的步数不再调它
+    (Claude Code 连续失败后停止自动压缩、照发)。按 run 记(``breaker_key``),下一次 run
+    重新给一次机会;只在进程内存里,不落盘。条数有上限,满了挤掉最早的(挤掉只是让那次
+    run 多试一次,安全那一侧)。"""
+
+    keys: dict[str, None] = field(default_factory=dict)
+
+    def trip(self, key: str) -> None:
+        if key not in self.keys and len(self.keys) >= _MAX_STREAK_KEYS:
+            self.keys.pop(next(iter(self.keys)))
+        self.keys[key] = None
+
+    def is_open(self, key: str) -> bool:
+        return key in self.keys
+
+
 @dataclass(frozen=True)
 class ContextCompressor:
     """Summarise the middle of a conversation when its estimated size
@@ -760,6 +778,10 @@ class ContextCompressor:
     _summary_failures: _FailureStreaks = field(
         default_factory=_FailureStreaks, init=False, repr=False, compare=False
     )
+    #: B-328 D3 —— 熔断开着的 run(``breaker_key``):这些 run 余下的步数不再调摘要模型。
+    _open_breakers: _OpenBreakers = field(
+        default_factory=_OpenBreakers, init=False, repr=False, compare=False
+    )
 
     @property
     def threshold_tokens(self) -> int:
@@ -795,10 +817,15 @@ class ContextCompressor:
         cached_summary: CachedSummary | None = None,
         on_summary: Callable[[CachedSummary], None] | None = None,
         on_cache_hit: Callable[[], None] | None = None,
+        breaker_key: str | None = None,
     ) -> list[BaseMessage]:
         """Compress the message list until it fits under the threshold.
 
         Returns a new list — never mutates the input.
+
+        B-328 D3 —— ``breaker_key``(这次 run 的 id)是熔断的作用域:连续失败到上限的那一步
+        把它记下,同一个 run 余下的步数不再调摘要模型,直接交回照发(不再计数);下一个 run
+        (另一个 key)重新试一次。``None`` = 不熔断(老调用方 / 单测)。
 
         Hand-back semantics (B-328 A①, replacing Mini-ADR L-2's fail-hard):
         this method never raises for "still over threshold". An empty middle
@@ -887,6 +914,11 @@ class ContextCompressor:
                 return await self._finish_compaction(
                     current, tokens_before, passes_done, on_compacted, input_chars
                 )
+            if breaker_key is not None and self._open_breakers.is_open(breaker_key):
+                # B-328 D3 —— 这次 run 已熔断:不再调摘要模型,照发(熔断那一步已计过数)。
+                return await self._finish_compaction(
+                    current, tokens_before, passes_done, on_compacted, input_chars
+                )
             try:
                 pending_through = _last_middle_id(
                     current, head_keep=self.head_keep, tail_keep=self.tail_keep
@@ -922,12 +954,15 @@ class ContextCompressor:
                 _cm_compressor_summary_failure_total.inc()
                 streak = self._summary_failures.bump(streak_key) if streak_key else 0
                 if streak >= _MAX_CONSECUTIVE_SUMMARY_FAILURES:
-                    # B-328 A① (D3) —— 摘要模型连续失败也交回、照发(Claude Code 熔断后
-                    # 照发同一做法);连续失败另记一类,看板上看得出摘要模型一直坏着。
+                    # B-328 A① (D3) —— 摘要模型连续失败:交回照发,并熔断这次 run(余下的步数
+                    # 不再调它,Claude Code 熔断后照发同一做法);计一次 summariser_failing。
                     logger.exception(
-                        "context_compressor.summariser_failed_hard consecutive=%d",
+                        "context_compressor.summariser_failed_hard consecutive=%d breaker=%s",
                         streak,
+                        "open" if breaker_key is not None else "none",
                     )
+                    if breaker_key is not None:
+                        self._open_breakers.trip(breaker_key)
                     self._note_over_threshold(current, passes_done, "summariser_failing")
                     return await self._finish_compaction(
                         current, tokens_before, passes_done, on_compacted, input_chars
