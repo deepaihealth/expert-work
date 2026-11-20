@@ -105,12 +105,13 @@ data:
   # B-209 PR-2: address-space ceiling of one parse / figure worker (MiB). A
   # heavy document past it fails alone instead of the cgroup OOM-killing the
   # pod. One parse worker with the 4Gi control-plane limit (2026-10-23
-  # decision: 2400, photos up to about 48 MP are described, larger ones
-  # skipped). 2026-11-20 (B-322): 2280 — the server process now also holds
-  # B-322's own image work for vision main models (110 MiB decode budget; in-pod
-  # 12 MP measured +94 MiB), its caches (32 + 4 MiB) and lent orientation
-  # candidates (16 MiB), and the pod keeps >= 50 MiB headroom: 1,528 + (2,280 -
-  # 650) + (1,536 - 654) = 4,040 of 4,096 MiB. Paired with the memory limit in
+  # decision: 2400; photos up to about 48 MP were described at that ceiling).
+  # 2026-11-20 (B-322): 2280 — the server process now also holds B-322's own
+  # image work for vision main models (110 MiB decode budget; in-pod 12 MP
+  # measured +94 MiB), its caches (32 + 4 MiB) and lent orientation candidates
+  # (16 MiB), and the pod keeps >= 50 MiB headroom: 1,528 + (2,280 - 650) +
+  # (1,536 - 654) = 4,040 of 4,096 MiB. The largest photo described at 2280 is
+  # not measured yet (runbook §127.6). Paired with the memory limit in
   # control-plane/deployment.yaml — change them together;
   # tools/deploy/test_parse_worker_memory_budget.py checks them.
   EXPERT_WORK_KNOWLEDGE_PARSE_WORKERS: "1"

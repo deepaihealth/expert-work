@@ -41,8 +41,9 @@ one CPU; sampled every 5 ms with VmSize and VmRSS read from the same
   peak.
 
 * B-322 (2026-11-20) adds :data:`B322_UPRIGHT_MIB` to the server process — the
-  memory of B-322's OWN image work for vision main models: the decodes it starts
-  itself (one full-resolution upright copy, or the orientation candidates /
+  memory of B-322's OWN image work for vision main models (JPEG only): the
+  decodes it starts itself (one full-resolution upright copy, or the
+  orientation candidates /
   ~1.5 MP copies sharing the two host decode slots) are held to
   ``orchestrator.image_views.FULL_COPY_PEAK_BYTES`` = 110 MiB, estimated from
   the file header before decoding (in-pod on the test control-plane, Pillow
