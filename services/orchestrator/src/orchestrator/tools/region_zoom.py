@@ -370,26 +370,55 @@ def _crop_open_image(
     return crops
 
 
-def upright_whole(image: Image.Image, degrees: int) -> Image.Image:
+def upright_whole(image: Image.Image, degrees: int, max_pixels: int | None = None) -> Image.Image:
     """B-322 —— 整张图按方向标记转正、再顺时针转 ``degrees`` 度(不按框裁;方向表与
-    :func:`crop_upright` 同一份,逐像素相同)。**不缩**:转正只换方向,像素与原图一样多,而原图
-    今天就是这么大发给厂商的(设计 §8.1 第 5 条细化,2026-11-20)。
+    :func:`crop_upright` 同一份,逐像素相同)。
 
-    省内存(审查 H1):要转时转完**马上关掉** ``image``,解开的那份原图像素不等到调用方收尾才放;
-    不用转时不复制,原样返回 ``image``(已解码)。所以调用方之后只能用返回值,不能再用 ``image``。
+    缩不缩(设计 §8.1 第 5 条再细化,2026-11-20):``max_pixels`` 是这个模型的单图预算;原图
+    像素**超过**它才缩到它(:func:`budget_size`),不超过的一律不缩(原图今天就是这么大发给厂商的)。
+    缩的时候省内存:JPEG 用 ``draft``(解码时就按 1/2、1/4、1/8 缩,取结果仍不小于预算的最小那一档),
+    别的格式先 ``reduce`` 整数倍,最后一次 LANCZOS 缩到预算;都在转之前做,转的是缩过的那份。
+
+    省内存(审查 H1):每做完一步就关掉上一份(解开的原图不等到调用方收尾才放);不缩、不转时不复制,
+    原样返回 ``image``(已解码)。所以调用方之后只能用返回值,不能再用 ``image``。
 
     解码前先看像素数:超过 :data:`MAX_DECODE_PIXELS` 抛 :class:`RegionImageError`。同步、吃 CPU。"""
     width, height = image.size
     if width * height > MAX_DECODE_PIXELS:
         msg = f"the image is {width}x{height} pixels, over the {MAX_DECODE_PIXELS}-pixel limit"
         raise RegionImageError(msg)
+    # 方向标记在缩之前读:缩出来的新图不带 EXIF。
     method = _UPRIGHT_METHODS.get(turned_orientation(_orientation(image), degrees))
+    target = budget_size(width, height, max_pixels)
+    current = image
+    if target is not None:
+        if isinstance(current, JpegImageFile):
+            current.draft(current.mode, target)  # 结果不小于 target 的最小一档
+        current.load()
+        factor = min(current.width // target[0], current.height // target[1])
+        if factor >= 2:
+            current = _replaced(current, current.reduce(factor))
+        if current.size != target:
+            current = _replaced(current, current.resize(target, Image.Resampling.LANCZOS))
     if method is None:
-        image.load()
-        return image
-    turned = image.transpose(method)
-    image.close()
-    return turned
+        current.load()
+        return current
+    return _replaced(current, current.transpose(method))
+
+
+def budget_size(width: int, height: int, max_pixels: int | None) -> tuple[int, int] | None:
+    """B-322 —— 原图超过单图预算 ``max_pixels`` 时缩到的尺寸(等比、向下取整、不超过预算);
+    不超过(或预算未知)是 ``None``:不缩。**这是转正图唯一的缩放判定点。**"""
+    if max_pixels is None or width * height <= max_pixels:
+        return None
+    factor = math.sqrt(max_pixels / (width * height))
+    return max(1, math.floor(width * factor)), max(1, math.floor(height * factor))
+
+
+def _replaced(old: Image.Image, new: Image.Image) -> Image.Image:
+    """换成新的一份,马上关掉旧的(放掉那份像素)。"""
+    old.close()
+    return new
 
 
 def _orientation(image: Image.Image) -> int:

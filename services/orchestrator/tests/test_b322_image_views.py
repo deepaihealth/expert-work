@@ -6,6 +6,7 @@ import asyncio
 import io
 import random
 import time
+import weakref
 from typing import Any
 
 import pytest
@@ -364,9 +365,9 @@ async def test_adapter_miss_runs_off_the_event_loop(monkeypatch: pytest.MonkeyPa
     seen: list[str] = []
     real = image_views.upright_copy
 
-    def spy(data: bytes, degrees: int) -> Any:
+    def spy(data: bytes, degrees: int, *rest: Any) -> Any:
         seen.append(threading.current_thread().name)
-        return real(data, degrees)
+        return real(data, degrees, *rest)
 
     monkeypatch.setattr(image_views, "upright_copy", spy)
     await resolve_message_images([_REF], _resolver(raw), [ImageView(90)])
@@ -389,3 +390,130 @@ def test_upright_whole_closes_the_original_once_turned() -> None:
     tags[0x0112] = 8  # 方向标记 8 再顺时针转 90 度 = 正好不用转
     plain = Image.open(io.BytesIO(_encode(_quadrants(), "PNG", exif=tags.tobytes())))
     assert upright_whole(plain, 90) is plain
+
+
+# ---------------------------------------------------------------------------
+# 复审:N1 / N3 / N6 与单图预算
+# ---------------------------------------------------------------------------
+
+
+async def _wait_for(predicate: Any, timeout_s: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize(
+    ("runner", "held"), [("in_host_crop_slot", 1), ("in_wide_host_crop_slot", 2)]
+)
+async def test_cancel_keeps_the_slots_until_the_thread_finishes(runner: str, held: int) -> None:
+    """审查 N1 —— 等的一方被取消,线程照跑;名额要等线程真结束才还,不然另一张全分辨率图又能开算。"""
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+
+    def work() -> int:
+        started.set()
+        release.wait(5)
+        return 1
+
+    task = asyncio.create_task(getattr(image_views, runner)(work))
+    await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    gate = image_views._gate()
+    assert gate._value == 2 - held  # 线程还在跑:名额没还
+    release.set()
+    await _wait_for(lambda: gate._value == 2)
+
+
+async def test_a_cancelled_full_copy_still_lands_in_the_cache() -> None:
+    """审查 N1 —— 首 token 超时换备用 / 用户取消时,已经开算的全分辨率图算完照样收进缓存。"""
+    raw = _encode(_quadrants(), "PNG")
+    digest = image_digest(raw)
+    task = asyncio.create_task(image_views.full_copy_in_slots(raw, 90, digest))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await _wait_for(lambda: image_views.UPRIGHT_VIEWS.has_full((digest, 90)))
+
+
+async def test_adapter_miss_does_not_wait_long_for_a_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """审查 N3 —— 解图名额被占着时,适配器当场重算最多等 ``ADAPTER_MISS_SLOT_WAIT_S``,等不到就这次
+    按原图发(计 ``adapter_busy``),不让首 token 跟着排队。"""
+    monkeypatch.setattr(image_views, "ADAPTER_MISS_SLOT_WAIT_S", 0.1)
+    raw = _encode(_quadrants(), "PNG")
+    gate = image_views._gate()
+    await gate.acquire()
+    await gate.acquire()
+    before = _count("adapter_busy")
+    started = time.monotonic()
+    try:
+        out = await resolve_message_images([_REF], _resolver(raw), [ImageView(90)])
+    finally:
+        gate.release()
+        gate.release()
+    assert time.monotonic() - started < 1.0
+    assert isinstance(out[0], ResolvedImage)
+    assert out[0].data == raw
+    assert _count("adapter_busy") == before + 1
+
+
+async def test_a_wide_slot_works_with_a_single_host_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """审查 N6 —— ``HOST_CROP_SLOTS`` 只有 1 时,占两个名额的退成占一个(不会永远等第二个)。"""
+    from orchestrator.tools import region_zoom
+
+    monkeypatch.setattr(region_zoom, "HOST_CROP_SLOTS", 1)
+    monkeypatch.setattr(image_views, "_HOST_CROP_GATES", weakref.WeakKeyDictionary())
+    assert await asyncio.wait_for(image_views.in_wide_host_crop_slot(lambda: 7), 2.0) == 7
+
+
+def test_a_copy_within_the_budget_is_byte_identical() -> None:
+    """设计 §8.1 第 5 条再细化 —— 不超过单图预算的原图一律不缩:有预算与没预算出的字节一样。"""
+    raw = _encode(_photo(1200, 900), "JPEG", quality=92)
+    unscaled = upright_copy(raw, 90)
+    assert upright_copy(raw, 90, max_pixels=1200 * 900) == unscaled
+    # qwen4-max 的情形:12.2 MP 的手机照片,预算 12.6 MP(约多 3%)—— 也不缩(更不放大)。
+    assert upright_copy(raw, 90, max_pixels=int(1200 * 900 * 12_595_200 / 12_192_768)) == unscaled
+
+
+def test_a_jpeg_over_the_budget_is_drafted_then_fitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """超过单图预算的 JPEG:解码时就按 DCT 缩(draft),再缩到预算;结果不超过预算、方向正确。"""
+    from PIL.JpegImagePlugin import JpegImageFile
+
+    drafts: list[tuple[int, int]] = []
+    real = JpegImageFile.draft
+
+    def spy(self: Any, mode: Any, size: Any) -> Any:
+        drafts.append(size)
+        return real(self, mode, size)
+
+    monkeypatch.setattr(JpegImageFile, "draft", spy)
+    stored = _quadrants().resize((2400, 1600))
+    raw = _encode(stored, "JPEG", quality=92)
+    found = upright_copy(raw, 90, max_pixels=240_000)
+    assert found is not None
+    image = _decode(found[1])
+    assert image.width * image.height <= 240_000
+    assert image.size == (400, 600)  # 600x400 的预算尺寸,转了 90 度
+    assert drafts == [(600, 400)]
+
+
+def test_a_png_over_the_budget_is_reduced_then_fitted() -> None:
+    stored = _quadrants().resize((2400, 1600))
+    found = upright_copy(_encode(stored, "PNG"), 270, max_pixels=240_000)
+    assert found is not None
+    image = _decode(found[1])
+    assert image.size == (400, 600)
+
+
+def test_a_view_carries_the_budget_only_for_full_copies() -> None:
+    assert parse_image_view({"degrees": 90, "max_pixels": 1000}) == ImageView(90, "full", 1000)
+    assert parse_image_view({"degrees": 90, "variant": "low", "max_pixels": 1000}) == ImageView(
+        90, "low"
+    )
+    assert parse_image_view({"degrees": 90, "max_pixels": 0}) is None
+    assert ImageView(90).as_dict() == {"degrees": 90, "variant": "full"}

@@ -902,12 +902,15 @@ async def build_agent(
                 ),
                 model=judge_model,
             )
+        main_entry = catalog_entry(spec.spec.model.provider, spec.spec.model.name)
         image_orienter = ImageOrienter(
             image_resolver=env.image_resolver,
             configured_model=orientation_model_label(
                 spec.spec.model.provider, spec.spec.model.name
             ),
             judge=judge,
+            # 原图超过主模型自己的单图预算,转正图才缩到它(§8.1 第 5 条再细化)。
+            max_image_pixels=main_entry.max_image_pixels if main_entry is not None else None,
         )
     # Stream J.7a (Mini-ADR J-23) — resolve + merge declared skills BEFORE the
     # tool registry so the sandbox tools can be bound with the skill seed-file

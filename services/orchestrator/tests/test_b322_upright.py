@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -183,7 +184,14 @@ class _Judge:
 
 def _mark_verified(monkeypatch: pytest.MonkeyPatch, provider: Provider, *names: str) -> None:
     entries = tuple(
-        e.model_copy(update={"orientation_verified": True}) if e.name in names else e
+        e.model_copy(
+            update={
+                "orientation_verified": True,
+                "max_image_pixels": e.max_image_pixels or 12_595_200,
+            }
+        )
+        if e.name in names
+        else e
         for e in MODEL_CATALOG[provider]
     )
     monkeypatch.setitem(MODEL_CATALOG, provider, entries)
@@ -1362,3 +1370,85 @@ async def test_no_images_means_no_work_and_no_state(monkeypatch: pytest.MonkeyPa
     assert spans == []
     for key in ("conversation_images", "image_orientations", "shown_image_angles"):
         assert not snapshot.values.get(key)
+
+
+# ---------------------------------------------------------------------------
+# 复审:N2 / N5 / N7 与单图预算
+# ---------------------------------------------------------------------------
+
+
+async def test_history_images_that_cannot_fit_skip_the_full_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """审查 N2 —— 历史图先按原图字节估转正图多大;这一步的份额放不下就直接用小副本,不白算一张
+    全分辨率图(以前算完再扔,还不收进缓存)。"""
+    first, second = _stored(90), _stored(270)
+    size = max(len(first), len(second))
+    monkeypatch.setattr(image_views.UPRIGHT_VIEWS, "full_cap_bytes", int(size * 2.5))
+    monkeypatch.setattr(upright_mod.UprightViewCache, "pin_full", _no_wait_pin)
+    made: list[int] = []
+    real = image_views.upright_copy
+
+    def counting(data: bytes, degrees: int, max_pixels: int | None = None) -> Any:
+        made.append(degrees)
+        return real(data, degrees, max_pixels)
+
+    monkeypatch.setattr(image_views, "upright_copy", counting)
+    s = _setup({_ref(1): first, _ref(2): second})
+    async with _graph(s) as compiled:
+        await _turn(compiled, s, _ref(1))
+        image_views.UPRIGHT_VIEWS.clear()  # 换了副本 / 被挤出:历史图的全分辨率那份不在了
+        made.clear()
+        await _turn(compiled, s, _ref(2), text="又一张横的")
+    assert made == [270]  # 只算了这一轮的新图;历史图直接用小副本
+    assert _last_user(s.main.prompts[-1][:1]).content[1]["view"]["variant"] == "low"  # type: ignore[index]
+
+
+async def test_newest_history_images_get_the_room_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """审查 N5 —— 历史里的横图,最近的先拿全分辨率。"""
+    first, second = _stored(90), _stored(270)
+    size = max(len(first), len(second))
+    monkeypatch.setattr(image_views.UPRIGHT_VIEWS, "full_cap_bytes", int(size * 2.5))
+    s = _setup({_ref(1): first, _ref(2): second})
+    async with _graph(s) as compiled:
+        await _turn(compiled, s, _ref(1))
+        await _turn(compiled, s, _ref(2), text="第二张")
+        image_views.UPRIGHT_VIEWS.clear()
+        await _turn(compiled, s, text="两张都在历史里")
+    prompt = s.main.prompts[-1]
+    older = _last_user(prompt[:1]).content[1]
+    newer = next(m for m in prompt if isinstance(m, HumanMessage) and "第二张" in _text(m)).content[
+        1
+    ]
+    assert newer["view"]["variant"] == "full"  # type: ignore[index]
+    assert older["view"]["variant"] == "low"  # type: ignore[index]
+
+
+def test_degrade_decisions_outlive_a_run_past_its_deadline() -> None:
+    """审查 N7 —— 过了时限的收尾那一步,本 run 的降级决定也至少留 ``RUN_STATE_FLOOR_S``。"""
+    run = upright_mod.StepRun(
+        run_id="r", turn="r", first_step=False, remaining_s=-5.0, cancel=CancellationToken()
+    )
+    assert run.expires_at() >= time.monotonic() + upright_mod.RUN_STATE_FLOOR_S - 1
+
+
+async def test_an_original_over_the_models_budget_is_sent_at_the_budget() -> None:
+    """设计 §8.1 第 5 条再细化 —— 原图超过主模型的单图预算,转正图缩到预算(块上带 ``max_pixels``);
+    不超过的不带、不缩。"""
+    s = _setup({_ref(1): _stored(90), _ref(2): _stored(270)})
+    budget = 600 * 400 - 1  # 比这张图少一个像素
+    capped = _orienter(s.resolver, s.judge)
+    capped.max_image_pixels = budget
+    async with _graph(s, orienter=capped) as compiled:
+        await _turn(compiled, s, _ref(1))
+    block = _last_user(s.main.prompts[0]).content[1]
+    assert block["view"] == {"degrees": 90, "variant": "full", "max_pixels": budget}  # type: ignore[index]
+    (sent,) = await _images_in(_last_user(s.main.prompts[0]), s.resolver)
+    image = _decode(sent)
+    assert image.width * image.height <= budget
+    assert s.main.replies == [SECRET]
+    roomy = _orienter(s.resolver, s.judge)
+    roomy.max_image_pixels = 600 * 400
+    async with _graph(s, orienter=roomy) as compiled:
+        await _turn(compiled, s, _ref(2))
+    assert "max_pixels" not in _last_user(s.main.prompts[-1]).content[1]["view"]  # type: ignore[index]

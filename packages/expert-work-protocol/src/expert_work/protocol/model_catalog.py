@@ -346,6 +346,10 @@ class ModelEntry(BaseModel):
     # §6.3 的 E 线,才在这里设为 True,并在条目上写体检日期与结果出处。没设的模型(含新加的)不判
     # 新图;已有结论照样显示。撤销走 :data:`ORIENTATION_REVOKED_MODELS`,不是把它改回 False。
     orientation_verified: bool = False
+    # B-322 —— 单图预算:这个模型一张图最多看多少像素(超过就被厂商缩图)。未知为 None。主模型自己
+    # 看图时,原图超过它才把转正图缩到它;不超过的一律不缩(设计 §8.1 第 5 条再细化)。**设
+    # ``orientation_verified`` 的前提**:不知道单图预算的模型不能核实(下面的校验)。
+    max_image_pixels: int | None = None
 
     @property
     def ocr_only(self) -> bool:
@@ -369,6 +373,12 @@ class ModelEntry(BaseModel):
             raise ValueError(msg)
         if self.ocr_caps is not None and self.ocr_caps.api == "chat_vlm" and not self.vision:
             msg = f"{self.name}: ocr_caps api='chat_vlm' needs vision=True"
+            raise ValueError(msg)
+        if self.orientation_verified and self.max_image_pixels is None:
+            msg = f"{self.name}: orientation_verified needs a known max_image_pixels (B-322)"
+            raise ValueError(msg)
+        if self.max_image_pixels is not None and self.max_image_pixels <= 0:
+            msg = f"{self.name}: max_image_pixels must be positive"
             raise ValueError(msg)
         return self
 
@@ -811,6 +821,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking_default=True,
             output_cap_field="max_completion_tokens",
             thinking_cap=True,
+            # B-322 单图预算:2026-11-19 实测单图封顶约 12.3k token、每 1,024 像素约 1 token
+            # → 12,300 x 1,024 = 12,595,200 像素。实测,未核厂商文档(B-322 设计 §4.2.5 表)。
+            max_image_pixels=12_595_200,
         ),
         ModelEntry(
             name="qwen3.8-max",
@@ -1128,11 +1141,13 @@ def orientation_revoked(label: str) -> bool:
 
 
 def orientation_judge_allowed(provider: str, name: str) -> bool:
-    """B-322 —— 这个模型能不能判新图的方向:目录里核实过、且没被撤销。目录外的模型一律不能。"""
+    """B-322 —— 这个模型能不能判新图的方向:目录里核实过、知道单图预算、且没被撤销。目录外的
+    模型一律不能。"""
     entry = catalog_entry(provider, name)
     return (
         entry is not None
         and entry.orientation_verified
+        and entry.max_image_pixels is not None
         and not orientation_revoked(orientation_model_label(provider, name))
     )
 

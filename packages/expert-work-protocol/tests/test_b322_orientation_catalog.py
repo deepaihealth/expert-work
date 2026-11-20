@@ -39,7 +39,14 @@ def test_no_model_is_verified_yet() -> None:
 
 def _mark_verified(monkeypatch: pytest.MonkeyPatch, provider: Provider, name: str) -> None:
     entries = tuple(
-        e.model_copy(update={"orientation_verified": True}) if e.name == name else e
+        e.model_copy(
+            update={
+                "orientation_verified": True,
+                "max_image_pixels": e.max_image_pixels or 1_000_000,
+            }
+        )
+        if e.name == name
+        else e
         for e in MODEL_CATALOG[provider]
     )
     monkeypatch.setitem(MODEL_CATALOG, provider, entries)
@@ -71,3 +78,31 @@ def test_revocation_does_not_depend_on_the_catalog_entry(monkeypatch: pytest.Mon
     monkeypatch.setattr(model_catalog, "ORIENTATION_REVOKED_MODELS", frozenset({"gone/old-name"}))
     assert orientation_revoked("gone/old-name") is True
     assert orientation_revoked("qwen/qwen4-max") is False
+
+
+def test_verified_needs_a_known_per_image_budget() -> None:
+    """单图预算是 ``orientation_verified`` 的前提:不知道就不能核实,功能也就不会对它运行。"""
+    with pytest.raises(ValueError, match="max_image_pixels"):
+        ModelEntry(name="x", orientation_verified=True)
+    assert ModelEntry(
+        name="x", orientation_verified=True, max_image_pixels=1_000
+    ).orientation_verified
+
+
+def test_judge_not_allowed_without_a_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    entries = tuple(
+        e.model_copy(update={"orientation_verified": True, "max_image_pixels": None})
+        if e.name == "qwen4-max"
+        else e
+        for e in MODEL_CATALOG["qwen"]
+    )
+    monkeypatch.setitem(MODEL_CATALOG, "qwen", entries)
+    assert orientation_judge_allowed("qwen", "qwen4-max") is False
+
+
+def test_qwen4_max_budget_is_the_measured_one() -> None:
+    from expert_work.protocol import catalog_entry
+
+    entry = catalog_entry("qwen", "qwen4-max")
+    assert entry is not None
+    assert entry.max_image_pixels == 12_300 * 1_024

@@ -137,7 +137,12 @@ async def _any_key(provider: str) -> list[ProviderKey]:
 @pytest.fixture(autouse=True)
 def _verified_qwen(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     entries = tuple(
-        e.model_copy(update={"orientation_verified": True})
+        e.model_copy(
+            update={
+                "orientation_verified": True,
+                "max_image_pixels": e.max_image_pixels or 12_595_200,
+            }
+        )
         if e.name in ("qwen4-max", "qwen3.8-max")
         else e
         for e in MODEL_CATALOG["qwen"]

@@ -344,7 +344,12 @@ def as_verified(models: Sequence[str]) -> Iterator[None]:
     try:
         for provider, entries in saved.items():
             MODEL_CATALOG[provider] = tuple(  # type: ignore[index]
-                e.model_copy(update={"orientation_verified": True})
+                e.model_copy(
+                    update={
+                        "orientation_verified": True,
+                        "max_image_pixels": e.max_image_pixels or 12_595_200,
+                    }
+                )
                 if (provider, e.name) in names
                 else e
                 for e in entries

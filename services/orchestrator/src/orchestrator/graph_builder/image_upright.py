@@ -47,12 +47,13 @@ from orchestrator.image_views import (
     ImageView,
     PreparedView,
     UprightViewCache,
+    copy_digest,
+    copy_size_limit,
+    full_copy_in_slots,
     image_digest,
     in_host_crop_slot,
-    in_wide_host_crop_slot,
     low_res_copy,
     main_model_image_view_cache_total,
-    upright_copy,
 )
 from orchestrator.multimodal import IMAGE_REF_BLOCK_TYPE, ImageResolver
 from orchestrator.tools.image_orientation import (
@@ -100,6 +101,8 @@ MIN_RUN_LEFT_S: Final = SEAM_RELOOK_MIN_RUN_LEFT_S
 MEMO_SIZE: Final = 512
 #: 一步钉住的全分辨率转正图最多占全分辨率区的几分之几(审查 M2):总给别的步骤留地方。
 STEP_PIN_SHARE: Final = 0.5
+#: run 在本进程里的降级决定 / 小副本至少留这么久(秒),即使时限已过(收尾那一步,审查 N7)。
+RUN_STATE_FLOOR_S: Final = 60.0
 
 ROTATED_NOTE: Final = (
     "Image {i} of {n} in this message was stored turned; it is shown rotated {degrees} degrees "
@@ -169,7 +172,9 @@ class StepRun:
     def expires_at(self) -> float:
         """这个 run 在本进程里的东西(小副本、降级决定)最晚留到什么时候。"""
         left = self.remaining_s if self.remaining_s is not None else LOW_COPY_FALLBACK_TTL_S
-        return time.monotonic() + max(0.0, left)
+        # 过了时限的收尾那一步 ``left`` 是负的:给个下限,降级决定不至于当场就过期、下一步又翻回去
+        # (审查 N7)。
+        return time.monotonic() + max(RUN_STATE_FLOOR_S, left)
 
 
 @dataclass
@@ -198,6 +203,8 @@ class _Shown:
     degrees: int = 0
     variant: str = "full"
     note: str | None = None
+    #: 全分辨率那一份缩到的单图预算(只有原图超过预算时才有)。
+    max_pixels: int | None = None
 
 
 @dataclass(frozen=True)
@@ -218,8 +225,13 @@ class ImageOrienter:
     configured_model: str
     judge: OrientationJudge | None = None
     views: UprightViewCache = UPRIGHT_VIEWS
-    #: (对话, 结论键) → 结论;(对话, ref) → (图编号, 图记录)。尽力而为、按副本:某一步判完了却
-    #: 失败 / 被取消、状态没落下时,同一对话之后的步骤从这里补回去(审查 M1;整步重跑不重问)。
+    #: 主模型的单图预算(模型目录 ``max_image_pixels``):原图超过它,转正图才缩到它。``None`` =
+    #: 未知 → 不缩(这样的模型也核实不了、不会判新图;只会显示别的模型留下的结论)。
+    max_image_pixels: int | None = None
+    #: (对话, 结论键) → 结论;(对话, ref) → (图编号, 图记录)。**尽力而为**:只在本副本、本次构建里,
+    #: 每样最多 :data:`MEMO_SIZE` 条、最久没用的先挤 —— 构建在对话之间共用,高负载时会很快挤掉,
+    #: 换副本也没有(审查 N8)。某一步判完了却失败 / 被取消、状态没落下时,同一对话之后的步骤从这里
+    #: 补回去(审查 M1;整步重跑不重问);挤掉了的,就是那张图按「上线前就在历史里」的老图处理。
     _memo: OrderedDict[tuple[str, str], dict[str, Any]] = field(
         default_factory=OrderedDict, init=False, repr=False
     )
@@ -577,7 +589,9 @@ class ImageOrienter:
 
         * 这一轮的新图优先用全分辨率,一次全拿到(放不下最多等
           :data:`~orchestrator.image_views.PIN_WAIT_S` 秒);
-        * 历史里的图逐张、不等:全分辨率区还有地方就用,没有就小副本,小副本区也满就按原样;
+        * 历史里的图逐张、不等,最近的先(审查 N5):先按原图字节**估**转正图多大(审查 N2),这一步
+          的份额或全分辨率区已经放不下就直接用小副本,不白算一张全分辨率图;放得下才算(算好的收进
+          缓存);小副本区也满就按原样;
         * 一步钉住的全分辨率图最多占全分辨率区的 :data:`STEP_PIN_SHARE`,别的步骤总还有地方;
         * 降过级的图在这个 run 里一直用降过的那一份(字节稳定,不来回翻)。"""
         out: dict[str, _Shown] = {}
@@ -606,10 +620,19 @@ class ImageOrienter:
             if step.pinned_bytes + size <= share and await self.views.pin_full(views):
                 step.pinned.extend(p.key for p in views)
                 step.pinned_bytes += size
-                out.update({i: _Shown(i, d, "full", "rotated") for i, d, _ in group})
+                out.update(
+                    {i: _Shown(i, d, "full", "rotated", self._cap(images[i])) for i, d, _ in group}
+                )
             else:
                 low.extend((i, d) for i, d, _ in group)
-        for image_id, degrees in old_full:
+        for image_id, degrees in reversed(old_full):
+            estimate = await self._estimated_copy_bytes(images[image_id], degrees)
+            if estimate is None:
+                out[image_id] = _Shown(image_id)  # 原图字节不在:适配器换成提示文字
+                continue
+            if step.pinned_bytes + estimate > share or not self.views.fits_full(estimate):
+                low.append((image_id, degrees))
+                continue
             made = await self._prepared_full(image_id, images[image_id], degrees, step, run, out)
             if made is None:
                 continue
@@ -617,7 +640,9 @@ class ImageOrienter:
             if step.pinned_bytes + size <= share and self.views.try_pin_full([made]):
                 step.pinned.append(made.key)
                 step.pinned_bytes += size
-                out[image_id] = _Shown(image_id, degrees, "full", "rotated")
+                out[image_id] = _Shown(
+                    image_id, degrees, "full", "rotated", self._cap(images[image_id])
+                )
             else:
                 low.append((image_id, degrees))
         for image_id, degrees in low:
@@ -636,8 +661,9 @@ class ImageOrienter:
         """全分辨率转正图:缓存里有就用;没有就生成(占两个解图名额)。原图字节取不到 → 不说什么、
         按原样(适配器换成提示文字);放弃转正(怎么退都超、解不开)→ 第 3 级。两种都返回 ``None``
         并在 ``out`` 里写好。"""
-        key = (str(image["sha"]), degrees)
-        cached = self.views.get(key[0], ImageView(degrees))
+        sha, cap = str(image["sha"]), self._cap(image)
+        key = (copy_digest(sha, cap), degrees)
+        cached = self.views.get(sha, ImageView(degrees, "full", cap))
         if cached is not None:
             return PreparedView(key, *cached)
         data = await self._bytes(str(image["refs"][0]), step)
@@ -645,15 +671,39 @@ class ImageOrienter:
             out[image_id] = _Shown(image_id)
             return None
         try:
-            made = await in_wide_host_crop_slot(upright_copy, data, degrees)
+            made = await full_copy_in_slots(data, degrees, sha, max_pixels=cap)
         except ValueError:
             made = None
         if made is None:
-            self._as_stored(run, key[0], "copy_too_large")
+            self._as_stored(run, sha, "copy_too_large")
             out[image_id] = _Shown(image_id, note="as_stored")
             return None
         main_model_image_view_cache_total.labels(outcome="precomputed").inc()
         return PreparedView(key, *made)
+
+    async def _estimated_copy_bytes(self, image: Mapping[str, Any], degrees: int) -> int | None:
+        """全分辨率转正图最多多大(字节规则的上限:有损 ≤ 原图;PNG / GIF ≤ ``max(原图,
+        min(原图 x 1.1, 4,900,000))``);缓存里有就是实际大小。原图字节取不到 → ``None``。"""
+        cached = self.views.get(str(image["sha"]), ImageView(degrees, "full", self._cap(image)))
+        if cached is not None:
+            return len(cached[1])
+        try:
+            resolved = await self.image_resolver.resolve(str(image["refs"][0]))
+        except Exception:
+            return None
+        return copy_size_limit(len(resolved.data), resolved.media_type)
+
+    def _cap(self, image: Mapping[str, Any]) -> int | None:
+        """这张图的全分辨率转正图要不要缩到单图预算:原图像素超过预算才要
+        (设计 §8.1 第 5 条再细化)。"""
+        width, height = image.get("width"), image.get("height")
+        if (
+            self.max_image_pixels is None
+            or not isinstance(width, int)
+            or not isinstance(height, int)
+        ):
+            return None
+        return self.max_image_pixels if width * height > self.max_image_pixels else None
 
     async def _low_copy(
         self,
@@ -919,7 +969,11 @@ def _rewritten(
             image_id = by_ref.get(str(block["ref"]))
             decision = shown.get(image_id) if image_id is not None else None
             if decision is not None and decision.degrees:
-                view = ImageView(decision.degrees, decision.variant)  # type: ignore[arg-type]
+                view = ImageView(
+                    decision.degrees,
+                    decision.variant,  # type: ignore[arg-type]
+                    decision.max_pixels if decision.variant == "full" else None,
+                )
                 block = {**block, VIEW_KEY: view.as_dict()}
                 changed = True
             if decision is not None and decision.note is not None:
