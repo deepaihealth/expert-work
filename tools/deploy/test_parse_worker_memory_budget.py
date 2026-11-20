@@ -40,10 +40,20 @@ one CPU; sampled every 5 ms with VmSize and VmRSS read from the same
   page). The figure worker is counted at its own ceiling, not at a measured
   peak.
 
-Shipped (2026-10-23: 4Gi, one parse worker at 2400 MiB, the figure worker at
-1536 MiB): 1,366 + (2,400 - 650) + (1,536 - 654) = 3,998 MiB of 4,096 — 98 MiB
-to spare. Raising either ingestion budget, the worker ceilings or the worker
-count eats into that first.
+* B-322 (2026-11-20) adds :data:`B322_UPRIGHT_MIB` to the server process: one
+  full-resolution upright copy of an image a vision main model looks at, held to
+  ``orchestrator.image_views.FULL_COPY_PEAK_BYTES`` (110 MiB, estimated from the
+  file header before decoding; in-pod on the test control-plane 4032 x 3024
+  turned 90 degrees peaked at +96 MiB — anything that would peak higher uses the
+  ~1.5 MP copy, and the two host decode slots together never exceed it) plus
+  the two copy caches (32 + 4 MiB).
+
+Shipped (2026-11-20: 4Gi, one parse worker at 2352 MiB, the figure worker at
+1536 MiB): (1,366 + 146) + (2,352 - 650) + (1,536 - 654) = 4,096 MiB of 4,096
+— nothing to spare (2026-10-23 had 98 MiB spare at 2400 MiB; B-322 took 146 of
+it and the parse worker gave back 48). Raising either ingestion budget, the
+worker ceilings, the worker count or the B-322 budget needs the pod limit
+raised first.
 """
 
 from __future__ import annotations
@@ -63,7 +73,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _K8S = _REPO_ROOT / "infra" / "k8s"
 _CONTAINER = "control-plane"
 
-MAIN_PROCESS_MIB = 614 + 752
+#: B-322 (2026-11-20): one full-resolution upright copy (``FULL_COPY_PEAK_BYTES``, 110 MiB; in-pod
+#: 12 MP measured +96 MiB) + the upright-copy caches (32 MiB full + 4 MiB low-res).
+B322_UPRIGHT_MIB = 110 + 32 + 4
+MAIN_PROCESS_MIB = 614 + 752 + B322_UPRIGHT_MIB
 PARSE_WORKER_NEVER_RESIDENT_MIB = 650
 FIGURE_WORKER_NEVER_RESIDENT_MIB = 654
 
@@ -243,10 +256,12 @@ def test_the_config_map_and_a_container_env_override_are_both_read(tmp_path: Pat
 @pytest.mark.parametrize(
     ("limit_mib", "workers", "cap_mib", "figure_cap_mib", "fits"),
     [
-        (4096, 2, 2400, 1536, False),  # two workers at 2400: 1652 MiB over
-        (4096, 2, 1574, 1536, True),  # the largest ceiling two workers fit 4Gi at
-        (4096, 2, 1575, 1536, False),
-        (4096, 1, 2400, 1536, True),  # shipped (2026-10-23): one parse worker, 98 MiB spare
+        (4096, 2, 2400, 1536, False),  # two workers at 2400: 1798 MiB over
+        (4096, 2, 1501, 1536, True),  # the largest ceiling two workers fit 4Gi at (B-322)
+        (4096, 2, 1502, 1536, False),
+        (4096, 1, 2352, 1536, True),  # shipped (2026-11-20): one parse worker, 0 MiB spare
+        (4096, 1, 2353, 1536, False),
+        (4096, 1, 2400, 1536, False),  # the 2026-10-23 ceiling no longer fits with B-322
         (6144, 2, 2400, 1536, True),
         (2048, 2, 1800, 1536, False),
     ],

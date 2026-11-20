@@ -104,13 +104,16 @@ data:
   # ------------------------------------------------- knowledge parse workers
   # B-209 PR-2: address-space ceiling of one parse / figure worker (MiB). A
   # heavy document past it fails alone instead of the cgroup OOM-killing the
-  # pod. One parse worker at 2400 with the 4Gi control-plane limit (2026-10-23
-  # decision): photos up to about 48 MP are described, larger ones skipped;
-  # two workers at 2400 would need ~5.4 GiB in the worst case. Paired with the
-  # memory limit in control-plane/deployment.yaml — change them together;
+  # pod. One parse worker with the 4Gi control-plane limit (2026-10-23
+  # decision: 2400, photos up to about 48 MP are described, larger ones
+  # skipped). 2026-11-20 (B-322): 2352 — the server process now also holds one
+  # full-resolution upright image copy for vision main models (110 MiB budget;
+  # in-pod 12 MP measured +96 MiB) plus its caches (32 + 4 MiB), so the parse
+  # worker gives back 48 MiB. Paired with the memory limit in
+  # control-plane/deployment.yaml — change them together;
   # tools/deploy/test_parse_worker_memory_budget.py checks them.
   EXPERT_WORK_KNOWLEDGE_PARSE_WORKERS: "1"
-  EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB: "2400"
+  EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB: "2352"
   # The figure worker's own ceiling: it renders clips and pages at most
   # 2,000 px long (a 59 MP picture peaks at ~1.04 GB of address space).
   EXPERT_WORK_KNOWLEDGE_FIGURE_WORKER_MAX_VM_MB: "1536"
