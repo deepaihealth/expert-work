@@ -917,11 +917,11 @@ class ContextCompressionPolicy(_B126OmitDefaultsMixin):
     prompt size exceeds ``context_window * threshold_pct``. The
     compressor preserves the first ``head_keep`` and last ``tail_keep``
     non-system messages, summarising everything in between via an LLM
-    call. ``max_passes`` caps repeated compression attempts before the
-    run aborts with ``ContextOverflowError`` (Mini-ADR L-2 — no
-    silent fallback; RT-ADR-6 softens one case: a transient summariser
-    LLM failure skips compression for the turn and only aborts after
-    three consecutive failed turns).
+    call. ``max_passes`` caps repeated compression attempts. B-328: the
+    threshold only says when saving STARTS — a prompt the compressor
+    cannot get under it is sent as is (warning log + counter); the run
+    fails only when the estimate is over the whole primary model window
+    after one hard shrink (``ContextOverflowError(reason="over_window")``).
     """
 
     model_config = ConfigDict(extra="forbid")

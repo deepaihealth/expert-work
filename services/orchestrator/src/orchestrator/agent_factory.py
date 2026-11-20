@@ -94,6 +94,7 @@ from orchestrator.context import (
     WorkspaceFileWriter,
     floor_head_keep_for_injection,
 )
+from orchestrator.context.result_budget import context_budget_for
 from orchestrator.errors import (
     AgentFactoryError,
     PlatformNotConfiguredError,
@@ -966,6 +967,13 @@ async def build_agent(
                 else None,
             ),
         )
+    # B-328 —— 主模型窗口 W 与单条预算 R(由压缩门槛 T 推出,不加新配置)。
+    context_budget = context_budget_for(
+        window_tokens=_resolved_context_window(spec.spec.model),
+        threshold_pct=spec.spec.policies.context_compression.threshold_pct,
+        absolute_cap_tokens=spec.spec.policies.context_compression.absolute_cap_tokens,
+        estimator=estimator,
+    )
 
     registry = await build_tool_registry(
         spec.spec.tools,
@@ -1362,6 +1370,7 @@ async def build_agent(
         context_compressor=context_compressor,
         working_window=working_window,
         tool_result_pruner=tool_result_pruner,
+        context_budget=context_budget,  # B-328 A② / A③
         tool_output_budget_enabled=tool_budget_enabled,
         pre_compaction_flush=pre_compaction_flush,
         workspace_writer_factory=workspace_writer_factory,

@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from uuid import UUID
 
+from expert_work.common.spotlight import datamark
 from expert_work.persistence import WORKSPACE_OVERFLOW_DIR
+from expert_work.runtime.tokens import TokenEstimator
 
 #: ``EXPERT_WORK_TOOL_OUTPUT_BUDGET`` falsey values (mirrors ``run_retry._FALSEY``).
 _BUDGET_ENV = "EXPERT_WORK_TOOL_OUTPUT_BUDGET"
@@ -124,6 +127,45 @@ FALLBACK_MAX_CHARS = 30_000
 EXEMPT_TOOLS = frozenset(
     {"read_document", "read_file", "list_dir", "knowledge_read", "knowledge_search"}
 )
+
+
+#: B-328 —— :func:`fit_prefix` 按比例收缩的轮数上限;每轮都按实测再算,两三轮就收敛。
+_FIT_ROUNDS = 8
+
+#: B-328 —— 工具按单条预算 R 截正文时,给围栏、平台 notice 与 footer 留的余量(token):
+#: 整条 ToolMessage 落在 R 以内,提示词视图里的 A② 就不会再截它一次。
+RESULT_ENVELOPE_RESERVE_TOKENS = 300
+
+
+def sent_token_counter(estimator: TokenEstimator) -> Callable[[str], int]:
+    """B-328 —— 按「发给模型的样子」量一段工具输出:先打数据标记(spotlight 的 ``datamark``,
+    英文里每个词间多一个字形),再估。不读写估算器的缓存(一次性的大段文字只会挤掉每步都要
+    用的消息前缀)。"""
+    count = getattr(estimator, "count_uncached", estimator.count)
+    return lambda text: int(count(datamark(text)))
+
+
+def fit_prefix(
+    text: str, render: Callable[[str], str], max_tokens: int, count: Callable[[str], int]
+) -> int:
+    """B-328 —— ``text`` 的前多少个字符放进 ``render`` 之后估算不超过 ``max_tokens``。
+
+    按比例收缩、每轮用 ``count`` 实测(不二分:二分要估十几个中间串);同样的输入每次
+    算出同一个长度(确定性),所以同一条结果每一步截出来逐字相同。``render(text[:n])``
+    连 ``render("")`` 都放不下时返回 0,由调用方决定怎么办。
+    """
+    n = len(text)
+    overhead = count(render(""))
+    for _ in range(_FIT_ROUNDS):
+        used = count(render(text[:n]))
+        if used <= max_tokens or n == 0:
+            return n
+        head_used = max(1, used - overhead)
+        scaled = int(n * max(0, max_tokens - overhead) / head_used * 0.98)
+        n = max(0, min(n - 1, scaled))
+    while n > 0 and count(render(text[:n])) > max_tokens:
+        n = n * 9 // 10
+    return n
 
 
 def _elide(text: str, *, head: int, tail: int, note: str) -> str:

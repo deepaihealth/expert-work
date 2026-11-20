@@ -3,8 +3,8 @@
 Pins the conflict-free invariants: head + tail messages survive the
 compression, the summary lands as a SystemMessage between them, the
 threshold gate fires only when estimated tokens cross
-``context_window * threshold_pct``, and an unsummarisable overflow
-raises :class:`ContextOverflowError`.
+``context_window * threshold_pct``, and (B-328) an unsummarisable
+overflow is handed back and sent instead of failing the run.
 """
 
 from __future__ import annotations
@@ -14,13 +14,13 @@ from dataclasses import dataclass, field
 
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from prometheus_client import REGISTRY
 
 from expert_work.common.conversation_channel import HIDE_FROM_UI
 from orchestrator.context import (
     CachedSummary,
     CompactionStats,
     ContextCompressor,
-    ContextOverflowError,
     estimate_tokens,
     floor_head_keep_for_injection,
 )
@@ -50,6 +50,14 @@ class _ScriptedSummariser:
         del messages, tools
         self.calls += 1
         return AIMessage(content=self.summary_text)
+
+
+def _over_threshold(cause: str) -> float:
+    """B-328 —— 「压不到门槛、照发」计数器的当前值。"""
+    value = REGISTRY.get_sample_value(
+        "expert_work_cm_compressor_over_threshold_total", {"cause": cause}
+    )
+    return value or 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -253,10 +261,10 @@ async def test_compress_summary_lands_between_head_and_tail() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compress_raises_when_no_middle_to_summarise() -> None:
+async def test_compress_hands_back_when_no_middle_to_summarise() -> None:
     """``head_keep + tail_keep`` covering the whole non-system slice
-    leaves no middle to summarise — surfacing as overflow tells the
-    operator the only knobs left are manifest-level."""
+    leaves no middle to summarise. B-328 A①: the messages go out as they
+    are (the model window, not this cost threshold, is the hard limit)."""
 
     @dataclass
     class _NeverCalled:
@@ -279,18 +287,19 @@ async def test_compress_raises_when_no_middle_to_summarise() -> None:
     )
     # 5 + 5 = 10; supply exactly 10 messages → no middle.
     msgs = _conversation(head=5, middle=0, tail=5, char_per_msg=200)
-    with pytest.raises(ContextOverflowError) as exc_info:
-        await compressor.compress(msgs)
-    assert exc_info.value.passes == 0
+    before = _over_threshold("nothing_to_summarise")
+    # B-328 A① —— 不再抛:原样交回、照发,记一次「没压到」。
+    assert await compressor.compress(msgs) == msgs
+    assert _over_threshold("nothing_to_summarise") == before + 1
 
 
 @pytest.mark.asyncio
-async def test_compress_raises_after_one_summary_when_the_summary_is_too_large() -> None:
+async def test_compress_hands_back_after_one_summary_when_the_summary_is_too_large() -> None:
     """A pathological summariser that itself returns a giant payload
     can't bring the estimate below threshold. Since B-64 there is nothing
     left to summarise after the first pass (the middle is only that
-    summary), so the compressor raises after one summary regardless of
-    ``max_passes`` — and reports the pass that actually ran."""
+    summary), so after one summary the compressor hands that result
+    back (B-328 A①) regardless of ``max_passes``."""
 
     @dataclass
     class _BloatedSummariser:
@@ -318,11 +327,12 @@ async def test_compress_raises_after_one_summary_when_the_summary_is_too_large()
         max_passes=2,
     )
     msgs = _conversation(head=1, middle=10, tail=1, char_per_msg=80)
-    with pytest.raises(ContextOverflowError) as exc_info:
-        await compressor.compress(msgs)
-    # 终审 #3 —— 报真实跑过的遍数,不是 ``_compress_once`` 那句不知情的 0。
-    assert exc_info.value.passes == 1
-    assert "after 1 compression pass(es)" in str(exc_info.value)
+    before = _over_threshold("nothing_to_summarise")
+    # B-328 A① —— 第 2 遍「中段只剩摘要」不再抛:交回第 1 遍的结果(头 + 摘要 + 尾)照发。
+    out = await compressor.compress(msgs)
+    assert [type(m) for m in out] == [HumanMessage, SystemMessage, HumanMessage]
+    assert "x" * 1000 in str(out[1].content)
+    assert _over_threshold("nothing_to_summarise") == before + 1
     # B-64 Task 7 回修第 4 轮 —— 第 2 遍的中段只剩第 1 遍的摘要,没有新东西可总结,
     # 按「中段已空」抛,不再用空的 NEW EVENTS 再调一次「更新」。原来这里断言的
     # ``calls == 2`` / ``passes == 2`` 钉的正是那次空更新。
@@ -403,19 +413,22 @@ async def test_transient_summariser_failure_skips_round() -> None:
 
 
 @pytest.mark.asyncio
-async def test_three_consecutive_summariser_failures_raise_overflow() -> None:
-    """RT-ADR-6 — the fail-hard backstop survives: a persistently
-    broken summariser escalates on the third consecutive failed round
-    of the SAME conversation instead of silently ballooning forever."""
+async def test_three_consecutive_summariser_failures_are_counted_and_sent() -> None:
+    """RT-ADR-6 / B-328 D3 — a persistently
+    broken summariser is counted on the third consecutive failed round
+    of the SAME conversation; the prompt still goes out."""
     summariser = _FlakySummariser(script=[False, False, False])
     compressor = _flaky_compressor(summariser)
     msgs = _conversation(head=1, middle=10, tail=1, char_per_msg=80)
 
     # streak 1 / 2 — skipped
+    before = _over_threshold("summariser_failing")
     assert await compressor.compress(msgs, streak_key="thread-a") == msgs
     assert await compressor.compress(msgs, streak_key="thread-a") == msgs
-    with pytest.raises(ContextOverflowError):  # streak 3 — fail-hard
-        await compressor.compress(msgs, streak_key="thread-a")
+    assert _over_threshold("summariser_failing") == before
+    # streak 3 — B-328 A① (D3): sent as is, counted as a broken summariser.
+    assert await compressor.compress(msgs, streak_key="thread-a") == msgs
+    assert _over_threshold("summariser_failing") == before + 1
 
 
 @pytest.mark.asyncio
@@ -444,14 +457,16 @@ async def test_failure_streaks_isolated_per_key() -> None:
     msgs = _conversation(head=1, middle=10, tail=1, char_per_msg=80)
 
     # Conversation A fails twice — streak 2, still skipping.
+    before = _over_threshold("summariser_failing")
     assert await compressor.compress(msgs, streak_key="thread-a") == msgs
     assert await compressor.compress(msgs, streak_key="thread-a") == msgs
     # Conversation B's FIRST failure: with a shared counter this would
-    # be the third consecutive failure and raise — it must skip.
+    # be the third consecutive failure — it must stay a plain skip.
     assert await compressor.compress(msgs, streak_key="thread-b") == msgs
-    # And A's streak is likewise untouched by B: its third failure raises.
-    with pytest.raises(ContextOverflowError):
-        await compressor.compress(msgs, streak_key="thread-a")
+    assert _over_threshold("summariser_failing") == before
+    # And A's streak is likewise untouched by B: its third failure counts.
+    assert await compressor.compress(msgs, streak_key="thread-a") == msgs
+    assert _over_threshold("summariser_failing") == before + 1
 
 
 @pytest.mark.asyncio
