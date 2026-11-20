@@ -1238,8 +1238,12 @@ async def test_new_images_get_full_resolution_and_history_degrades_alone(
     """审查 M2 —— 地方不够时,这一轮的新图用全分辨率;历史里的图自己降到小副本,不把新图一起拖下去
     (以前是全部一次拿齐,多一张就全部降级)。一步最多钉住全分辨率区的一半。"""
     first, second = _stored(90), _stored(270)
-    size = max(len((upright_copy(d, t) or ("", b""))[1]) for d, t in ((first, 90), (second, 270)))
-    monkeypatch.setattr(image_views.UPRIGHT_VIEWS, "full_cap_bytes", int(size * 2.5))
+    new_copy = len((upright_copy(second, 270) or ("", b""))[1])
+    old_estimate = image_views.copy_size_limit(len(first), "image/png")
+    # 全分辨率区放得下新图 + 历史图,但一步的份额(一半)放不下两张 —— 只有份额能把历史图挡下来。
+    monkeypatch.setattr(
+        image_views.UPRIGHT_VIEWS, "full_cap_bytes", int((new_copy + old_estimate) * 1.5)
+    )
     monkeypatch.setattr(upright_mod.UprightViewCache, "pin_full", _no_wait_pin)
     s = _setup({_ref(1): first, _ref(2): second})
     async with _graph(s) as compiled:
