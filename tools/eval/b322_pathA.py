@@ -116,8 +116,15 @@ class Item:
 
 def _split(model: str) -> tuple[str, str]:
     provider, _, name = model.partition("/")
-    if not provider or not name or catalog_entry(provider, name) is None:
+    entry = catalog_entry(provider, name) if provider and name else None
+    if entry is None:
         raise b301_plan.PlanError(f"{model}: not a catalog model (want provider/name)")
+    if entry.max_image_pixels is None:
+        # 单图预算是 orientation_verified 的前提:不知道它的模型体检过也不能设核实(B-322 §8.1)。
+        raise b301_plan.PlanError(
+            f"{model}: no max_image_pixels in the model catalog; measure the per-image budget "
+            "and add it before a health check"
+        )
     return provider, name
 
 
@@ -347,7 +354,6 @@ def as_verified(models: Sequence[str]) -> Iterator[None]:
                 e.model_copy(
                     update={
                         "orientation_verified": True,
-                        "max_image_pixels": e.max_image_pixels or 12_595_200,
                     }
                 )
                 if (provider, e.name) in names

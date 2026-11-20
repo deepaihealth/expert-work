@@ -195,3 +195,9 @@ async def test_run_stops_at_the_stop_line_without_recording_a_fake_answer(tmp_pa
     for record in b301_plan.read_records(results):
         assert all(call.get("outcome") == "ok" for call in record["calls"])
         assert record["conclusion"] != "unjudged"
+
+
+def test_a_model_without_a_per_image_budget_is_refused() -> None:
+    """单图预算是核实的前提:没有的模型不报价、不体检(复审 L4)。"""
+    with pytest.raises(b301_plan.PlanError, match="max_image_pixels"):
+        e_group.quote(models=("qwen/qwen3.8-max",), stop_line=None)

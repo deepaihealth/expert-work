@@ -499,6 +499,7 @@ def test_a_jpeg_over_the_budget_is_drafted_then_fitted(monkeypatch: pytest.Monke
     image = _decode(found[1])
     assert image.width * image.height <= 240_000
     assert image.size == (400, 600)  # 600x400 的预算尺寸,转了 90 度
+    # 1/4 那一档 600 x 400 = 24 万正好落在 [95% 预算, 预算] 里:按它解码,不再缩。
     assert drafts == [(600, 400)]
 
 
@@ -517,3 +518,143 @@ def test_a_view_carries_the_budget_only_for_full_copies() -> None:
     )
     assert parse_image_view({"degrees": 90, "max_pixels": 0}) is None
     assert ImageView(90).as_dict() == {"degrees": 90, "variant": "full"}
+
+
+# ---------------------------------------------------------------------------
+# 第 5 条三细化(2026-11-20):缩放结果落在 [95% 预算, 预算]
+# ---------------------------------------------------------------------------
+
+
+def _drafts(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    from PIL.JpegImagePlugin import JpegImageFile
+
+    seen: list[Any] = []
+    real = JpegImageFile.draft
+
+    def spy(self: Any, mode: Any, size: Any) -> Any:
+        result = real(self, mode, size)
+        seen.append((size, self.size))
+        return result
+
+    monkeypatch.setattr(JpegImageFile, "draft", spy)
+    return seen
+
+
+@pytest.mark.parametrize("budget", [1_000_000, 990_000])
+def test_a_half_draft_just_under_the_budget_is_kept(
+    monkeypatch: pytest.MonkeyPatch, budget: int
+) -> None:
+    """48~50 MP 照片的情形(缩小版):按一半解码得到 1200 x 800 = 96 万,在 [95% 预算, 预算] 里,
+    就用它,不再整张解开、也不再缩一次。"""
+    seen = _drafts(monkeypatch)
+    raw = _encode(_quadrants().resize((2400, 1600)), "JPEG", quality=92)
+    found = upright_copy(raw, 90, max_pixels=budget)
+    assert found is not None
+    image = _decode(found[1])
+    assert image.size == (800, 1200)
+    assert budget * 0.95 <= image.width * image.height <= budget
+    assert [decoded for _, decoded in seen] == [(1200, 800)]  # 确实按一半读的
+
+
+def test_no_draft_lands_in_the_window_so_none_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    """按一半读是 96 万 > 预算 90 万,按四分之一是 24 万 < 95%:没有一档落在 [95%, 100%] 里 ——
+    不用 draft,整张解开后一次 LANCZOS 缩到预算(内存贵;``_pin`` 先估过才会走到这里)。"""
+    seen = _drafts(monkeypatch)
+    raw = _encode(_quadrants().resize((2400, 1600)), "JPEG", quality=92)
+    found = upright_copy(raw, 90, max_pixels=900_000)
+    assert found is not None
+    image = _decode(found[1])
+    assert 900_000 * 0.95 <= image.width * image.height <= 900_000
+    assert seen == []
+
+
+def test_the_budget_plan_lands_in_the_window() -> None:
+    """``budget_size`` 是唯一的判定点:解码时缩 / 整数倍缩只在结果落进 [95%, 100%] 预算时才用。"""
+    from orchestrator.tools.region_zoom import BUDGET_FLOOR, budget_size
+
+    qwen = 12_595_200
+    assert budget_size(4032, 3024, qwen, jpeg=True) is None  # 12.2 MP:不超过预算,不缩
+    phone48 = budget_size(8064, 6048, qwen, jpeg=True)
+    assert phone48 is not None
+    assert (phone48.draft, phone48.reduce, phone48.resize) == (2, 1, False)  # 按一半读,直接用
+    png48 = budget_size(8064, 6048, qwen, jpeg=False)
+    assert png48 is not None
+    assert (png48.draft, png48.reduce, png48.resize) == (1, 2, False)
+    twenty = budget_size(5184, 3888, qwen, jpeg=True)  # 1/2 只有 504 万(40%):不用 draft
+    assert twenty is not None
+    assert (twenty.draft, twenty.reduce, twenty.resize) == (1, 1, True)
+    tw, th = twenty.target
+    assert qwen * BUDGET_FLOOR <= tw * th <= qwen
+
+
+def test_the_peak_estimate_matches_the_measured_classes() -> None:
+    """解码之前的峰值估算:12 MP 照片与按一半读的 48 MP 照片在每张转正图的内存预算以内;20 MP 照片
+    (要整张解开再缩)、48 MP PNG、6000 万像素的 JPEG 超过 —— 它们改用小副本。"""
+    from orchestrator.image_views import FULL_COPY_PEAK_BYTES
+    from orchestrator.tools.region_zoom import upright_peak_bytes
+
+    qwen, mib = 12_595_200, 1024 * 1024
+
+    def peak(w: int, h: int, *, jpeg: bool = True, mode: str = "RGB", size: int = 4 * mib) -> int:
+        return upright_peak_bytes(w, h, mode, qwen, jpeg=jpeg, encoded_bytes=size)
+
+    assert peak(4032, 3024) <= FULL_COPY_PEAK_BYTES
+    assert peak(4096, 3072, size=10 * mib) <= FULL_COPY_PEAK_BYTES  # 12.58 MP、10 MiB:最贵的不缩图
+    assert peak(8064, 6048) <= FULL_COPY_PEAK_BYTES
+    assert peak(5184, 3888) > FULL_COPY_PEAK_BYTES
+    assert peak(8064, 6048, jpeg=False) > FULL_COPY_PEAK_BYTES
+    assert peak(9487, 6324) > FULL_COPY_PEAK_BYTES  # 6000 万像素(上传解码上限)
+    assert peak(5184, 3888, mode="L") <= FULL_COPY_PEAK_BYTES  # 灰度:每像素 1 字节
+
+
+async def test_the_adapter_does_not_make_a_full_copy_over_the_peak_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(image_views, "FULL_COPY_PEAK_BYTES", 1000)
+    raw = _encode(_quadrants(), "PNG")
+    before = _count("peak_over_budget")
+    out = await resolve_message_images([_REF], _resolver(raw), [ImageView(90)])
+    assert isinstance(out[0], ResolvedImage)
+    assert out[0].data == raw
+    assert _count("peak_over_budget") == before + 1
+
+
+def test_small_copies_take_one_or_two_slots_by_their_estimated_peak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """候选 / 小副本按估的峰值占解图名额:不到每张预算的一半占 1 个、不到预算占 2 个(两个名额加起来
+    不超过预算),再大不做。"""
+    from orchestrator.tools import region_zoom
+
+    raw = _encode(_quadrants(), "PNG")
+    assert image_views.small_copy_slots(raw) == 1
+    peak = region_zoom.crop_peak_bytes(600, 400, "RGB", jpeg=False, encoded_bytes=len(raw))
+    monkeypatch.setattr(image_views, "FULL_COPY_PEAK_BYTES", peak + 1)
+    assert image_views.small_copy_slots(raw) == 2
+    monkeypatch.setattr(image_views, "FULL_COPY_PEAK_BYTES", peak - 1)
+    assert image_views.small_copy_slots(raw) is None
+
+
+def test_the_crop_estimate_matches_the_measured_classes() -> None:
+    """本机按审查方法实测:12 MP JPEG 约 41 MiB、20 MP JPEG 约 64 MiB、48.8 MP PNG 约 228 MiB。"""
+    from orchestrator.tools.region_zoom import crop_peak_bytes
+
+    mib = 1024 * 1024
+
+    def estimate(w: int, h: int, *, jpeg: bool = True) -> float:
+        return crop_peak_bytes(w, h, "RGB", jpeg=jpeg, encoded_bytes=2 * mib) / mib
+
+    assert 30 <= estimate(4032, 3024) <= 50
+    assert 50 <= estimate(5184, 3888) <= 75
+    assert 30 <= estimate(9487, 6324) <= 60  # 6000 万像素 JPEG:按 1/4 读
+    assert estimate(8064, 6048, jpeg=False) > 200  # 大 PNG 得整张解开
+
+
+def test_the_jpeg_draft_request_picks_the_intended_scale() -> None:
+    """复审 —— Pillow 按「原尺寸 // 请求尺寸」选 draft 档:宽高不是倍数时(9487)也要真按 1/4 读。"""
+    raw = _encode(Image.new("RGB", (9487, 6324), (40, 80, 120)), "JPEG", quality=50)
+    from orchestrator.tools.region_zoom import _draft_request
+
+    image = Image.open(io.BytesIO(raw))
+    image.draft("RGB", _draft_request(image.size, 4))
+    assert image.size == (2372, 1581)

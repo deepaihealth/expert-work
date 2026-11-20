@@ -22,12 +22,14 @@ B. 平台段合成之后(:func:`~orchestrator.graph_builder.platform_context.wit
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import math
 import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal
 from uuid import UUID
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -49,11 +51,13 @@ from orchestrator.image_views import (
     UprightViewCache,
     copy_digest,
     copy_size_limit,
+    full_copy_fits_memory,
     full_copy_in_slots,
     image_digest,
-    in_host_crop_slot,
+    in_host_crop_slots,
     low_res_copy,
     main_model_image_view_cache_total,
+    small_copy_slots,
 )
 from orchestrator.multimodal import IMAGE_REF_BLOCK_TYPE, ImageResolver
 from orchestrator.tools.image_orientation import (
@@ -72,12 +76,11 @@ from orchestrator.tools.image_orientation import (
     parse_orientation_reply,
 )
 from orchestrator.tools.orientation_judge import judge_orientation
-from orchestrator.tools.region_zoom import image_size
+from orchestrator.tools.region_zoom import crop_image, image_size
 from orchestrator.tools.seam_relook import SEAM_RELOOK_MIN_RUN_LEFT_S
 from orchestrator.tools.vision import (
     _FULL_FRAME,
     _SYSTEM_PROMPT,
-    _crop_in_thread,
     _stringify,
     _tile_slots,
 )
@@ -347,7 +350,13 @@ class ImageOrienter:
             "height": size[1] if size else None,
             "first_turn": run.turn,
         }
-        if not _judgeable(entry) and run.first_step:
+        if small_copy_slots(data) is None:
+            # 连问方向的候选都要整张解开一张很大的图(大 PNG 之类),峰值超过每张的内存预算:不判,
+            # 按原样发(复审 H-new)。
+            entry["too_large"] = True
+            if run.first_step:
+                main_model_image_orientation_skipped_total.labels(reason="too_large").inc()
+        elif not _judgeable(entry) and run.first_step:
             main_model_image_orientation_skipped_total.labels(reason="tiny").inc()
         return image_id, entry
 
@@ -463,8 +472,10 @@ class ImageOrienter:
             first = ("no", models.get("0") if isinstance(models, Mapping) else None)
         calls = 0
 
+        slots = small_copy_slots(data) or 2
+
         async def candidate(degrees: int) -> dict[str, Any]:
-            crop = (await _crop_in_thread(data, [_FULL_FRAME], degrees))[0]
+            crop = (await _candidate_crop(data, degrees, slots))[0]
             key = (digest, degrees)
             self.views.lend(key, "image/jpeg", crop.data)
             lent.append(key)
@@ -612,7 +623,9 @@ class ImageOrienter:
         group: list[tuple[str, int, PreparedView]] = []
         for image_id, degrees in new_full:
             made = await self._prepared_full(image_id, images[image_id], degrees, step, run, out)
-            if made is not None:
+            if made == "low":
+                low.append((image_id, degrees))
+            elif made is not None:
                 group.append((image_id, degrees, made))
         if group:
             views = [p for _, _, p in group]
@@ -634,6 +647,9 @@ class ImageOrienter:
                 low.append((image_id, degrees))
                 continue
             made = await self._prepared_full(image_id, images[image_id], degrees, step, run, out)
+            if made == "low":
+                low.append((image_id, degrees))
+                continue
             if made is None:
                 continue
             size = len(made.data)
@@ -657,10 +673,11 @@ class ImageOrienter:
         step: UprightStep,
         run: StepRun,
         out: dict[str, _Shown],
-    ) -> PreparedView | None:
+    ) -> PreparedView | Literal["low"] | None:
         """全分辨率转正图:缓存里有就用;没有就生成(占两个解图名额)。原图字节取不到 → 不说什么、
         按原样(适配器换成提示文字);放弃转正(怎么退都超、解不开)→ 第 3 级。两种都返回 ``None``
-        并在 ``out`` 里写好。"""
+        并在 ``out`` 里写好。解码之前估峰值内存超过 ``FULL_COPY_PEAK_BYTES`` → ``"low"``:用小副本
+        (审查 H-new)。"""
         sha, cap = str(image["sha"]), self._cap(image)
         key = (copy_digest(sha, cap), degrees)
         cached = self.views.get(sha, ImageView(degrees, "full", cap))
@@ -670,6 +687,9 @@ class ImageOrienter:
         if data is None:
             out[image_id] = _Shown(image_id)
             return None
+        if not full_copy_fits_memory(data, cap):
+            main_model_image_view_cache_total.labels(outcome="peak_over_budget").inc()
+            return "low"
         try:
             made = await full_copy_in_slots(data, degrees, sha, max_pixels=cap)
         except ValueError:
@@ -691,7 +711,12 @@ class ImageOrienter:
             resolved = await self.image_resolver.resolve(str(image["refs"][0]))
         except Exception:
             return None
-        return copy_size_limit(len(resolved.data), resolved.media_type)
+        limit = copy_size_limit(len(resolved.data), resolved.media_type)
+        # 超过单图预算、要缩的图:按缩后像素占原图的比例估(复审 L3),别按原图字节估。
+        cap, width, height = self._cap(image), image.get("width"), image.get("height")
+        if cap is not None and isinstance(width, int) and isinstance(height, int):
+            return math.ceil(limit * cap / (width * height))
+        return limit
 
     def _cap(self, image: Mapping[str, Any]) -> int | None:
         """这张图的全分辨率转正图要不要缩到单图预算:原图像素超过预算才要
@@ -721,8 +746,15 @@ class ImageOrienter:
             data = await self._bytes(str(image["refs"][0]), step)
             if data is None:
                 return _Shown(image_id)
+            slots = small_copy_slots(data)
+            if slots is None:  # 连小副本都要整张解开一张大图:不做(复审 H-new)
+                main_model_image_view_cache_total.labels(outcome="peak_over_budget").inc()
+                self._as_stored(run, sha, "copy_too_large")
+                return _Shown(image_id, note="as_stored")
             try:
-                cached = await in_host_crop_slot(low_res_copy, data, degrees)
+                cached = await in_host_crop_slots(
+                    slots, functools.partial(low_res_copy, data, degrees)
+                )
             except ValueError:
                 self._as_stored(run, sha, "copy_too_large")
                 return _Shown(image_id, note="as_stored")
@@ -795,7 +827,17 @@ def _judgeable(image: Mapping[str, Any]) -> bool:
     """尺寸认得出、短边不小于 :data:`MIN_SIDE_PIXELS` 的图才问。"""
     width, height = image.get("width"), image.get("height")
     return (
-        isinstance(width, int) and isinstance(height, int) and min(width, height) >= MIN_SIDE_PIXELS
+        image.get("too_large") is not True
+        and isinstance(width, int)
+        and isinstance(height, int)
+        and min(width, height) >= MIN_SIDE_PIXELS
+    )
+
+
+async def _candidate_crop(data: bytes, degrees: int, slots: int) -> list[Any]:
+    """问方向的一张候选(与 B-301 同一个 ``crop_image`` 调用),按估的峰值占 1 或 2 个解图名额。"""
+    return await in_host_crop_slots(
+        slots, functools.partial(crop_image, data, [_FULL_FRAME], degrees)
     )
 
 

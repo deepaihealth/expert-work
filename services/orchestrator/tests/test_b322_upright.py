@@ -584,14 +584,14 @@ async def test_second_step_timing_out_is_pending_then_retried_next_turn() -> Non
 async def test_candidate_failure_in_the_second_step_is_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real = upright_mod._crop_in_thread
+    real = upright_mod._candidate_crop
 
-    async def failing(data: bytes, boxes: Any, degrees: int, *a: Any) -> Any:
+    async def failing(data: bytes, degrees: int, slots: int) -> Any:
         if degrees:
             raise OSError("no memory")
-        return await real(data, boxes, degrees, *a)
+        return await real(data, degrees, slots)
 
-    monkeypatch.setattr(upright_mod, "_crop_in_thread", failing)
+    monkeypatch.setattr(upright_mod, "_candidate_crop", failing)
     s = _setup({_ref(): _stored(90)})
     async with _graph(s) as compiled:
         config = await _turn(compiled, s, _ref())
@@ -1321,14 +1321,14 @@ async def test_running_out_of_the_thirty_seconds_counts_as_deadline(
 ) -> None:
     """审查 L4 —— 30 秒用完、第 2 步没来得及问,计 ``deadline``。"""
     s = _setup({_ref(): _stored(90)})
-    real = upright_mod._crop_in_thread
+    real = upright_mod._candidate_crop
 
-    async def slow(data: bytes, boxes: Any, degrees: int, *a: Any) -> Any:
+    async def slow(data: bytes, degrees: int, slots: int) -> Any:
         if degrees:
             await asyncio.sleep(1.5)  # 生成候选吃掉时间,第 2 步问不完
-        return await real(data, boxes, degrees, *a)
+        return await real(data, degrees, slots)
 
-    monkeypatch.setattr(upright_mod, "_crop_in_thread", slow)
+    monkeypatch.setattr(upright_mod, "_candidate_crop", slow)
     monkeypatch.setattr(upright_mod, "ORIENTATION_TIMEOUT_S", 6.5)
     before = _count(main_model_image_orientation_skipped_total, reason="deadline")
     async with _graph(s) as compiled:
@@ -1456,3 +1456,49 @@ async def test_an_original_over_the_models_budget_is_sent_at_the_budget() -> Non
     async with _graph(s, orienter=roomy) as compiled:
         await _turn(compiled, s, _ref(2))
     assert "max_pixels" not in _last_user(s.main.prompts[-1]).content[1]["view"]  # type: ignore[index]
+
+
+async def test_an_image_whose_full_copy_would_peak_too_high_gets_the_low_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """审查 H-new —— 解码之前估全分辨率转正图的峰值内存,超过每张的预算就不出全分辨率图,改用
+    小副本(已有的第 2 级那条路),计 ``peak_over_budget``;模型照样看到转正的图。"""
+    monkeypatch.setattr(upright_mod, "full_copy_fits_memory", lambda data, cap: False)
+    made: list[int] = []
+    real = image_views.upright_copy
+
+    def counting(data: bytes, degrees: int, max_pixels: int | None = None) -> Any:
+        made.append(degrees)
+        return real(data, degrees, max_pixels)
+
+    monkeypatch.setattr(image_views, "upright_copy", counting)
+    before = _count(image_views.main_model_image_view_cache_total, outcome="peak_over_budget")
+    s = _setup({_ref(): _stored(90)})
+    async with _graph(s) as compiled:
+        await _turn(compiled, s, _ref())
+    assert made == []  # 没解码出全分辨率那一份
+    block = _last_user(s.main.prompts[0]).content[1]
+    assert block["view"] == {"degrees": 90, "variant": "low"}  # type: ignore[index]
+    assert s.main.replies == [SECRET]
+    assert (
+        _count(image_views.main_model_image_view_cache_total, outcome="peak_over_budget")
+        == before + 1
+    )
+
+
+async def test_an_image_too_large_even_for_candidates_is_not_judged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复审 H-new —— 连问方向的候选都要整张解开一张很大的图(大 PNG 之类),估的峰值超过每张的内存
+    预算:这张图不判、按原样发,计 ``too_large``;不解码它。"""
+    monkeypatch.setattr(image_views, "FULL_COPY_PEAK_BYTES", 1000)
+    before = _count(main_model_image_orientation_skipped_total, reason="too_large")
+    s = _setup({_ref(): _stored(90)})
+    async with _graph(s) as compiled:
+        config = await _turn(compiled, s, _ref())
+        snapshot = await compiled.aget_state(config)
+    assert s.judge.calls == []
+    assert _last_user(s.main.prompts[0]).content == _user("读一下", _ref()).content
+    (image,) = snapshot.values["conversation_images"].values()
+    assert image["too_large"] is True
+    assert _count(main_model_image_orientation_skipped_total, reason="too_large") == before + 1

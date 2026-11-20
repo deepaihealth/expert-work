@@ -55,6 +55,12 @@ PIN_WAIT_S: Final = 5.0
 _PIN_POLL_S: Final = 0.05
 #: 没有截止时刻的 run(单测 / 评测 / 不限时)小副本最多留多久;正常由 run 收尾释放。
 LOW_COPY_FALLBACK_TTL_S: Final = 3600.0
+#: 一张全分辨率转正图允许的峰值内存(审查 H-new)。取 12 MP 照片那一档:pod 实测 4032 x 3024 转 90 度
+#: +96 MiB(2026-11-20,测试环境控制面);12.6 MP(qwen4-max 的单图预算)加编码约 106 MiB。解码**之前**按
+#: :func:`full_copy_peak` 估,超过它的图不出全分辨率转正图,改用小副本(第 2 级那条路),计
+#: ``peak_over_budget``。控制面主进程的内存常数按它 + 两个缓存区算
+#: (``tools/deploy/test_parse_worker_memory_budget.py``)。
+FULL_COPY_PEAK_BYTES: Final = 110 * 1024 * 1024
 #: 适配器当场重算(``adapter_miss``)最多等解图名额多久(秒)。它发生在 ``_prepare_request`` 里、
 #: 算在路由的首 token 计时里(审查 N3):等不到就这一次按原图发,不让首 token 跟着解图排队。
 #: 2 秒:一次普通裁图约 0.1~0.3 秒、一张 12 MP 转正图约 0.1~0.2 秒(本机),等两轮还够。
@@ -77,14 +83,18 @@ _MEDIA_TYPES: Final = {
     "GIF": "image/gif",
 }
 
-ViewOutcome = Literal["hit", "precomputed", "adapter_miss", "adapter_busy", "low_res_copy"]
+ViewOutcome = Literal[
+    "hit", "precomputed", "adapter_miss", "adapter_busy", "low_res_copy", "peak_over_budget"
+]
 main_model_image_view_cache_total = expert_work_counter(
     "expert_work_main_model_image_view_cache_total",
     "B-322 upright copies of Path A images by outcome: hit (the adapter read a precomputed "
     "copy), precomputed (agent_node made one before the model call), adapter_miss (the adapter "
     "had to make it), adapter_busy (the adapter could not get a decode slot within "
-    "ADAPTER_MISS_SLOT_WAIT_S and sent the stored image) and low_res_copy (the full copy did "
-    "not fit; a ~1.5 MP copy was used).",
+    "ADAPTER_MISS_SLOT_WAIT_S and sent the stored image for that one call; the prompt note made "
+    "before the call still says the image is shown rotated), low_res_copy (the full copy did "
+    "not fit; a ~1.5 MP copy was used) and peak_over_budget (making the full copy would peak "
+    "over FULL_COPY_PEAK_BYTES, estimated before decoding; the ~1.5 MP copy was used).",
     ("outcome",),
 )
 
@@ -177,6 +187,52 @@ def upright_copy(
         return _encode_within(whole, source_format, len(data))
     finally:
         whole.close()
+
+
+def _header(data: bytes) -> tuple[int, int, str, bool] | None:
+    """只读文件头:``(宽, 高, 颜色模式, 是不是 JPEG)``;认不出 → ``None``。"""
+    from orchestrator.tools.region_zoom import OPEN_FORMATS  # 延迟导入,见模块说明
+
+    try:
+        with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
+            (width, height), mode, fmt = image.size, image.mode, image.format
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return None
+    return width, height, mode, fmt in ("JPEG", "MPO")
+
+
+def full_copy_peak(data: bytes, max_pixels: int | None) -> int | None:
+    """解码之前估这张图的全分辨率转正图峰值内存(只读文件头;审查 H-new)。认不出 → ``None``。"""
+    from orchestrator.tools.region_zoom import upright_peak_bytes  # 延迟导入,见模块说明
+
+    header = _header(data)
+    if header is None:
+        return None
+    width, height, mode, jpeg = header
+    return upright_peak_bytes(width, height, mode, max_pixels, jpeg=jpeg, encoded_bytes=len(data))
+
+
+def full_copy_fits_memory(data: bytes, max_pixels: int | None) -> bool:
+    peak = full_copy_peak(data, max_pixels)
+    return peak is not None and peak <= FULL_COPY_PEAK_BYTES
+
+
+def small_copy_slots(data: bytes) -> int | None:
+    """问方向的候选 / 小副本(:func:`low_res_copy`,整张框的 ``crop_image``)该占几个解图名额(复审
+    H-new):估的峰值不到 :data:`FULL_COPY_PEAK_BYTES` 的一半占 1 个,不到它占 2 个(两个名额加起来
+    永远不超过它);更大的(要整张解开的大 PNG 之类)→ ``None``:不做,这张图不判方向。"""
+    from orchestrator.tools.region_zoom import crop_peak_bytes  # 延迟导入,见模块说明
+
+    header = _header(data)
+    if header is None:
+        return None
+    width, height, mode, jpeg = header
+    peak = crop_peak_bytes(width, height, mode, jpeg=jpeg, encoded_bytes=len(data))
+    if peak <= FULL_COPY_PEAK_BYTES // 2:
+        return 1
+    if peak <= FULL_COPY_PEAK_BYTES:
+        return 2
+    return None
 
 
 def copy_size_limit(original_bytes: int, media_type: str) -> int:
@@ -461,8 +517,9 @@ class UprightViewCache:
     def lend(self, key: ViewKey, media_type: str, data: bytes) -> None:
         """候选图在问的那一会儿借给适配器;同一张图被两个对话同时问时按次数借还。借出的字节算在
         全分辨率区的上限里:先挤掉没钉住的转正图腾地方,之后钉住新图时也把它们算进去。**从不拒借**
-        (问方向不因此失败),所以钉住的 + 借出的**可能略超**上限:超出的最多是同时在问的候选
-        (每张约 0.3~0.6 MB,同时在飞的调用受 12 个切块名额限制,约 4~7 MB)(审查 N4)。"""
+        (问方向不因此失败),所以钉住的 + 借出的**可能略超**上限:候选借出到这张图判完为止
+        (一张图最多 4 张、每张约 0.3~0.6 MB;一步最多判 8 张图 → 一个对话约 13 MB),超出的最多是
+        「同时在判图的对话数 x 约 13 MB」(审查 N4 / 复审 L2)。"""
         held = self._lent.get(key)
         self._lent[key] = (media_type, data, (held[2] if held is not None else 0) + 1)
         self._evict_unpinned()
@@ -506,6 +563,9 @@ async def view_bytes(digest: str, view: ImageView, data: bytes) -> tuple[str, by
         return cached
     try:
         if view.variant == "full":
+            if not full_copy_fits_memory(data, view.max_pixels):
+                main_model_image_view_cache_total.labels(outcome="peak_over_budget").inc()
+                return None
             return await full_copy_in_slots(
                 data,
                 view.degrees,
@@ -513,9 +573,13 @@ async def view_bytes(digest: str, view: ImageView, data: bytes) -> tuple[str, by
                 max_pixels=view.max_pixels,
                 wait_s=ADAPTER_MISS_SLOT_WAIT_S,
             )
+        slots = small_copy_slots(data)
+        if slots is None:
+            main_model_image_view_cache_total.labels(outcome="peak_over_budget").inc()
+            return None
         return await _run_in_slots(
             functools.partial(low_res_copy, data, view.degrees),
-            slots=1,
+            slots=slots,
             wait_s=ADAPTER_MISS_SLOT_WAIT_S,
         )
     except SlotBusyError:
@@ -614,6 +678,12 @@ async def _run_in_slots[T](
 
     task.add_done_callback(finished)
     return await asyncio.shield(task)
+
+
+async def in_host_crop_slots[T](slots: int, call: Callable[[], T]) -> T:
+    """在 ``slots`` 个解图名额里、线程中跑 ``call``(按估的峰值内存定占几个,
+    见 :func:`small_copy_slots`)。"""
+    return await _run_in_slots(call, slots=slots)
 
 
 async def in_host_crop_slot[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
