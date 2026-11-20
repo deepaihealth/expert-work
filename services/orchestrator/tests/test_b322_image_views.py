@@ -554,7 +554,7 @@ def test_the_peak_estimate_matches_the_measured_classes() -> None:
         return upright_peak_bytes(w, h, mode, qwen, encoded_bytes=size)
 
     assert peak(4032, 3024) <= FULL_COPY_PEAK_BYTES
-    assert peak(4096, 3072, size=10 * mib) <= FULL_COPY_PEAK_BYTES  # 12.58 MP、10 MiB:最贵的不缩图
+    assert peak(4096, 3072, size=3 * mib) <= FULL_COPY_PEAK_BYTES  # 12.58 MP、3 MiB:最贵的不缩图
     assert peak(8064, 6048) <= FULL_COPY_PEAK_BYTES
     assert peak(5184, 3888) > FULL_COPY_PEAK_BYTES
     assert peak(8064, 6048, mode="CMYK", size=20 * mib) > FULL_COPY_PEAK_BYTES
@@ -714,3 +714,25 @@ def test_a_12mp_webp_is_skipped_without_decoding(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(Image.Image, "load", spy)
     assert image_views.skip_reason(raw) == "format_unsupported"
     assert loads == []
+
+
+def test_a_progressive_jpeg_is_not_supported() -> None:
+    """复审第六轮 L3 —— 渐进式 JPEG 的解码缓冲没量过:按文件头不做(纵深防御)。"""
+    buffer = io.BytesIO()
+    _quadrants().save(buffer, format="JPEG", quality=95, progressive=True)
+    raw = buffer.getvalue()
+    assert image_views.skip_reason(raw) == "format_unsupported"
+    assert image_views.small_copy_slots(raw) is None
+    baseline = _encode(_quadrants(), "JPEG", quality=95)
+    assert image_views.skip_reason(baseline) is None
+
+
+def test_the_full_copy_estimate_covers_the_reviewers_measurements() -> None:
+    """复审第六轮 L1 —— 奇数尺寸 12 MP、方向标记 6、灰度:估算(含 x1.05)不低于审查量到的数。"""
+    from orchestrator.tools.region_zoom import upright_peak_bytes
+
+    mib = 1024 * 1024
+    qwen = 12_595_200
+    assert upright_peak_bytes(4031, 3023, "RGB", qwen, encoded_bytes=4 * mib) >= 103.7 * mib
+    assert upright_peak_bytes(4032, 3024, "RGB", qwen, encoded_bytes=4 * mib) >= 101.1 * mib
+    assert upright_peak_bytes(4032, 3024, "L", qwen, encoded_bytes=3 * mib) >= 31.3 * mib

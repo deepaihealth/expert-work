@@ -108,8 +108,9 @@ STEP_PIN_SHARE: Final = 0.5
 #: 「这张图不判」(格式不支持 / 太大)的规则版本:改了 ``image_views.UPRIGHT_MODES``、内存预算或
 #: 估法(``region_zoom.crop_peak_bytes`` 的常数)就改它,所有这样记下的图在之后某一轮的第一步重新
 #: 看一次(复审 L-1)。只看图本身,与主模型、单图预算无关(复审第五轮 L3),所以版本就是全部的标签。
-#: 第六轮(只转 JPEG、重新校准估算)改成 2。测试按这些常数钉住它:改了常数不改版本就红。
-SKIP_RULES_VERSION: Final = "b322-skip-2"
+#: 第六轮(只转 JPEG、重新校准估算)改成 2;复审后(渐进式 JPEG 不做、全分辨率估算 x1.05)改成 3。
+#: 测试按这些常数钉住它:改了常数不改版本就红。
+SKIP_RULES_VERSION: Final = "b322-skip-3"
 #: run 在本进程里的降级决定 / 小副本至少留这么久(秒),即使时限已过(收尾那一步,审查 N7)。
 RUN_STATE_FLOOR_S: Final = 60.0
 

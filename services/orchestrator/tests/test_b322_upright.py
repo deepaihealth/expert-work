@@ -1667,6 +1667,8 @@ def _skip_rules_fingerprint() -> str:
         region_zoom.CROP_OVERHEAD_PER_PIXEL,
         region_zoom.FULL_COPY_OVERHEAD_BYTES,
         region_zoom.PEAK_SAFETY,
+        region_zoom.FULL_COPY_SAFETY,
+        region_zoom.FULL_COPY_OVERHEAD_PER_PIXEL,
         sorted(region_zoom._BYTES_PER_PIXEL.items()),
         region_zoom.REGION_TARGET_PIXELS,
         region_zoom._JPEG_DRAFT_SCALES,
@@ -1679,5 +1681,5 @@ def test_the_skip_rules_version_is_pinned_to_what_it_depends_on() -> None:
     """复审第五轮 L3 —— 改了支持的格式、内存预算或估算常数却没改 ``SKIP_RULES_VERSION``:旧的「不判」
     决定会一直留着。改了就同时改版本和这里的指纹。"""
     assert {upright_mod.SKIP_RULES_VERSION: _skip_rules_fingerprint()} == {
-        "b322-skip-2": "02a58ebbb0ce36d2",
+        "b322-skip-3": "68df3d19bb354dc0",
     }

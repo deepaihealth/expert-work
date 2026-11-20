@@ -199,7 +199,11 @@ def _header(data: bytes) -> tuple[int, int, str] | None:
     try:
         with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
             (width, height), mode, fmt = image.size, image.mode, image.format or ""
+            # 渐进式 JPEG:解码缓冲的形状没量过,不在支持范围内(复审第六轮 L3,纵深防御)。
+            progressive = bool(image.info.get("progressive") or image.info.get("progression"))
     except (OSError, ValueError, Image.DecompressionBombError):
+        return None
+    if progressive:
         return None
     if mode not in UPRIGHT_MODES.get(fmt, frozenset()):
         return None

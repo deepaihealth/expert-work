@@ -466,6 +466,11 @@ CROP_OVERHEAD_PER_PIXEL: Final = 2.5
 FULL_COPY_OVERHEAD_BYTES: Final = 2 * 1024 * 1024
 #: 候选图 / 小副本的估算在校准之后再乘的安全系数(复审第五轮 M1)。
 PEAK_SAFETY: Final = 1.2
+#: 全分辨率转正图的估算再乘的安全系数(复审第六轮 L1:奇数尺寸 12 MP 估 98.2 实 103.7、方向标记 6
+#: 估 98.2 实 101.1、灰度估 28.2 实 31.3)。灰度的差在每像素上(1.05 盖不住),所以另加每个像素
+#: :data:`FULL_COPY_OVERHEAD_PER_PIXEL` 字节。
+FULL_COPY_SAFETY: Final = 1.05
+FULL_COPY_OVERHEAD_PER_PIXEL: Final = 0.25
 
 
 def crop_peak_bytes(
@@ -515,18 +520,23 @@ def upright_peak_bytes(
     """B-322 审查 H-new —— 解码**之前**估一张 JPEG 全分辨率转正图的峰值内存:解开的那份 + 同时还在的
     另一份(转,或 LANCZOS 的两遍)+ 编码出来的字节 + :data:`FULL_COPY_OVERHEAD_BYTES`。只看文件头
     (尺寸、颜色模式)与 :func:`budget_size` 的缩法。实测(第六轮):12 MP RGB 转 90 度实 95.8 MiB、
-    估 96.3。这份不乘安全系数:它占两个解图名额、单独在算,上限 110 MiB 对 12 MP 留了约 14 MiB。"""
+    估 96.3,再乘 :data:`FULL_COPY_SAFETY`(1.05;审查量到奇数尺寸 12 MP 实 103.7、灰度实 31.3,
+    都不超过乘后的估算)。它占两个解图名额、单独在算,上限 110 MiB。"""
     bpp = _BYTES_PER_PIXEL[mode]
     plan = budget_size(width, height, max_pixels)
-    extra = encoded_bytes + FULL_COPY_OVERHEAD_BYTES
+    fixed = encoded_bytes + FULL_COPY_OVERHEAD_BYTES
     if plan is None:
-        return 2 * width * height * bpp + extra
-    dw, dh = _scaled((width, height), plan.draft)
-    decoded = dw * dh * bpp
-    if plan.resize:
-        tw, th = plan.target
-        return decoded + tw * dh * bpp + tw * th * bpp + extra
-    return 2 * decoded + extra
+        pixels = width * height
+        raw = 2 * pixels * bpp
+    else:
+        dw, dh = _scaled((width, height), plan.draft)
+        pixels = dw * dh
+        if plan.resize:
+            tw, th = plan.target
+            raw = pixels * bpp + tw * dh * bpp + tw * th * bpp
+        else:
+            raw = 2 * pixels * bpp
+    return math.ceil((raw + fixed + FULL_COPY_OVERHEAD_PER_PIXEL * pixels) * FULL_COPY_SAFETY)
 
 
 def _replaced(old: Image.Image, new: Image.Image) -> Image.Image:
