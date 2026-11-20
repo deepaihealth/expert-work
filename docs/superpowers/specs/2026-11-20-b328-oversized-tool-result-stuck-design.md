@@ -229,6 +229,16 @@
 - 不记住被拒的事:下一步、下一轮照常走,再被拒就再缩一次(每次多一个被拒请求;4xx 是否计费**未核实**)。是否按对话记住见 §8 D7。
 - `LLMClientError` 今天不换厂商、不重试(`llm_error_handling.py:62-70`,`router.py:587-592`),新子类沿用;重试由 `agent_node` 自己做,只一次。
 
+**实现定稿(2026-11-20,PR R 三轮代码审查后,以本段为准;上面「输入类词 + 长度类词同时出现」的判法已被取代)**:
+
+1. **按短语认**:`context length/window`、`maximum context`、`prompt (is) too long`、`input` 后 30 字内跟 `too long/length`、`input token count` 后 40 字内跟 `exceeds`、`exceeded model token limit`、`上下文` 或 `输入` 后 10 字内跟 `长度/超过/超出/超长`。
+2. **排除词**:命中短语前后 60 字内出现 `rate limit`、`per minute`、`quota`、`budget_tokens`、`completion tokens`、`image` 就不算;正文其它位置出现不影响。`max_tokens` 不是排除词。
+3. **用在哪**:只在 4xx 通用分支(401/402/408/409/429/403 之后)和 OpenAI、Anthropic 两个流式适配器错误事件的默认分支之前。正例都是核过出处的厂商原话(OpenAI、Anthropic、通义、智谱、Kimi、Gemini);DeepSeek 原文没核到,没收。
+4. **输入还是输出占大头**:厂商写明「输入 N + 要求的输出 M > 窗口 W」时(OpenAI「N in the messages, M in the completion」、Anthropic「N + M > W」),N ≤ W/2 说明是输出上限撑爆,缩输入救不了:不重试,直接 `vendor_rejected`,报错写「input + requested output exceeds the window」;否则照常缩一次重试一次。
+5. **重试**:从 before chain 之前的提示词狠缩一次,重走 before chain(预算收尾那一步旁路缓存),只重试一次;缩后的提示词替换 `messages`;被拒的那次不计费、不写缓存。
+6. **结构化输出重发**:被说太长时同样狠缩一次、重试一次,不再查缓存;再被拒就 `vendor_rejected`,报错里的估算与主调用同一个估算器。
+7. **日志**:只记阶段、状态码、错误类型和正文长度;厂商原话只放在报错里(前 200 字)。
+
 ### 4.3 PR B —— 读文档按智能体的预算返回
 
 - **单条上限按 R**:`read_document` 返回给模型的正文按 R 截,用平台估算器量 token(中文 1 字约 0.88 token,§1.5)。R 由工厂建工具时传入(与压缩器同一个 T)。
@@ -435,4 +445,5 @@
   - **X2** 「输入」类词去掉 `messages`;正反样例必须用开发时核实过的厂商原话。
   - **X3** 两条测不红的用例改列为护栏,写清各自守什么。
   - **X4** A 和 B 合成一个 PR(§7)。
+- 第 4.2 版(2026-11-20,PR R 代码审查后):§4.2 补「实现定稿」—— 识别规则改为短语 + 就近排除词,加「输入还是输出占大头」与结构化重发的救法、日志不记厂商原话。
 - 第 4.1 版(2026-11-20,代码审查后):§0「会变的地方」补列其它带副本的大工具结果(含本步刚返回的)与关了压缩的智能体;范围本来就在 D2 / A② 的定义里,只是 §0 漏写(代码审查 M1、L6)。
