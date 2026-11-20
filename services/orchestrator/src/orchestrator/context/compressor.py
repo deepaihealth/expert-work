@@ -758,7 +758,8 @@ class ContextCompressor:
     #: 终审 #3 —— **今天 ``>= 1`` 的任何值效果都一样**。第 1 遍之后提示词是
     #: 「头 + 摘要 + 尾」,第 2 遍起中段永远只剩那份摘要(``head_keep == 0`` 时连
     #: 摘要都被并进开头的 system 段、中段为空),:meth:`_compress_once` 按「中段已空」
-    #: 立即抛(B-64 Task 7 回修第 4 轮)。原来第 2..n 遍是用空 NEW EVENTS 调「更新」,
+    #: 立即抛(B-64 Task 7 回修第 4 轮;B-328 起 :meth:`compress` 接住后交回照发)。
+    #: 原来第 2..n 遍是用空 NEW EVENTS 调「更新」,
     #: 靠模型碰巧把摘要写短才可能过线。字段留着:存量 manifest 带着它,而
     #: ``ContextCompressionPolicy`` 是 ``extra="forbid"``,删掉会让它们 422。
     max_passes: int = 3

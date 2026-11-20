@@ -2901,6 +2901,9 @@ PY
 - [ ] **128.4 翻页接着读**:追问文档后半部分的内容。判据:模型用 `read_file` 按 footer 给的路径带 offset / limit 翻页,每页不超过约 1.3 万字;回答对得上原文。**没修好时**:模型看不到后半部分、或一页就把上下文塞满。
 - [ ] **128.5 技能不截**:让它读那个中文技能。判据:发给模型的那份里 `skill_view` 结果没有 B-328 的截短说明(「only the first … are shown here to keep each result within this agent's per-result budget」)。注:超过 1.2 万字的工具结果在工具返回时本来就外置成「开头 + 结尾预览 + footer」(B-328 之前就如此,`skill_view` 不在免外置名单里),所以约 2 万字的技能看到的是那份预览,不算本节失败;要看「完整」就用 1.2 万字以内的技能。**没修好时**:技能正文后面跟着 B-328 的截短说明。
 - [ ] **128.6 默认配置不受影响**:任一默认配置(压缩门槛 20 万)的智能体读一份几千字的文档。判据:结果与上线前一样,没有截断说明、没有 footer。
+- [ ] **128.7 跑代码打印的大段输出也截到 R**:同一个测试智能体(门槛 6 万,R = 12,000)让它用 `exec_python` 打印约 2 万字中文。判据:工具返回时照旧落盘(footer 指向 `.tool_results/<run>/…-exec_python.txt`);发给模型的那份里这条结果约 1.3 万字以内、关围栏之后有「only the first … are shown … The full text is saved at … page through it with read_file」;再追问输出后半段,模型用 `read_file` 按那个路径带 offset / limit 翻页读到。同样适用于 bash、http / MCP / `web_search` 这类带工作区副本的结果,以及本步刚返回的那条。**没修好时**:这条结果原样约 1.8 万 token 留在提示词里。
+
+**注意**:A②(单条预算截短)和 A③(发送前超窗口才狠缩 / 失败)与压缩开关无关 —— `context_compression.enabled: false` 的智能体也有,R 按它策略里的门槛数算。
 
 厂商说「上下文太长」时缩一次重试(PR R)不在本节,只有单测;真栈上不故意造超窗口请求。
 

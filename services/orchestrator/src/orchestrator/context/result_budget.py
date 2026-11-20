@@ -191,17 +191,32 @@ def _source_path(message: ToolMessage, args: Mapping[str, Any] | None) -> str | 
         return None
     if not any(m in raw for m in _UNSTABLE_PATH_MARKERS):
         return raw
-    fenced = _fenced(message.content) if isinstance(message.content, str) else None
-    later = _LATER_TURNS_PATH_RE.search(fenced[2]) if fenced is not None else None
+    # 没开 spotlight 时正文和平台 notice 分不开(正文可能伪造这句),不认。
+    fenced = isinstance(message.content, str) and _fenced(message.content) is not None
+    region = _platform_region(message) if fenced else None
+    later = _LATER_TURNS_PATH_RE.search(region) if region is not None else None
     return later.group(1) if later is not None else None
+
+
+def _platform_region(message: ToolMessage) -> str | None:
+    """找 footer / B-317 那句时只看工具回执里平台写的那段:开了 spotlight 是关围栏之后;
+    并且去掉后来贴上的恢复建议 / ``<platform-context>``(A③ 时它们已在,里面的工作区快照
+    会列出别的文件名)。没开 spotlight 时只能是整条去掉尾巴。"""
+    content = message.content
+    if not isinstance(content, str):
+        return None
+    fenced = _fenced(content)
+    region = fenced[2] if fenced is not None else content
+    return region[: len(region) - len(_tails(region, True))]
 
 
 def _copy_path(message: ToolMessage) -> str | None:
     """工作区里的全文副本(持久化路径优先,其次 footer 里取出的路径 —— 与清理闸同一套:
-    只取正则认得的路径;围栏里伪造的 footer 被数据标记打断,认不出来)。"""
+    只取正则认得的路径)。"""
     path = _artifact_path(message)
-    if path is None and isinstance(message.content, str):
-        path = _footer_claimed_path(message.content)
+    region = _platform_region(message)
+    if path is None and region is not None:
+        path = _footer_claimed_path(region)
     return path
 
 
@@ -260,7 +275,7 @@ def _shrink_one(
     recovery = _recovery(message, args) or ""
     name = message.name or "tool"
     # 原来多大:footer 里记着全文大小就用它(上下文里那段本来就是截过的)。
-    total = _footer_total_chars(content) or _visible_len(parts.body)
+    total = _footer_total_chars(_platform_region(message) or "") or _visible_len(parts.body)
 
     def render(head: str) -> str:
         return _fence(parts.nonce, head) + _shrink_note(name, total, _visible_len(head), recovery)
@@ -354,8 +369,13 @@ def _collapse_prior(message: ToolMessage, args: Mapping[str, Any] | None) -> Too
             f"to fit the model's context window. {reread}\n{_PRUNE_TAG_CLOSE}"
         )
     else:
-        stub = _collapsed_content(message, lossy_note="older context, not preserved") or content
-    return message if stub == content else message.model_copy(update={"content": stub})
+        collapsed = _collapsed_content(message, lossy_note="older context, not preserved")
+        if collapsed is None:
+            return message
+        stub = collapsed
+    # 失败结果上贴的恢复建议(B-163,几百字)照样挂着:收起的是原文,不是平台对这次失败的说明。
+    tails = _split(content, keep_tails=True).tails
+    return message.model_copy(update={"content": stub + tails})
 
 
 def hard_shrink(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
@@ -405,8 +425,12 @@ def fit_to_window(
     tools: Sequence[ToolSpec],
     *,
     budget: ContextBudget,
+    skip_deferred: bool = False,
 ) -> list[BaseMessage]:
     """A③ —— 发送前按「消息 + 工具定义」估一次,只防超过主模型的整个窗口 W。
+
+    ``skip_deferred``:厂商侧搜工具(``native_search``)时,标了 ``defer_loading`` 的工具
+    不进上下文,不计;``allowed_tools`` 那一档全量 schema 照样上线,要计(调用方按档位传)。
 
     ≤ W 原样返回。> W 先 :func:`hard_shrink` 一次;缩完 ≤ W 返回缩后的(调用方用它替换本步
     的 ``messages``:缓存查 / 存、结构化重发、计费都用这一份);仍 > W 抛
@@ -418,7 +442,8 @@ def fit_to_window(
     """
     est = budget.estimator or CharTokenEstimator()
     window = budget.window_tokens
-    tool_tokens = tool_definition_tokens(tools, est)
+    counted = [t for t in tools if not t.defer_loading] if skip_deferred else list(tools)
+    tool_tokens = tool_definition_tokens(counted, est)
     total = sum(estimate_message(m, est) for m in messages) + tool_tokens
     if total <= window:
         return list(messages)

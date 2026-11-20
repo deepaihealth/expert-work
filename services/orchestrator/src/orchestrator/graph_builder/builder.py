@@ -1360,7 +1360,10 @@ def build_react_graph(
         # 提示词替换本步 ``messages``(缓存查 / 存、结构化重发、计费都用它)。在 before chain 前。
         if context_budget is not None:
             messages = fit_to_window(
-                messages, [] if budget_exhausted else tools, budget=context_budget
+                messages,
+                [] if budget_exhausted else tools,
+                budget=context_budget,
+                skip_deferred=tool_disclosure == "native_search",
             )
         # B-66 — ``:regenerate`` 的 run:本轮不查响应缓存(写入照常)。
         cache_bypass = configurable.get(LLM_CACHE_BYPASS_KEY) is True
