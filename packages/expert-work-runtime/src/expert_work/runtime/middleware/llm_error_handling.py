@@ -81,6 +81,14 @@ class LLMUnauthorizedError(LLMClientError):
     """
 
 
+class LLMContextTooLongError(LLMClientError):
+    """B-328 PR R —— 厂商说「输入太长 / 超过上下文」(HTTP 4xx,或流式中途的错误事件)。
+
+    仍是 :class:`LLMClientError`:不重试、不换厂商、不记熔断(同一份提示词换谁都一样长)。
+    ``agent_node`` 主调用接住它,狠缩一次再试一次(``graph_builder.vendor_too_long``)。
+    """
+
+
 class LLMServerError(LLMError):
     """5xx-class error — vendor-side fault. Retried + counts toward breaker."""
 
