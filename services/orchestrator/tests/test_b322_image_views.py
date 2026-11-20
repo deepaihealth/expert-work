@@ -658,3 +658,22 @@ def test_the_jpeg_draft_request_picks_the_intended_scale() -> None:
     image = Image.open(io.BytesIO(raw))
     image.draft("RGB", _draft_request(image.size, 4))
     assert image.size == (2372, 1581)
+
+
+def test_a_large_png_is_reduced_before_the_full_frame_crop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """复审 —— 不是 JPEG 的图没有解码时缩:整张框的裁图(问方向的候选 / 小副本)先整数倍缩一次,
+    不在原尺寸上裁 / 转(48.8 MP PNG 570 → 228 MiB)。结果尺寸不变(仍缩到约 150 万像素)。"""
+    from orchestrator.tools.region_zoom import crop_image
+
+    factors: list[int] = []
+    real = Image.Image.reduce
+
+    def spy(self: Image.Image, factor: Any, box: Any = None) -> Image.Image:
+        factors.append(factor)
+        return real(self, factor, box)
+
+    monkeypatch.setattr(Image.Image, "reduce", spy)
+    raw = _encode(Image.new("RGB", (4000, 3000), (30, 60, 90)), "PNG")
+    (crop,) = crop_image(raw, [(0, 0, 1000, 1000)], 90)
+    assert factors == [2]
+    assert crop.width * crop.height <= 1_500_000
