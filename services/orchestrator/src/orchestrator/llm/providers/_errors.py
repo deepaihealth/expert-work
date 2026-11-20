@@ -31,6 +31,7 @@ substrings — conservative but covering the common vendor phrasings (OpenAI
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 
 from expert_work.runtime.middleware import (
@@ -67,29 +68,33 @@ def _looks_account_dead(body: str) -> bool:
     return any(marker in low for marker in _KEY_DEAD_MARKERS)
 
 
-# B-328 PR R —— 「输入太长」要**同时**有一个说输入的词和一个说长度的词(不认厂商名)。不收
-# ``messages``:OpenAI / Anthropic 的 400 正文常以 ``messages.0.content.1.image…`` 这种 JSON
-# 路径开头,收了它「图片超过 5 MB」也会命中。核过的厂商原话见 ``test_b328_vendor_too_long``。
-_INPUT_WORDS: tuple[str, ...] = ("context", "prompt", "input", "上下文", "输入", "提示")
-_LENGTH_WORDS: tuple[str, ...] = (
-    "length",
-    "too long",
-    "tokens",
-    "maximum",
-    "exceed",
-    "长度",
-    "超过",
-    "超出",
+# B-328 PR R —— 「输入太长」按**短语**认,不按两个散落的词(审查 R1:``budget_tokens: Input
+# should be …``、严格 schema 的 ``In context=(…), 'maximum' is not permitted``、``input image
+# exceeds the maximum size`` 用「输入词 + 长度词」都会误中)。不收 ``messages``:OpenAI / Anthropic
+# 的 400 正文常以 ``messages.0.content.1.image…`` 这种路径开头。核过出处的厂商原话(正反例)见
+# ``test_b328_vendor_too_long``。
+_TOO_LONG_RE = re.compile(
+    r"context (?:length|window)"
+    r"|maximum context"
+    r"|prompt (?:is )?too long"
+    r"|input.{0,30}(?:too long|length)"
+    r"|exceeded model token limit"
+    r"|上下文.{0,10}(?:长度|超过|超出|超长)"
+    r"|输入.{0,10}(?:长度|超过|超出|超长)"
+)
+#: 同一句里说的是限流、额度、输出上限、思考预算或图片 —— 缩输入救不了,不认。
+_NOT_TOO_LONG_RE = re.compile(
+    r"rate limit|rate_limit|per minute|quota|max_tokens|budget_tokens|completion tokens|image"
 )
 
 
 def looks_context_too_long(body: str) -> bool:
     """B-328 PR R —— 厂商这句话是不是在说「输入太长 / 超过上下文」。
 
-    只在 4xx 的通用分支(401 / 402 / 408 / 409 / 429 / 403 都已先分走,限流到不了这里)和
-    两个流式适配器的错误事件默认分支之前用。"""
+    只在 4xx 的通用分支(401 / 402 / 408 / 409 / 429 / 403 都已先分走)和两个流式适配器的
+    错误事件默认分支之前用(流式那里没有状态码,网关的限流事件也会提到 input tokens)。"""
     low = body.lower()
-    return any(word in low for word in _INPUT_WORDS) and any(word in low for word in _LENGTH_WORDS)
+    return _TOO_LONG_RE.search(low) is not None and _NOT_TOO_LONG_RE.search(low) is None
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:

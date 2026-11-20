@@ -1562,7 +1562,11 @@ def build_react_graph(
                         tools=tools,
                         call=_main_call,
                         before_llm_chain=before_llm_chain,
-                        chain_payload={"tenant_id": tenant_id, "llm_cache_bypass": cache_bypass},
+                        # 收尾那一步本来就不用缓存(工具调用的缓存回答会把循环带回去)。
+                        chain_payload={
+                            "tenant_id": tenant_id,
+                            "llm_cache_bypass": cache_bypass or budget_exhausted,
+                        },
                         estimator=(context_budget.estimator if context_budget is not None else None)
                         or token_estimator,
                     )
@@ -3819,12 +3823,28 @@ async def _finalize_structured_response(
         response = cache_hit
     else:
         _llm_structured_finalize_total.labels(outcome="resend").inc()
+
         # Same span + cancellation discipline as the primary call (E.15 /
         # 10.1): a cancel mid-resend interrupts the in-flight await.
-        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "llm_call"):
-            response = await token.run_cancellable(
-                caller(messages=finalize_messages, tools=[], output_schema=spec)
+        async def _resend(prompt: list[BaseMessage]) -> AIMessage:
+            return await token.run_cancellable(
+                caller(messages=prompt, tools=[], output_schema=spec)
             )
+
+        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "llm_call"):
+            try:
+                response = await _resend(finalize_messages)
+            except LLMContextTooLongError as rejected:
+                # B-328 PR R —— 重发同样狠缩一次、重试一次(不再重查缓存)。
+                finalize_messages, response, _ = await retry_after_too_long(
+                    rejected,
+                    pre_chain_messages=finalize_messages,
+                    tools=[],
+                    call=_resend,
+                    before_llm_chain=None,
+                    chain_payload={},
+                    estimator=None,
+                )
 
     # B3 — stage 2 spend (finding 2 fix): a resend is a second real billed
     # call the pre-hoist budget accounting never saw (it only ran once, on

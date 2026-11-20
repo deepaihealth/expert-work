@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
@@ -53,6 +54,66 @@ async def _noop(_ctx: MiddlewareContext) -> None:
     return None
 
 
+#: OpenAI 的「输入 + 要求的输出」写法:``maximum context length is W tokens. However, you
+#: requested T tokens (N in the messages, M in the completion)``。
+_SPLIT_RE = re.compile(
+    r"maximum context length is (\d+) tokens.{0,80}?\((\d+) in the messages, "
+    r"(\d+) in the completion\)",
+    re.DOTALL,
+)
+
+
+def _input_output_split(text: str) -> tuple[int, int, int] | None:
+    """厂商报了「输入 N + 要求的输出 M > 窗口 W」时的 ``(W, N, M)``,读不出来为 ``None``。"""
+    match = _SPLIT_RE.search(text)
+    if match is None:
+        return None
+    window, messages, completion = (int(g) for g in match.groups())
+    return window, messages, completion
+
+
+def _log_rejection(error: LLMContextTooLongError, stage: str) -> None:
+    """只记状态码、错误类型和正文长度 —— 厂商原话只放进报错(它可能带着租户内容)。"""
+    text = str(error)
+    logger.warning(
+        "agent_node.vendor_too_long stage=%s status=%s type=%s chars=%d",
+        stage,
+        getattr(error, "status", None),
+        type(error).__name__,
+        len(text),
+    )
+
+
+def _rejected(
+    error: LLMContextTooLongError,
+    messages: Sequence[BaseMessage],
+    tools: Sequence[ToolSpec],
+    estimator: TokenEstimator | None,
+    *,
+    retried: bool,
+) -> ContextOverflowError:
+    est = estimator or CharTokenEstimator()
+    estimate = sum(estimate_message(m, est) for m in messages) + tool_definition_tokens(tools, est)
+    vendor_text = str(error)[:_VENDOR_TEXT_CHARS]
+    split = _input_output_split(str(error))
+    if split is not None:
+        window, used, completion = split
+        what = (
+            f"input + requested output exceeds the window ({used} input + {completion} "
+            f"output > {window})"
+        )
+    else:
+        what = "the model rejected the prompt as too long"
+    when = "even after one hard shrink" if retried else "(not retried: the input is not the cause)"
+    detail = (
+        f"context overflow: {what} {when}; platform estimate {estimate} tokens (messages + "
+        f"tool definitions); vendor said: {vendor_text}"
+    )
+    return ContextOverflowError(
+        estimated_tokens=estimate, threshold=0, reason="vendor_rejected", detail=detail
+    )
+
+
 async def retry_after_too_long(
     rejected: LLMContextTooLongError,
     *,
@@ -66,37 +127,32 @@ async def retry_after_too_long(
     """狠缩一次、重试一次。返回 ``(本步最终的提示词, 回答, 是否缓存命中)``。
 
     ``chain_payload`` 是 before chain 除 ``messages`` / ``tools`` 以外的那几个键(租户、
-    缓存旁路),与第一次一样。
+    缓存旁路 —— 收尾那一步调用方传旁路,不吃缓存)。``before_llm_chain=None`` 时不重查缓存
+    (结构化重发用)。
+
+    厂商写明了「输入 N + 要求的输出 M」而输入不到窗口一半时,原因是输出上限,缩输入救不了:
+    不重试,直接干净失败。
     """
-    shrunk = hard_shrink(pre_chain_messages)
-    messages = list(shrunk)
+    _log_rejection(rejected, "first")
+    split = _input_output_split(str(rejected))
+    if split is not None and split[1] * 2 <= split[0]:
+        _vendor_too_long_total.labels(outcome="output_side").inc()
+        raise _rejected(rejected, pre_chain_messages, tools, estimator, retried=False) from rejected
+    messages = list(hard_shrink(pre_chain_messages))
     if before_llm_chain is not None:
-        ctx = MiddlewareContext(
-            payload={**chain_payload, "messages": messages, "tools": list(tools)}
-        )
+        payload = {**chain_payload, "messages": messages, "tools": list(tools)}
+        ctx = MiddlewareContext(payload=payload)
         await before_llm_chain.invoke(ctx, _noop)
         messages = list(ctx.payload.get("messages", messages))
         hit = ctx.payload.get("llm_cache_hit")
         if isinstance(hit, AIMessage):
             _vendor_too_long_total.labels(outcome="cache_hit").inc()
             return messages, hit, True
-    logger.warning("agent_node.vendor_too_long_retry error=%s", str(rejected)[:_VENDOR_TEXT_CHARS])
     try:
         response = await call(messages)
     except LLMContextTooLongError as again:
+        _log_rejection(again, "retry")
         _vendor_too_long_total.labels(outcome="rejected_again").inc()
-        est = estimator or CharTokenEstimator()
-        estimate = sum(estimate_message(m, est) for m in messages) + tool_definition_tokens(
-            tools, est
-        )
-        vendor_text = str(again)[:_VENDOR_TEXT_CHARS]
-        detail = (
-            "context overflow: the model rejected the prompt as too long even after one "
-            f"hard shrink; platform estimate {estimate} tokens (messages + tool "
-            f"definitions); vendor said: {vendor_text}"
-        )
-        raise ContextOverflowError(
-            estimated_tokens=estimate, threshold=0, reason="vendor_rejected", detail=detail
-        ) from again
+        raise _rejected(again, messages, tools, estimator, retried=True) from again
     _vendor_too_long_total.labels(outcome="retried").inc()
     return messages, response, False

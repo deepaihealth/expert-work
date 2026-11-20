@@ -2905,7 +2905,7 @@ PY
 
 **注意**:A②(单条预算截短)和 A③(发送前超窗口才狠缩 / 失败)与压缩开关无关 —— `context_compression.enabled: false` 的智能体也有,R 按它策略里的门槛数算。
 
-厂商说「上下文太长」时缩一次重试(PR R)与 A+B 同一班车发,只有单测(识别规则的正反样例都是核过出处的厂商原话);真栈上不故意造超窗口请求。发布后看 `/metrics` 的 `expert_work_llm_vendor_too_long_total{outcome}`:`rejected_again` 持续有数说明有厂商估算与平台差得多,记下来另立项。
+厂商说「上下文太长」时缩一次重试(PR R)与 A+B 同一班车发,只有单测(按短语认 + 排除限流 / 额度 / max_tokens / 思考预算 / 图片;正例都是核过出处的厂商原话,反例另有几条审查给的形状);厂商写明「输入 N + 要求的输出 M」且输入不到窗口一半时不重试、直接失败,报错写清是输出上限撑爆;真栈上不故意造超窗口请求。发布后看 `/metrics` 的 `expert_work_llm_vendor_too_long_total{outcome}`:`rejected_again` 持续有数说明有厂商估算与平台差得多,记下来另立项。
 
 ## §129 模型目录:新增豆包 `doubao-seed-2-1-turbo-260628` / `doubao-seed-2-1-lite-260915`(价目表迁移 0196,没有开关)
 
