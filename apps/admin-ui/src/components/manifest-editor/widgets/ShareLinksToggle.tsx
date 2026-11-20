@@ -1,5 +1,7 @@
 /**
- * ShareLinksToggle — B-326「分享文件链接」开关 + 有效期。
+ * ShareLinksToggle — B-326「分享文件链接」勾选框 + 有效期。
+ *
+ * 和上面的工具勾选框同一个样式、同一列；有效期是它下面缩进的一行子选项。
  *
  * 开:写 ``share_links: {enabled: true}``(用户填过有效期才带 ``ttl_minutes``)。
  * 关:整块删掉,不写 ``enabled: false`` —— 后端口径是「不写 = 关,且不落库」。
@@ -7,7 +9,7 @@
  * 有效期只在开着时显示,5..1440 分钟,留空 = 平台默认 120。手改 YAML 写出范围外的值时,
  * 输入框标红并通过 ``useReportFormErrors`` 拦住保存(后端同样会拒)。
  */
-import { InputNumber, Switch, Typography } from "antd";
+import { Checkbox, InputNumber, Typography } from "antd";
 import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -24,6 +26,9 @@ import {
 } from "../form_model";
 
 const { Text } = Typography;
+
+// Lines the lifetime row up under the checkbox label (antd box 16px + 8px gap).
+const SUB_OPTION_INDENT = 24;
 
 interface ShareLinksToggleProps {
   formData: unknown;
@@ -57,28 +62,43 @@ export function ShareLinksToggle({ formData, onChange }: ShareLinksToggleProps) 
   });
 
   return (
-    <div data-testid="af-share-links" style={{ marginTop: 12 }}>
-      <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-        <Switch
+    <div data-testid="af-share-links">
+      <span>
+        <Checkbox
           checked={enabled}
-          data-testid="af-share-links-switch"
-          aria-label={t("agent_form.share_links_label")}
-          onChange={toggle}
-        />
-        <Text>{t("agent_form.share_links_label")}</Text>
+          data-testid="af-share-links-checkbox"
+          onChange={(e) => toggle(e.target.checked)}
+        >
+          {t("agent_form.share_links_label")}
+        </Checkbox>
         <FieldHelp text={t("agent_form.share_links_help")} testId="af-share-links" />
       </span>
       {!enabled && ttlInvalid && (
         // Hand-edited YAML: the input is hidden while off, but the stored value is
         // still validated by the backend — say why saving is blocked.
-        <Text type="danger" data-testid="af-share-links-ttl-error" style={{ display: "block" }}>
+        <Text
+          type="danger"
+          data-testid="af-share-links-ttl-error"
+          style={{ display: "block", marginLeft: SUB_OPTION_INDENT }}
+        >
           {invalidText}
         </Text>
       )}
       {enabled && (
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
-          <Text>{t("agent_form.share_links_ttl_label")}</Text>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: 8,
+            marginTop: 6,
+            marginLeft: SUB_OPTION_INDENT,
+          }}
+        >
+          <Text type="secondary">{t("agent_form.share_links_ttl_label")}</Text>
           <InputNumber
+            size="small"
+            style={{ width: 96 }}
             data-testid="af-share-links-ttl"
             aria-label={t("agent_form.share_links_ttl_label")}
             min={SHARE_LINKS_TTL_MIN}
