@@ -55,6 +55,7 @@ from control_plane.api._run_event_stream import (
     EXTERNAL_HIDDEN_EVENTS,
     EXTERNAL_STRIPPED_STATE_KEYS,
 )
+from control_plane.api._share_links import share_view
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.runs import resolve_approval_decision
 from control_plane.runtime import AgentRuntime
@@ -339,6 +340,16 @@ def build_external_approvals_router() -> APIRouter:
                     runs=runs,
                     run_id=run_record.run_id,
                     tenant_id=tenant_id,
+                ),
+                # B-326 —— 续跑接着暂停前的标记:链接按当前配置重给(第二天才批的审批不会
+                # 再发一遍已过期的链接;暂停期间关了分享链接就不发)。
+                artifact_view=share_view(
+                    request,
+                    tenant_id=tenant_id,
+                    user_id=meta.user_id,
+                    thread_id=meta.thread_id,
+                    agent_name=meta.agent_name,
+                    run_id=run_record.run_id,
                 ),
             ),
             media_type="text/event-stream",

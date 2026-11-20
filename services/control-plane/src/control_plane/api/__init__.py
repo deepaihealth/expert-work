@@ -66,6 +66,7 @@ from control_plane.api.platform_skills import build_platform_skills_router
 from control_plane.api.platform_tool_budget_config import (
     build_platform_tool_budget_config_router,
 )
+from control_plane.api.public_files import build_public_files_router
 from control_plane.api.quality import build_quality_router
 from control_plane.api.quota import build_quota_router
 from control_plane.api.rate_card import build_rate_card_router
@@ -140,6 +141,7 @@ __all__ = [
     "build_platform_recognition_config_router",
     "build_platform_skills_router",
     "build_platform_tool_budget_config_router",
+    "build_public_files_router",
     "build_quality_router",
     "build_quota_router",
     "build_rate_card_router",

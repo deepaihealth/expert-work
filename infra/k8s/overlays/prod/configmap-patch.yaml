@@ -21,6 +21,14 @@ data:
   EXPERT_WORK_OIDC_JWKS_URI: "https://expert-work.deepaihealth.com/kc/realms/expert-work/protocol/openid-connect/certs"
   # 与 test 一致(#1145 第三方对接拍板):成员开通走 password 模式。
   EXPERT_WORK_MEMBER_PROVISIONING_MODE: "password"
+  # B-326 —— 产物分享链接的公开地址(<这个地址>/v1/public/files/<id>,终端用户不登录
+  # 直接打开)。与 test overlay 同一项,只换生产域名。
+  # 注意:ALB / SLS 的访问日志记的是完整路径(含链接 id,即凭据),应用侧的脱敏管不到。
+  EXPERT_WORK_PUBLIC_BASE_URL: "https://expert-work.deepaihealth.com"
+  # B-326 M1 —— 只信这些来源转发的 X-Forwarded-For(按 IP 限流 / 审计记真实客户端)。
+  # = ALB 的两个交换机 vsw-bp1xumod1z9ltvhvtc02p / vsw-bp1djdop0m69qe1u10dte(见 infra/k8s/cluster/prod/albconfig.yaml)的网段(阿里云控制台 2026-11-19 查得)。
+  # 注意:这些交换机里也跑着集群自己的 pod,集群内的 pod 能伪造 XFF——只影响限流分桶和审计 IP。
+  EXPERT_WORK_TRUSTED_PROXY_CIDRS: '["172.26.0.0/16","172.29.0.0/16"]'
   # PROD-12(#1315):每副本的模型 RPM = 配置值 / 本值(向上取整),让
   # N 副本的总出量不超过厂商额度。必须与 control-plane Deployment 的
   # spec.replicas(base 为 2)同步改 —— smoke.sh 校验两者一致。

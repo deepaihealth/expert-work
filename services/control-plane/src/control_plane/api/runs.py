@@ -51,6 +51,7 @@ from control_plane.api._run_event_stream import build_event_producer, make_run_p
 from control_plane.api._run_progress import run_info_fields
 from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._session_title import title_from_text
+from control_plane.api._share_links import share_view, strip_view, thread_share_view
 from control_plane.api._user_scope import (
     caller_owns_thread,
     get_user_repo,
@@ -1647,6 +1648,16 @@ async def spawn_run(
                 run_id=run_record.run_id,
                 tenant_id=tenant_id,
             ),
+            # B-326 —— 直播的 end 也按当前配置给分享链接(跑得比有效期还久的 run 不收尾在
+            # 一条已过期的链接上)。
+            artifact_view=share_view(
+                request,
+                tenant_id=tenant_id,
+                user_id=effective_user_id,
+                thread_id=thread_id,
+                agent_name=record_spec.metadata.name,
+                run_id=run_record.run_id,
+            ),
         )
 
     if queued_behind is not None:
@@ -1707,6 +1718,15 @@ async def spawn_run(
                 launch=_launch,
                 is_disconnected=request.is_disconnected,
                 cancel_on_disconnect=on_disconnect is DisconnectMode.CANCEL,
+                # B-326 —— 别的副本跑完了这一轮时,收尾 end 帧上的分享链接按当前配置续。
+                artifact_view=share_view(
+                    request,
+                    tenant_id=tenant_id,
+                    user_id=effective_user_id,
+                    thread_id=thread_id,
+                    agent_name=record_spec.metadata.name,
+                    run_id=run_id,
+                ),
             ),
             media_type="text/event-stream",
             headers=headers,
@@ -2680,6 +2700,20 @@ def build_runs_router() -> APIRouter:
             ),
             since_seq=since_seq,
             scope=lambda: applied_scope(scope),
+            # B-326 —— 平台运维跨租户审计查看时,三条 end 分支(回放 / 探针 / live)都不出
+            # 分享链接;同租户的控制台本来就能下载这些文件,与对外接口一样按当前配置给。
+            artifact_view=(
+                strip_view
+                if target_tenant != request.state.tenant_id
+                else share_view(
+                    request,
+                    tenant_id=target_tenant,
+                    user_id=meta.user_id,
+                    thread_id=thread_id,
+                    agent_name=meta.agent_name,
+                    run_id=run_id,
+                )
+            ),
         )
         headers = {
             "Cache-Control": "no-cache",
@@ -2773,6 +2807,13 @@ def build_runs_router() -> APIRouter:
                     runs=request.app.state.run_store,
                     run_id=run_record.run_id,
                     tenant_id=request.state.tenant_id,
+                ),
+                # B-326 —— 续跑接着暂停前的标记:链接按当前配置重给。
+                artifact_view=await thread_share_view(
+                    request,
+                    tenant_id=request.state.tenant_id,
+                    thread_id=thread_id,
+                    run_id=run_record.run_id,
                 ),
             ),
             media_type="text/event-stream",

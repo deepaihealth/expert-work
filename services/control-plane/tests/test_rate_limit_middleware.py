@@ -218,3 +218,31 @@ async def test_no_salt_falls_back_to_per_instance_random_key() -> None:
     )
     bucket_other = await _fetch_apikey_bucket(stub_other)
     assert bucket_other != bucket_first  # independent instance → different random key
+
+
+@pytest.mark.asyncio
+async def test_public_share_path_ignores_unverified_api_key_header() -> None:
+    """B-326 —— ``/v1/public/…`` never verifies ``X-API-Key``; a random header per request
+    must not buy a fresh bucket, so those paths always use the IP bucket."""
+    stub = _StubLimiter(
+        decision=RateLimitDecision(allowed=True, retry_after_s=0.0, remaining=5.0),
+        calls=[],
+    )
+    app = FastAPI()
+    app.add_middleware(RateLimitMiddleware, limiter=stub)
+
+    @app.get("/v1/public/files/{link_id}")
+    async def public_file(link_id: str) -> JSONResponse:
+        return JSONResponse({"id": link_id})
+
+    @app.get("/v1/public/files/{link_id}/{name}")
+    async def public_file_named(link_id: str, name: str) -> JSONResponse:
+        return JSONResponse({"id": link_id, "name": name})
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.get("/v1/public/files/abc", headers={"X-API-Key": "random-1"})
+        await client.get("/v1/public/files/abc", headers={"X-API-Key": "random-2"})
+        await client.get("/v1/public/files/abc/report.pdf", headers={"X-API-Key": "random-3"})
+    assert [dimension for dimension, _ in stub.calls] == ["ip", "ip", "ip"]
+    assert len({key for _, key in stub.calls}) == 1

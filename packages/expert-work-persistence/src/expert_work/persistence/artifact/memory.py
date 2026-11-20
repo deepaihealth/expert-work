@@ -156,6 +156,49 @@ class InMemoryArtifactStore(ArtifactStore):
             return None
         return self._latest_of(artifact)
 
+    async def get_latest_version_under(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, path_prefix: str
+    ) -> ArtifactVersion | None:
+        if (
+            await self.get_by_id(tenant_id=tenant_id, user_id=user_id, artifact_id=artifact_id)
+            is None
+        ):
+            return None
+        under = [
+            v
+            for v in self._versions
+            if v.artifact_id == artifact_id and v.path_in_workspace.startswith(path_prefix)
+        ]
+        return max(under, key=lambda v: v.version) if under else None
+
+    async def get_by_id(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID
+    ) -> Artifact | None:
+        artifact = self._artifacts.get(artifact_id)
+        if (
+            artifact is None
+            or artifact.tenant_id != tenant_id
+            or artifact.user_id != user_id
+            or artifact.deleted_at is not None
+        ):
+            return None
+        return artifact
+
+    async def get_live_versions(
+        self, *, tenant_id: UUID, user_id: UUID, version_ids: Sequence[UUID]
+    ) -> dict[UUID, tuple[Artifact, ArtifactVersion]]:
+        wanted = set(version_ids)
+        out: dict[UUID, tuple[Artifact, ArtifactVersion]] = {}
+        for v in self._versions:
+            if v.id not in wanted:
+                continue
+            artifact = await self.get_by_id(
+                tenant_id=tenant_id, user_id=user_id, artifact_id=v.artifact_id
+            )
+            if artifact is not None:
+                out[v.id] = (artifact, v)
+        return out
+
     async def get_version_by_id(
         self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, version: int
     ) -> ArtifactVersion | None:

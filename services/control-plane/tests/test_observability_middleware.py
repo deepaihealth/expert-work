@@ -191,3 +191,33 @@ async def test_real_app_opens_no_fastapi_native_spans(
         if s.instrumentation_scope is not None
     }
     assert "fastapi" not in scopes
+
+
+@pytest.mark.asyncio
+async def test_share_link_id_is_not_recorded_on_the_span(
+    tracer_provider: TracerProvider,
+) -> None:
+    """B-326 L6 —— the link id is a bearer credential: the span keeps the route shape."""
+    app = FastAPI(telemetry=NATIVE_TELEMETRY_OFF)
+    app.add_middleware(ObservabilityMiddleware)
+
+    @app.get("/v1/public/files/{link_id}")
+    async def public_file(link_id: str) -> JSONResponse:
+        return JSONResponse({"id": link_id})
+
+    @app.get("/v1/public/files/{link_id}/{name}")
+    async def public_file_named(link_id: str, name: str) -> JSONResponse:
+        return JSONResponse({"id": link_id, "name": name})
+
+    exporter: InMemorySpanExporter = tracer_provider.test_exporter  # type: ignore[attr-defined]
+    exporter.clear()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.get("/v1/public/files/AbCdEfGhIjKlMnOp")
+        await client.get("/v1/public/files/AbCdEfGhIjKlMnOp/report.pdf")
+    attrs = [
+        dict(s.attributes or {})
+        for s in exporter.get_finished_spans()
+        if s.name == "expert_work.control_plane.http_request"
+    ]
+    assert [a.get("http.target") for a in attrs] == ["/v1/public/files/{link_id}"] * 2
+    assert "AbCdEfGhIjKlMnOp" not in repr(attrs)

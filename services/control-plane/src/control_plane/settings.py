@@ -14,11 +14,14 @@ from __future__ import annotations
 from typing import Literal
 from uuid import UUID
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from control_plane.client_ip import parse_trusted_proxies
+from expert_work.persistence.artifact_share import DEFAULT_MAX_DOWNLOADS
 from expert_work.protocol import PROVIDER_CATALOG, Provider, Tool
 from orchestrator.tools.sandbox_image_contract import MAX_TIMEOUT_S
+from orchestrator.tools.share_file import PUBLIC_FILES_PATH, normalize_public_base_url
 
 #: Default tenant UUID assigned to header-less dev requests. ``00...00`` is
 #: deliberately the nil UUID so it sticks out in audit_log dumps.
@@ -177,6 +180,40 @@ class Settings(BaseSettings):
     #: manages its own async pool. ``None`` is only valid when
     #: ``checkpointer_backend`` is ``memory``.
     checkpointer_dsn: str | None = None
+
+    #: B-326 —— this deployment's public base URL (scheme + host, e.g.
+    #: ``https://expert-work-test.deepaihealth.com``), used to build artifact share
+    #: links (``<base>/v1/public/files/<id>/<name>``) that end users open without
+    #: logging in. ``None`` = share links are unavailable: an agent that enables
+    #: ``spec.share_links`` fails to build with a clear error. Validated at load
+    #: (absolute http(s), no quote / backslash / whitespace — integrators pass the
+    #: link on verbatim).
+    public_base_url: str | None = None
+
+    #: B-326 M-e —— downloads one share link may serve. Counted atomically per link;
+    #: past it the public endpoint answers the same opaque 404 as an expired link, so a
+    #: forwarded link cannot drain the tenant's ``artifact_download`` quota.
+    share_link_max_downloads: int = Field(default=DEFAULT_MAX_DOWNLOADS, ge=1)
+
+    #: B-326 M1 —— CIDRs (or addresses) of the reverse proxies in front of the
+    #: control plane whose ``X-Forwarded-For`` is believed for the client IP (gateway
+    #: per-IP rate limit, public-download audit). Empty (default) = trust nobody: the
+    #: TCP peer is the client. Set it to the load balancer's source ranges only —
+    #: anything wider lets a caller choose its own rate-limit bucket.
+    trusted_proxy_cidrs: list[str] = Field(default_factory=list)
+
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def _check_trusted_proxy_cidrs(cls, value: list[str]) -> list[str]:
+        parse_trusted_proxies(value)  # raises on a malformed entry
+        return [v.strip() for v in value if v.strip()]
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _check_public_base_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        return normalize_public_base_url(value)
 
     # ------------------------------------------------------------------ tools (E.7)
     #: Base URL of the self-hosted SearXNG instance backing the builtin
@@ -440,8 +477,17 @@ class Settings(BaseSettings):
     #: ``/v1/setup`` is the unauthenticated first-run wizard (gated by the
     #: setup token + the zero-admin invariant). Any other path requires a
     #: valid JWT in M0.
+    #: B-326 —— ``/v1/public/files`` is the artifact share-link download
+    #: (``GET /v1/public/files/{id}``): the link itself is the credential (a
+    #: 16-char random id, time-limited), the end user holding it has no principal.
     auth_exempt_path_prefixes: list[str] = Field(
-        default_factory=lambda: ["/healthz", "/metrics", "/v1/webhooks", "/v1/setup"],
+        default_factory=lambda: [
+            "/healthz",
+            "/metrics",
+            "/v1/webhooks",
+            "/v1/setup",
+            PUBLIC_FILES_PATH,
+        ],
     )
 
     # ------------------------------------------------------------------ mTLS (C.2)

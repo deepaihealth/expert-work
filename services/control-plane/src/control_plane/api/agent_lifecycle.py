@@ -118,6 +118,7 @@ def build_agent_purge_deps(request: Request) -> AgentPurgeDeps:
         artifact_snapshots=getattr(state, "artifact_snapshots", None),
         agent_file_versions=getattr(state, "agent_file_versions", None),
         trajectories=trajectory_store_for(state.agent_runtime),
+        share_links=getattr(state, "artifact_share_link_store", None),
     )
 
 

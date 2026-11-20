@@ -285,6 +285,7 @@ from orchestrator.tools.overflow import (
 )
 from orchestrator.tools.registry import (
     FIGURE_RUN_IDS_KEY,
+    SHARE_LINKS_TTL_KEY,
     TOOL_ALLOWED_STATE_KEYS,
     TURN_ROOT_RUN_KEY,
     WORKSPACE_CLEANED_KEY,
@@ -298,6 +299,7 @@ from orchestrator.tools.registry import (
     workspace_view_fields,
 )
 from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
+from orchestrator.tools.share_file import SHARE_FILE_TOOL_NAME
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 from orchestrator.tools.workspace_paths import (
     WorkspaceView,
@@ -691,6 +693,10 @@ def build_react_graph(
     # B-267 第 3 步 —— 每轮轻量探测(平台开关 ``kb_first_routing`` 开、绑了知识库、智能体
     # 没关 ``knowledge.probe``)。``None``(默认)= 不探测, 提示词与之前逐字相同。
     knowledge_probe: KnowledgeProbe | None = None,
+    # B-326 —— 本智能体开了分享链接(``spec.share_links``)时它的有效期(分钟)。图只用它告诉
+    # 委派出去的子代「根开了、按这个有效期铸」(``ToolContext.share_links_ttl_minutes``):
+    # 根没开时子代不标记交付。``None``(默认)= 没开。
+    share_links_ttl_minutes: int | None = None,
 ) -> StateGraph[AgentState, None, AgentState, AgentState]:
     """Assemble the ReAct ``StateGraph`` and return it uncompiled.
 
@@ -864,6 +870,9 @@ def build_react_graph(
             tools,
             trigger_origin=bool((config.get("configurable") or {}).get("trigger_origin", False)),
         )
+        # B-326 —— 委派出去的子代:根没开分享链接时,``share_file`` 不给模型看;
+        # ``ShareFileTool.call`` 同样拒绝(双保险)。
+        tools = _filter_share_tool(tools, config)
         messages = list(state["messages"])
         # P-1 —— 被取代的轮整段剔除,放在一切上下文闸(pruner / working_window /
         # compressor)之前:它们不占窗口预算、不进摘要。只改 prompt 视图,检查点
@@ -2170,6 +2179,7 @@ def build_react_graph(
             edit_file_streaks=state.get("edit_file_streaks"),
             edit_file_history=state.get("edit_file_history"),
             figure_view_steps=figure_view_steps,
+            share_links_ttl_minutes=share_links_ttl_minutes,
         )
         # B-317 —— 字面量守卫:MCP / http 参数与平台工具的路径参数里不会被展开的 ``$名字``、
         # ``$EXPERT_WORK_*``,以及交给外部服务的本轮本地路径。与手抄守卫同一口径(审批门之后、
@@ -4792,6 +4802,22 @@ async def _project_workspace_state(
     return result
 
 
+def _filter_share_tool(tools: list[ToolSpec], config: RunnableConfig) -> list[ToolSpec]:
+    """B-326 —— a delegated child whose root agent has share links off never sees
+    ``share_file``. A root run keeps its bind list as built (the tool is there only when
+    the agent opted in)."""
+    configurable = config.get("configurable") or {}
+    if configurable.get("child_run") is not True or _root_ttl(configurable) is not None:
+        return tools
+    return [s for s in tools if s.name != SHARE_FILE_TOOL_NAME]
+
+
+def _root_ttl(configurable: Mapping[str, Any]) -> int | None:
+    """B-326 —— the root's share-link lifetime a parent passed down, or ``None``."""
+    raw = configurable.get(SHARE_LINKS_TTL_KEY)
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else None
+
+
 def _filter_scheduling_tools(tools: list[ToolSpec], *, trigger_origin: bool) -> list[ToolSpec]:
     """Withhold manage_task from the LLM under a scheduler-triggered run so the
     model can't self-schedule (Spec 1 D-13). Applied to the final bind list,
@@ -4814,6 +4840,7 @@ def _build_tool_context(
     edit_file_streaks: Mapping[str, Any] | None = None,
     edit_file_history: Mapping[str, Any] | None = None,
     figure_view_steps: int = 0,
+    share_links_ttl_minutes: int | None = None,
 ) -> ToolContext:
     """Lift tenant / user binding out of ``config["configurable"]`` into
     a :class:`ToolContext`. Missing values fall through as ``None`` —
@@ -4945,6 +4972,12 @@ def _build_tool_context(
         edit_file_history=edit_file_history if isinstance(edit_file_history, Mapping) else {},
         turn_root_run_id=_parse_uuid(configurable.get(TURN_ROOT_RUN_KEY)),
         figure_view_steps=figure_view_steps,
+        # B-326 —— 子代用父传下来的根有效期;根 run 用本图接线时的值。
+        share_links_ttl_minutes=(
+            _root_ttl(configurable)
+            if configurable.get("child_run") is True
+            else share_links_ttl_minutes
+        ),
     )
 
 

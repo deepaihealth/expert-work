@@ -65,6 +65,7 @@ import { FallbackChainEditor } from "./widgets/FallbackChainEditor";
 import { McpToolPicker, type McpPickerSource } from "./widgets/McpToolPicker";
 import { OutputSchemaEditor } from "./widgets/OutputSchemaEditor";
 import { PromptTemplateEditor } from "./widgets/PromptTemplateEditor";
+import { ShareLinksToggle } from "./widgets/ShareLinksToggle";
 
 const { Text } = Typography;
 
@@ -485,6 +486,8 @@ export function FormView({
             </span>
           ))}
         </div>
+        {/* B-326 — public, time-limited links to registered artifacts. */}
+        <ShareLinksToggle formData={formData} onChange={onChange} />
         <Text
           type="secondary"
           data-testid="af-tools-config-note"

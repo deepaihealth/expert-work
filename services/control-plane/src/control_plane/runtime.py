@@ -170,6 +170,7 @@ from orchestrator.tools.knowledge_catalog import catalog_fingerprint
 from orchestrator.tools.knowledge_log import LoggedKnowledgeRetriever, RetrievalLogSink
 from orchestrator.tools.knowledge_rerank import RerankOutcome, RerankRanking
 from orchestrator.tools.locks import KeyedLock, ProcessKeyedLock
+from orchestrator.tools.share_file import ShareLinkService
 from orchestrator.trajectory.recorder import TrajectoryRecorder
 from orchestrator.usage_metering import (
     MeteredLLMCaller,
@@ -2278,6 +2279,7 @@ def build_tool_env(
     embedding_model_key: Callable[[], Awaitable[str | None]] | None = None,
     reading_rule: bool = False,
     figure_view_steps: int = 0,
+    share_links: ShareLinkService | None = None,
 ) -> ToolEnv:
     """Assemble the M0 :class:`ToolEnv`.
 
@@ -2313,6 +2315,8 @@ def build_tool_env(
         artifact_snapshots=artifact_snapshots,
         # B-236 —— 对话开场复制按对话互斥;没给(单测 / 无库)就是进程内的锁。
         conversation_seed_lock=conversation_seed_lock or ProcessKeyedLock(),
+        # B-326 —— 产物分享链接(配了公开地址才有)。
+        share_links=share_links,
         # B-236 review 7 —— 开场复制前问的配额闸(与上传同一道)。
         workspace_quota=workspace_quota,
         # B-267 —— 平台总开关与 web_search 夹具目录(都来自 Settings)。

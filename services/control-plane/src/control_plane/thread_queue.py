@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from control_plane.api._run_event_stream import ArtifactView
 from expert_work.runtime.runs import InterruptReason, RunInfo, RunStatus
 from expert_work.runtime.runs.store import RunStore
 from expert_work.runtime.stream_bridge.base import HEARTBEAT_FRAME
@@ -127,6 +128,7 @@ async def queued_turn_stream(
     launch: Callable[[RunInfo], Awaitable[AsyncIterator[bytes]]],
     is_disconnected: Callable[[], Awaitable[bool]],
     cancel_on_disconnect: bool,
+    artifact_view: ArtifactView | None = None,
     poll_interval_s: float = POLL_INTERVAL_S,
     renew_interval_s: float = RENEW_INTERVAL_S,
     heartbeat_interval_s: float = HEARTBEAT_INTERVAL_S,
@@ -180,7 +182,11 @@ async def queued_turn_stream(
                         end_frame_data(
                             run_id=run_id,
                             status=_END_STATUS[row.status],
-                            artifacts=row.artifacts,
+                            artifacts=(
+                                await artifact_view(row.artifacts)
+                                if artifact_view is not None
+                                else row.artifacts
+                            ),
                             completed=row.completed,
                             exit_reason=row.exit_reason,
                             unresolved_failures=row.unresolved_failures,

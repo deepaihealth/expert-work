@@ -22,6 +22,7 @@ from expert_work.persistence import (
 from expert_work.persistence.agent_disable import AgentDisableStore
 from expert_work.persistence.agent_instance import AgentInstanceStore
 from expert_work.persistence.agent_spec import AgentSpecStore
+from expert_work.persistence.artifact_share import ArtifactShareLinkStore
 from expert_work.persistence.curation import CurationCandidateStore, EvalDatasetStore
 from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.image_upload import ImageUploadStore
@@ -97,6 +98,8 @@ class AgentPurgeDeps:
     agent_file_versions: AgentFileVersionStore | None = None
     #: B-285 —— run 路径写轨迹对象的地方(``runtime.trajectory_recorder``);``None`` = 不写。
     trajectories: TrajectoryStore | None = None
+    #: B-326 —— 这个智能体铸的产物分享链接;``None`` = 这个部署没有分享链接。
+    share_links: ArtifactShareLinkStore | None = None
 
 
 @dataclass(frozen=True)

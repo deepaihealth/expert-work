@@ -35,6 +35,7 @@ from expert_work.persistence import (
     create_async_session_factory,
 )
 from expert_work.persistence.artifact.base import ArtifactStore
+from expert_work.protocol import ArtifactVersion
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 #: 本文件专用的库 —— 见模块 docstring 为什么不能用共享的那个。
@@ -233,3 +234,114 @@ async def test_update_kind_and_list_versions_address_by_id(store: ArtifactStore)
     versions = await store.list_versions(tenant_id=tenant_id, user_id=user_id, artifact_id=row.id)
     assert versions is not None
     assert [v.version for v in versions] == [2, 1]
+
+
+async def test_get_by_id_scopes_and_hides_deleted(store: ArtifactStore) -> None:
+    """B-326 —— 公开分享链接的下载端点按 id 取产物:本租户 + 本用户 + 没软删才返回,带
+    ``agent_key`` / ``name`` 供端点核对。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    await _save(store, tenant_id=tenant_id, user_id=user_id, agent_key=_PLAN, name="报告.docx")
+    [row] = await store.list_for_user(tenant_id=tenant_id, user_id=user_id, agent_key=_PLAN)
+
+    got = await store.get_by_id(tenant_id=tenant_id, user_id=user_id, artifact_id=row.id)
+    assert got is not None
+    assert (got.id, got.agent_key, got.name) == (row.id, _PLAN, "报告.docx")
+    assert await store.get_by_id(tenant_id=tenant_id, user_id=uuid4(), artifact_id=row.id) is None
+    assert await store.get_by_id(tenant_id=uuid4(), user_id=user_id, artifact_id=row.id) is None
+    assert await store.get_by_id(tenant_id=tenant_id, user_id=user_id, artifact_id=uuid4()) is None
+
+    await store.soft_delete(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        agent_key=_PLAN,
+        name="报告.docx",
+        now=datetime.now(UTC),
+    )
+    assert await store.get_by_id(tenant_id=tenant_id, user_id=user_id, artifact_id=row.id) is None
+
+
+async def test_get_latest_version_under_picks_the_newest_under_a_prefix(
+    store: ArtifactStore,
+) -> None:
+    """B-326 LOW-3 —— 「本会话登记的最新一版」一次查询;前缀按字面比较(``_`` / ``%`` 不是通配)。"""
+    tenant_id, user_id = uuid4(), uuid4()
+
+    async def save(path: str) -> int:
+        version = await store.save_version(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            agent_key=_PLAN,
+            name="报告.pdf",
+            kind="document",
+            path_in_workspace=path,
+            created_in_thread=str(uuid4()),
+        )
+        return version.version
+
+    a, b = "agents/p/threads/aaa_1/work/", "agents/p/threads/aaa%1/work/"
+    v1 = await save(a + "报告.pdf")
+    await save(b + "报告.pdf")
+    v3 = await save(a + "sub/报告.pdf")
+    await save("agents/p/报告.pdf")
+    [row] = await store.list_for_user(tenant_id=tenant_id, user_id=user_id, agent_key=_PLAN)
+
+    def under(prefix: str) -> object:
+        return store.get_latest_version_under(
+            tenant_id=tenant_id, user_id=user_id, artifact_id=row.id, path_prefix=prefix
+        )
+
+    got = await under(a)  # type: ignore[misc]
+    assert got is not None
+    assert got.version == v3
+    other = await under(b)  # type: ignore[misc]
+    assert other is not None
+    assert other.version == v1 + 1
+    assert await under("agents/p/threads/zzz/work/") is None  # type: ignore[misc]
+    assert (
+        await store.get_latest_version_under(
+            tenant_id=tenant_id, user_id=uuid4(), artifact_id=row.id, path_prefix=a
+        )
+        is None
+    )
+
+
+async def test_get_live_versions_batches_and_hides_deleted(store: ArtifactStore) -> None:
+    """B-326 M3 —— 读产物清单时一次查完被标记交付的各个版本:版本没了 / 产物软删了 / 别的
+    用户的,一律不在结果里。"""
+    tenant_id, user_id = uuid4(), uuid4()
+
+    async def save(name: str, agent_key: str = _PLAN) -> ArtifactVersion:
+        return await store.save_version(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            agent_key=agent_key,
+            name=name,
+            kind="document",
+            path_in_workspace=name,
+            created_in_thread=str(uuid4()),
+        )
+
+    a1, a2, b1 = await save("a.pdf"), await save("a.pdf"), await save("b.pdf", _SOP)
+    got = await store.get_live_versions(
+        tenant_id=tenant_id, user_id=user_id, version_ids=[a1.id, a2.id, b1.id, uuid4()]
+    )
+    assert {k: (art.name, art.agent_key, v.version) for k, (art, v) in got.items()} == {
+        a1.id: ("a.pdf", _PLAN, 1),
+        a2.id: ("a.pdf", _PLAN, 2),
+        b1.id: ("b.pdf", _SOP, 1),
+    }
+    assert (
+        await store.get_live_versions(tenant_id=tenant_id, user_id=uuid4(), version_ids=[a1.id])
+        == {}
+    )
+    assert (
+        await store.get_live_versions(tenant_id=uuid4(), user_id=user_id, version_ids=[a1.id]) == {}
+    )
+    assert await store.get_live_versions(tenant_id=tenant_id, user_id=user_id, version_ids=[]) == {}
+    await store.soft_delete(
+        tenant_id=tenant_id, user_id=user_id, agent_key=_PLAN, name="a.pdf", now=datetime.now(UTC)
+    )
+    after = await store.get_live_versions(
+        tenant_id=tenant_id, user_id=user_id, version_ids=[a1.id, b1.id]
+    )
+    assert set(after) == {b1.id}

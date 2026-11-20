@@ -82,6 +82,7 @@ async def test_run_once_reports_the_holding_area_counts(tmp_path: Path) -> None:
         "_delete_event_log",
         "_delete_sandbox_egress_audit",
         "_delete_finished_memory_writeback_jobs",
+        "_delete_expired_share_links",
         "_delete_finished_knowledge_tasks",
         "_delete_orphaned_knowledge_revisions",
         "_delete_expired_knowledge_retrieval_logs",

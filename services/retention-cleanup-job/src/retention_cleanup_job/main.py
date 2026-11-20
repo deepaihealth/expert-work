@@ -176,7 +176,8 @@ def log_done(report: CleanupReport) -> None:
         "memory_hard_deleted=%d workspaces_hard_deleted=%d "
         "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
         "sandbox_egress_audit=%d memory_writeback_jobs=%d knowledge_tasks=%d "
-        "knowledge_revisions=%d knowledge_retrieval_logs=%d failed_passes=%s duration=%.2fs",
+        "knowledge_revisions=%d knowledge_retrieval_logs=%d share_links=%d "
+        "failed_passes=%s duration=%.2fs",
         report.audit_deleted,
         report.audit_skipped_unacked,
         report.event_deleted,
@@ -235,6 +236,7 @@ def log_done(report: CleanupReport) -> None:
         report.knowledge_tasks_deleted,
         report.knowledge_revisions_deleted,
         report.knowledge_retrieval_logs_deleted,
+        report.share_links_deleted,
         ",".join(report.failed_passes) or "-",
         report.duration_seconds,
     )

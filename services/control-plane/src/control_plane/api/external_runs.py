@@ -46,6 +46,7 @@ from control_plane.api._run_event_stream import (
 )
 from control_plane.api._run_progress import run_info_fields
 from control_plane.api._run_usage import make_usage_loader
+from control_plane.api._share_links import RunArtifacts, refresh_share_links_for_runs
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.agents import (
     ExternalFileRef,
@@ -235,6 +236,8 @@ async def _supersede_and_run(
                 usage_store=state.token_usage_store,
                 tenant_id=tenant_id,
                 stream_format=stream_format,
+                request=request,
+                agent_code=agent_code,
             )
 
     try:
@@ -391,6 +394,8 @@ async def _supersede_and_run(
             usage_store=state.token_usage_store,
             tenant_id=tenant_id,
             stream_format=stream_format,
+            request=request,
+            agent_code=agent_code,
         )
 
 
@@ -494,6 +499,18 @@ def build_external_runs_router() -> APIRouter:
             rows=rows,
             same_user=True,
         )
+        # B-326 —— 标记交付的产物:按智能体当前配置换上这段对话里能用的链接(一页一次查询)。
+        refreshed = await refresh_share_links_for_runs(
+            request,
+            [
+                RunArtifacts(run_id=r.run_id, thread_id=r.thread_id, artifacts=r.artifacts)
+                for r in rows
+            ],
+            tenant_id=tenant_id,
+            user_id=end_user_id,
+            agent_name=agent_code,
+        )
+        artifacts_by_run = {r.run_id: arts for r, arts in zip(rows, refreshed, strict=True)}
         return JSONResponse(
             {
                 "success": True,
@@ -509,7 +526,7 @@ def build_external_runs_router() -> APIRouter:
                             "error": r.error,
                             # 产物清单契约 —— 覆盖「没消费到 end 就终局」的
                             # 重连收尾重建;null = 历史 run 无记录。
-                            "artifacts": r.artifacts,
+                            "artifacts": artifacts_by_run[r.run_id],
                             # P-1 —— 被取代 / 重发链接;两者都是 null = 普通一轮。
                             "superseded_by": str(r.superseded_by_run_id)
                             if r.superseded_by_run_id

@@ -30,6 +30,7 @@ from expert_work.protocol import (
     HTTPToolSpec,
     KnowledgeSpec,
     MCPToolSpec,
+    ShareLinksSpec,
     SubAgentSpec,
     ToolSpecEntry,
     VisionSpec,
@@ -67,6 +68,7 @@ from orchestrator.tools.read_document import ReadDocumentTool
 from orchestrator.tools.read_page import FigureDelivery, ReadPageTool
 from orchestrator.tools.registry import ToolRegistry
 from orchestrator.tools.sandbox import ExecPythonTool, SandboxRuntime
+from orchestrator.tools.share_file import ShareFileTool, ShareLinkService
 from orchestrator.tools.skill_authoring import SKILL_AUTHORING_BUILTINS
 from orchestrator.tools.spawn_worker import SpawnWorkerTool, WorkerBuildFn
 from orchestrator.tools.subagent import MAX_SUBAGENT_DEPTH, ChildAgentBuilder, SubAgentTool
@@ -179,6 +181,10 @@ class ToolEnv:
     #: B-235 —— ``save_artifact`` 每次登记复制一份那一刻的字节到这里。``None`` 时
     #: ``save_artifact`` 不注册(显式声明则报错),与 ``sandbox_runtime`` 同款处置。
     artifact_snapshots: ArtifactSnapshotStore | None = None
+    #: B-326 —— 产物分享链接(``share_file`` 工具标记交付,链接记进 run 的产物清单)。控制面在配了
+    #: 公开地址(``EXPERT_WORK_PUBLIC_BASE_URL``)时接线;``None`` = 这个部署没有分享链接,
+    #: 开了 ``spec.share_links`` 的智能体构建时报错。
+    share_links: ShareLinkService | None = None
     #: Resolves an ``agent_ref`` and builds the referenced sub-agent —
     #: backs the ``SubAgentTool``\\s a manifest's ``spec.subagents``
     #: block declares (Stream J.4). Injected by the control-plane, which
@@ -272,6 +278,7 @@ async def build_tool_registry(
     vl_usage_meter: VLUsageMeter | None = None,
     context_window: int | None = None,
     supports_vision: bool = False,
+    share_links: ShareLinksSpec | None = None,
 ) -> ToolRegistry:
     """Build a :class:`ToolRegistry` from a manifest's ``tools:`` entries.
 
@@ -302,6 +309,9 @@ async def build_tool_registry(
     (manifest ``model.supports_vision``). Together with ``vision`` it decides
     how ``read_page``'s rendered pages reach the model, which is what its
     success receipt tells the model (see :func:`_figure_delivery`).
+
+    ``share_links`` (B-326) is the manifest's ``spec.share_links`` block; when
+    enabled it activates the ``share_file`` tool (never for a dynamic worker).
 
     ``context_window`` (Stream HX-12) feeds the small-pool escape hatch:
     when the deferred (MCP) pool's total schema size fits comfortably in
@@ -413,6 +423,7 @@ async def build_tool_registry(
         registry, tool_env, parent_spec, dynamic_workers, subagent_depth, vision_gap=vision_gap
     )
     _register_knowledge_search(registry, knowledge, tool_env)
+    _register_share_file(registry, share_links, tool_env)
     _register_ask_image(
         registry, vision, tool_env, vl_caller, quick_vl_caller, plain_vl_caller, vl_usage_meter
     )
@@ -1042,6 +1053,24 @@ def _register_read_page(
             image_resolver=env.image_resolver,
         )
     )
+
+
+def _register_share_file(
+    registry: ToolRegistry, share_links: ShareLinksSpec | None, env: ToolEnv
+) -> None:
+    """B-326 —— ``spec.share_links.enabled`` → ``share_file``。
+
+    动态子智能体不注册:它的回复交给父、不到用户手上,父自己开了才有。开了却没接线(平台没配
+    公开地址)是配置错误,构建时就报,不在第一次调用时才发现。
+    """
+    if share_links is None or not share_links.enabled or env.worker_policy:
+        return
+    if env.share_links is None:
+        raise AgentFactoryError(
+            "spec.share_links is enabled but share links are not configured on this "
+            "platform (ToolEnv.share_links; set EXPERT_WORK_PUBLIC_BASE_URL)"
+        )
+    registry.register(ShareFileTool(service=env.share_links, ttl_minutes=share_links.ttl_minutes))
 
 
 def _require_artifact_store(env: ToolEnv, tool_name: str) -> ArtifactStore:

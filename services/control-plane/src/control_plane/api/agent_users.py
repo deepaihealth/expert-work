@@ -341,6 +341,7 @@ def _build_purge_deps(request: Request) -> PurgeUserDeps:
         agent_file_versions=getattr(state, "agent_file_versions", None),
         workspace_root=_nas_root(getattr(state, "workspace_store", None)),
         trajectories=trajectory_store_for(state.agent_runtime),
+        share_links=getattr(state, "artifact_share_link_store", None),
     )
 
 

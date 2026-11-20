@@ -1618,6 +1618,11 @@ export interface TranslationKeys {
     tool_clarify_tool_usage_help: string;
     tool_ask_for_approval: string;
     tool_ask_for_approval_help: string;
+    share_links_label: string;
+    share_links_help: string;
+    share_links_ttl_label: string;
+    share_links_ttl_hint: string;
+    share_links_ttl_invalid: string;
     tools_config_note: string;
     section_approval: string;
     section_approval_help: string;
@@ -5650,6 +5655,12 @@ const en: TranslationKeys = {
     tool_ask_for_approval: "Ask for human approval",
     tool_ask_for_approval_help:
       "Let the agent pause mid-run and file an approval request when it wants a human decision — the run resumes once someone approves in the approvals list.\nFor agents people chat with live, leave this off: the agent should just ask in the conversation. Turn it on for unattended runs (scheduled tasks, API-driven runs) or actions that need an audited sign-off.",
+    share_links_label: "Share file links",
+    share_links_help:
+      "When on, the agent can mark files it registered in the conversation for delivery: in the run's artifact list returned by the API, each marked file carries a download link (share_url) for your app to send to the end user. Anyone who has the link can download the file without logging in; the link stops working once it expires. The link never appears in the agent's reply.",
+    share_links_ttl_label: "Link lifetime (minutes)",
+    share_links_ttl_hint: "5–1440 minutes; leave empty for the default {{default}} minutes",
+    share_links_ttl_invalid: "The lifetime must be a whole number of minutes between {{min}} and {{max}}",
     tools_config_note:
       "File read/write and saving artifacts are on by default and not listed here — edit the YAML view to change them. Web search works out of the box (the platform's own free search service).",
     section_approval: "Human approval",

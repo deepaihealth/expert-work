@@ -72,11 +72,39 @@ ARTIFACT_RECORDER_KEY = "artifact_manifest_recorder"
 #: 只在有时才提登记)。
 SAVE_ARTIFACT_TOOL_NAME = "save_artifact"
 
+#: B-326 —— 标记交付的产物在清单项上多出的两个对外字段。
+SHARE_FIELDS: tuple[str, ...] = ("share_url", "share_expires_at")
+#: B-326 —— 标记交付项上的内部元数据(``{"artifact_id", "version_id", "agent_key"}``):
+#: run 行里存着,读清单时据它核对产物还在、按当前配置续链接;**从不对外** —— ``end`` 帧
+#: (:func:`public_entries`)和读清单的接口都把它去掉。
+SHARE_META_KEY = "_share"
+#: Inside :data:`SHARE_META_KEY` on a merged entry: this run also *registered* that
+#: version (``save_artifact``), not only marked it — so a continuation seeded from the
+#: snapshot counts it again (B-226). Stripped together with the rest of ``_share``.
+_REGISTERED_KEY = "registered"
+
+
+def public_entries(artifacts: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """The artifact list as integrators see it: :data:`SHARE_META_KEY` removed."""
+    if artifacts is None:
+        return None
+    return [
+        {k: v for k, v in e.items() if k != SHARE_META_KEY}
+        if isinstance(e, Mapping) and SHARE_META_KEY in e
+        else e
+        for e in artifacts
+    ]
+
 
 class ArtifactRecorder:
     """产物清单契约 —— 本 run 的产物登记累积器(``ARTIFACT_RECORDER_KEY`` 注入的那个对象)。
 
     name 去重、后登记覆盖(与前端产物 chips 的 newest-wins 同义)。调用它 = 登记一条。
+
+    B-326 —— 带 ``share_url`` 的项是「标记交付」(``share_file``),按 (name, version) 另记,
+    不被同名的后续登记冲掉:清单里同名项的 ``version`` 与标记的版本相同时,分享字段并到那一
+    项上;不同(标记的是别的版本,或标记之后又登记了新版本)时,标记的那一版单独成一项 ——
+    此时清单里同一个 name 会出现两项,带分享字段的那项的 ``version`` 就是链接下载到的版本。
     子代拿到的是 :meth:`scoped` 分出来的视图:写进同一份清单(整棵委派树的登记都在
     end 帧里),``count`` 数的是**自己这棵子树**登记过的名字(自己的 + 自己委派出去的子代
     的)—— B-226 ① 收尾指令里的「本 run 登记了几个产物」读它:父的收尾算上子代交付的,
@@ -87,29 +115,74 @@ class ArtifactRecorder:
         self,
         entries: dict[str, dict[str, Any]] | None = None,
         parent: ArtifactRecorder | None = None,
+        marks: dict[tuple[str, object], dict[str, Any]] | None = None,
     ) -> None:
         self._entries: dict[str, dict[str, Any]] = {} if entries is None else entries
+        self._marks: dict[tuple[str, object], dict[str, Any]] = {} if marks is None else marks
         self._parent = parent
         self._subtree: set[str] = set()
 
     def __call__(self, entry: dict[str, Any]) -> None:
         name = str(entry.get("name"))
+        if SHARE_META_KEY in entry or "share_url" in entry:
+            # A mark is not a registration (L8): marking a file saved in an earlier
+            # turn does not make this run "deliver" one for the B-226 count.
+            self._marks[(name, entry.get("version"))] = entry
+            return
         self._entries[name] = entry
         node: ArtifactRecorder | None = self
         while node is not None:
             node._subtree.add(name)
             node = node._parent
 
+    def seed(self, entries: list[Any] | None) -> None:
+        """A continuation picks up the list its paused run had. Marks come back without
+        ``share_url`` / ``share_expires_at`` (kept: :data:`SHARE_META_KEY`): the link
+        issued before the pause may have expired, or the agent may have turned share
+        links off since — whoever reports the list re-derives them from the mark."""
+        for e in entries or []:
+            if not isinstance(e, dict) or not e.get("name"):
+                continue
+            if SHARE_META_KEY in e:
+                bare = {k: v for k, v in e.items() if k not in SHARE_FIELDS}
+                meta = bare[SHARE_META_KEY]
+                if isinstance(meta, Mapping) and meta.get(_REGISTERED_KEY):
+                    # Saved *and* marked in this run (merged by :meth:`snapshot`): put
+                    # back both halves, so the B-226 count still includes it.
+                    self({k: v for k, v in bare.items() if k != SHARE_META_KEY})
+                    bare = {
+                        **bare,
+                        SHARE_META_KEY: {k: v for k, v in meta.items() if k != _REGISTERED_KEY},
+                    }
+                self(bare)
+            else:
+                self(dict(e))
+
     def scoped(self) -> ArtifactRecorder:
         """给委派出去的子代:同一份清单, 计数只含它自己的子树(也计进本视图)。"""
-        return ArtifactRecorder(self._entries, parent=self)
+        return ArtifactRecorder(self._entries, parent=self, marks=self._marks)
 
     @property
     def count(self) -> int:
         return len(self._subtree)
 
     def snapshot(self) -> list[dict[str, Any]]:
-        return list(self._entries.values())
+        out: list[dict[str, Any]] = []
+        merged: set[tuple[str, object]] = set()
+        for name, entry in self._entries.items():
+            key = (name, entry.get("version"))
+            mark = self._marks.get(key)
+            if mark is None:
+                out.append(entry)
+                continue
+            merged.add(key)
+            extra = {k: mark[k] for k in SHARE_FIELDS if k in mark}
+            meta = mark.get(SHARE_META_KEY)
+            if isinstance(meta, Mapping):
+                extra[SHARE_META_KEY] = {**meta, _REGISTERED_KEY: True}
+            out.append({**entry, **extra})
+        out.extend(m for key, m in self._marks.items() if key not in merged)
+        return out
 
 
 def _require_user_scope(ctx: ToolContext, tool: str) -> tuple[UUID, UUID]:

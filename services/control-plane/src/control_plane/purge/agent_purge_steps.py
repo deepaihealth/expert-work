@@ -381,7 +381,16 @@ async def purge_artifacts(
     keep_users: set[UUID],
 ) -> None:
     """B-235 —— 先删各版本的字节副本;有一份没删掉,登记行就留着(重跑时靠它找到副本)。
-    ``keep_users`` 的产物这次不动(见 :func:`purge_conversations`)。"""
+    ``keep_users`` 的产物这次不动(见 :func:`purge_conversations`)。B-326 —— 分享链接先删:
+    它不依赖副本,删了链接立刻失效。"""
+    if deps.share_links is not None:
+        await run(
+            summary,
+            "artifact_share_links",
+            deps.share_links.delete_for_agent(
+                tenant_id=tenant_id, agent_key=key, keep_users=keep_users
+            ),
+        )
     if keep_users:
         skip(summary, "artifact")
     if deps.artifact_snapshots is not None:

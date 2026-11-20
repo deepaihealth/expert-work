@@ -1852,6 +1852,42 @@ async def test_resume_seeds_manifest_from_seed_artifacts() -> None:
     assert pre_pause in row.artifacts and post in row.artifacts
 
 
+@pytest.mark.asyncio
+async def test_resume_drops_the_paused_runs_issued_link_but_keeps_the_mark() -> None:
+    """B-326 M1 —— 续跑接着记暂停前的标记(``_share``),但不把暂停前发出的链接原样再发一遍:
+    那条可能已过期、或智能体已关掉分享链接,由报清单的一方按当前配置重给。"""
+    from expert_work.runtime.runs.store import InMemoryRunStore
+
+    store = InMemoryRunStore()
+    bridge = InMemoryStreamBridge()
+    rm = RunManager(store)
+    thread_id, tenant_id = uuid4(), uuid4()
+    base = {"name": "r.pdf", "kind": "document", "version": 1, "created_at": "x"}
+    meta = {"artifact_id": "a", "version_id": "v", "agent_key": "k"}
+    record = await rm.create(
+        run_id=uuid4(),
+        thread_id=thread_id,
+        tenant_id=tenant_id,
+        on_disconnect=DisconnectMode.CANCEL,
+        is_resume=True,
+    )
+    record.seed_artifacts = [
+        {**base, "share_url": "old", "share_expires_at": "yesterday", "_share": meta}
+    ]
+    graph = _RecordingGraph(chunks=[{"agent": {"step_count": 1}}], manifest_entries=[])
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": []},
+        config={},
+    )
+    row = await store.get(run_id=record.run_id, tenant_id=tenant_id)
+    assert row is not None
+    assert row.artifacts == [{**base, "_share": meta}]
+
+
 @dataclass
 class _CountingGraph(_RecordingGraph):
     """登记完之后读一次记录器的 ``count`` —— 收尾指令(B-226 ①)读的就是它。"""

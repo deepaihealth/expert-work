@@ -245,6 +245,8 @@ class AuditAction(StrEnum):
     # 连文件带行一起清掉;一个逻辑产物所有版本都清完时行标过期(``deleted_at``)。
     # 一条审计对应一个逻辑产物一次 sweep,details 里列出清掉的版本号。
     ARTIFACT_EXPIRED = "artifact:expired"
+    # B-326 —— 有人用分享链接(``GET /v1/public/files/{id}``,不登录)下载了一个产物版本。
+    ARTIFACT_SHARE_DOWNLOAD = "artifact:share_download"
     # approval / HITL (Stream J.8 — Mini-ADR J-24)
     APPROVAL_REQUESTED = "approval:requested"
     APPROVAL_DECIDED = "approval:decided"

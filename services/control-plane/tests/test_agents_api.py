@@ -1709,3 +1709,42 @@ async def test_fixed_values_on_an_unreachable_server_save_with_a_warning(
         "MCP server(s) could not be reached during this save check, so their tools, "
         "arg_bindings and fixed values were not checked: deepcare"
     ) in warning
+
+
+_SHARE_LINKS_YAML = (
+    _VALID_YAML
+    + """\
+  share_links:
+    enabled: true
+    ttl_minutes: 60
+"""
+)
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_share_links_without_a_public_base_url(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    """B-326 LOW-1 —— a clear 422 at save time, not an agent that can never share."""
+    app, client = b5_app_client
+    assert app.state.settings.public_base_url is None  # type: ignore[attr-defined]
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _SHARE_LINKS_YAML})
+    assert resp.status_code == 422, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "MANIFEST_UNBUILDABLE"
+    assert "EXPERT_WORK_PUBLIC_BASE_URL" in error["message"]
+    # Off (or absent) is never refused for this reason.
+    off = _SHARE_LINKS_YAML.replace("enabled: true", "enabled: false")
+    assert (await client.post("/v1/agents", json={"manifest_yaml": off})).status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_create_accepts_share_links_when_the_platform_has_a_base_url(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    app, client = b5_app_client
+    app.state.settings = app.state.settings.model_copy(  # type: ignore[attr-defined]
+        update={"public_base_url": "https://files.example.test"}
+    )
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _SHARE_LINKS_YAML})
+    assert resp.status_code == 201, resp.text

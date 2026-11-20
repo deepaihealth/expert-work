@@ -54,6 +54,7 @@ from control_plane.api._run_event_stream import (
 )
 from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._session_title import title_from_text
+from control_plane.api._share_links import share_view
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.external_events import build_events_response
 from control_plane.api.runs import (
@@ -295,6 +296,8 @@ async def _idempotent_run_response(
     usage_store: TokenUsageStore,
     tenant_id: UUID,
     stream_format: str,
+    request: Request,
+    agent_code: str,
 ) -> StreamingResponse | JSONResponse:
     """Render an idempotency-hit ``run`` back in the shape its ``mode`` expects.
 
@@ -328,6 +331,15 @@ async def _idempotent_run_response(
                 usage=usage_store, runs=run_store, run_id=run.run_id, tenant_id=tenant_id
             ),
             stream_format=stream_format,
+            # B-326 —— 重放的 end 按当前配置给分享链接(两个调用点共用这一处)。
+            artifact_view=share_view(
+                request,
+                tenant_id=tenant_id,
+                user_id=run.user_id,
+                thread_id=run.thread_id,
+                agent_name=agent_code,
+                run_id=run.run_id,
+            ),
         )
     return JSONResponse(
         status_code=202,
@@ -1033,6 +1045,22 @@ class _BuildCheck:
     warning: str | None = None
 
 
+def _share_links_without_base_url(spec: Any, request: Request) -> str | None:
+    """B-326 —— the refusal message when ``spec.share_links.enabled`` but the platform
+    has no ``EXPERT_WORK_PUBLIC_BASE_URL``; ``None`` otherwise."""
+    block = getattr(getattr(spec, "spec", None), "share_links", None)
+    if block is None or not block.enabled:
+        return None
+    settings = getattr(request.app.state, "settings", None)
+    if settings is not None and settings.public_base_url:
+        return None
+    return (
+        "spec.share_links is enabled, but this platform has no public base URL for share "
+        "links (EXPERT_WORK_PUBLIC_BASE_URL is not set). Turn share links off for this "
+        "agent, or ask the platform operator to configure the public base URL."
+    )
+
+
 async def _check_buildable(
     request: Request,
     *,
@@ -1090,6 +1118,16 @@ async def _check_buildable(
         record_manifest_build_check(outcome="rejected")
         return _BuildCheck(
             rejected=_envelope_error("MANIFEST_UNBUILDABLE", off_catalog, 422), error=off_catalog
+        )
+    # B-326 LOW-1 —— static, like the catalog check: an agent that turns share links on
+    # on a platform with no public base URL can never mint a usable link. Checked here
+    # (not only by the build) because a platform credential gap ends the build earlier
+    # with a warning-only outcome, which would let this slip through.
+    share_gap = _share_links_without_base_url(spec, request)
+    if share_gap is not None:
+        record_manifest_build_check(outcome="rejected")
+        return _BuildCheck(
+            rejected=_envelope_error("MANIFEST_UNBUILDABLE", share_gap, 422), error=share_gap
         )
     runtime = getattr(request.app.state, "agent_runtime", None)
     if runtime is None:
@@ -1823,6 +1861,8 @@ def build_agents_router() -> APIRouter:
                     usage_store=request.app.state.token_usage_store,
                     tenant_id=tenant_id,
                     stream_format=payload.stream_format,
+                    request=request,
+                    agent_code=agent_code,
                 )
 
         try:
@@ -2037,6 +2077,8 @@ def build_agents_router() -> APIRouter:
                 usage_store=request.app.state.token_usage_store,
                 tenant_id=tenant_id,
                 stream_format=payload.stream_format,
+                request=request,
+                agent_code=agent_code,
             )
 
     @router.get("", dependencies=_CONSOLE_ONLY)

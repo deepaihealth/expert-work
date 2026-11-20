@@ -30,10 +30,12 @@ from control_plane.api._external import (
 from control_plane.api._run_event_stream import (
     EXTERNAL_HIDDEN_EVENTS,
     EXTERNAL_STRIPPED_STATE_KEYS,
+    ArtifactView,
     build_event_producer,
     make_run_probe,
 )
 from control_plane.api._run_usage import make_usage_loader
+from control_plane.api._share_links import share_view
 from control_plane.api._user_scope import get_user_repo
 from control_plane.runtime import AgentRuntime
 from expert_work.persistence.tenant_user import TenantUserStore
@@ -76,6 +78,8 @@ async def build_events_response(
     load_usage: Callable[[], Awaitable[list[dict[str, Any]] | None]] | None = None,
     since_seq: int | None = None,
     stream_format: str = STREAM_FORMAT_LEGACY,
+    # B-326 —— 对外续传 / 幂等重放:``end`` 帧上的分享链接按当前配置续(``share_view``)。
+    artifact_view: ArtifactView | None = None,
 ) -> StreamingResponse:
     """Build the SSE ``StreamingResponse`` for one run — replay or live-attach.
 
@@ -137,6 +141,7 @@ async def build_events_response(
         # PR-A.3 Task 8 — 对外平面零新暴露:system_prompt 对第三方 API key
         # 的回放 / live 接合都不可见。
         hide_events=EXTERNAL_HIDDEN_EVENTS,
+        artifact_view=artifact_view,
         # 召回的长期记忆等内部数据:帧照发、值里删键(落库行不动,控制台照看全量)。
         strip_state_keys=EXTERNAL_STRIPPED_STATE_KEYS,
         stream_format=stream_format,
@@ -222,6 +227,14 @@ def build_external_events_router() -> APIRouter:
             ),
             since_seq=since_seq,
             stream_format=stream_format,
+            artifact_view=share_view(
+                request,
+                tenant_id=tenant_id,
+                user_id=run.user_id,
+                thread_id=run.thread_id,
+                agent_name=agent_code,
+                run_id=run.run_id,
+            ),
         )
 
     return router

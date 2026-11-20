@@ -32,6 +32,7 @@ from control_plane.api._external import (
     own_feedback_by_run,
     reject_nul_path_params,
 )
+from control_plane.api._share_links import RunArtifacts, refresh_share_links_for_runs
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.external_sessions import _ACTIVE_RUN_STATUSES
 from control_plane.runtime import AgentRuntime
@@ -471,6 +472,18 @@ def build_external_session_items_router() -> APIRouter:
                 wire["tombstone"] = tombstoned
                 items.append(wire)
 
+        # B-326 —— 标记交付的产物:按智能体当前配置换上这段对话里能用的链接(一页一次查询)。
+        refreshed = await refresh_share_links_for_runs(
+            request,
+            [
+                RunArtifacts(run_id=run.run_id, thread_id=session_id, artifacts=run.artifacts)
+                for run in turns
+            ],
+            tenant_id=tenant_id,
+            user_id=meta.user_id,
+            agent_name=meta.agent_name,
+        )
+        artifacts_by_run = {run.run_id: arts for run, arts in zip(turns, refreshed, strict=True)}
         return JSONResponse(
             {
                 "success": True,
@@ -486,7 +499,7 @@ def build_external_session_items_router() -> APIRouter:
                             "error": run.error,
                             # 产物清单契约 —— run 行固化的登记快照;null =
                             # 历史 run 无记录(≠ 零交付,零交付是 [])。
-                            "artifacts": run.artifacts,
+                            "artifacts": artifacts_by_run[run.run_id],
                             # P-2 —— 只回显当前 ``user_id`` 自己打的那一票。
                             "feedback": own.get(str(run.run_id)),
                             # P-1 —— 被取代 / 重发链接;两者都是 null = 普通一轮。
