@@ -10,7 +10,10 @@ provider's official docs — do NOT carry stale names. Mark retired models
 ``deprecated=True`` so they stay referenceable but drop out of the dropdown
 (``models_for_provider``).
 
-Last verified: 2026-11-19 (Claude 5 family, B-320: Anthropic API reference cached
+Last verified: 2026-11-20 (doubao-seed-2-1-turbo-260628 / doubao-seed-2-1-lite-260915:
+model id, image input, thinking off, reasoning_effort levels, the total output cap and its
+range probed; context window from the vendor model-list doc) /
+2026-11-19 (Claude 5 family, B-320: Anthropic API reference cached
 2026-11-03 — not probed, no Anthropic key on the test stack) /
 2026-11-17 (qwen4-max: vendor model page only — modalities, context
 window and prices; thinking / output-cap fields copied from qwen3.8-max, not probed) /
@@ -998,7 +1001,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # flagship; its previous snapshot doubao-seed-2-1-pro-260628 and the Seed
     # 2.0 family are kept deprecated so saved manifests still resolve. All
     # tiers support vision; 260915 has a 1024K context (vendor console
-    # 2026-11-11), the older entries 256K. Older doubao-*-32k series superseded.
+    # 2026-11-11), the older entries 256K. The cheaper Seed 2.1 tiers
+    # doubao-seed-2-1-turbo-260628 (256K) / doubao-seed-2-1-lite-260915 (1024K) were
+    # added 2026-11-20 (see their entries). Older doubao-*-32k series superseded.
     # B-105(2026-09-24 实调)—— ``thinking.budget_tokens`` 被厂商忽略(200 正常返回,
     # 思考长度不受限),真正生效的档位控制是 ``reasoning_effort`` → shape "effort";
     # 厂商档位 minimal/low/medium/high 实调都有效、没有 max,effort_map 把 max 顶到 high。
@@ -1011,6 +1016,42 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         # 1024k、最大输出 256k、最大思考内容 256k;页面是这一档的,不分日期快照)。
         ModelEntry(
             name="doubao-seed-2-1-pro-260915",
+            vision=True,
+            context_window=1_024_000,
+            thinking="effort",
+            thinking_default=True,
+            output_cap_field="max_completion_tokens",
+            max_output_tokens=262_144,
+            effort_map={"max": "high"},
+        ),
+        # 2026-11-20 —— Seed 2.1 的 turbo / lite 两档(用户 11-20 同意上架),排在 pro 后面,
+        # 不是任何东西的默认。字段照 pro 260915,下面三类来源分开写:
+        # · 实调(2026-11-20,平台豆包 key,Chat API,两档各 9 次、lite 多 1 次音频,合计
+        #   ¥0.018):模型名被接受;合成数字图读对(``vision``);``thinking.type=disabled``
+        #   被接受且思考 token 为 0;开思考 + ``max_completion_tokens=300`` 回 length、
+        #   completion 正好 300 且全是思考(合计上限管得住思考 → ``output_cap_field``);
+        #   ``reasoning_effort`` minimal / low / medium / high / max 都 200,minimal 思考 0、
+        #   其余有思考,max 与 high 思考量相当(厂商文档:xhigh / max 映射到 high;
+        #   ``effort_map`` 仍同 pro 显式顶到 high);``max_completion_tokens=10,000,000`` 回
+        #   400「expected a value <= 262144」→ ``max_output_tokens=262_144``。
+        # · 厂商模型列表文档(volcengine.com/docs/82379/1330310,2026-11-20 无登录读):
+        #   turbo 上下文 256K、lite 上下文 1024K;两档最大回答 256K(默认 4K)、最大思维链
+        #   256K;深度思考 / 多模态理解 / 工具调用 / 结构化输出。深度思考文档:两档都支持
+        #   enabled(默认)/ disabled,``reasoning_effort`` 默认 high。
+        # · lite 能听音频(实调读对 1.6 秒 wav,Chat API ``input_audio``),平台没接音频输入,
+        #   目录也没有这一位;音频单价(输入 12 元 / 百万)价目表装不下,见迁移 0196。
+        ModelEntry(
+            name="doubao-seed-2-1-turbo-260628",
+            vision=True,
+            context_window=256_000,
+            thinking="effort",
+            thinking_default=True,
+            output_cap_field="max_completion_tokens",
+            max_output_tokens=262_144,
+            effort_map={"max": "high"},
+        ),
+        ModelEntry(
+            name="doubao-seed-2-1-lite-260915",
             vision=True,
             context_window=1_024_000,
             thinking="effort",
