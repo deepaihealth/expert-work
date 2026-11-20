@@ -141,11 +141,13 @@ def test_png_screenshot_is_not_shrunk_and_stays_within_the_png_allowance() -> No
     assert len(data) <= max(len(raw), min(int(len(raw) * 1.1), LOSSLESS_MAX_BYTES))
 
 
-def test_twelve_megapixel_cap() -> None:
+def test_copy_is_never_downscaled_below_the_originals_size() -> None:
+    """设计 §8.1 第 5 条细化(2026-11-20,用户;审查 H1):转正图与原图一样多像素,不缩 —— 原图今天
+    就是这么大发给厂商的。4032 x 3024 的手机照片转 90 度是 3024 x 4032,不是 3000 x 4000。"""
     raw = _encode(Image.new("RGB", (4032, 3024), (10, 20, 30)), "JPEG", quality=92)
     found = upright_copy(raw, 90)
     assert found is not None
-    assert _decode(found[1]).size == (3000, 4000)
+    assert _decode(found[1]).size == (3024, 4032)
 
 
 def test_a_copy_that_cannot_fit_gives_up(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -291,7 +293,7 @@ def test_low_region_belongs_to_runs() -> None:
     far = time.monotonic() + 600
     assert cache.hold_low("run-1", [_prepared("a", 60)], far)
     assert not cache.hold_low("run-2", [_prepared("b", 60)], far)  # 小区也满
-    cache.set_run_mode("run-1", "a", "low")
+    cache.set_run_mode("run-1", "a", "low", far)
     cache.release_run("run-1")  # 正常结束、出错、被取消都走这里
     assert cache.low_bytes == 0
     assert cache.run_mode("run-1", "a") is None
@@ -303,3 +305,87 @@ def test_low_copy_expires_at_the_run_deadline() -> None:
     assert cache.hold_low("run-1", [_prepared("a", 60)], time.monotonic() - 1)
     assert cache.hold_low("run-2", [_prepared("b", 60)], time.monotonic() + 60)
     assert not cache.has_low(("a", 90))
+
+
+def test_run_modes_expire_for_runs_that_never_reach_sse() -> None:
+    """审查 L2 —— 委派子代的 run 不经 ``sse.run_agent`` 收尾:降级决定按过期清掉,不泄漏。"""
+    cache = UprightViewCache(full_cap_bytes=10, low_cap_bytes=10)
+    cache.set_run_mode("child-run", "a", "raw", time.monotonic() - 1)
+    assert cache.run_mode("child-run", "a") is None
+    cache.set_run_mode("child-run", "z", "raw", time.monotonic() - 1)
+    cache.set_run_mode("child-run", "b", "raw", time.monotonic() + 60)
+    assert ("child-run", "z") not in cache._run_modes  # 写新的时顺手清掉过期的
+    assert cache.run_mode("child-run", "b") == "raw"
+
+
+def test_lent_candidates_count_toward_the_full_cap() -> None:
+    """审查 L6 —— 借出的问方向候选图算进全分辨率区的上限:挤掉没钉住的转正图,钉不下就不钉。"""
+    cache = UprightViewCache(full_cap_bytes=100, low_cap_bytes=10)
+    assert cache.try_pin_full([_prepared("a", 60)])
+    cache.unpin_full([("a", 90)])
+    cache.lend(("cand", 0), "image/jpeg", b"x" * 50)
+    assert not cache.has_full(("a", 90))  # 没钉住的被挤掉
+    assert not cache.try_pin_full([_prepared("b", 60)])  # 50 + 60 > 100
+    cache.give_back(("cand", 0))
+    assert cache.try_pin_full([_prepared("b", 60)])
+
+
+async def test_a_full_copy_takes_both_decode_slots() -> None:
+    """审查 H1 —— 全分辨率转正图占两个解图名额:它在跑时别的解图排队;几个全分辨率的同时来,
+    一次只跑一个,不会各拿一个名额互等。"""
+    import threading
+
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def work(_: int) -> int:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return 0
+
+    await asyncio.gather(*(image_views.in_wide_host_crop_slot(work, n) for n in range(3)))
+    assert peak == 1
+    active = peak = 0
+    await asyncio.gather(*(image_views.in_host_crop_slot(work, n) for n in range(4)))
+    assert peak == 2
+
+
+async def test_adapter_miss_runs_off_the_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """审查 H1 —— 适配器当场重算走解图名额、在线程里,不占事件循环。"""
+    import threading
+
+    raw = _encode(_quadrants(), "PNG")
+    seen: list[str] = []
+    real = image_views.upright_copy
+
+    def spy(data: bytes, degrees: int) -> Any:
+        seen.append(threading.current_thread().name)
+        return real(data, degrees)
+
+    monkeypatch.setattr(image_views, "upright_copy", spy)
+    await resolve_message_images([_REF], _resolver(raw), [ImageView(90)])
+    assert seen
+    assert seen[0] != threading.main_thread().name
+
+
+def test_upright_whole_closes_the_original_once_turned() -> None:
+    """审查 H1 —— 转完马上关掉原图(解开的那份像素放掉);不用转时不复制、原样返回。"""
+    from orchestrator.tools.region_zoom import upright_whole
+
+    image = Image.open(io.BytesIO(_encode(_quadrants(), "PNG")))
+    turned = upright_whole(image, 90)
+    assert turned is not image
+    with pytest.raises(ValueError):
+        image.load()  # 已关
+    assert turned.size == (400, 600)
+
+    tags = Image.Exif()
+    tags[0x0112] = 8  # 方向标记 8 再顺时针转 90 度 = 正好不用转
+    plain = Image.open(io.BytesIO(_encode(_quadrants(), "PNG", exif=tags.tobytes())))
+    assert upright_whole(plain, 90) is plain

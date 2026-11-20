@@ -901,7 +901,6 @@ async def build_agent(
                     models=chain_models(judge_model),
                 ),
                 model=judge_model,
-                stamped=usage_store is not None,
             )
         image_orienter = ImageOrienter(
             image_resolver=env.image_resolver,

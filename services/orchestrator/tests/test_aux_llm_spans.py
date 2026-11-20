@@ -383,7 +383,6 @@ async def test_main_model_orientation_check_emits_named_span(
                 default=("qwen", "qwen4-max")
             ),
             model=spec,
-            stamped=False,
         ),
     )
     run = StepRun(

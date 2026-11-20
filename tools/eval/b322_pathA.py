@@ -457,7 +457,6 @@ async def run_items(
                     default=(provider, name)
                 ),
                 model=spec,
-                stamped=False,
             ),
         )
     queues: dict[str, deque[Item]] = {}

@@ -166,3 +166,32 @@ def test_report_fails_when_too_many_calls_go_unanswered() -> None:
     result = e_group.report(rows)["qwen/qwen4-max"]
     assert result["H_timeout_or_off_topic"]["bad"] == 10
     assert result["E_pass"] is False
+
+
+async def test_run_stops_at_the_stop_line_without_recording_a_fake_answer(tmp_path: Path) -> None:
+    """止损:过线之后不再发调用;``SpendStopError`` 不是 ``Exception``,问方向那一层的兜底接不住,
+    那一条作废(不写结果)—— 不会被当成「没答成」写进结果、算进判线。"""
+    images = _subset()
+    rotation_of = {e_group._ref(i): i.rotation for i in images}
+    no_text = {e_group._ref(i) for i in images if i.image_class == images_mod.NO_TEXT_CLASS}
+    q = dict(e_group.quote(models=("qwen/qwen4-max",), stop_line=None))
+    q["stop_line_yuan"] = 0.03  # 两三次调用就到线
+    results = tmp_path / "out.jsonl"
+    image_views.UPRIGHT_VIEWS.clear()
+    summary = await e_group.run_from_quote(
+        q,
+        models=("qwen/qwen4-max",),
+        results=results,
+        env_files=[],
+        state_dir=tmp_path / "state",
+        factory=_fake_factory(rotation_of, no_text),
+        image_set=images,
+        items=e_group.plan_items(("qwen/qwen4-max",), images),
+    )
+    assert summary.stopped_reason is not None
+    assert "stop line" in summary.stopped_reason
+    assert summary.done + summary.discarded <= len(images)
+    assert summary.discarded >= 1
+    for record in b301_plan.read_records(results):
+        assert all(call.get("outcome") == "ok" for call in record["calls"])
+        assert record["conclusion"] != "unjudged"

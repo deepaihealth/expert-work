@@ -213,7 +213,6 @@ def _orienter(
                 default=("qwen", "qwen4-max"), models=chain_models(spec)
             ),
             model=spec,
-            stamped=False,
         )
         if judge is not None
         else None
@@ -652,11 +651,11 @@ async def test_retry_waits_while_the_image_is_out_of_view(monkeypatch: pytest.Mo
     s = _setup({_ref(): _stored(90)}, reply=_answers({0: "raise"}))
     async with _graph(s) as compiled:
         await _turn(compiled, s, _ref())
-        real = upright_mod._image_ids_in_view
-        monkeypatch.setattr(upright_mod, "_image_ids_in_view", lambda messages, by_ref: [])
+        real = upright_mod._refs_in_view
+        monkeypatch.setattr(upright_mod, "_refs_in_view", lambda messages: [])
         await _turn(compiled, s, text="图被挤出去了")
         assert s.judge.calls == [0]
-        monkeypatch.setattr(upright_mod, "_image_ids_in_view", real)
+        monkeypatch.setattr(upright_mod, "_refs_in_view", real)
         s.judge.reply = _honest
         await _turn(compiled, s, text="图回来了")
     assert s.judge.calls[1:] == [0, 90, 180, 270]
@@ -783,7 +782,6 @@ def replace_meter(s: _Setup, spec: ModelSpec) -> ImageOrienter:
             default=("qwen", "qwen4-max"), models=chain_models(spec)
         ),
         model=spec,
-        stamped=True,
     )
     return ImageOrienter(image_resolver=s.resolver, configured_model=_MAIN, judge=judge)
 
@@ -895,7 +893,6 @@ async def test_revocation_shows_as_stored_then_rejudges_next_turn(
                 default=("qwen", "qwen3.8-max"), models=chain_models(spec)
             ),
             model=spec,
-            stamped=True,
         )
         # 同一轮的后续步骤(续跑段):按原样、无说明、状态不改写。
         root = config["configurable"]["run_id"]
@@ -1038,14 +1035,38 @@ async def test_a_forged_platform_note_in_user_text_is_escaped() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_the_copy_is_ready_before_the_call_and_read_on_every_resolve() -> None:
-    """一步里路由换备用 / 思考升档 / 结构化输出重发都重新解析图片:每一次都读到缓存。"""
+async def test_the_copy_is_ready_before_the_call_and_read_on_every_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一步里路由换备用 / 思考升档 / 结构化输出重发都重新解析图片:每一次都读到缓存。
+
+    审查 M3 —— 调模型的那一刻,另一个步骤来要一大块地方:这一步的转正图钉住了,就挤不掉它
+    (别人那块放不下);没钉住就会被挤掉、适配器当场重算。"""
     s = _setup({_ref(): _stored(90)})
     s.main.resolves_per_call = 3
+    cache = image_views.UPRIGHT_VIEWS
+    ours = len((upright_copy(_stored(90), 90) or ("", b""))[1])
+    monkeypatch.setattr(cache, "full_cap_bytes", ours * 3)
+    # 别人先放进一张没钉住的旧图(排在我们这张后面),再来要一大块:放得下(我们这张 + 它不超上限),
+    # 腾地方只能挤那张旧的 —— 钉住的这张永远不被挤。
+    stale = image_views.PreparedView(("stale", 90), "image/jpeg", b"s" * ours)
+    other = image_views.PreparedView(("someone-else", 90), "image/jpeg", b"x" * (ours * 2 - 1))
+    others_got_in: list[bool] = []
+
+    def another_step_wants_room() -> None:
+        if not others_got_in:
+            assert cache.try_pin_full([stale])
+            cache.unpin_full([stale.key])
+            others_got_in.append(cache.try_pin_full([other]))
+
+    s.main.before_resolve = another_step_wants_room
     miss = _count(image_views.main_model_image_view_cache_total, outcome="adapter_miss")
     hits = _count(image_views.main_model_image_view_cache_total, outcome="hit")
     async with _graph(s) as compiled:
         await _turn(compiled, s, _ref())
+    assert others_got_in == [True]
+    assert not cache.has_full(stale.key)
+    cache.unpin_full([other.key])  # 那个「别的步骤」结束
     assert _count(image_views.main_model_image_view_cache_total, outcome="adapter_miss") == miss
     assert _count(image_views.main_model_image_view_cache_total, outcome="hit") == hits + 3
     # 这一步结束后钉住解除。
@@ -1134,7 +1155,7 @@ async def test_low_copies_are_released_at_run_end() -> None:
     key = (image_views.image_digest(_stored(90)), 90)
     copy = image_views.low_res_copy(_stored(90), 90)
     assert cache.hold_low("run-x", [image_views.PreparedView(key, *copy)], 10**12)
-    cache.set_run_mode("run-x", key[0], "low")
+    cache.set_run_mode("run-x", key[0], "low", 10**12)
     image_views.release_run_views("run-x")
     assert cache.low_bytes == 0
     assert cache.run_mode("run-x", key[0]) is None
@@ -1168,7 +1189,7 @@ async def test_run_agent_releases_the_runs_low_copies_on_every_exit() -> None:
     copy = image_views.low_res_copy(_stored(90), 90)
     run = str(record.run_id)
     assert cache.hold_low(run, [image_views.PreparedView(key, *copy)], 10**12)
-    cache.set_run_mode(run, key[0], "low")
+    cache.set_run_mode(run, key[0], "low", 10**12)
     await run_agent(
         bridge=InMemoryStreamBridge(),
         run_manager=rm,
@@ -1179,3 +1200,165 @@ async def test_run_agent_releases_the_runs_low_copies_on_every_exit() -> None:
     )
     assert cache.low_bytes == 0
     assert cache.run_mode(run, key[0]) is None
+
+
+# ---------------------------------------------------------------------------
+# 审查第一轮:M1 / M2 / LOW
+# ---------------------------------------------------------------------------
+
+
+async def test_a_judged_step_that_fails_does_not_lose_the_image() -> None:
+    """审查 M1 —— 判完的那一步失败了(状态没落下):下一轮这张图在历史里,不能被当成「上线前的
+    老图」原样发;从进程内记录补回登记与结论,也不重问。"""
+    s = _setup({_ref(): _stored(90)})
+    s.main.script = [RuntimeError("provider down")]
+    async with _graph(s) as compiled:
+        with pytest.raises(RuntimeError):
+            await _turn(compiled, s, _ref())
+        asked = len(s.judge.calls)
+        config = await _turn(compiled, s, text="再看一次")
+        snapshot = await compiled.aget_state(config)
+    assert len(s.judge.calls) == asked
+    assert s.main.replies[-1] == SECRET
+    assert list(snapshot.values["conversation_images"])  # 登记补回了状态
+    assert [r["conclusion"] for r in snapshot.values["image_orientations"].values()] == ["rotated"]
+
+
+async def test_new_images_get_full_resolution_and_history_degrades_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """审查 M2 —— 地方不够时,这一轮的新图用全分辨率;历史里的图自己降到小副本,不把新图一起拖下去
+    (以前是全部一次拿齐,多一张就全部降级)。一步最多钉住全分辨率区的一半。"""
+    first, second = _stored(90), _stored(270)
+    size = max(len((upright_copy(d, t) or ("", b""))[1]) for d, t in ((first, 90), (second, 270)))
+    monkeypatch.setattr(image_views.UPRIGHT_VIEWS, "full_cap_bytes", int(size * 2.5))
+    monkeypatch.setattr(upright_mod.UprightViewCache, "pin_full", _no_wait_pin)
+    s = _setup({_ref(1): first, _ref(2): second})
+    async with _graph(s) as compiled:
+        await _turn(compiled, s, _ref(1))
+        await _turn(compiled, s, _ref(2), text="又一张横的")
+    prompt = s.main.prompts[-1]
+    old_block = _last_user(prompt[:1]).content[1]
+    new_block = _last_user(prompt).content[1]
+    assert new_block["view"] == {"degrees": 270, "variant": "full"}  # type: ignore[index]
+    assert old_block["view"] == {"degrees": 90, "variant": "low"}  # type: ignore[index]
+    assert s.main.replies == [SECRET, SECRET]
+
+
+async def test_unreadable_is_counted_once_per_image_not_per_step() -> None:
+    s = _setup({})
+    s.main.script = [_tool_call()]
+    registry = ToolRegistry()
+    registry.register(_Noop())
+    before = _count(main_model_image_orientation_skipped_total, reason="unreadable")
+    async with _graph(s, registry=registry) as compiled:
+        await _turn(compiled, s, _ref(9))  # 两步;字节不在
+    assert _count(main_model_image_orientation_skipped_total, reason="unreadable") == before + 1
+
+
+async def test_model_not_verified_is_counted_once_per_image() -> None:
+    """审查 L4 —— 每张新图只计一次;没有路由时「到期再判」的图不按轮重复计。"""
+    s = _setup({_ref(): _stored(90)}, reply=_answers({0: "raise"}))
+    before = _count(main_model_image_orientation_skipped_total, reason="model_not_verified")
+    unverified = _orienter(s.resolver, None)
+    async with make_checkpointer("memory") as cp:
+        verified_build = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=s.main,
+                tool_registry=ToolRegistry(),
+                supports_vision=True,
+                image_orienter=s.orienter,
+            )
+        )
+        await _turn(verified_build, s, _ref())  # 判成 unjudged,下一轮「到期」
+        unverified_build = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=s.main,
+                tool_registry=ToolRegistry(),
+                supports_vision=True,
+                image_orienter=unverified,
+            )
+        )
+        await _turn(unverified_build, s, text="第二轮")
+        await _turn(unverified_build, s, text="第三轮")
+        assert (
+            _count(main_model_image_orientation_skipped_total, reason="model_not_verified")
+            == before
+        )
+        await _turn(unverified_build, s, _ref(), text="新图(同一张字节,已有结论)")
+    assert _count(main_model_image_orientation_skipped_total, reason="model_not_verified") == before
+
+
+async def test_switch_off_is_counted_and_clears_the_shown_angles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _setup({_ref(): _stored(90)})
+    async with _graph(s) as compiled:
+        config = await _turn(compiled, s, _ref())
+        assert (await compiled.aget_state(config)).values["shown_image_angles"]
+        monkeypatch.setenv(MAIN_MODEL_ORIENTATION_ENV, "off")
+        before = _count(main_model_image_orientation_skipped_total, reason="switch_off")
+        config = await _turn(compiled, s, _ref(), text="关了开关再发一次")
+        snapshot = await compiled.aget_state(config)
+    assert not snapshot.values.get("shown_image_angles")
+    assert _count(main_model_image_orientation_skipped_total, reason="switch_off") == before + 1
+
+
+async def test_running_out_of_the_thirty_seconds_counts_as_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """审查 L4 —— 30 秒用完、第 2 步没来得及问,计 ``deadline``。"""
+    s = _setup({_ref(): _stored(90)})
+    real = upright_mod._crop_in_thread
+
+    async def slow(data: bytes, boxes: Any, degrees: int, *a: Any) -> Any:
+        if degrees:
+            await asyncio.sleep(1.5)  # 生成候选吃掉时间,第 2 步问不完
+        return await real(data, boxes, degrees, *a)
+
+    monkeypatch.setattr(upright_mod, "_crop_in_thread", slow)
+    monkeypatch.setattr(upright_mod, "ORIENTATION_TIMEOUT_S", 6.5)
+    before = _count(main_model_image_orientation_skipped_total, reason="deadline")
+    async with _graph(s) as compiled:
+        config = await _turn(compiled, s, _ref())
+        snapshot = await compiled.aget_state(config)
+    (record,) = snapshot.values["image_orientations"].values()
+    assert record["conclusion"] == "pending"
+    assert _count(main_model_image_orientation_skipped_total, reason="deadline") == before + 1
+
+
+async def test_note_numbering_skips_images_replaced_by_text() -> None:
+    """审查 L7 —— 字节不在的图适配器换成提示文字,「第几张 / 共几张」不数它。"""
+    s = _setup({_ref(2): _stored(90)})
+    async with _graph(s) as compiled:
+        await _turn(compiled, s, _ref(1), _ref(2))  # _ref(1) 的字节不在
+    assert "Image 1 of 1 in this message was stored turned" in _note(s)
+
+
+def test_image_ids_grow_on_a_prefix_collision() -> None:
+    """审查 L1 —— 两张不同的图哈希前 8 位相同:第二张的编号加长,不并成一张。"""
+    first = "a" * 8 + "1" * 56
+    second = "a" * 8 + "2" * 56
+    assert upright_mod._image_id(first, {}) == f"img_{first[:8]}"
+    taken = {f"img_{first[:8]}": {"sha": first}}
+    assert upright_mod._image_id(first, taken) == f"img_{first[:8]}"
+    assert upright_mod._image_id(second, taken) == f"img_{second[:16]}"
+
+
+async def test_no_images_means_no_work_and_no_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """审查 L3 —— 没有图的步骤:不开 span、不写任何新通道。"""
+    spans: list[str] = []
+    real_span = upright_mod.expert_work_span
+
+    def counting(component: Any, action: str) -> Any:
+        spans.append(action)
+        return real_span(component, action)
+
+    monkeypatch.setattr(upright_mod, "expert_work_span", counting)
+    s = _setup({})
+    async with _graph(s) as compiled:
+        config = await _turn(compiled, s, text="没有图")
+        snapshot = await compiled.aget_state(config)
+    assert spans == []
+    for key in ("conversation_images", "image_orientations", "shown_image_angles"):
+        assert not snapshot.values.get(key)

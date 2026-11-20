@@ -716,7 +716,7 @@ async def resolve_message_images(
                 out.append(UPLOAD_IMAGE_GONE_TEXT)
                 continue
             view = views[index] if index < len(views) else None
-            out.append(resolved if view is None else _viewed(resolved, view))
+            out.append(resolved if view is None else await _viewed(resolved, view))
             continue
         try:
             out.append(await resolver.resolve(ref))
@@ -733,9 +733,9 @@ async def resolve_message_images(
     return out
 
 
-def _viewed(resolved: ResolvedImage, view: ImageView) -> ResolvedImage:
+async def _viewed(resolved: ResolvedImage, view: ImageView) -> ResolvedImage:
     """B-322 —— 原图换成按 ``view`` 转正的那一份;拿不到(放弃转正)就是原图。"""
-    found = view_bytes(image_digest(resolved.data), view, resolved.data)
+    found = await view_bytes(image_digest(resolved.data), view, resolved.data)
     if found is None:
         return resolved
     media_type, data = found

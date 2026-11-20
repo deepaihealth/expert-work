@@ -446,9 +446,10 @@ class AgentState(TypedDict):
     #: B-236 review 10 —— ``seed_skipped_dirs`` 之外还有几个目录没复制(名字只记前
     #: ``MAX_REPORTED_DIRS`` 个)。快照段写成「… and N more」。
     seed_skipped_more: NotRequired[int]
-    #: B-322 —— 主模型自己看图(Path A)时见过的图:图编号(``img_`` + 图哈希前 8 位)→
-    #: ``{"sha": 图哈希前 16 位, "refs": [原图 ref…], "width", "height", "first_turn"}``。只在
-    #: 出现新图时追加,不淘汰(每条约 150 字节)。``graph_builder.image_upright`` 写。
+    #: B-322 —— 主模型自己看图(Path A)时见过的图:图编号(``img_`` + 图哈希前 8 位,撞了别的图
+    #: 就加长)→ ``{"sha": 图哈希(sha256 十六进制全长), "refs": [原图 ref…], "width", "height",
+    #: "first_turn"}``。只在出现新图时追加,不淘汰(每条约 200 字节)。
+    #: ``graph_builder.image_upright`` 写。
     conversation_images: NotRequired[
         Annotated[dict[str, dict[str, Any]], _merge_conversation_images]
     ]

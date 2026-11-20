@@ -29,8 +29,9 @@ import hashlib
 import io
 import math
 import time
+import weakref
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final, Literal, get_args
 
@@ -118,36 +119,57 @@ def image_digest(data: bytes) -> str:
 def upright_copy(data: bytes, degrees: int) -> tuple[str, bytes] | None:
     """原图按方向标记转正、再顺时针转 ``degrees`` 度的整张图 → ``(媒体类型, 字节)``。
 
-    像素:原像素,超过 1,200 万 / 长边 4,000 才缩。格式跟原图走(JPEG 92 / WebP 90 / PNG 最高压缩 /
-    GIF)。字节:有损格式超过原图就按 85、75 再存,仍超就每次缩到 0.8 倍像素再试、最低到小副本的
-    像素数;无损格式不超过 ``max(原图, min(原图 x 1.1, 4,900,000))`` 就照发,不缩像素,超了才缩。
-    还超(实际上碰不到)→ ``None``:放弃转正,调用方按原样发并计 ``copy_too_large``。
+    像素:与原图一样多,**不缩**(原图今天就是这么大发给厂商的;设计 §8.1 第 5 条细化)。格式跟
+    原图走(JPEG 92 / WebP 90 / PNG 最高压缩 / GIF)。字节:有损格式超过原图就按 85、75 再存,仍超
+    就每次缩到 0.8 倍像素再试、最低到小副本的像素数;无损格式不超过
+    ``max(原图, min(原图 x 1.1, 4,900,000))`` 就照发,超了才缩。还超(实际上碰不到)→ ``None``:
+    放弃转正,调用方按原样发并计 ``copy_too_large``。
 
-    认不出 / 解不开的图抛 ``RegionImageError``。同步、吃 CPU,调用方放到线程里(占解图名额)。"""
+    内存(审查 H1):解开的原图转完立刻放掉(:func:`~orchestrator.tools.region_zoom.upright_whole`),
+    编完就关掉转好的那份。认不出 / 解不开的图抛 ``RegionImageError``。同步、吃 CPU:调用方用
+    :func:`in_wide_host_crop_slot` 放到线程里(一张全分辨率转正图占两个解图名额)。"""
     from orchestrator.tools.region_zoom import (  # 延迟导入,见模块说明
         OPEN_FORMATS,
-        REGION_TARGET_PIXELS,
-        UPRIGHT_COPY_MAX_PIXELS,
         RegionImageError,
         upright_whole,
     )
 
     try:
-        with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
-            source_format = image.format or "PNG"
-            whole = upright_whole(image, degrees, UPRIGHT_COPY_MAX_PIXELS)
-    except RegionImageError:
-        raise
+        image = Image.open(io.BytesIO(data), formats=OPEN_FORMATS)
     except (OSError, ValueError, Image.DecompressionBombError) as exc:
         msg = f"the image could not be decoded for turning upright ({type(exc).__name__})"
         raise RegionImageError(msg) from exc
+    try:
+        source_format = image.format or "PNG"
+        whole = upright_whole(image, degrees)
+    except RegionImageError:
+        image.close()
+        raise
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        image.close()
+        msg = f"the image could not be decoded for turning upright ({type(exc).__name__})"
+        raise RegionImageError(msg) from exc
+    try:
+        return _encode_within(whole, source_format, len(data))
+    finally:
+        whole.close()
+
+
+def _encode_within(
+    whole: Image.Image, source_format: str, original_bytes: int
+) -> tuple[str, bytes] | None:
+    """按字节规则编码(见 :func:`upright_copy`)。"""
+    from orchestrator.tools.region_zoom import REGION_TARGET_PIXELS  # 延迟导入,见模块说明
+
     fmt = "JPEG" if source_format == "MPO" else source_format
     media_type = _MEDIA_TYPES.get(fmt, "image/png")
     if fmt in _FIRST_QUALITY:
-        limit = len(data)
+        limit = original_bytes
         qualities: tuple[int | None, ...] = (_FIRST_QUALITY[fmt], *_FALLBACK_QUALITIES)
     else:
-        limit = max(len(data), min(math.floor(len(data) * LOSSLESS_GROWTH), LOSSLESS_MAX_BYTES))
+        limit = max(
+            original_bytes, min(math.floor(original_bytes * LOSSLESS_GROWTH), LOSSLESS_MAX_BYTES)
+        )
         qualities = (None,)
     for quality in qualities:
         encoded = _encode(whole, fmt, quality)
@@ -184,7 +206,10 @@ def _encode(image: Image.Image, fmt: str, quality: int | None) -> bytes:
         rgb.save(buffer, format="JPEG", quality=quality, subsampling=2)
     elif fmt == "WEBP":
         has_alpha = image.mode in ("RGBA", "LA") or "transparency" in image.info
-        image.convert("RGBA" if has_alpha else "RGB").save(buffer, format="WEBP", quality=quality)
+        mode = "RGBA" if has_alpha else "RGB"
+        # 模式已经对了就不转(convert 会再复制一整张;审查 H1)。
+        ready = image if image.mode == mode else image.convert(mode)
+        ready.save(buffer, format="WEBP", quality=quality)
     elif fmt == "GIF":
         image.save(buffer, format="GIF")
     else:
@@ -249,8 +274,9 @@ class UprightViewCache:
         self._full: OrderedDict[ViewKey, _FullEntry] = OrderedDict()
         self._low: dict[ViewKey, _LowEntry] = {}
         self._lent: dict[ViewKey, tuple[str, bytes, int]] = {}
-        #: (run, 图哈希) → 这张图这个 run 里降到哪一级(小副本 / 按原样);run 收尾时清。
-        self._run_modes: dict[tuple[str, str], RunMode] = {}
+        #: (run, 图哈希) → 这张图这个 run 里降到哪一级(小副本 / 按原样)与过期的单调时刻;
+        #: run 收尾时清,委派子代(``sse`` 收不到它的尾)靠过期清(审查 L2)。
+        self._run_modes: dict[tuple[str, str], tuple[RunMode, float]] = {}
 
     # -- 读(适配器)--------------------------------------------------------
 
@@ -284,6 +310,11 @@ class UprightViewCache:
     def low_bytes(self) -> int:
         return sum(len(e.data) for e in self._low.values())
 
+    @property
+    def lent_bytes(self) -> int:
+        """正借给适配器的问方向候选图(也算在全分辨率区的上限里,审查 L6)。"""
+        return sum(len(held[1]) for held in self._lent.values())
+
     def try_pin_full(self, items: Sequence[PreparedView]) -> bool:
         """把 ``items`` 一次全部钉住(已在缓存里的只加钉,不在的放进去);放不下就一个都不钉、
         返回 ``False``。放得下时先挤掉没钉住的旧条目(最久没用的先挤),缓存永不超过上限。"""
@@ -291,23 +322,27 @@ class UprightViewCache:
         wanted = {p.key for p in new}
         needed = sum(len(p.data) for p in new if p.key not in self._full)
         needed += sum(len(e.data) for k, e in self._full.items() if e.pins > 0 or k in wanted)
-        if needed > self.full_cap_bytes:
+        if needed + self.lent_bytes > self.full_cap_bytes:
             return False
         for prepared in new:
             if prepared.key not in self._full:
                 self._full[prepared.key] = _FullEntry(prepared.media_type, prepared.data)
-        total = self.full_bytes
-        for key in list(self._full):
-            if total <= self.full_cap_bytes:
-                break
-            entry = self._full[key]
-            if entry.pins == 0 and key not in wanted:
-                total -= len(entry.data)
-                del self._full[key]
+        self._evict_unpinned(keep=wanted)
         for key in wanted:
             self._full[key].pins += 1
             self._full.move_to_end(key)
         return True
+
+    def _evict_unpinned(self, keep: set[ViewKey] | frozenset[ViewKey] = frozenset()) -> None:
+        """挤掉没钉住的旧条目(最久没用的先挤),直到全分辨率区 + 借出的候选不超过上限。"""
+        total = self.full_bytes + self.lent_bytes
+        for key in list(self._full):
+            if total <= self.full_cap_bytes:
+                break
+            entry = self._full[key]
+            if entry.pins == 0 and key not in keep:
+                total -= len(entry.data)
+                del self._full[key]
 
     def unpin_full(self, keys: Sequence[ViewKey]) -> None:
         for key in keys:
@@ -351,10 +386,19 @@ class UprightViewCache:
     # -- run 级的降级决定 ---------------------------------------------------
 
     def run_mode(self, run_id: str, digest: str) -> RunMode | None:
-        return self._run_modes.get((run_id, digest))
+        held = self._run_modes.get((run_id, digest))
+        if held is None:
+            return None
+        if held[1] <= time.monotonic():
+            del self._run_modes[(run_id, digest)]
+            return None
+        return held[0]
 
-    def set_run_mode(self, run_id: str, digest: str, mode: RunMode) -> None:
-        self._run_modes[(run_id, digest)] = mode
+    def set_run_mode(self, run_id: str, digest: str, mode: RunMode, expires_at: float) -> None:
+        now = time.monotonic()
+        for key in [k for k, (_mode, at) in self._run_modes.items() if at <= now]:
+            del self._run_modes[key]
+        self._run_modes[(run_id, digest)] = (mode, expires_at)
 
     def release_run(self, run_id: str) -> None:
         """run 收尾(正常结束、出错、被取消都走):它的小副本与降级决定一并释放。"""
@@ -369,9 +413,11 @@ class UprightViewCache:
     # -- 问方向的候选图(只借不存)-----------------------------------------
 
     def lend(self, key: ViewKey, media_type: str, data: bytes) -> None:
-        """候选图在问的那一会儿借给适配器;同一张图被两个对话同时问时按次数借还。"""
+        """候选图在问的那一会儿借给适配器;同一张图被两个对话同时问时按次数借还。借出的字节算在
+        全分辨率区的上限里:先挤掉没钉住的转正图腾地方(从不拒借 —— 问方向不因此失败)。"""
         held = self._lent.get(key)
         self._lent[key] = (media_type, data, (held[2] if held is not None else 0) + 1)
+        self._evict_unpinned()
 
     def give_back(self, key: ViewKey) -> None:
         held = self._lent.get(key)
@@ -399,9 +445,10 @@ def release_run_views(run_id: object) -> None:
     UPRIGHT_VIEWS.release_run(str(run_id))
 
 
-def view_bytes(digest: str, view: ImageView, data: bytes) -> tuple[str, bytes] | None:
+async def view_bytes(digest: str, view: ImageView, data: bytes) -> tuple[str, bytes] | None:
     """适配器取一张带 ``view`` 的图:先读缓存(计 ``hit``);没读到就当场算一次(计
-    ``adapter_miss``,这一步照样成功);算不出来(放弃转正 / 解不开)→ ``None``,按原图发。"""
+    ``adapter_miss``,这一步照样成功)—— 也在解图名额里、在线程里算,不占事件循环(审查 H1);
+    算不出来(放弃转正 / 解不开)→ ``None``,按原图发。"""
     cached = UPRIGHT_VIEWS.get(digest, view)
     # 问方向的候选只借不存,不进主模型转正图的缓存计数。
     if view.variant != "candidate":
@@ -411,7 +458,63 @@ def view_bytes(digest: str, view: ImageView, data: bytes) -> tuple[str, bytes] |
         return cached
     try:
         if view.variant == "full":
-            return upright_copy(data, view.degrees)
-        return low_res_copy(data, view.degrees)
+            return await in_wide_host_crop_slot(upright_copy, data, view.degrees)
+        return await in_host_crop_slot(low_res_copy, data, view.degrees)
     except ValueError:  # RegionImageError:解不开 —— 按原图发
         return None
+
+
+# ---------------------------------------------------------------------------
+# 宿主解图名额
+# ---------------------------------------------------------------------------
+
+#: B-266 review round 2 g —— 宿主裁图的进程内名额(``region_zoom.HOST_CROP_SLOTS``),在**进线程
+#: 之前**用 ``asyncio.Semaphore`` 拿:线程池里的线程从不阻塞着等。信号量绑定在创建它的循环上,按循环
+#: 各一个。``ask_image`` 裁图、B-322 的候选图 / 小副本 / 转正图都共用它。
+_HOST_CROP_GATES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+#: 要一次拿两个名额的任务先排这把锁:同一时间只有一个任务在凑两个名额,不会两个任务各拿一个互等。
+_WIDE_GATES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _gate() -> asyncio.Semaphore:
+    from orchestrator.tools.region_zoom import HOST_CROP_SLOTS  # 延迟导入,见模块说明
+
+    loop = asyncio.get_running_loop()
+    gate = _HOST_CROP_GATES.get(loop)
+    if gate is None:
+        gate = _HOST_CROP_GATES[loop] = asyncio.Semaphore(HOST_CROP_SLOTS)
+    return gate
+
+
+async def in_host_crop_slot[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    """在一个宿主解图名额里、线程中跑一次解图 / 裁图(不新增解图并发)。"""
+    async with _gate():
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+
+async def in_wide_host_crop_slot[**P, T](
+    func: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+) -> T:
+    """B-322 —— 占**两个**解图名额跑(全分辨率转正图:一张 12 MP 照片解开 + 转一份,本机实测峰值
+    约是一次普通裁图的两倍,审查 H1)。凑名额时先排 :data:`_WIDE_GATES`,不会两个任务各拿一个互等。"""
+    gate = _gate()
+    loop = asyncio.get_running_loop()
+    wide = _WIDE_GATES.get(loop)
+    if wide is None:
+        wide = _WIDE_GATES[loop] = asyncio.Lock()
+    async with wide:
+        await gate.acquire()
+        try:
+            await gate.acquire()
+        except BaseException:
+            gate.release()
+            raise
+    try:
+        return await asyncio.to_thread(func, *args, **kwargs)
+    finally:
+        gate.release()
+        gate.release()

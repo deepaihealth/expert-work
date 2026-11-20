@@ -24,7 +24,7 @@ import logging
 import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -53,6 +53,11 @@ from expert_work.runtime.middleware.llm_error_handling import (
     LLMUnauthorizedError,
 )
 from expert_work.runtime.storage.base import ObjectNotFoundError
+
+# B-266 review round 2 g —— 宿主解图名额(``region_zoom.HOST_CROP_SLOTS``)的闸;B-322 起放在叶子模块
+# ``orchestrator.image_views`` 里,适配器那一侧当场重算转正图也走同一道闸。
+from orchestrator.image_views import _HOST_CROP_GATES as _HOST_CROP_GATES
+from orchestrator.image_views import in_host_crop_slot as in_host_crop_slot
 from orchestrator.llm.truncation import (
     ServedOutputCap,
     is_unusable_truncation,
@@ -101,7 +106,6 @@ from orchestrator.tools.region_zoom import (
     AUTO_GATE_PIXELS,
     AUTO_REGION,
     DOCUMENT_ZOOM_DPI,
-    HOST_CROP_SLOTS,
     LARGE_IMAGE_PIXELS,
     MAX_BAND_PIXELS,
     REGION_HINT,
@@ -214,28 +218,10 @@ _TILE_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaph
 )
 
 
-#: B-266 review round 2 g —— 宿主裁图的进程内名额(:data:`HOST_CROP_SLOTS`),在**进线程之前**
-#: 用 ``asyncio.Semaphore`` 拿:线程池里的线程从不阻塞着等。信号量绑定在创建它的循环上,按循环各一个。
-_HOST_CROP_GATES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
-    weakref.WeakKeyDictionary()
-)
-
-
 async def _crop_in_thread(
     data: bytes, boxes: Sequence[Box], degrees: int, max_pixels: int = REGION_TARGET_PIXELS
 ) -> list[CroppedImage]:
     return await in_host_crop_slot(crop_image, data, boxes, degrees, max_pixels)
-
-
-async def in_host_crop_slot[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
-    """在宿主解图名额(:data:`HOST_CROP_SLOTS`)里、线程中跑一次解图 / 裁图。B-322 主模型的
-    候选图与转正图也走这里:不新增解图并发,主进程内存峰值的上限不变。"""
-    loop = asyncio.get_running_loop()
-    gate = _HOST_CROP_GATES.get(loop)
-    if gate is None:
-        gate = _HOST_CROP_GATES[loop] = asyncio.Semaphore(HOST_CROP_SLOTS)
-    async with gate:
-        return await asyncio.to_thread(func, *args, **kwargs)
 
 
 def _tile_slots() -> asyncio.Semaphore:

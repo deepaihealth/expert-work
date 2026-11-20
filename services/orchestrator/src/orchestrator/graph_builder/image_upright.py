@@ -27,7 +27,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final
 from uuid import UUID
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -48,6 +48,8 @@ from orchestrator.image_views import (
     PreparedView,
     UprightViewCache,
     image_digest,
+    in_host_crop_slot,
+    in_wide_host_crop_slot,
     low_res_copy,
     main_model_image_view_cache_total,
     upright_copy,
@@ -77,7 +79,6 @@ from orchestrator.tools.vision import (
     _crop_in_thread,
     _stringify,
     _tile_slots,
-    in_host_crop_slot,
 )
 
 if TYPE_CHECKING:
@@ -97,6 +98,8 @@ MIN_SIDE_PIXELS: Final = 32
 MIN_RUN_LEFT_S: Final = SEAM_RELOOK_MIN_RUN_LEFT_S
 #: 进程内记录最多几条(整步从检查点重跑时不重问;每条几百字节)。
 MEMO_SIZE: Final = 512
+#: 一步钉住的全分辨率转正图最多占全分辨率区的几分之几(审查 M2):总给别的步骤留地方。
+STEP_PIN_SHARE: Final = 0.5
 
 ROTATED_NOTE: Final = (
     "Image {i} of {n} in this message was stored turned; it is shown rotated {degrees} degrees "
@@ -134,8 +137,6 @@ class OrientationJudge:
     meter: UsageMeter
     #: 剪过枝、关了思考的那棵模型树(构建期测试核它每个节点都核实)。
     model: ModelSpec
-    #: 路由上挂了盖章层(有用量存储时)。
-    stamped: bool
 
     def answered_by(self, response: AIMessage) -> str:
         """实际应答的模型 ``provider/name``(按盖章解析;没盖章时是配置的主模型)。"""
@@ -158,6 +159,17 @@ class StepRun:
     tenant_id: UUID | None = None
     user_id: UUID | None = None
     token_budget: TokenBudget | None = None
+    #: 这条对话(状态所在的线程);进程内记录按它记。空 = 用 ``run_id``。
+    thread: str = ""
+
+    @property
+    def conversation(self) -> str:
+        return self.thread or self.run_id
+
+    def expires_at(self) -> float:
+        """这个 run 在本进程里的东西(小副本、降级决定)最晚留到什么时候。"""
+        left = self.remaining_s if self.remaining_s is not None else LOW_COPY_FALLBACK_TTL_S
+        return time.monotonic() + max(0.0, left)
 
 
 @dataclass
@@ -166,11 +178,15 @@ class UprightStep:
 
     views: UprightViewCache
     pinned: list[tuple[str, int]] = field(default_factory=list)
+    pinned_bytes: int = 0
     update: dict[str, Any] = field(default_factory=dict)
+    #: 这一步取字节失败的 ref(适配器会把它们换成提示文字;说明里的「第几张」不数它们)。
+    unreadable: set[str] = field(default_factory=set)
 
     def release(self) -> None:
         self.views.unpin_full(self.pinned)
         self.pinned = []
+        self.pinned_bytes = 0
 
     def state_update(self) -> dict[str, Any]:
         return dict(self.update)
@@ -202,7 +218,12 @@ class ImageOrienter:
     configured_model: str
     judge: OrientationJudge | None = None
     views: UprightViewCache = UPRIGHT_VIEWS
+    #: (对话, 结论键) → 结论;(对话, ref) → (图编号, 图记录)。尽力而为、按副本:某一步判完了却
+    #: 失败 / 被取消、状态没落下时,同一对话之后的步骤从这里补回去(审查 M1;整步重跑不重问)。
     _memo: OrderedDict[tuple[str, str], dict[str, Any]] = field(
+        default_factory=OrderedDict, init=False, repr=False
+    )
+    _registered: OrderedDict[tuple[str, str], tuple[str, dict[str, Any]]] = field(
         default_factory=OrderedDict, init=False, repr=False
     )
 
@@ -219,8 +240,21 @@ class ImageOrienter:
         messages: Sequence[BaseMessage],
         run: StepRun,
     ) -> list[BaseMessage]:
-        """A 段:判新图、定角度、预先生成并钉住转正图、换块。紧急开关关着时原样返回、不写状态。"""
+        """A 段:判新图、定角度、预先生成并钉住转正图、换块。紧急开关关着时提示词原样。"""
+        turn_refs = list(dict.fromkeys(_string_list(state.get("turn_image_refs"))))
         if not main_model_orientation_switch_on():
+            # 关着:提示词与没有这个功能时逐字节相同;上一次留下的显示角度在状态里清掉。
+            if state.get("shown_image_angles"):
+                step.update["shown_image_angles"] = {}
+            if run.first_step and turn_refs:
+                main_model_image_orientation_skipped_total.labels(reason="switch_off").inc(
+                    len(turn_refs)
+                )
+            return list(messages)
+        view_refs = _refs_in_view(messages)
+        if not turn_refs and not view_refs:
+            if state.get("shown_image_angles"):
+                step.update["shown_image_angles"] = {}
             return list(messages)
         started = time.monotonic()
         images: dict[str, dict[str, Any]] = dict(state.get("conversation_images") or {})
@@ -228,51 +262,41 @@ class ImageOrienter:
         new_images: dict[str, dict[str, Any]] = {}
         new_records: dict[str, dict[str, Any]] = {}
         by_ref = {ref: image_id for image_id, rec in images.items() for ref in rec.get("refs", [])}
+        # 之前某一步登记过、那一步却没落状态的图:从进程内记录补回来(审查 M1)。
+        for ref in dict.fromkeys([*turn_refs, *view_refs]):
+            remembered = self._registered.get((run.conversation, ref))
+            if ref not in by_ref and remembered is not None:
+                image_id, entry = remembered
+                merged = _with_ref(images.get(image_id), entry, ref)
+                images[image_id] = new_images[image_id] = merged
+                by_ref[ref] = image_id
         turn_ids: list[str] = []
-        for ref in dict.fromkeys(_string_list(state.get("turn_image_refs"))):
-            image_id = by_ref.get(ref)
-            if image_id is None:
-                registered = await self._register(ref, run=run)
+        for ref in turn_refs:
+            known = by_ref.get(ref)
+            if known is None:
+                registered = await self._register(ref, images, step=step, run=run)
                 if registered is None:
                     continue
-                image_id, entry = registered
-                if image_id in images:
-                    entry = {**images[image_id], "refs": [*images[image_id]["refs"], ref]}
-                images[image_id] = new_images[image_id] = entry
-                by_ref[ref] = image_id
-            turn_ids.append(image_id)
-        in_view = _image_ids_in_view(messages, by_ref)
-        # 进程内记录先于状态(整步从检查点重跑时状态里还没有本步的结论);
-        # 有而状态没有的,补进本步返回值。
+                known, fresh_entry = registered
+                images[known] = new_images[known] = fresh_entry
+                by_ref[ref] = known
+                self._keep(self._registered, (run.conversation, ref), (known, fresh_entry))
+            turn_ids.append(known)
+        in_view = list(dict.fromkeys(by_ref[r] for r in view_refs if r in by_ref))
+        # 进程内记录比状态新的(整步重跑、或那一步失败没落状态),补进本步返回值。
         for image_id in {*turn_ids, *in_view}:
             key = _record_key(images[image_id])
-            remembered = self._memo.get((run.turn, key))
-            if remembered is not None and records.get(key) != remembered:
-                records[key] = new_records[key] = remembered
+            remembered_record = self._memo.get((run.conversation, key))
+            if remembered_record is not None and _newer(remembered_record, records.get(key)):
+                records[key] = new_records[key] = remembered_record
         selected = self._select(turn_ids, in_view, images, records, run)
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "image_orientation") as span:
             judged = await self._judge_all(selected, run, started)
             for item, record in judged:
                 records[item.key] = new_records[item.key] = record
-                self._remember((run.turn, item.key), record)
-            shown = await self._shown(in_view, images, records, step, run)
-            span.set_attribute("image_orientation.new_images", len(new_images))
-            span.set_attribute("image_orientation.asked", len(judged))
-            span.set_attribute(
-                "image_orientation.rotated", sum(r["conclusion"] == "rotated" for _, r in judged)
-            )
-            span.set_attribute(
-                "image_orientation.undetermined",
-                sum(r["conclusion"] == "undetermined" for _, r in judged),
-            )
-            span.set_attribute(
-                "image_orientation.not_answered",
-                sum(r["conclusion"] in ("pending", "unjudged") for _, r in judged),
-            )
-            span.set_attribute(
-                "image_orientation.extra_calls", sum(int(r.get("calls", 0)) for _, r in judged)
-            )
-            span.set_attribute("image_orientation.duration_ms", _ms_since(started))
+                self._keep(self._memo, (run.conversation, item.key), record)
+            shown = await self._shown(in_view, set(turn_ids), images, records, step, run)
+            _span_attributes(span, new_images, judged, started)
         if new_images:
             step.update["conversation_images"] = new_images
         if new_records:
@@ -280,16 +304,29 @@ class ImageOrienter:
         angles = {s.image_id: s.degrees for s in shown.values()}
         if angles != (state.get("shown_image_angles") or {}):
             step.update["shown_image_angles"] = angles
-        return _rewrite(messages, shown, by_ref)
+        return _rewrite(messages, shown, by_ref, step.unreadable)
 
-    async def _register(self, ref: str, *, run: StepRun) -> tuple[str, dict[str, Any]] | None:
+    async def _register(
+        self,
+        ref: str,
+        images: Mapping[str, Mapping[str, Any]],
+        *,
+        step: UprightStep,
+        run: StepRun,
+    ) -> tuple[str, dict[str, Any]] | None:
         """新见到的这一轮的图:取字节、算哈希、记尺寸。字节取不到 → ``None``(适配器照旧换成提示
-        文字)。短边不到 :data:`MIN_SIDE_PIXELS` 的照样登记,但不问(:func:`_judgeable`)。"""
-        data = await self._bytes(ref)
+        文字)。短边不到 :data:`MIN_SIDE_PIXELS` 的照样登记,但不问(:func:`_judgeable`)。
+        计数只在一轮的第一步计(同一张图不按步数重复计)。"""
+        data = await self._bytes(ref, step)
         if data is None:
-            main_model_image_orientation_skipped_total.labels(reason="unreadable").inc()
+            if run.first_step:
+                main_model_image_orientation_skipped_total.labels(reason="unreadable").inc()
             return None
         digest = image_digest(data)
+        image_id = _image_id(digest, images)
+        existing = images.get(image_id)
+        if existing is not None:  # 同一张图(同样的字节)又传了一次
+            return image_id, _with_ref(existing, existing, ref)
         size = image_size(data)
         entry: dict[str, Any] = {
             "sha": digest,
@@ -298,18 +335,27 @@ class ImageOrienter:
             "height": size[1] if size else None,
             "first_turn": run.turn,
         }
-        if not _judgeable(entry):
+        if not _judgeable(entry) and run.first_step:
             main_model_image_orientation_skipped_total.labels(reason="tiny").inc()
-        return f"img_{digest[:8]}", entry
+        return image_id, entry
 
-    async def _bytes(self, ref: str) -> bytes | None:
+    async def _bytes(self, ref: str, step: UprightStep | None = None) -> bytes | None:
         if ref.startswith(WORKSPACE_REF_PREFIX):
             return None
         try:
             return (await self.image_resolver.resolve(ref)).data
         except Exception:
             logger.info("image_upright.unreadable", exc_info=True)
+            if step is not None:
+                step.unreadable.add(ref)
             return None
+
+    @staticmethod
+    def _keep(store: OrderedDict[Any, Any], key: Any, value: Any) -> None:
+        store[key] = value
+        store.move_to_end(key)
+        while len(store) > MEMO_SIZE:
+            store.popitem(last=False)
 
     def _select(
         self,
@@ -338,9 +384,10 @@ class ImageOrienter:
                 ):
                     again.append(_ToJudge(image_id, key, images[image_id]["refs"][0], record))
         if self.judge is None:
-            if run.first_step and (fresh or again):
+            # 每张新图只在它那一轮的第一步计一次(再判的不计:没有路由,它们每轮都会「到期」)。
+            if run.first_step and fresh:
                 main_model_image_orientation_skipped_total.labels(reason="model_not_verified").inc(
-                    len(fresh) + len(again)
+                    len(fresh)
                 )
             return []
         if (fresh or again) and run.remaining_s is not None and run.remaining_s < MIN_RUN_LEFT_S:
@@ -437,6 +484,8 @@ class ImageOrienter:
             main_model_image_orientation_skipped_total.labels(
                 reason="answer_from_unverified_model"
             ).inc()
+        if orientation.reason == "deadline":  # 30 秒用完、没来得及问完(审查 L4)
+            main_model_image_orientation_skipped_total.labels(reason="deadline").inc()
         main_model_image_orientation_total.labels(
             conclusion=classified.conclusion, degrees=str(classified.degrees)
         ).inc()
@@ -460,7 +509,7 @@ class ImageOrienter:
         self, block: dict[str, Any], budget_s: float, run: StepRun
     ) -> tuple[Answer, str | None]:
         """问一次「正不正」:最多等 ``budget_s``(含排队等切块名额);照常扣池 / 记账;任何
-        ``Exception`` 都变成 ``error``,从不往外抛(取消照常往上走)。"""
+        ``Exception`` 都变成 ``error``,从不往外抛(取消与 ``BaseException`` 照常往上走)。"""
         judge = self.judge
         assert judge is not None  # noqa: S101 - 只在有路由时调
         messages: list[BaseMessage] = [
@@ -486,23 +535,18 @@ class ImageOrienter:
         word = parse_orientation_reply(_stringify(response.content))
         return (word, model) if word is not None else ("off_topic", model)
 
-    def _remember(self, key: tuple[str, str], record: dict[str, Any]) -> None:
-        self._memo[key] = record
-        self._memo.move_to_end(key)
-        while len(self._memo) > MEMO_SIZE:
-            self._memo.popitem(last=False)
-
     # ------------------------------------------------------------ 显示
 
     async def _shown(
         self,
         in_view: Sequence[str],
+        this_turn: set[str],
         images: Mapping[str, Mapping[str, Any]],
         records: Mapping[str, Mapping[str, Any]],
         step: UprightStep,
         run: StepRun,
     ) -> dict[str, _Shown]:
-        """视野里每张登记过的图这一步怎么显示;横的图的转正图在这里生成并钉住(三级退路)。"""
+        """视野里每张登记过的图这一步怎么显示;横的图的转正图在这里生成并钉住。"""
         shown: dict[str, _Shown] = {}
         turned: list[tuple[str, int]] = []
         for image_id in dict.fromkeys(in_view):
@@ -518,18 +562,27 @@ class ImageOrienter:
             else:
                 shown[image_id] = _Shown(image_id)
         if turned:
-            shown.update(await self._pin(turned, images, step, run))
+            shown.update(await self._pin(turned, this_turn, images, step, run))
         return shown
 
     async def _pin(
         self,
         turned: Sequence[tuple[str, int]],
+        this_turn: set[str],
         images: Mapping[str, Mapping[str, Any]],
         step: UprightStep,
         run: StepRun,
     ) -> dict[str, _Shown]:
+        """横的图怎么发(审查 M2):
+
+        * 这一轮的新图优先用全分辨率,一次全拿到(放不下最多等
+          :data:`~orchestrator.image_views.PIN_WAIT_S` 秒);
+        * 历史里的图逐张、不等:全分辨率区还有地方就用,没有就小副本,小副本区也满就按原样;
+        * 一步钉住的全分辨率图最多占全分辨率区的 :data:`STEP_PIN_SHARE`,别的步骤总还有地方;
+        * 降过级的图在这个 run 里一直用降过的那一份(字节稳定,不来回翻)。"""
         out: dict[str, _Shown] = {}
-        full: list[tuple[str, int]] = []
+        new_full: list[tuple[str, int]] = []
+        old_full: list[tuple[str, int]] = []
         low: list[tuple[str, int]] = []
         for image_id, degrees in turned:
             mode = self.views.run_mode(run.run_id, images[image_id]["sha"])
@@ -537,96 +590,127 @@ class ImageOrienter:
                 out[image_id] = _Shown(image_id, note="as_stored")
             elif mode == "low":
                 low.append((image_id, degrees))
+            elif image_id in this_turn:
+                new_full.append((image_id, degrees))
             else:
-                full.append((image_id, degrees))
-        prepared: list[PreparedView] = []
-        for image_id, degrees in full:
-            made = await self._full_copy(images[image_id], degrees)
-            if made is None:  # 原图字节不在了:适配器照旧换成提示文字,这里什么都不说
-                out[image_id] = _Shown(image_id)
-            elif made == "too_large":
-                self._as_stored(run, images[image_id]["sha"], "copy_too_large")
-                out[image_id] = _Shown(image_id, note="as_stored")
+                old_full.append((image_id, degrees))
+        share = int(self.views.full_cap_bytes * STEP_PIN_SHARE)
+        group: list[tuple[str, int, PreparedView]] = []
+        for image_id, degrees in new_full:
+            made = await self._prepared_full(image_id, images[image_id], degrees, step, run, out)
+            if made is not None:
+                group.append((image_id, degrees, made))
+        if group:
+            views = [p for _, _, p in group]
+            size = sum(len(p.data) for p in views)
+            if step.pinned_bytes + size <= share and await self.views.pin_full(views):
+                step.pinned.extend(p.key for p in views)
+                step.pinned_bytes += size
+                out.update({i: _Shown(i, d, "full", "rotated") for i, d, _ in group})
             else:
-                prepared.append(made)
-        if prepared and await self.views.pin_full(prepared):
-            step.pinned.extend(p.key for p in prepared)
-            for image_id, degrees in full:
-                if image_id not in out:
-                    out[image_id] = _Shown(image_id, degrees, "full", "rotated")
-        elif prepared:
-            # 第 1 级等满也放不下:这一步要用的全分辨率图一起降到小副本(角度不变)。
-            low.extend((i, d) for i, d in full if i not in out)
-        if low:
-            out.update(await self._hold_low(low, images, run))
+                low.extend((i, d) for i, d, _ in group)
+        for image_id, degrees in old_full:
+            made = await self._prepared_full(image_id, images[image_id], degrees, step, run, out)
+            if made is None:
+                continue
+            size = len(made.data)
+            if step.pinned_bytes + size <= share and self.views.try_pin_full([made]):
+                step.pinned.append(made.key)
+                step.pinned_bytes += size
+                out[image_id] = _Shown(image_id, degrees, "full", "rotated")
+            else:
+                low.append((image_id, degrees))
+        for image_id, degrees in low:
+            out[image_id] = await self._low_copy(image_id, degrees, images[image_id], step, run)
         return out
 
-    async def _full_copy(
-        self, image: Mapping[str, Any], degrees: int
-    ) -> PreparedView | Literal["too_large"] | None:
-        """全分辨率转正图:缓存里有就用;没有就在解图名额里生成。原图字节取不到 → ``None``;
-        放弃转正(怎么退都超、解不开)→ ``"too_large"``。"""
+    async def _prepared_full(
+        self,
+        image_id: str,
+        image: Mapping[str, Any],
+        degrees: int,
+        step: UprightStep,
+        run: StepRun,
+        out: dict[str, _Shown],
+    ) -> PreparedView | None:
+        """全分辨率转正图:缓存里有就用;没有就生成(占两个解图名额)。原图字节取不到 → 不说什么、
+        按原样(适配器换成提示文字);放弃转正(怎么退都超、解不开)→ 第 3 级。两种都返回 ``None``
+        并在 ``out`` 里写好。"""
         key = (str(image["sha"]), degrees)
         cached = self.views.get(key[0], ImageView(degrees))
         if cached is not None:
             return PreparedView(key, *cached)
-        data = await self._bytes(str(image["refs"][0]))
+        data = await self._bytes(str(image["refs"][0]), step)
         if data is None:
+            out[image_id] = _Shown(image_id)
             return None
         try:
-            made = await in_host_crop_slot(upright_copy, data, degrees)
+            made = await in_wide_host_crop_slot(upright_copy, data, degrees)
         except ValueError:
-            return "too_large"
+            made = None
         if made is None:
-            return "too_large"
+            self._as_stored(run, key[0], "copy_too_large")
+            out[image_id] = _Shown(image_id, note="as_stored")
+            return None
         main_model_image_view_cache_total.labels(outcome="precomputed").inc()
         return PreparedView(key, *made)
 
-    async def _hold_low(
+    async def _low_copy(
         self,
-        low: Sequence[tuple[str, int]],
-        images: Mapping[str, Mapping[str, Any]],
+        image_id: str,
+        degrees: int,
+        image: Mapping[str, Any],
+        step: UprightStep,
         run: StepRun,
-    ) -> dict[str, _Shown]:
-        """第 2 级:约 150 万像素的小副本,一次全部归给本 run;小区也满 → 第 3 级按原样。"""
-        out: dict[str, _Shown] = {}
-        prepared: list[tuple[str, PreparedView]] = []
-        for image_id, degrees in low:
-            image = images[image_id]
-            key = (str(image["sha"]), degrees)
-            cached = self.views.get(key[0], ImageView(degrees, "low"))
-            if cached is None:
-                data = await self._bytes(str(image["refs"][0]))
-                if data is None:
-                    out[image_id] = _Shown(image_id)
-                    continue
-                try:
-                    cached = await in_host_crop_slot(low_res_copy, data, degrees)
-                except ValueError:
-                    out[image_id] = _Shown(image_id, note="as_stored")
-                    continue
-            prepared.append((image_id, PreparedView(key, *cached)))
-        expires_at = time.monotonic() + (
-            run.remaining_s if run.remaining_s is not None else LOW_COPY_FALLBACK_TTL_S
-        )
-        held = self.views.hold_low(run.run_id, [p for _, p in prepared], expires_at)
-        for image_id, view in prepared:
-            sha = view.key[0]
-            if held:
-                if self.views.run_mode(run.run_id, sha) != "low":
-                    main_model_image_view_cache_total.labels(outcome="low_res_copy").inc()
-                self.views.set_run_mode(run.run_id, sha, "low")
-                out[image_id] = _Shown(image_id, view.key[1], "low", "rotated")
-            else:
-                self._as_stored(run, sha, "pin_over_cap")
-                out[image_id] = _Shown(image_id, note="as_stored")
-        return out
+    ) -> _Shown:
+        """第 2 级:约 150 万像素的小副本,归给本 run;小区也满 → 第 3 级按原样。"""
+        sha = str(image["sha"])
+        key = (sha, degrees)
+        cached = self.views.get(sha, ImageView(degrees, "low"))
+        if cached is None:
+            data = await self._bytes(str(image["refs"][0]), step)
+            if data is None:
+                return _Shown(image_id)
+            try:
+                cached = await in_host_crop_slot(low_res_copy, data, degrees)
+            except ValueError:
+                self._as_stored(run, sha, "copy_too_large")
+                return _Shown(image_id, note="as_stored")
+        if not self.views.hold_low(run.run_id, [PreparedView(key, *cached)], run.expires_at()):
+            self._as_stored(run, sha, "pin_over_cap")
+            return _Shown(image_id, note="as_stored")
+        if self.views.run_mode(run.run_id, sha) != "low":
+            main_model_image_view_cache_total.labels(outcome="low_res_copy").inc()
+        self.views.set_run_mode(run.run_id, sha, "low", run.expires_at())
+        return _Shown(image_id, degrees, "low", "rotated")
 
     def _as_stored(self, run: StepRun, sha: str, reason: str) -> None:
         """第 3 级:这张图在这个 run 剩下的步骤里一直按原样(不来回翻);下一轮重新试。"""
         if self.views.run_mode(run.run_id, sha) != "raw":
             main_model_image_orientation_skipped_total.labels(reason=reason).inc()
-        self.views.set_run_mode(run.run_id, sha, "raw")
+        self.views.set_run_mode(run.run_id, sha, "raw", run.expires_at())
+
+
+def _span_attributes(
+    span: Any,
+    new_images: Mapping[str, Any],
+    judged: Sequence[tuple[_ToJudge, Mapping[str, Any]]],
+    started: float,
+) -> None:
+    span.set_attribute("image_orientation.new_images", len(new_images))
+    span.set_attribute("image_orientation.asked", len(judged))
+    for name, conclusions in (
+        ("rotated", ("rotated",)),
+        ("undetermined", ("undetermined",)),
+        ("not_answered", ("pending", "unjudged")),
+    ):
+        span.set_attribute(
+            f"image_orientation.{name}", sum(r["conclusion"] in conclusions for _, r in judged)
+        )
+    span.set_attribute(
+        "image_orientation.extra_calls", sum(int(r.get("calls", 0)) for _, r in judged)
+    )
+    span.set_attribute("image_orientation.duration_ms", _ms_since(started))
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +778,8 @@ def _record(
         "verified_when_judged": True,
         "reason": reason,
         "calls": calls,
+        # 进程内记录与状态谁新(审查 M1:整步重跑、或那一步没落状态时用进程内那份)。
+        "judged_at": time.time(),
     }
 
 
@@ -755,18 +841,44 @@ def _image_blocks(msg: BaseMessage) -> list[Mapping[str, Any]]:
     ]
 
 
-def _image_ids_in_view(messages: Sequence[BaseMessage], by_ref: Mapping[str, str]) -> list[str]:
-    ids: list[str] = []
-    for msg in messages:
-        for block in _image_blocks(msg):
-            image_id = by_ref.get(str(block["ref"]))
-            if image_id is not None:
-                ids.append(image_id)
-    return list(dict.fromkeys(ids))
+def _refs_in_view(messages: Sequence[BaseMessage]) -> list[str]:
+    """提示词视图里出现的上传图 ref(按出现顺序、去重)。"""
+    refs = [str(block["ref"]) for msg in messages for block in _image_blocks(msg)]
+    return [ref for ref in dict.fromkeys(refs) if not ref.startswith(WORKSPACE_REF_PREFIX)]
+
+
+def _image_id(digest: str, images: Mapping[str, Mapping[str, Any]]) -> str:
+    """图编号:``img_`` + 图哈希前 8 位;撞上了别的图(前缀相同、哈希不同)就加长,直到不撞(审查 L1)。"""
+    for length in (8, 16, 64):
+        image_id = f"img_{digest[:length]}"
+        existing = images.get(image_id)
+        if existing is None or existing.get("sha") == digest:
+            return image_id
+    return f"img_{digest}"
+
+
+def _with_ref(
+    current: Mapping[str, Any] | None, entry: Mapping[str, Any], ref: str
+) -> dict[str, Any]:
+    """图记录并上一个 ref(同一张图的字节传了两次);已有记录的以它为准。"""
+    base = dict(current if current is not None else entry)
+    refs = list(base.get("refs", []))
+    if ref not in refs:
+        refs.append(ref)
+    return {**base, "refs": refs}
+
+
+def _newer(remembered: Mapping[str, Any], stored: Mapping[str, Any] | None) -> bool:
+    if stored is None:
+        return True
+    return float(remembered.get("judged_at", 0.0)) > float(stored.get("judged_at", 0.0))
 
 
 def _rewrite(
-    messages: Sequence[BaseMessage], shown: Mapping[str, _Shown], by_ref: Mapping[str, str]
+    messages: Sequence[BaseMessage],
+    shown: Mapping[str, _Shown],
+    by_ref: Mapping[str, str],
+    unreadable: set[str] | frozenset[str] = frozenset(),
 ) -> list[BaseMessage]:
     """视图里换块、打说明的标;没变的消息原样(identity 不变)。原消息从不改。"""
     if not shown:
@@ -777,15 +889,21 @@ def _rewrite(
         if not blocks:
             out.append(msg)
             continue
-        out.append(_rewritten(msg, len(blocks), shown, by_ref))
+        total = sum(str(block["ref"]) not in unreadable for block in blocks)
+        out.append(_rewritten(msg, total, shown, by_ref, unreadable))
     return out
 
 
 def _rewritten(
-    msg: BaseMessage, total: int, shown: Mapping[str, _Shown], by_ref: Mapping[str, str]
+    msg: BaseMessage,
+    total: int,
+    shown: Mapping[str, _Shown],
+    by_ref: Mapping[str, str],
+    unreadable: set[str] | frozenset[str],
 ) -> BaseMessage:
     """一条带图的消息:横的图块加 ``view``;要说明的图按「这条消息里的第几张」记进标里(适配器把
-    文字全放在前、图全放在后,所以只能按序号说)。"""
+    文字全放在前、图全放在后,所以只能按序号说)。这一步取不到字节的图适配器会换成提示文字,
+    不算「图」,序号与总数都不数它(审查 L7)。"""
     content: list[Any] = []
     notes: list[str] = []
     index = 0
@@ -795,6 +913,7 @@ def _rewritten(
             isinstance(block, Mapping)
             and block.get("type") == IMAGE_REF_BLOCK_TYPE
             and isinstance(block.get("ref"), str)
+            and str(block["ref"]) not in unreadable
         ):
             index += 1
             image_id = by_ref.get(str(block["ref"]))

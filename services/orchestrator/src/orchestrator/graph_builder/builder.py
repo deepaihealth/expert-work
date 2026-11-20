@@ -1270,6 +1270,7 @@ def build_react_graph(
                     tenant_id=tenant_id,
                     user_id=user_id,
                     token_budget=token_budget,
+                    thread=str(turn_ctx.thread_id or ""),
                 ),
             )
         # B-84 PR-2 —— 工作区快照段。**每轮重取**(宿主 NAS listdir 实测 8.3ms),
