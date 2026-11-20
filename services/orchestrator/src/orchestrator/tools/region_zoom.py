@@ -356,17 +356,10 @@ def _crop_open_image(
         )
         raise RegionImageError(msg)
     orientation = turned_orientation(_orientation(image), degrees)
-    scale = _draft_scale((width, height), boxes, max_pixels)
     if isinstance(image, JpegImageFile):
+        scale = _draft_scale((width, height), boxes, max_pixels)
         if scale > 1:
-            # B-322 复审:按下取整请求 —— Pillow 按「原尺寸 // 请求尺寸」选档,向上取整的请求
-            # 在宽高不是倍数时会退一档(9487 宽按 1/4 请求实际只按 1/2 解码)。
-            image.draft(image.mode, _draft_request((width, height), scale))
-    elif scale > 1:
-        # B-322 复审:不是 JPEG 的没有解码时缩;解开之后先整数倍缩一次(每一块缩后仍不少于
-        # ``max_pixels``,与 JPEG 的 draft 同一判据),再裁 —— 不在整张原尺寸上裁 / 转。
-        image.load()
-        image = image.reduce(scale)
+            image.draft(image.mode, (-(-width // scale), -(-height // scale)))
     crops: list[CroppedImage] = []
     for box in boxes:
         piece = _flatten(crop_upright(image, box, orientation))
@@ -473,7 +466,9 @@ def _in_window(size: tuple[int, int], max_pixels: int) -> bool:
 
 
 #: 每个像素在内存里占几个字节(Pillow 的存法:RGB / RGBA / CMYK 都是 4 字节一像素)。
-_BYTES_PER_PIXEL: Final = {"1": 1, "L": 1, "P": 1, "I;16": 2, "LA": 4, "RGB": 4, "RGBA": 4}
+#: 每个像素在内存里占几个字节(Pillow 的存法:RGB / RGBA / LA / CMYK 都是 4 字节一像素)。只列 B-322
+#: 转正支持的颜色模式(``orchestrator.image_views.UPRIGHT_MODES``)。
+_BYTES_PER_PIXEL: Final = {"L": 1, "LA": 4, "RGB": 4, "RGBA": 4, "CMYK": 4}
 
 
 def crop_peak_bytes(
@@ -485,16 +480,34 @@ def crop_peak_bytes(
     encoded_bytes: int,
     max_pixels: int = REGION_TARGET_PIXELS,
 ) -> int:
-    """B-322 复审 —— 解码之前估 :func:`crop_image` 对整张框(问方向的候选 / 小副本)的峰值内存:
-    JPEG 按 ``draft`` 之后的那份算三份(解开、裁下、转),别的格式要先整张解开,再加整数倍缩后的三份。
-    本机按审查同一方法实测校准:12 MP JPEG 约 41 MiB,20 MP JPEG 约 64 MiB,48.8 MP PNG 约 228 MiB。"""
+    """B-322 —— 解码之前估 :func:`crop_image` 对整张框(问方向的候选 / 小副本)的峰值内存,按它现在
+    (与 main 逐字节相同)的做法:JPEG 按 ``draft`` 缩小解码 —— 它的请求尺寸向上取整,Pillow 按
+    ``原尺寸 // 请求尺寸`` 选档,宽高不是倍数时会大一档(9487 宽请求 1/4、实际按 1/2);PNG 整张解开。
+    之后解开的那份一直在,再有裁下、转、转 RGB 的几份:RGB / CMYK 共三份,L 是两份 1 字节的加一份
+    RGB,RGBA / LA 铺白底多两份。按审查方法实测校准:12 MP JPEG 约 41 MiB、20 MP JPEG 约 64 MiB、
+    60 MP JPEG 约 184 MiB、48.8 MP RGB PNG 约 570 MiB。"""
     bpp = _BYTES_PER_PIXEL.get(mode, 4)
-    scale = _draft_scale((width, height), [(0, 0, REGION_SCALE, REGION_SCALE)], max_pixels)
-    sw, sh = _scaled((width, height), scale)
-    reduced = sw * sh * bpp
+    scale = 1
     if jpeg:
-        return 3 * reduced + encoded_bytes
-    return width * height * bpp + 3 * reduced + encoded_bytes
+        wanted = _draft_scale((width, height), [(0, 0, REGION_SCALE, REGION_SCALE)], max_pixels)
+        if wanted > 1:
+            scale = _pillow_draft_scale((width, height), _scaled((width, height), wanted))
+    sw, sh = _scaled((width, height), scale)
+    pixels = sw * sh
+    if mode == "L":
+        copies = 2 * pixels + 4 * pixels
+    elif mode in ("RGBA", "LA"):
+        copies = 5 * pixels * bpp
+    else:
+        copies = 3 * pixels * bpp
+    return copies + encoded_bytes
+
+
+def _pillow_draft_scale(size: tuple[int, int], requested: tuple[int, int]) -> int:
+    """Pillow 的 JPEG ``draft`` 对这个请求实际选哪一档(它的选法:``原尺寸 // 请求尺寸`` 以内最大的
+    1、2、4、8)。"""
+    scale = min(size[0] // max(1, requested[0]), size[1] // max(1, requested[1]))
+    return max(a for a in (1, 2, 4, 8) if scale >= a)
 
 
 def upright_peak_bytes(
