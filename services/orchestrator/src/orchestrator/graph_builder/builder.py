@@ -283,6 +283,24 @@ from orchestrator.tools.knowledge_probe import (
     latest_user_text,
     record_follow_up,
 )
+from orchestrator.tools.link_registry import (
+    NOT_RUN_CONTENT as LINK_NOT_RUN_CONTENT,
+)
+from orchestrator.tools.link_registry import (
+    LinkRefusal,
+    LinkRewrite,
+    check_link_calls,
+    conversation_links_of,
+    count_refusal,
+    has_mcp_tools,
+    ids_by_variable,
+    links_note,
+    make_link_rewrite,
+    masked_error_text,
+    note_ids_in_reply,
+    refusal_message,
+    with_rewritten_links,
+)
 from orchestrator.tools.mcp import parse_mcp_tool_name
 from orchestrator.tools.mutation_classifier import classify as classify_mutation
 from orchestrator.tools.mutation_classifier import resource_space as mutation_resource_space
@@ -596,6 +614,8 @@ def build_react_graph(
     conversation_seed_node: MemoryNode | None = None,
     # B-236 第三层 —— 对话第一次 run 开场时读一次 /agent/AGENT_NOTES.md(``agent_notes``)。
     agent_notes_node: MemoryNode | None = None,
+    # B-330 —— run-start 链接登记(``link_registry``;纯计算,只写 ``conversation_links``)。
+    link_registry_node: MemoryNode | None = None,
     # B-67 §七 —— 本 agent 声明为 ``trusted`` 的变量名。手抄守卫的提示只对这些变量写出
     # 链接名与模型抄的那串(那条合成消息不过 spotlight 围栏);默认空 = 一律不写。
     trusted_input_names: frozenset[str] = frozenset(),
@@ -1369,6 +1389,13 @@ def build_react_graph(
         # B-282 —— 留存作业清掉了这段会话闲置的工作目录:同样一次性、只进提示词视图。
         if configurable.get(WORKSPACE_CLEANED_KEY) is True and not configurable.get("child_run"):
             messages = _append_tail_human_message(messages, WORKSPACE_CLEANED_NOTE)
+        # B-330 —— 本对话收到的链接(编号与事实,没有链接本身);登记为空或没有 MCP 工具时不出现。
+        links_text = links_note(
+            conversation_links_of(state, configurable),
+            has_mcp=has_mcp_tools(tool_registry.all_specs()),
+        )
+        if links_text is not None:
+            messages = _append_tail_human_message(messages, links_text)
         # B-206 11-09 —— 这一轮用过知识库, 之后每一步平台段里带一句「答前核对」(只进视图,
         # 不多调一次模型;见 ``answer_check``)。
         answer_check = answer_check_note(state["messages"])
@@ -1930,6 +1957,8 @@ def build_react_graph(
             persisted_messages = _stamp_agent_messages(persisted_messages, config)
             looped_this_turn = bool(ctx.payload.get("loop_detected")) or primary_loop_detected
             mw_exit_reason = _exit_reason_for(persisted_messages, budget_reason=budget_reason)
+            if mw_exit_reason == "text_response":
+                note_ids_in_reply(persisted_messages)  # B-330 —— 只计数
             update_mw: dict[str, Any] = {
                 "messages": persisted_messages,
                 "step_count": step_count + 1,
@@ -1981,6 +2010,8 @@ def build_react_graph(
         emit_messages = without_served_by(emit_messages)  # B-102 —— 同上
         emit_messages = _stamp_agent_messages(emit_messages, config)
         plain_exit_reason = _exit_reason_for(emit_messages, budget_reason=budget_reason)
+        if plain_exit_reason == "text_response":
+            note_ids_in_reply(emit_messages)  # B-330 —— 只计数
         update_plain: dict[str, Any] = {
             "messages": emit_messages,
             "step_count": step_count + 1,
@@ -2182,6 +2213,30 @@ def build_react_graph(
             # ``elif not state.get("pending_approval")`` —— 带着上一轮的陈旧值
             # (见上面 ``stale_approval``)跳过检测,新一轮的门控调用就不经审批
             # 直接执行了。
+            # B-330 —— 链接编号的检查在审批门(和动作筛查)之前:本批有编号错误时这一步不挂任何
+            # 审批 —— 坏的那条得到错误结果,其它得到「没有执行」,模型重发。不动审批目标的挑选:
+            # 续跑会对整批重新选目标,跳过坏调用去挂后面那条会让续跑选错(复审 N1)。
+            detect_links = conversation_links_of(state, config.get("configurable") or {})
+            detect_refusals = check_link_calls(tool_calls, detect_links, registry_bindings)
+            if detect_refusals:
+                refused_messages = await _refuse_link_batch(
+                    tool_calls,
+                    detect_refusals,
+                    _build_tool_context(config, conversation_links=detect_links),
+                    audit_logger_from_config(config),
+                )
+                first_refused = min(detect_refusals)
+                return {
+                    **stale_approval,
+                    "messages": refused_messages,
+                    # B-226 ⑤ —— 被拒的那条没执行,是欠账(与动作筛查 block 同一做法)。
+                    "unresolved_failures": _record_refused_call(
+                        state.get("unresolved_failures") or [],
+                        tool_calls[first_refused],
+                        refused_messages[first_refused],
+                        tool_registry,
+                    ),
+                }
             # Stream PI-3b — action screening: judge each proposed tool call
             # against the user's request before dispatch. A misaligned turn is
             # denied (block) or routed to the approval gate (approval).
@@ -2274,6 +2329,7 @@ def build_react_graph(
             turn_documents=state.get("turn_documents"),
             turn_document_original_names=state.get("turn_document_original_names"),
             turn_image_refs=state.get("turn_image_refs"),
+            conversation_links=state.get("conversation_links"),
             viewed_figures=state.get("viewed_figures"),
             figure_reads=state.get("figure_reads"),
             run_state=state,
@@ -2284,6 +2340,20 @@ def build_react_graph(
             # B-322 —— 父代对本轮图的方向定论,委派时种进子代。
             image_orientations=seedable_orientations(state),
         )
+        # B-330 —— 派发前再查一次编号(审批续跑时人可能用「修改」改了参数),命中的不派发;
+        # 其余 MCP 调用在派发前最后一步换回(``_dispatch_tool`` 的 ``link_rewrite``)。
+        link_refusals = check_link_calls(tool_calls, ctx_obj.conversation_links, registry_bindings)
+        for index in sorted(link_refusals.keys() & approved_calls):
+            refused_name = str(tool_calls[index].get("name", ""))
+            _literal_guard_blocked_after_approval_total.labels(
+                tool=_metric_tool_label(refused_name)
+            ).inc()
+            logger.warning(
+                "tools.link_id_blocked_after_approval tool=%s reason=%s",
+                refused_name,
+                link_refusals[index].reason,
+            )
+        link_rewrite = make_link_rewrite(ctx_obj.conversation_links, registry_bindings)
         # B-317 —— 字面量守卫:MCP / http 参数与平台工具的路径参数里不会被展开的 ``$名字``、
         # ``$EXPERT_WORK_*``,以及交给外部服务的本轮本地路径。与手抄守卫同一口径(审批门之后、
         # 只影响派发);在建好 ``ctx_obj`` 之后算,本轮输入目录的 run 与工具解析路径用同一个值。
@@ -2358,6 +2428,7 @@ def build_react_graph(
                     budget_enabled=tool_output_budget_enabled,
                     bound_args=bound_args,
                     inputs_store=workspace_store,
+                    link_rewrite=link_rewrite,
                 )
             )
 
@@ -2381,6 +2452,9 @@ def build_react_graph(
             literal = literal_hits.get(index)
             if literal is not None:
                 return await _reject_literal(tc, literal, ctx_obj, audit_logger)
+            refusal = link_refusals.get(index)
+            if refusal is not None:
+                return await _reject_link(tc, refusal, ctx_obj, audit_logger)
             async with semaphore:
                 return await _run_call(tc, bound_args)
 
@@ -2466,11 +2540,12 @@ def build_react_graph(
                     batch_outcomes.append((_ledger_key(tool_calls[idx], tool_message, None), None))
                 continue
             # B-317 —— 守卫拦下、没执行的调用不进 B-302 的文件账(与下面 ``ran_calls`` 同一个条件)。
-            if not (idx in guard_hits or idx in literal_hits):
+            if not (idx in guard_hits or idx in literal_hits or idx in link_refusals):
                 file_events.append(_file_tool_event(tool_calls[idx], tool_message))
             if not (
                 idx in guard_hits
                 or idx in literal_hits
+                or idx in link_refusals
                 or _is_refused_repeat(tool_message)
                 or (classified is not None and classified.error_class == "blocked_by_policy")
             ):
@@ -2694,6 +2769,11 @@ def build_react_graph(
         graph.add_node("agent_notes", agent_notes_node)  # type: ignore[arg-type]
         graph.add_edge(START, "agent_notes")
         tails.append("agent_notes")
+    # B-330 —— 链接登记同样自成一支(只写 ``conversation_links``,与上面各支写集不相交)。
+    if link_registry_node is not None:
+        graph.add_node("link_registry", link_registry_node)  # type: ignore[arg-type]
+        graph.add_edge(START, "link_registry")
+        tails.append("link_registry")
     if not tails:
         tails.append(START)
     if len(tails) > 1:
@@ -4169,6 +4249,7 @@ async def _dispatch_tool(
     budget_enabled: bool = True,
     bound_args: Sequence[str] = (),
     inputs_store: WorkspaceStore | None = None,
+    link_rewrite: LinkRewrite | None = None,
 ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
     """Dispatch one tool call.
 
@@ -4196,11 +4277,15 @@ async def _dispatch_tool(
     from the platform rather than from the model. Names only, never values:
     a bound value IS the customer record this feature exists to stop the
     model from retyping.
+
+    B-330 —— ``link_rewrite`` 在中间件之后、真正调用之前把 MCP 参数里的链接编号换成原链接
+    (派发前最后一步);轨迹 span 记的是换回**之前**那份参数(编号版),审计只多记编号。
     """
     name = str(tool_call.get("name", ""))
     call_id = str(tool_call.get("id", ""))
     args = tool_call.get("args") or {}
     started = time.monotonic()
+    rewritten_links: tuple[str, ...] = ()
 
     try:
         if before_tool_dispatch_chain is not None:
@@ -4211,6 +4296,9 @@ async def _dispatch_tool(
             args = mw_ctx.payload.get("tool_args", args) or {}
 
         tool = registry.get_required(name)
+        record_args = args
+        if link_rewrite is not None:
+            args, rewritten_links = link_rewrite(name, args)
         # 10.1 — one ``expert_work.orchestrator.tool_call`` child span per tool
         # dispatch, attached under the session root span.
         with expert_work_span(
@@ -4226,7 +4314,7 @@ async def _dispatch_tool(
                 budget_enabled=budget_enabled,
                 inputs_store=inputs_store,
             )
-            _record_tool_io(span, args, outcome[0].content)
+            _record_tool_io(span, record_args, outcome[0].content)
             if outcome[0].status == "error":
                 _record_tool_error(span, outcome)
         ok = outcome[0].status != "error"
@@ -4263,9 +4351,12 @@ async def _dispatch_tool(
             reason=None if ok else "tool_error",
             duration_ms=duration_ms,
             # Stream 14.4 — MCP traffic audit: server + response volume.
-            extra_details=_with_bound_args(
-                _mcp_audit_details(name, content=str(outcome[0].content), is_error=not ok),
-                bound_args,
+            extra_details=with_rewritten_links(
+                _with_bound_args(
+                    _mcp_audit_details(name, content=str(outcome[0].content), is_error=not ok),
+                    bound_args,
+                ),
+                rewritten_links,
             ),
         )
         return outcome
@@ -4605,7 +4696,7 @@ async def _reject_literal(
         extra_details={"input_variable": hit.name, "argument": hit.arg},
     )
     message = ToolMessage(
-        content=literal_guard_message(hit),
+        content=literal_guard_message(hit, link_ids=ids_by_variable(ctx.conversation_links)),
         tool_call_id=call_id,
         status="error",
         name=name,
@@ -4613,6 +4704,69 @@ async def _reject_literal(
     )
     classified = classified_invalid_arguments(tool_name=name, summary=reason)
     return message, {}, 0, classified
+
+
+async def _reject_link(
+    tool_call: Mapping[str, Any],
+    refusal: LinkRefusal,
+    ctx: ToolContext,
+    audit_logger: AuditLogger | None,
+) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
+    """B-330 —— 链接编号被拒:不派发,合成错误 ToolMessage(形状同字面量守卫)。
+
+    审计 ``tool:blocked``,原因 ``link_id_<reason>``,details 只有编号;提示里只有参数名与编号。
+    """
+    name = str(tool_call.get("name", ""))
+    call_id = str(tool_call.get("id", ""))
+    reason = f"link_id_{refusal.reason}"
+    count_refusal(refusal)
+    _tool_call_total.labels(tool=_metric_tool_label(name), outcome="blocked").inc()
+    await _emit_tool_audit(
+        audit_logger,
+        ctx,
+        name=name,
+        call_id=call_id,
+        args=tool_call.get("args") or {},
+        path_args=(),
+        from_skill=None,
+        action=AuditAction.TOOL_BLOCKED,
+        result=AuditResult.DENIED,
+        reason=reason,
+        duration_ms=0,
+        extra_details={"link_id": refusal.link_id, "argument": refusal.arg},
+    )
+    message = ToolMessage(
+        content=refusal_message(refusal, ctx.conversation_links),
+        tool_call_id=call_id,
+        status="error",
+        name=name,
+        additional_kwargs={"duration_ms": 0},
+    )
+    return message, {}, 0, classified_invalid_arguments(tool_name=name, summary=reason)
+
+
+async def _refuse_link_batch(
+    tool_calls: Sequence[Mapping[str, Any]],
+    refusals: Mapping[int, LinkRefusal],
+    ctx: ToolContext,
+    audit_logger: AuditLogger | None,
+) -> list[ToolMessage]:
+    """B-330 —— 检测路径:本批有编号错误 → 坏的得错误结果,其它得「没有执行」(一条不派发)。"""
+    messages: list[ToolMessage] = []
+    for index, call in enumerate(tool_calls):
+        refusal = refusals.get(index)
+        if refusal is not None:
+            messages.append((await _reject_link(call, refusal, ctx, audit_logger))[0])
+            continue
+        messages.append(
+            ToolMessage(
+                content=LINK_NOT_RUN_CONTENT,
+                tool_call_id=str(call.get("id") or ""),
+                status="error",
+                name=call.get("name"),
+            )
+        )
+    return messages
 
 
 async def _reject_retyped_url(
@@ -4954,6 +5108,7 @@ def _build_tool_context(
     turn_documents: list[str] | None = None,
     turn_document_original_names: Mapping[str, str] | None = None,
     turn_image_refs: list[str] | None = None,
+    conversation_links: object = None,
     viewed_figures: list[str] | None = None,
     figure_reads: list[dict[str, Any]] | None = None,
     run_state: Mapping[str, Any] | None = None,
@@ -5081,6 +5236,11 @@ def _build_tool_context(
         turn_documents=docs,
         turn_document_original_names=originals,
         turn_image_refs=images,
+        # B-330 —— 本对话的链接登记(逐条清洗):根对话来自检查点通道,委派子代来自父传下来的
+        # config。MCP 工具遮回结果、往下委派都读这里。
+        conversation_links=conversation_links_of(
+            {"conversation_links": conversation_links}, configurable
+        ),
         agent_key=view_fields["agent_key"],
         inputs_run_id=inputs_run_id,
         prompt_inputs=prompt_inputs,
@@ -5296,9 +5456,14 @@ async def _invoke_tool(
         # artifact, for the tools node's per-file consecutive-failure count.
         kind = exc.kind if isinstance(exc, EditFileMismatchError) else None
         hint = await _inputs_candidates_hint(inputs_store, tool.spec.name, args, ctx)
+        # B-330 —— MCP 服务的错误信息常回显收到的参数:登记过的链接先遮回编号(截断之前),
+        # 工具结果、恢复建议与 span 状态用的都是遮过的文字。
+        masked = masked_error_text(tool.spec.name, exc, ctx.conversation_links)
+        if masked is not None:
+            classified = replace(classified, summary=_capped_summary(masked))
         return (
             ToolMessage(
-                content=_format_error(exc) + hint,
+                content=_format_error(exc, summary=masked) + hint,
                 tool_call_id=call_id,
                 status="error",
                 name=tool.spec.name,
@@ -5462,8 +5627,17 @@ async def _externalize_tool_overflow(
     return replacement, footer, rel
 
 
-def _format_error(exc: BaseException) -> str:
-    summary = str(exc)
+def _capped_summary(text: str) -> str:
+    """与 ``error_classifier._summarise`` 同一口径(去首尾空白、500 字截断)。"""
+    text = text.strip()
+    if len(text) > _ERROR_SUMMARY_MAX_CHARS:
+        return text[:_ERROR_SUMMARY_MAX_CHARS] + "...[truncated]"
+    return text
+
+
+def _format_error(exc: BaseException, *, summary: str | None = None) -> str:
+    # B-330 —— ``summary`` 给了就用它代替 ``str(exc)``(遮过链接的文字),截断照旧。
+    summary = str(exc) if summary is None else summary
     # B-302 PR 3 —— an exception may carry its own cap (``edit_file``'s mismatch error:
     # 1,500, spec §4.3.6); every other tool keeps the 500-character cut.
     cap = int(getattr(exc, "max_error_chars", _ERROR_SUMMARY_MAX_CHARS))

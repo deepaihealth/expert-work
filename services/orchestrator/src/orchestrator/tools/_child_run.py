@@ -60,6 +60,7 @@ from orchestrator.tools._worker_events import (
     build_worker_update_frame,
 )
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder
+from orchestrator.tools.link_registry import CONVERSATION_LINKS_KEY
 from orchestrator.tools.registry import (
     FIGURE_RUN_IDS_KEY,
     SHARE_LINKS_TTL_KEY,
@@ -1050,6 +1051,11 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     # 子代干的也是父 agent 的活,取值口径与 agent_key / inputs_run_id 一致:用父的。
     # B-127 的固定值不走这里:它住在子代**自己**的 registry 绑定表里(worker 的 spec
     # 是父 spec 的拷贝、``tools`` 连绑定原样带过去),与 config 无关。
+    # B-330 —— 本对话的链接登记走 config 往下传(孙代沿用):子代写父对话的编号照常换回。
+    # **不种进子代的状态**:子代的检查点按子线程 id 持久化,会话 / 用户清除删不到它,原链接会
+    # 留在那里(审查 M3)。非标量值不进检查点 metadata。
+    if ctx.conversation_links:
+        configurable[CONVERSATION_LINKS_KEY] = tuple(dict(e) for e in ctx.conversation_links)
     if ctx.prompt_inputs:
         # 键写成字面量,与上面 ``inputs_run_id`` / ``agent_key`` 同一写法:本模块在
         # ``tools`` 早于 ``sse`` 被导入(tools → assembly → spawn_worker → 本模块),

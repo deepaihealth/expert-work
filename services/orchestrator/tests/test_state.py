@@ -38,6 +38,8 @@ def test_required_keys_present() -> None:
         "turn_documents",
         "turn_document_original_names",
         "turn_image_refs",
+        # B-330 —— 本对话的链接登记(跨轮,只增不减)
+        "conversation_links",
         "plan",
         "reflections",
         "recalled_memories",

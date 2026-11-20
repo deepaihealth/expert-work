@@ -404,6 +404,9 @@ class ToolContext:
     #: * 两者都不是 → 不列。子代既没有原生视觉也没有 ``ask_image``,列出来只是
     #:   给它一串用不上的字符串。
     turn_image_refs: tuple[str, ...] = ()
+    #: B-330 —— 检查点里的 ``conversation_links``(本对话的链接登记,已按 ``id`` / ``url`` 清洗)。
+    #: MCP 工具据此把结果里的原链接遮回编号;委派时整份种进子代。**含原链接,只给平台用。**
+    conversation_links: tuple[Mapping[str, Any], ...] = ()
     #: 工作区分层 —— 本次调用属于哪个 agent。值是 ``sanitize_agent_key(spec.metadata.name)``,
     #: 与 ``/opt/skills/<agent_key>`` / ``PYTHONUSERBASE`` 用的是同一个,**不要新造第二种算法**。
     #:
