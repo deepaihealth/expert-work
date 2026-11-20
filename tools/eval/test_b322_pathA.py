@@ -66,7 +66,17 @@ def _fake_factory(rotation_of: dict[str, int], no_text: set[str]) -> Any:
     return build
 
 
-async def test_run_drives_the_real_two_steps_without_spending(tmp_path: Path) -> None:
+async def test_run_drives_the_real_two_steps_without_spending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(
+        model_catalog.MODEL_CATALOG,
+        "qwen",
+        tuple(
+            e.model_copy(update={"orientation_verified": False}) if e.name == "qwen4-max" else e
+            for e in model_catalog.MODEL_CATALOG["qwen"]
+        ),
+    )
     images = _subset()
     rotation_of = {e_group._ref(i): i.rotation for i in images}
     no_text = {e_group._ref(i) for i in images if i.image_class == images_mod.NO_TEXT_CLASS}
@@ -95,7 +105,7 @@ async def test_run_drives_the_real_two_steps_without_spending(tmp_path: Path) ->
             assert got[image.image_id] == ("upright", 0)
         else:
             assert got[image.image_id] == ("rotated", image.rotation)
-    # 体检只在本进程里临时当作核实,跑完恢复。
+    # 体检只在本进程里临时当作核实,跑完恢复(开头把目录里的核实标记摘掉,才看得出恢复)。
     assert not model_catalog.orientation_judge_allowed("qwen", "qwen4-max")
     # 账本按计划落在状态目录里(不能删)。
     assert (tmp_path / "state" / f"{q['plan_id']}.spend.jsonl").exists()
