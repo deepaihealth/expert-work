@@ -207,16 +207,31 @@ async def test_write_failure_degrades_without_footer() -> None:
     assert str(_tool_message(state).content) == _CAPPED
 
 
-async def test_exempt_fetch_back_tool_is_never_externalized() -> None:
+async def test_exempt_fetch_back_tool_is_never_externalized_by_size() -> None:
     # CM-F3 loop guard, narrowed to the fetch-back readers (EXEMPT_TOOLS):
-    # externalizing read_document/read_file/list_dir would create a
-    # persist→read→persist loop, so they are skipped even with full_content.
+    # externalizing read_document/read_file/list_dir BY SIZE would create a
+    # persist→read→persist loop, so a big result with no full_content stays.
     writer = _RecordingWriter()
     state = await _run_one_turn(
-        tool=_SpillTool(name="read_document", read_only=True), writer=writer, thread_id="ov-4"
+        tool=_BigResultTool(name="read_document"), writer=writer, thread_id="ov-4"
     )
     assert writer.writes == {}
-    assert str(_tool_message(state).content) == _CAPPED
+    assert str(_tool_message(state).content) == _FULL
+
+
+async def test_exempt_tool_full_content_is_still_saved() -> None:
+    # B-328 —— the exemption covers size-based externalization only: a full text the
+    # tool itself hands over (read_document cut to the per-result budget) goes through
+    # CM-5 like bash / exec_python — saved, footer appended. Reading it back is
+    # read_file, which pages and is never externalized itself, so there is no loop.
+    writer = _RecordingWriter()
+    state = await _run_one_turn(
+        tool=_SpillTool(name="read_document", read_only=True), writer=writer, thread_id="ov-4b"
+    )
+    assert writer.writes == {".tool_results/adhoc/tc-1-read_document.txt": _FULL}
+    content = str(_tool_message(state).content)
+    assert content.startswith(_CAPPED)
+    assert ".tool_results/adhoc/tc-1-read_document.txt" in content
 
 
 async def test_a_knowledge_read_page_reaches_the_model_whole() -> None:

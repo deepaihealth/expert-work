@@ -35,6 +35,7 @@ from orchestrator import (
     build_react_graph,
 )
 from orchestrator.context import ContextCompressor, ContextOverflowError
+from orchestrator.context.result_budget import ContextBudget
 
 
 @dataclass
@@ -216,12 +217,13 @@ async def test_agent_node_without_compressor_runs_pre_l2_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unsummarisable_overflow_raises_context_overflow_error() -> None:
+async def test_unsummarisable_overflow_past_the_window_raises_over_window() -> None:
     """A conversation whose head + tail alone exceed the threshold
-    cannot be saved by compression. Mini-ADR L-2 surfaces this as a
-    ContextOverflowError so the orchestrator writes a clean run-failed
-    audit row rather than silently letting the prompt blow past the
-    upstream window."""
+    cannot be saved by compression. B-328: the compressor hands it back;
+    because it is also over the whole model window, the pre-send check
+    fails the run cleanly (``reason="over_window"``) so the orchestrator
+    writes a RUN_FAILED audit row instead of sending a request no model
+    can take."""
 
     @dataclass
     class _NeverCalled:
@@ -250,12 +252,13 @@ async def test_unsummarisable_overflow_raises_context_overflow_error() -> None:
         llm_caller=agent_llm,
         tool_registry=ToolRegistry(),
         context_compressor=compressor,
+        context_budget=ContextBudget(window_tokens=100, result_tokens=4_000),
     )
 
     async with make_checkpointer("memory") as cp:
         compiled = GraphRunner(checkpointer=cp).compile(graph)
         cfg: RunnableConfig = {"configurable": {"thread_id": str(uuid4())}}
-        with pytest.raises(ContextOverflowError):
+        with pytest.raises(ContextOverflowError) as exc_info:
             await compiled.ainvoke(
                 {
                     "messages": history,
@@ -264,6 +267,8 @@ async def test_unsummarisable_overflow_raises_context_overflow_error() -> None:
                 },
                 config=cfg,
             )
+    assert exc_info.value.reason == "over_window"
+    assert agent_llm.calls == []
 
 
 # ---------------------------------------------------------------------------

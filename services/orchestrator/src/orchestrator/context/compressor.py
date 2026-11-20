@@ -28,21 +28,21 @@ Mini-ADR L-2 highlights:
   same caller, but the contract is "summarise this, return one
   message" rather than "act as the agent" so a future hop to a
   dedicated cheaper model is a one-field change.
-* **Hard cap via ``max_passes``** — if successive summarisations
-  cannot bring the estimated size below threshold the compressor
-  raises :class:`ContextOverflowError`. Hiding the failure behind a
-  silent fallback would let the run keep ballooning until the
-  upstream rejects it; the explicit signal lets the orchestrator log
-  a clean run-failed audit.
+* **Hard cap via ``max_passes``** — successive summarisations stop after
+  ``max_passes``. B-328: not getting under the threshold no longer fails
+  the run — the threshold is where saving STARTS (B-126), not the model's
+  limit. The prompt is handed back and sent (warning log +
+  ``expert_work_cm_compressor_over_threshold_total``); the one platform-side
+  failure left is "over the whole model window" (``agent_node``'s pre-send
+  check, :mod:`orchestrator.context.result_budget`).
 * **Transient summariser failure skips, not fails (RT-ADR-6)** — a
   summariser LLM exception no longer fails the run on the spot: the
   round returns the messages uncompressed (metric + warning log) and
-  the next turn retries. Only ``_MAX_CONSECUTIVE_SUMMARY_FAILURES``
+  the next turn retries. ``_MAX_CONSECUTIVE_SUMMARY_FAILURES``
   consecutive failed rounds of the SAME conversation (the streak is
   keyed by the caller-supplied ``streak_key`` — thread_id — because a
-  compressor instance is shared across conversations) escalate to
-  :class:`ContextOverflowError`; an empty middle that is still over
-  threshold stays fail-hard (nothing left to summarise).
+  compressor instance is shared across conversations) are logged and
+  counted as ``summariser_failing``; B-328 sends the prompt then too.
 * **Summariser prompt budget (RT-ADR-10)** — the transcript handed to
   the summariser is itself bounded: a per-message char cap plus a
   total hard budget (halved between PREVIOUS SUMMARY and NEW EVENTS
@@ -117,6 +117,15 @@ _cm_compressor_tokens_saved_total = expert_work_counter(
     "expert_work_cm_compressor_tokens_saved_total",
     "Estimated prompt tokens reclaimed by middle-summarisation (Stream RT-2).",
 )
+# B-328 A① — the compressor could not get under its (cost) threshold and handed
+# the prompt back to be sent as is. ``cause``: nothing_to_summarise (empty
+# middle / only the summary left), max_passes, summariser_failing (the
+# RT-ADR-6 consecutive-failure streak).
+_cm_compressor_over_threshold_total = expert_work_counter(
+    "expert_work_cm_compressor_over_threshold_total",
+    "Compression rounds that ended above the threshold and were sent as is (B-328).",
+    ["cause"],
+)
 
 #: Stream CM-3 — pre-compaction hook. Awaited with the middle slice that is
 #: about to be summarised away, *before* it is discarded, so an upper layer
@@ -173,7 +182,8 @@ class CachedSummary:
 _CHARS_PER_TOKEN: int = 4
 
 #: RT-ADR-6 — consecutive failed compression rounds tolerated before the
-#: compressor escalates to :class:`ContextOverflowError`. Below the cap a
+#: streak is logged / counted as ``summariser_failing`` (B-328: the prompt is
+#: still sent, no :class:`ContextOverflowError` any more). Below the cap a
 #: summariser failure skips the round (the prompt goes out uncompressed —
 #: the estimate is conservative, the upstream usually still accepts it)
 #: and the next turn retries.
@@ -286,30 +296,46 @@ _SUMMARY_UPDATER_SYSTEM_PROMPT: str = (
 
 
 class ContextOverflowError(Exception):
-    """Stream L.L2 — repeated compression could not get the estimated
-    prompt size under the configured threshold.
+    """The prompt cannot be sent: it does not fit the model.
 
-    Raised by :meth:`ContextCompressor.compress` when the middle slice
-    is empty but the estimate still exceeds threshold, after
-    ``max_passes`` successful passes that could not get under
-    threshold, or after ``_MAX_CONSECUTIVE_SUMMARY_FAILURES``
-    consecutive rounds whose summariser call failed (RT-ADR-6 — a
-    single transient failure skips the round instead). The
-    orchestrator catches it at the :class:`MaxStepsExceededError`-style
-    terminal path so the run fails with a clean ``RUN_FAILED`` audit
-    row instead of letting the upstream provider reject the request
-    with a 422 (Mini-ADR L-2 — no silent fallback that hides the
-    overflow).
+    B-328 —— :meth:`ContextCompressor.compress` no longer raises this. The
+    compressor's threshold (``threshold_tokens``) is where the lossy gates START
+    saving (B-126 ``absolute_cap_tokens`` can put it far below the model
+    window); not getting under it is handed back and the prompt goes out
+    (warning log + ``expert_work_cm_compressor_over_threshold_total``). The one
+    platform-side failure left is ``reason="over_window"``: the estimate of
+    messages + tool definitions is over the primary model's whole window even
+    after the one hard shrink (``context.result_budget.fit_to_window``). The
+    run then fails with a clean ``RUN_FAILED`` row instead of sending a
+    request no model can take (Mini-ADR L-2).
     """
 
-    def __init__(self, estimated_tokens: int, threshold: int, passes: int) -> None:
+    def __init__(
+        self,
+        estimated_tokens: int,
+        threshold: int,
+        passes: int = 0,
+        *,
+        reason: str = "over_threshold",
+        detail: str | None = None,
+    ) -> None:
         super().__init__(
-            f"context overflow: estimated {estimated_tokens} tokens > threshold "
-            f"{threshold} after {passes} compression pass(es)"
+            detail
+            or (
+                f"context overflow: estimated {estimated_tokens} tokens > threshold "
+                f"{threshold} after {passes} compression pass(es)"
+            )
         )
         self.estimated_tokens = estimated_tokens
         self.threshold = threshold
         self.passes = passes
+        self.reason = reason
+
+
+class _NothingToSummariseError(Exception):
+    """B-328 —— :meth:`ContextCompressor._compress_once` 的中段是空的(或只剩上一遍的
+    摘要):这一遍没有东西可总结。只在压缩器内部用,:meth:`ContextCompressor.compress`
+    接住后把当前结果交回。"""
 
 
 def estimate_tokens(
@@ -670,7 +696,7 @@ class _FailureStreaks:
     that ``AgentRuntime._cache`` shares per ``(tenant, agent, version)``
     across every thread / run / user of that agent, so a single shared
     counter would let conversation A's failures escalate conversation
-    C's first wobble into a false :class:`ContextOverflowError` — and,
+    C's first wobble into a false ``summariser_failing`` — and,
     in the other direction, healthy conversations' resets would mask a
     genuinely broken summariser.
 
@@ -695,6 +721,24 @@ class _FailureStreaks:
         self.counts.pop(key, None)
 
 
+@dataclass
+class _OpenBreakers:
+    """B-328 D3 —— 熔断:一次 run 里摘要模型连续失败到上限后,这次 run 余下的步数不再调它
+    (Claude Code 连续失败后停止自动压缩、照发)。按 run 记(``breaker_key``),下一次 run
+    重新给一次机会;只在进程内存里,不落盘。条数有上限,满了挤掉最早的(挤掉只是让那次
+    run 多试一次,安全那一侧)。"""
+
+    keys: dict[str, None] = field(default_factory=dict)
+
+    def trip(self, key: str) -> None:
+        if key not in self.keys and len(self.keys) >= _MAX_STREAK_KEYS:
+            self.keys.pop(next(iter(self.keys)))
+        self.keys[key] = None
+
+    def is_open(self, key: str) -> bool:
+        return key in self.keys
+
+
 @dataclass(frozen=True)
 class ContextCompressor:
     """Summarise the middle of a conversation when its estimated size
@@ -714,7 +758,8 @@ class ContextCompressor:
     #: 终审 #3 —— **今天 ``>= 1`` 的任何值效果都一样**。第 1 遍之后提示词是
     #: 「头 + 摘要 + 尾」,第 2 遍起中段永远只剩那份摘要(``head_keep == 0`` 时连
     #: 摘要都被并进开头的 system 段、中段为空),:meth:`_compress_once` 按「中段已空」
-    #: 立即抛(B-64 Task 7 回修第 4 轮)。原来第 2..n 遍是用空 NEW EVENTS 调「更新」,
+    #: 立即抛(B-64 Task 7 回修第 4 轮;B-328 起 :meth:`compress` 接住后交回照发)。
+    #: 原来第 2..n 遍是用空 NEW EVENTS 调「更新」,
     #: 靠模型碰巧把摘要写短才可能过线。字段留着:存量 manifest 带着它,而
     #: ``ContextCompressionPolicy`` 是 ``extra="forbid"``,删掉会让它们 422。
     max_passes: int = 3
@@ -729,10 +774,14 @@ class ContextCompressor:
     #: the ``streak_key`` handed to :meth:`compress` (thread_id in
     #: production; this instance is shared across conversations). A
     #: key's streak resets on any successful pass; reaching
-    #: ``_MAX_CONSECUTIVE_SUMMARY_FAILURES`` escalates that
-    #: conversation's failure to :class:`ContextOverflowError`.
+    #: ``_MAX_CONSECUTIVE_SUMMARY_FAILURES`` logs / counts that
+    #: conversation as ``summariser_failing`` (B-328: sent as is).
     _summary_failures: _FailureStreaks = field(
         default_factory=_FailureStreaks, init=False, repr=False, compare=False
+    )
+    #: B-328 D3 —— 熔断开着的 run(``breaker_key``):这些 run 余下的步数不再调摘要模型。
+    _open_breakers: _OpenBreakers = field(
+        default_factory=_OpenBreakers, init=False, repr=False, compare=False
     )
 
     @property
@@ -769,26 +818,25 @@ class ContextCompressor:
         cached_summary: CachedSummary | None = None,
         on_summary: Callable[[CachedSummary], None] | None = None,
         on_cache_hit: Callable[[], None] | None = None,
+        breaker_key: str | None = None,
     ) -> list[BaseMessage]:
         """Compress the message list until it fits under the threshold.
 
         Returns a new list — never mutates the input.
 
-        Failure semantics (Mini-ADR L-2 as revised by RT-ADR-6):
+        B-328 D3 —— ``breaker_key``(这次 run 的 id)是熔断的作用域:连续失败到上限的那一步
+        把它记下,同一个 run 余下的步数不再调摘要模型,直接交回照发(不再计数);下一个 run
+        (另一个 key)重新试一次。``None`` = 不熔断(老调用方 / 单测)。
 
-        - an empty middle that is still over threshold raises
-          :class:`ContextOverflowError` immediately (nothing left to
-          summarise — the only knobs are manifest-level);
-        - ``max_passes`` successful passes that cannot get under
-          threshold raise :class:`ContextOverflowError`;
-        - a transient summariser failure SKIPS compression for this
-          round — the current messages are returned uncompressed
-          (metric + warning log) and the next turn retries. Only
-          ``_MAX_CONSECUTIVE_SUMMARY_FAILURES`` consecutive failed
-          rounds *of the same conversation* escalate to
-          :class:`ContextOverflowError`, so a persistently broken
-          summariser still fails loudly instead of silently ballooning
-          forever.
+        Hand-back semantics (B-328 A①, replacing Mini-ADR L-2's fail-hard):
+        this method never raises for "still over threshold". An empty middle
+        (or one holding only the previous summary), ``max_passes`` used up, or
+        ``_MAX_CONSECUTIVE_SUMMARY_FAILURES`` consecutive summariser failures
+        of the same conversation all return the current messages — every
+        summary already produced has been reported through ``on_summary`` —
+        with a warning log and ``expert_work_cm_compressor_over_threshold_total``.
+        A transient summariser failure below the streak cap SKIPS the round
+        (RT-ADR-6: metric + warning log) and the next turn retries.
 
         ``streak_key`` scopes the consecutive-failure count — pass the
         conversation identity (the LangGraph ``thread_id``): this
@@ -799,7 +847,7 @@ class ContextCompressor:
         semantics but is NOT counted toward escalation — without a
         conversation identity, counting on the shared instance would
         reintroduce exactly the cross-conversation false-failure the
-        key exists to prevent. The empty-middle / max_passes fail-hard
+        key exists to prevent. The empty-middle / max_passes hand-back
         paths are unaffected by the key.
 
         Stream CM-3 — ``on_pre_compaction`` (when supplied) is awaited with
@@ -816,8 +864,8 @@ class ContextCompressor:
         ``on_pre_compaction``: the caller swallows its own failures.
 
         B-64 Task 7 回修第 3 轮 —— ``reserved``(见 :meth:`should_compress`)计入
-        「压到阈值以下」的目标,但**不新增失败**:中段已空(``_compress_once`` 抛
-        :class:`ContextOverflowError`)时,只要不算预留已经在阈值以下就照常返回;
+        「压到阈值以下」的目标:中段已空(``_compress_once`` 抛
+        ``_NothingToSummariseError``)时,不算预留已经在阈值以下就不记「没压到」;
         次数用完那条判据本来就只看 ``current``。
 
         回修第 4 轮 —— 「中段已空」也包括「中段只剩上一轮的摘要」(见
@@ -827,10 +875,8 @@ class ContextCompressor:
         从完整历史重来,所以小窗口模型(8K 那一档)是**每步一次**总结调用;返回的
         提示词加上图块仍可能超过阈值,由厂商在真实窗口上裁决。
 
-        不带预留时,「中段只剩摘要」这时仍在阈值上 → 抛 :class:`ContextOverflowError`,
-        与原来「空更新两遍 → 次数用完 → 抛」结果相同,只是少了两次白费的调用 ——
-        唯一的差别:原来的空更新可能把摘要本身改写得更短、侥幸压到阈值下,现在不再
-        碰这个运气。
+        不带预留时,「中段只剩摘要」这时仍在阈值上 → B-328 起交回照发(记「没压到」),
+        不再用空的 NEW EVENTS 白跑「更新」。
 
         B-126(修 1.2-2)—— ``cached_summary``(调用方从检查点读出的上一次摘要 +
         它覆盖到的 ``through_id``)在本方法一开始尝试替换中段里已覆盖的那一段(见
@@ -869,6 +915,11 @@ class ContextCompressor:
                 return await self._finish_compaction(
                     current, tokens_before, passes_done, on_compacted, input_chars
                 )
+            if breaker_key is not None and self._open_breakers.is_open(breaker_key):
+                # B-328 D3 —— 这次 run 已熔断:不再调摘要模型,照发(熔断那一步已计过数)。
+                return await self._finish_compaction(
+                    current, tokens_before, passes_done, on_compacted, input_chars
+                )
             try:
                 pending_through = _last_middle_id(
                     current, head_keep=self.head_keep, tail_keep=self.tail_keep
@@ -880,21 +931,15 @@ class ContextCompressor:
                     on_summary(
                         CachedSummary(through_id=pending_through, text=str(wrapped_summary.content))
                     )
-            except ContextOverflowError as exc:
-                if reserve and self._estimate(current) < self.threshold_tokens:
-                    return await self._finish_compaction(
-                        current, tokens_before, passes_done, on_compacted, input_chars
-                    )
-                # 终审 #3 —— ``_compress_once`` 不知道这是第几遍,它报的 ``passes=0``
-                # 在第 2 遍撞上「中段只剩摘要」时是错的:RUN_FAILED 里会写「压了 0 遍」,
-                # 而第 1 遍其实跑过了。按本次调用真实完成的遍数重报。
-                if exc.passes != passes_done:
-                    raise ContextOverflowError(
-                        estimated_tokens=exc.estimated_tokens,
-                        threshold=exc.threshold,
-                        passes=passes_done,
-                    ) from exc
-                raise
+            except _NothingToSummariseError:
+                # B-328 A① —— 中段已空 / 只剩摘要:不再抛,交回当前结果照发(这一次已经
+                # 产出的摘要已经由 ``on_summary`` 交给调用方,照常写回检查点)。不算预留
+                # 已在阈值下(B-64 回修第 3 轮)不算「没压到」。
+                if not (reserve and self._estimate(current) < self.threshold_tokens):
+                    self._note_over_threshold(current, passes_done, "nothing_to_summarise")
+                return await self._finish_compaction(
+                    current, tokens_before, passes_done, on_compacted, input_chars
+                )
             except RunCancelledError:
                 # A cancelled run must abort, never be mistaken for a
                 # transient summariser failure (CM-3 hook contract).
@@ -910,15 +955,19 @@ class ContextCompressor:
                 _cm_compressor_summary_failure_total.inc()
                 streak = self._summary_failures.bump(streak_key) if streak_key else 0
                 if streak >= _MAX_CONSECUTIVE_SUMMARY_FAILURES:
+                    # B-328 A① (D3) —— 摘要模型连续失败:交回照发,并熔断这次 run(余下的步数
+                    # 不再调它,Claude Code 熔断后照发同一做法);计一次 summariser_failing。
                     logger.exception(
-                        "context_compressor.summariser_failed_hard consecutive=%d",
+                        "context_compressor.summariser_failed_hard consecutive=%d breaker=%s",
                         streak,
+                        "open" if breaker_key is not None else "none",
                     )
-                    raise ContextOverflowError(
-                        estimated_tokens=self._estimate(current),
-                        threshold=self.threshold_tokens,
-                        passes=pass_idx,
-                    ) from exc
+                    if breaker_key is not None:
+                        self._open_breakers.trip(breaker_key)
+                    self._note_over_threshold(current, passes_done, "summariser_failing")
+                    return await self._finish_compaction(
+                        current, tokens_before, passes_done, on_compacted, input_chars
+                    )
                 _cm_compressor_skipped_total.inc()
                 logger.warning(
                     "context_compressor.summariser_failed_skipping consecutive=%d "
@@ -939,13 +988,21 @@ class ContextCompressor:
             _cm_compressor_pass_total.inc()
             passes_done += 1
         if self._estimate(current) >= self.threshold_tokens:
-            raise ContextOverflowError(
-                estimated_tokens=self._estimate(current),
-                threshold=self.threshold_tokens,
-                passes=self.max_passes,
-            )
+            self._note_over_threshold(current, passes_done, "max_passes")
         return await self._finish_compaction(
             current, tokens_before, passes_done, on_compacted, input_chars
+        )
+
+    def _note_over_threshold(self, current: Sequence[BaseMessage], passes: int, cause: str) -> None:
+        """B-328 A① —— 压不到门槛以下、照发:一条警告日志 + 计数器(不新增 run_event)。"""
+        _cm_compressor_over_threshold_total.labels(cause=cause).inc()
+        logger.warning(
+            "context_compressor.over_threshold_sent cause=%s estimated_tokens=%d threshold=%d "
+            "passes=%d",
+            cause,
+            self._estimate(current),
+            self.threshold_tokens,
+            passes,
         )
 
     async def _finish_compaction(
@@ -1002,16 +1059,9 @@ class ContextCompressor:
         """
         split = _split(messages, head_keep=self.head_keep, tail_keep=self.tail_keep)
         if not split.middle:
-            # Nothing summarisable — head+tail already span the
-            # remainder. Surfacing this as an overflow is the right
-            # signal because the only knobs left to turn are the
-            # head/tail-keep counts (manifest-level) or a bigger
-            # window.
-            raise ContextOverflowError(
-                estimated_tokens=self._estimate(messages),
-                threshold=self.threshold_tokens,
-                passes=0,
-            )
+            # Nothing summarisable — head+tail already span the remainder.
+            # B-328: :meth:`compress` hands the current messages back.
+            raise _NothingToSummariseError
         # Stream CM-7 (Mini-ADR CM-H2) — when the middle carries an
         # earlier compression's summary, UPDATE it with the new events
         # instead of re-summarising its own output (lossy chain).
@@ -1022,11 +1072,7 @@ class ContextCompressor:
             # 「更新」(白花一次主模型调用、反复重写摘要会漂移),还会把那份摘要再
             # 交给 ``on_pre_compaction`` 冲进长期记忆一次。带预留时最容易撞上:
             # 头 + 摘要 + 尾不算预留已经够小、加上预留仍超,剩下的每一遍都是空更新。
-            raise ContextOverflowError(
-                estimated_tokens=self._estimate(messages),
-                threshold=self.threshold_tokens,
-                passes=0,
-            )
+            raise _NothingToSummariseError
         # Stream CM-3 — flush the middle to durable memory BEFORE it is
         # summarised away (and before the summariser LLM call, so the
         # salient points survive even if summarisation then fails).

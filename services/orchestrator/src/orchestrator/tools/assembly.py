@@ -175,6 +175,10 @@ class ToolEnv:
     #: 文件不存在然后重打一遍。``None`` = 这个部署没接工作区存储:与
     #: ``sandbox_runtime is None`` 同款处置(显式声明报错, 基础能力静默跳过)。
     workspace_store: WorkspaceStore | None = None
+    #: B-328 —— 单条预算 R(token):``read_document`` 一次返回的正文、``read_file`` 每页都
+    #: 不超过它。工厂按压缩门槛 T 算(``context.result_budget``);``None`` = 不限(单测)。
+    #: 进程内字段,不是 manifest 字段。
+    result_budget_tokens: int | None = None
     #: Artifact registry backing the ``save_artifact`` / ``list_artifacts``
     #: builtins (Stream J.9).
     artifact_store: ArtifactStore | None = None
@@ -979,7 +983,13 @@ def _register_file_op(
                 "is configured (ToolEnv.workspace_store)"
             )
         if name == "read_file":
-            registry.register(ReadFileTool(store=env.workspace_store))
+            registry.register(
+                ReadFileTool(
+                    store=env.workspace_store,
+                    token_cap=env.result_budget_tokens,
+                    estimator=default_estimator(),
+                )
+            )
         elif name == "list_dir":
             registry.register(ListDirTool(store=env.workspace_store))
         else:
@@ -1024,6 +1034,8 @@ def _register_read_document(
         ReadDocumentTool(
             client=env.sandbox_runtime,
             skill_seed_files=skill_seed_files,
+            result_budget_tokens=env.result_budget_tokens,
+            estimator=default_estimator(),
         )
     )
 

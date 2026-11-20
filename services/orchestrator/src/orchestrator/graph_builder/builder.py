@@ -141,6 +141,11 @@ from orchestrator.context.memory_render import (
     memory_reminder,
     select_memory_lines,
 )
+from orchestrator.context.result_budget import (
+    ContextBudget,
+    fit_to_window,
+    shrink_oversized_results,
+)
 from orchestrator.context.system_prompt_view import keep_latest_system_prompt
 from orchestrator.graph_builder._approval import (
     ApprovalTarget,
@@ -601,6 +606,9 @@ def build_react_graph(
     # tool results to 1-line references (lossless for Phase-1-externalized ones).
     # ``None`` → no prune (the default; unchanged from pre-CM-12).
     tool_result_pruner: ToolResultPruner | None = None,
+    # B-328 —— 主模型窗口 W 与单条预算 R:能分段重读的大结果在提示词视图里截到 R(A②),
+    # 发送前超过整个窗口才狠缩 / 干净失败(A③)。``None`` = 两样都不做(单测 / 子图)。
+    context_budget: ContextBudget | None = None,
     # Phase 3 — resolved (platform AND agent) master switch for the tool-output
     # budget feature. Threaded into ``_externalize_tool_overflow`` so the
     # generalized (#859) + persist (item 2) branches honour it; the pruner is
@@ -885,6 +893,13 @@ def build_react_graph(
         # B-236 —— 开场注入的记忆索引段(落在第一轮)。下面的滑窗 / 压缩可能把它挤出提示词
         # 视图,那之后放回原件(:func:`_keep_agent_notes_block`)。
         notes_block = _latest_agent_notes_block(messages)
+        # B-328 A② —— 能分段重读的大结果截到单条预算 R(只看大小,每步一样),在三道闸之前。
+        if context_budget is not None:
+            messages = shrink_oversized_results(
+                messages,
+                budget_tokens=context_budget.result_tokens,
+                estimator=context_budget.estimator,
+            )
         # Stream CM-12 — mechanical tool-result prune: the cheapest, least-lossy
         # gate, run FIRST. When over threshold it collapses OLD tool results
         # (beyond the most-recent N) to 1-line references — lossless for
@@ -1037,11 +1052,10 @@ def build_react_graph(
         # ``<context-summary>`` system message, keeping head + tail
         # intact. Mini-ADR L-2 as revised by RT-ADR-6: a transient
         # summariser failure skips compression for this turn (the
-        # prompt goes out uncompressed, retried next turn); a
-        # ContextOverflowError still surfaces as a run failure — empty
-        # middle, max_passes exhausted, or three consecutive failed
-        # rounds — so the orchestrator can write a clean RUN_FAILED
-        # audit row.
+        # prompt goes out uncompressed, retried next turn). B-328 A①:
+        # not getting under the threshold (empty middle, max_passes,
+        # three consecutive failed rounds) is handed back and sent; the
+        # only platform-side failure is the pre-send window check below.
         # B-64 Task 7 回修第 3 轮 —— 渲染页段在**压缩判定之前**造好:它挂在压缩之后,
         # 压缩器看不见它,而它带着 ≤6 张整页 + ≤2 张局部图(B-268;每张按
         # ``IMAGE_BLOCK_TOKEN_COST`` 计)加
@@ -1176,6 +1190,8 @@ def build_react_graph(
                     cached_summary=cached,
                     on_summary=new_summary.append,
                     on_cache_hit=lambda: cache_hit_marks.append(True),
+                    # B-328 D3 —— 熔断按 run:连续失败到上限后这次 run 不再调摘要模型。
+                    breaker_key=str(turn_ctx.run_id) if turn_ctx.run_id else None,
                 )
                 compression_span.set_attribute("cm.summary.reused", bool(cache_hit_marks))
             if new_summary:
@@ -1340,6 +1356,15 @@ def build_react_graph(
         # 缓存 lookup 之前。
         if wrapup_message is not None:
             messages = [*messages, wrapup_message]
+        # B-328 A③ —— 消息 + 工具定义超过主模型整个窗口才狠缩一次,仍超就干净失败;缩后的
+        # 提示词替换本步 ``messages``(缓存查 / 存、结构化重发、计费都用它)。在 before chain 前。
+        if context_budget is not None:
+            messages = fit_to_window(
+                messages,
+                [] if budget_exhausted else tools,
+                budget=context_budget,
+                skip_deferred=tool_disclosure == "native_search",
+            )
         # B-66 — ``:regenerate`` 的 run:本轮不查响应缓存(写入照常)。
         cache_bypass = configurable.get(LLM_CACHE_BYPASS_KEY) is True
 
@@ -5271,7 +5296,9 @@ async def _externalize_tool_overflow(
     (:data:`EXEMPT_TOOLS`) are skipped — their source is cheaply re-readable, so
     externalizing them would just create a persist→read→persist loop (CM-F3).
     """
-    if writer is None or tool.spec.name in EXEMPT_TOOLS:
+    # B-328 —— 免的是「按大小外置」;工具自己交出的全文(``read_document`` 按单条预算截了正文)
+    # 照常走 CM-5 落盘 + footer。
+    if writer is None or (tool.spec.name in EXEMPT_TOOLS and result.full_content is None):
         return None, None, None
 
     budget_on = budget_enabled

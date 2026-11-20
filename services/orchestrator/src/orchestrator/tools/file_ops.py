@@ -48,6 +48,7 @@ from pathlib import PurePosixPath
 from typing import Any, NoReturn
 from uuid import UUID
 
+from expert_work.runtime.tokens import CharTokenEstimator, TokenEstimator
 from orchestrator.tools.edit_file_diagnostics import (
     COUNTED_EDIT_FAILURES,
     EDIT_DIAGNOSTICS_SOURCE,
@@ -65,6 +66,11 @@ from orchestrator.tools.locks import (
     write_lock_conversation,
 )
 from orchestrator.tools.nas_workspace_store import MISSING_DIR_ERRORS
+from orchestrator.tools.overflow import (
+    RESULT_ENVELOPE_RESERVE_TOKENS,
+    fit_prefix,
+    sent_token_counter,
+)
 from orchestrator.tools.registry import (
     ToolBlockedError,
     ToolContext,
@@ -1049,6 +1055,10 @@ class ReadFileTool:
 
     store: WorkspaceStore
     output_char_cap: int = DEFAULT_OUTPUT_CHAR_CAP
+    #: B-328 —— 每页还要不超过单条预算 R(token,按发给模型的样子量);先到者为准。
+    #: ``None`` = 只按字数(单测)。
+    token_cap: int | None = None
+    estimator: TokenEstimator | None = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -1122,11 +1132,19 @@ class ReadFileTool:
             msg = "read_file failed: binary_unsupported"
             raise FileOpError(msg) from exc
         page = _select_page(text, offset=offset, limit=limit, cap=self.output_char_cap)
+        if self.token_cap is not None:
+            count = sent_token_counter(self.estimator or CharTokenEstimator())
+            budget = self.token_cap - RESULT_ENVELOPE_RESERVE_TOKENS
+            fits = fit_prefix(page.content, lambda head: head, budget, count)
+            if fits < len(page.content):
+                page = _select_page(text, offset=offset, limit=limit, cap=max(1, fits))
         return ToolResult(
             content=page.content,
             notice=page.notice,
             meta={
                 "path": rel,
+                # B-328 —— 真实路径(B-317 ``ResolvedPath.path``):跨轮的找回说明用它。
+                "source_path": target.path,
                 # 整个文件的 sha256(不是返回给模型的那一截)—— edit_file 的
                 # expected_hash CAS 拿它做比对, 截断过的哈希对不上任何东西。
                 "content_hash": hashlib.sha256(data).hexdigest(),

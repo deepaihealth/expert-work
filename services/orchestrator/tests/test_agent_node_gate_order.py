@@ -106,9 +106,10 @@ class _TracingCompressor:
         cached_summary: object = None,
         on_summary: object = None,
         on_cache_hit: object = None,
+        breaker_key: str | None = None,
     ) -> list[BaseMessage]:
         del on_pre_compaction, on_compacted, streak_key, reserved, cached_summary
-        del on_summary, on_cache_hit
+        del on_summary, on_cache_hit, breaker_key
         self.order.append("compressor")
         self.seen.append(list(messages))
         return [*messages, HumanMessage(content="[compressor-mark]")]
@@ -213,9 +214,10 @@ class _DroppingCompressor:
         cached_summary: object = None,
         on_summary: object = None,
         on_cache_hit: object = None,
+        breaker_key: str | None = None,
     ) -> list[BaseMessage]:
         del on_pre_compaction, on_compacted, streak_key, reserved, cached_summary
-        del on_summary, on_cache_hit
+        del on_summary, on_cache_hit, breaker_key
         self.seen.append(list(messages))
         head, tail = list(messages[:1]), list(messages[-self.tail_keep :])
         return [*head, HumanMessage(content="<context-summary>…</context-summary>"), *tail]
