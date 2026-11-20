@@ -84,9 +84,10 @@ def _upright() -> Image.Image:
 
 
 def _stored(turn: int) -> bytes:
-    """正放的图逆时针转了 ``turn`` 度存下来 —— 要顺时针转 ``turn`` 度才正。"""
+    """正放的图逆时针转了 ``turn`` 度存下来 —— 要顺时针转 ``turn`` 度才正。B-322 只转 JPEG:存成
+    JPEG 100(4:4:4),转正图按 92 存不比它大。"""
     buffer = io.BytesIO()
-    _upright().rotate(turn, expand=True).save(buffer, format="PNG")
+    _upright().rotate(turn, expand=True).save(buffer, format="JPEG", quality=100, subsampling=0)
     return buffer.getvalue()
 
 
@@ -997,7 +998,7 @@ def test_pending_unjudged_and_revoked_are_not_seeded(monkeypatch: pytest.MonkeyP
 
 def _tiny() -> bytes:
     buffer = io.BytesIO()
-    Image.new("RGB", (1, 1)).save(buffer, format="PNG")
+    Image.new("RGB", (1, 1)).save(buffer, format="JPEG")
     return buffer.getvalue()
 
 
@@ -1239,7 +1240,7 @@ async def test_new_images_get_full_resolution_and_history_degrades_alone(
     (以前是全部一次拿齐,多一张就全部降级)。一步最多钉住全分辨率区的一半。"""
     first, second = _stored(90), _stored(270)
     new_copy = len((upright_copy(second, 270) or ("", b""))[1])
-    old_estimate = image_views.copy_size_limit(len(first), "image/png")
+    old_estimate = len(first)  # 字节规则:转正图不比原图大
     # 全分辨率区放得下新图 + 历史图,但一步的份额(一半)放不下两张 —— 只有份额能把历史图挡下来。
     monkeypatch.setattr(
         image_views.UPRIGHT_VIEWS, "full_cap_bytes", int((new_copy + old_estimate) * 1.5)
@@ -1491,7 +1492,7 @@ async def test_an_image_too_large_even_for_candidates_is_not_judged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """连问方向的候选都要超过每张的内存预算:这张图不判、按原样发、不加说明,计 ``too_large``;
-    记成带版本的 skipped,规则版本或单图预算变了才重新看(复审 L-1)。"""
+    记成带版本的 skipped,规则版本变了才重新看(复审 L-1)。"""
     monkeypatch.setattr(image_views, "FULL_COPY_PEAK_BYTES", 1000)
     before = _count(main_model_image_orientation_skipped_total, reason="too_large")
     s = _setup({_ref(): _stored(90)})
@@ -1499,11 +1500,11 @@ async def test_an_image_too_large_even_for_candidates_is_not_judged(
         config = await _turn(compiled, s, _ref())
         (record,) = (await compiled.aget_state(config)).values["image_orientations"].values()
         assert (record["conclusion"], record["reason"]) == ("skipped", "too_large")
-        assert record["skip_tag"] == s.orienter.skip_tag
+        assert record["skip_tag"] == upright_mod.SKIP_RULES_VERSION
         await _turn(compiled, s, text="下一轮:规则没变,不重新看")
         assert _count(main_model_image_orientation_skipped_total, reason="too_large") == before + 1
         # 规则版本变了:下一轮第一步重新看(内存预算放宽了,这次就判)。
-        monkeypatch.setattr(upright_mod, "SKIP_RULES_VERSION", "b322-skip-2")
+        monkeypatch.setattr(upright_mod, "SKIP_RULES_VERSION", "b322-skip-next")
         monkeypatch.setattr(image_views, "FULL_COPY_PEAK_BYTES", 110 * 1024 * 1024)
         config = await _turn(compiled, s, text="规则变了")
         (record,) = (await compiled.aget_state(config)).values["image_orientations"].values()
@@ -1512,16 +1513,27 @@ async def test_an_image_too_large_even_for_candidates_is_not_judged(
     assert _last_user(s.main.prompts[0]).content == _user("读一下", _ref()).content
 
 
-@pytest.mark.parametrize("shape", ["webp", "png-p", "png-1", "png-i16"])
+_PNG_MODES = {
+    "png-rgb": "RGB",
+    "png-rgba": "RGBA",
+    "png-l": "L",
+    "png-la": "LA",
+    "png-p": "P",
+    "png-1": "1",
+    "png-i16": "I;16",
+}
+
+
+@pytest.mark.parametrize("shape", ["webp", *_PNG_MODES])
 async def test_unsupported_shapes_are_not_judged_and_sent_as_stored(shape: str) -> None:
-    """第五轮收窄范围 —— WebP / 调色板 / 1 位 / 16 位灰度的图:不判、原样发、不加说明,每张计一次
+    """第六轮(用户)只转 JPEG —— PNG(各种模式)/ WebP 的图:不判、原样发、不加说明,每张计一次
     ``format_unsupported``。"""
     base = _upright().rotate(90, expand=True)
     buffer = io.BytesIO()
     if shape == "webp":
         base.save(buffer, format="WEBP")
     else:
-        mode = {"png-p": "P", "png-1": "1", "png-i16": "I;16"}[shape]
+        mode = _PNG_MODES[shape]
         (base.convert(mode) if mode != "I;16" else base.convert("L").convert("I;16")).save(
             buffer, format="PNG"
         )
@@ -1545,15 +1557,16 @@ async def test_unsupported_shapes_are_not_judged_and_sent_as_stored(shape: str) 
 async def test_too_many_lent_candidates_leave_the_image_for_later(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """全进程借出的候选到了上限:这张图这一步不判(没答成),计 ``candidates_over_cap``,下一轮再判。"""
+    """复审第五轮 M2 —— 全进程借出的候选到了上限:这张图这一步不判、什么都不记(没有结论记录、不加
+    次数),只计 ``candidates_over_cap``、不记日志;下一轮第一步按新图再判。"""
     monkeypatch.setattr(image_views, "LENT_CANDIDATES_CAP_BYTES", 10)
     before = _count(main_model_image_orientation_skipped_total, reason="candidates_over_cap")
     s = _setup({_ref(): _stored(90)})
     async with _graph(s) as compiled:
         config = await _turn(compiled, s, _ref())
-        (record,) = (await compiled.aget_state(config)).values["image_orientations"].values()
-        assert record["conclusion"] == "unjudged"
+        assert not (await compiled.aget_state(config)).values.get("image_orientations")
         assert s.judge.calls == []
+        assert _note(s) == "读一下"  # 没有说明
         assert (
             _count(main_model_image_orientation_skipped_total, reason="candidates_over_cap")
             == before + 1
@@ -1562,3 +1575,109 @@ async def test_too_many_lent_candidates_leave_the_image_for_later(
         await _turn(compiled, s, text="下一轮")
     assert s.judge.calls == [0, 90, 180, 270]
     assert s.main.replies[-1] == SECRET
+
+
+@pytest.mark.parametrize(
+    ("table", "left"),
+    [
+        ({0: "no", 90: "raise", 180: "no", 270: "no"}, "pending"),
+        ({0: "raise"}, "unjudged"),
+    ],
+)
+@pytest.mark.usefixtures("_short_timeout")
+async def test_the_final_retry_hitting_the_candidate_cap_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    table: Mapping[int, str],
+    left: str,
+) -> None:
+    """复审第五轮 M2 —— 最后一次再判正好撞上借出候选的上限:不写记录、不加次数、不变成 undetermined
+    (也不记带调用栈的日志);下一轮第一步照常再判。"""
+    s = _setup({_ref(): _stored(90)}, reply=_answers(table))
+    async with _graph(s) as compiled:
+        config = await _turn(compiled, s, _ref())
+        (first,) = (await compiled.aget_state(config)).values["image_orientations"].values()
+        assert (first["conclusion"], first["attempts"]) == (left, 1)
+        calls = len(s.judge.calls)
+        monkeypatch.setattr(image_views, "LENT_CANDIDATES_CAP_BYTES", 10)
+        with caplog.at_level("DEBUG"):
+            config = await _turn(compiled, s, text="第二轮:最后一次再判,候选借不出")
+        (second,) = (await compiled.aget_state(config)).values["image_orientations"].values()
+        assert second == first
+        assert len(s.judge.calls) == calls
+        assert not [r for r in caplog.records if r.exc_info]
+        monkeypatch.setattr(image_views, "LENT_CANDIDATES_CAP_BYTES", 16 * 1024 * 1024)
+        s.judge.reply = _honest
+        config = await _turn(compiled, s, text="第三轮")
+        (third,) = (await compiled.aget_state(config)).values["image_orientations"].values()
+    assert (third["conclusion"], third["degrees"], third["attempts"]) == ("rotated", 90, 2)
+    assert s.main.replies[-1] == SECRET
+
+
+def _png(turn: int = 90) -> bytes:
+    buffer = io.BytesIO()
+    _upright().rotate(turn, expand=True).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+async def test_skipped_decisions_are_seeded_so_children_do_not_count_again() -> None:
+    """复审第五轮 L2 —— 「不判」(格式不支持)的决定带着版本种进子代:子代不再看一遍文件头、不再计数;
+    旧版本记下的不种(子代按新规则重新看)。"""
+    parent = _setup({_ref(): _png()})
+    async with _graph(parent) as compiled:
+        config = await _turn(compiled, parent, _ref())
+        state = (await compiled.aget_state(config)).values
+    seeded = seedable_orientations(state)
+    ((key, record),) = seeded.items()
+    assert (record["conclusion"], record["skip_tag"]) == ("skipped", upright_mod.SKIP_RULES_VERSION)
+    before = _count(main_model_image_orientation_skipped_total, reason="format_unsupported")
+    child = _setup({_ref(): _png()})
+    async with _graph(child) as compiled:
+        await compiled.ainvoke(
+            {
+                "messages": [_user("子代的任务", _ref())],
+                "turn_image_refs": [_ref()],
+                "image_orientations": seeded,
+                "step_count": 0,
+                "max_steps": 6,
+            },
+            config=_config(child),
+        )
+    assert _count(main_model_image_orientation_skipped_total, reason="format_unsupported") == before
+    stale = {**state, "image_orientations": {key: {**record, "skip_tag": "b322-skip-1"}}}
+    assert seedable_orientations(stale) == {}
+
+
+def _skip_rules_fingerprint() -> str:
+    """「不判」规则依赖的一切:支持的格式 / 颜色模式、每张的内存预算、估算的校准常数,以及按它们对一组
+    尺寸算出的名额决定(估算公式改了也会变)。"""
+    import hashlib
+
+    from orchestrator.tools import region_zoom
+
+    sizes = [(w, w * 3 // 4) for w in range(400, 9600, 400)]
+    decisions = [
+        (w, h, mode, image_views.slots_for(w, h, mode))
+        for w, h in sizes
+        for mode in ("L", "RGB", "CMYK")
+    ]
+    rules = (
+        sorted((fmt, sorted(modes)) for fmt, modes in image_views.UPRIGHT_MODES.items()),
+        image_views.FULL_COPY_PEAK_BYTES,
+        region_zoom.CROP_OVERHEAD_PER_PIXEL,
+        region_zoom.FULL_COPY_OVERHEAD_BYTES,
+        region_zoom.PEAK_SAFETY,
+        sorted(region_zoom._BYTES_PER_PIXEL.items()),
+        region_zoom.REGION_TARGET_PIXELS,
+        region_zoom._JPEG_DRAFT_SCALES,
+        decisions,
+    )
+    return hashlib.sha256(repr(rules).encode()).hexdigest()[:16]
+
+
+def test_the_skip_rules_version_is_pinned_to_what_it_depends_on() -> None:
+    """复审第五轮 L3 —— 改了支持的格式、内存预算或估算常数却没改 ``SKIP_RULES_VERSION``:旧的「不判」
+    决定会一直留着。改了就同时改版本和这里的指纹。"""
+    assert {upright_mod.SKIP_RULES_VERSION: _skip_rules_fingerprint()} == {
+        "b322-skip-2": "02a58ebbb0ce36d2",
+    }

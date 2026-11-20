@@ -30,6 +30,12 @@ from orchestrator.tools.image_orientation import (
 logger = logging.getLogger(__name__)
 
 
+class CandidateDeferredError(Exception):
+    """``candidate`` 抛它 = 调用方决定这张图**这一步不判**(B-322 复审第五轮 M2:借出的候选到了全进程
+    上限)。原样穿出 :func:`judge_orientation`,不当成「候选生成不出来」、不记日志;调用方自己处理。
+    ``ask_image`` 从不抛它,所以它的行为不变。"""
+
+
 async def judge_orientation[C](
     *,
     candidate: Callable[[int], Awaitable[C]],
@@ -41,7 +47,8 @@ async def judge_orientation[C](
     """B-301 设计 §4.1 的两步。没时间、0 度候选生成不出来、第 1 步没答成 = 没问成;第 1 步答 no
     之后没时间问第 2 步也是没问成。
 
-    * ``candidate(角度)``:一张顺时针转了这么多度的候选(ref / 内容块,随调用方);抛错 = 生成不出来。
+    * ``candidate(角度)``:一张顺时针转了这么多度的候选(ref / 内容块,随调用方);抛错 = 生成不出来
+      (:class:`CandidateDeferredError` 除外:原样往外抛)。
     * ``ask(候选, 最多等多少秒)`` → ``(回答, 应答的模型)``;从不往外抛(没答成就是 ``timeout`` /
       ``error``)。
     * ``budget(还要花的秒数)``:此刻再问一次最多等多久;``None`` = 不问了。
@@ -57,6 +64,8 @@ async def judge_orientation[C](
         started = time.monotonic()
         try:
             zero = await candidate(0)
+        except CandidateDeferredError:
+            raise
         except Exception:
             logger.warning("%s.orientation_candidate_failed", log_prefix, exc_info=True)
             return Orientation("not_asked", reason="no_copy")
@@ -84,6 +93,8 @@ async def judge_orientation[C](
         started = time.monotonic()
         try:
             turned.append(await candidate(turn))
+        except CandidateDeferredError:
+            raise
         except Exception:
             logger.warning("%s.orientation_candidate_failed", log_prefix, exc_info=True)
             return Orientation("undetermined", 0, answers, models, extra_calls=1)

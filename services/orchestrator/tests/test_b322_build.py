@@ -39,9 +39,10 @@ _REF = f"expert_work://image/{_TENANT}/{_USER}/00000000-0000-4000-8000-000000000
 _USAGE = {"input_tokens": 1500, "output_tokens": 1, "total_tokens": 1501}
 
 
-def _png() -> bytes:
+def _jpeg() -> bytes:
+    """B-322 只转 JPEG(第六轮)。"""
     buffer = io.BytesIO()
-    Image.new("RGB", (300, 200), (200, 10, 10)).save(buffer, format="PNG")
+    Image.new("RGB", (300, 200), (200, 10, 10)).save(buffer, format="JPEG", quality=95)
     return buffer.getvalue()
 
 
@@ -170,7 +171,7 @@ async def _run(
 
     monkeypatch.setattr("orchestrator.agent_factory._build_provider", _fake_build_provider)
     store = InMemoryTokenUsageStore()
-    resolver = InMemoryImageResolver({_REF: ResolvedImage(media_type="image/png", data=_png())})
+    resolver = InMemoryImageResolver({_REF: ResolvedImage(media_type="image/jpeg", data=_jpeg())})
     async with make_checkpointer("memory") as cp:
         built = await build_agent(
             _spec("qwen/qwen3.8-max" if backup is not None else "deepseek/deepseek-flash"),

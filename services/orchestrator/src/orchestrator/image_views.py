@@ -15,8 +15,9 @@
 * 问方向的候选图(约 150 万像素)也在内存里生成,只在问的那一会儿「借」给适配器
   (:meth:`UprightViewCache.lend`),不缓存。
 
-字节规则:转正图**不比原图大**(PNG / GIF 例外:不超过 ``min(原图 x 1.1, 4,900,000 字节)``);
-同一输入每次生成的字节完全相同(固定编码参数、不写元数据)—— 厂商前缀缓存按字节比。
+只转 JPEG(L / RGB / CMYK;设计 §8.1 第 5 条五细化,2026-11-20 用户):别的格式不判方向、按原样发。
+字节规则:转正图**不比原图大**;同一输入每次生成的字节完全相同(固定编码参数、不写元数据)——
+厂商前缀缓存按字节比。
 
 本模块是叶子:只依赖 Pillow 与 :mod:`orchestrator.tools.region_zoom` 的纯几何函数(函数里延迟导入,
 免得适配器层一导入就拉起整个 ``orchestrator.tools``)。
@@ -66,28 +67,21 @@ FULL_COPY_PEAK_BYTES: Final = 110 * 1024 * 1024
 #: 2 秒:一次普通裁图约 0.1~0.3 秒、一张 12 MP 转正图约 0.1~0.2 秒(本机),等两轮还够。
 ADAPTER_MISS_SLOT_WAIT_S: Final = 2.0
 
-#: B-322 第五轮(2026-11-20,用户收窄范围)—— 转正只做内存估得准的格式 / 颜色模式;别的(WebP、
-#: GIF、调色板 P、1 位、16 位灰度、其它模式)不判方向、按原样发、不加说明
-#: (计 ``format_unsupported``)。
-#: 只看文件头判断,不解码。
+#: B-322 只转 JPEG(第六轮,2026-11-20 用户:设计 §8.1 第 5 条五细化)—— 内存估得准、实测校准过的
+#: 只有它。别的(PNG 各种模式、WebP、GIF、JPEG 的其它颜色模式)不判方向、按原样发、不加说明
+#: (计 ``format_unsupported``)。只看文件头判断,不解码。改了它就改
+#: ``graph_builder.image_upright.SKIP_RULES_VERSION``(测试钉住)。
 UPRIGHT_MODES: Final[Mapping[str, frozenset[str]]] = {
     "JPEG": frozenset({"L", "RGB", "CMYK"}),
     "MPO": frozenset({"L", "RGB", "CMYK"}),
-    "PNG": frozenset({"L", "LA", "RGB", "RGBA"}),
 }
-#: 问方向时借给适配器的候选图,全进程合计最多这么多字节(复审第四轮):超过就这张图这一步不判(计
-#: ``candidates_over_cap``),下一轮第一步再判。算进控制面主进程的内存常数。
+#: 问方向时借给适配器的候选图,全进程合计最多这么多字节(复审第四轮):超过就这张图这一步不判、
+#: 什么都不记(计 ``candidates_over_cap``,复审第五轮 M2)。算进控制面主进程的内存常数。
 LENT_CANDIDATES_CAP_BYTES: Final = 16 * 1024 * 1024
-#: JPEG 依次用的质量(与上传转码同档:92,超了退 85、75)。
-_FIRST_QUALITY: Final = {"JPEG": 92}
-_FALLBACK_QUALITIES: Final = (85, 75)
+#: 依次用的 JPEG 质量(与上传转码同档:92,超了退 85、75)。
+_QUALITIES: Final = (92, 85, 75)
 #: 每次缩像素到上一次的 0.8 倍(像素数),最低到小副本的像素数。
 _SHRINK_FACTOR: Final = 0.8
-#: PNG 无损,转完字节只因压缩顺序略有出入:允许到 ``min(原图 x 1.1, 4,900,000)``(十进制
-#: 4.9 MB,低于 Anthropic 的 5 MB;5 MiB 会超过它)。
-LOSSLESS_GROWTH: Final = 1.1
-LOSSLESS_MAX_BYTES: Final = 4_900_000
-_MEDIA_TYPES: Final = {"JPEG": "image/jpeg", "MPO": "image/jpeg", "PNG": "image/png"}
 
 ViewOutcome = Literal[
     "hit", "precomputed", "adapter_miss", "adapter_busy", "low_res_copy", "peak_over_budget"
@@ -159,11 +153,9 @@ def upright_copy(
 ) -> tuple[str, bytes] | None:
     """原图按方向标记转正、再顺时针转 ``degrees`` 度的整张图 → ``(媒体类型, 字节)``。
 
-    只做 :data:`UPRIGHT_MODES` 里的格式 / 颜色模式(别的抛 ``RegionImageError``,调用方之前就不会
-    走到这里)。像素:不超过单图预算就不缩(设计 §8.1 第 5 条)。格式跟原图走(JPEG 92 / PNG 最高
-    压缩)。字节:JPEG 超过原图就按 85、75 再存,仍超就每次缩到 0.8 倍像素再试、最低到小副本的
-    像素数;PNG 不超过
-    ``max(原图, min(原图 x 1.1, 4,900,000))`` 就照发,超了才缩。还超(实际上碰不到)→ ``None``:
+    只做 :data:`UPRIGHT_MODES` 里的 JPEG(别的抛 ``RegionImageError``,调用方之前就不会走到这里)。
+    像素:不超过单图预算就不缩(设计 §8.1 第 5 条)。存成 JPEG 92;字节超过原图就按 85、75 再存,
+    仍超就每次缩到 0.8 倍像素再试、最低到小副本的像素数。还超(实际上碰不到)→ ``None``:
     放弃转正,调用方按原样发并计 ``copy_too_large``。
 
     内存(审查 H1):解开的原图转完立刻放掉(:func:`~orchestrator.tools.region_zoom.upright_whole`),
@@ -194,14 +186,14 @@ def upright_copy(
         msg = f"the image could not be decoded for turning upright ({type(exc).__name__})"
         raise RegionImageError(msg) from exc
     try:
-        return _encode_within(whole, source_format, len(data))
+        return _encode_within(whole, len(data))
     finally:
         whole.close()
 
 
-def _header(data: bytes) -> tuple[int, int, str, bool] | None:
-    """只读文件头:``(宽, 高, 颜色模式, 是不是 JPEG)``;认不出、或不是 :data:`UPRIGHT_MODES` 里的
-    格式 / 颜色模式 → ``None``。"""
+def _header(data: bytes) -> tuple[int, int, str] | None:
+    """只读文件头:``(宽, 高, 颜色模式)``;认不出、或不是 :data:`UPRIGHT_MODES` 里的格式 / 颜色模式
+    → ``None``。"""
     from orchestrator.tools.region_zoom import OPEN_FORMATS  # 延迟导入,见模块说明
 
     try:
@@ -211,16 +203,17 @@ def _header(data: bytes) -> tuple[int, int, str, bool] | None:
         return None
     if mode not in UPRIGHT_MODES.get(fmt, frozenset()):
         return None
-    return width, height, mode, fmt in ("JPEG", "MPO")
+    return width, height, mode
 
 
 def skip_reason(data: bytes) -> str | None:
-    """这张图 B-322 做不做(只读文件头,不解码):格式 / 颜色模式不在 :data:`UPRIGHT_MODES` 里 →
+    """这张图 B-322 做不做(只读文件头,不解码):不是 :data:`UPRIGHT_MODES` 里的 JPEG →
     ``"format_unsupported"``;问方向的候选都要超过每张的内存预算 → ``"too_large"``;
-    能做 → ``None``。"""
-    if _header(data) is None:
+    能做 → ``None``。只看图本身(与主模型、单图预算无关)。"""
+    header = _header(data)
+    if header is None:
         return "format_unsupported"
-    if small_copy_slots(data) is None:
+    if slots_for(*header) is None:
         return "too_large"
     return None
 
@@ -232,8 +225,8 @@ def full_copy_peak(data: bytes, max_pixels: int | None) -> int | None:
     header = _header(data)
     if header is None:
         return None
-    width, height, mode, jpeg = header
-    return upright_peak_bytes(width, height, mode, max_pixels, jpeg=jpeg, encoded_bytes=len(data))
+    width, height, mode = header
+    return upright_peak_bytes(width, height, mode, max_pixels, encoded_bytes=len(data))
 
 
 def full_copy_fits_memory(data: bytes, max_pixels: int | None) -> bool:
@@ -242,17 +235,20 @@ def full_copy_fits_memory(data: bytes, max_pixels: int | None) -> bool:
 
 
 def small_copy_slots(data: bytes) -> int | None:
-    """问方向的候选 / 小副本(:func:`low_res_copy`,整张框的 ``crop_image``)该占几个解图名额(复审
-    H-new):估的峰值不到 :data:`FULL_COPY_PEAK_BYTES` 的一半占 1 个,不到它占 2 个(B-322 自己的
-    解码在两个名额里加起来不超过它;``ask_image`` 自己的裁图不走这道估算,不受它约束);更大的(要
-    整张解开的大 PNG 之类)、不支持的格式 → ``None``:不做,这张图不判方向。"""
+    """问方向的候选 / 小副本(:func:`low_res_copy`,整张框的 ``crop_image``)该占几个解图名额:见
+    :func:`slots_for`。不支持的格式 → ``None``。"""
+    header = _header(data)
+    return None if header is None else slots_for(*header)
+
+
+def slots_for(width: int, height: int, mode: str) -> int | None:
+    """按解码之前估的峰值(:func:`~orchestrator.tools.region_zoom.crop_peak_bytes`,已乘安全系数)
+    定占几个解图名额(复审 H-new / 第五轮 M1):不到 :data:`FULL_COPY_PEAK_BYTES` 的一半占 1 个 ——
+    两个这样的同时在算,加起来也不超过它;不到它占 2 个(单独在算);更大的 → ``None``:不做,这张图
+    不判方向(``too_large``)。``ask_image`` 自己的裁图不走这道估算,不受它约束。"""
     from orchestrator.tools.region_zoom import crop_peak_bytes  # 延迟导入,见模块说明
 
-    header = _header(data)
-    if header is None:
-        return None
-    width, height, mode, jpeg = header
-    peak = crop_peak_bytes(width, height, mode, jpeg=jpeg, encoded_bytes=len(data))
+    peak = crop_peak_bytes(width, height, mode)
     if peak <= FULL_COPY_PEAK_BYTES // 2:
         return 1
     if peak <= FULL_COPY_PEAK_BYTES:
@@ -260,37 +256,20 @@ def small_copy_slots(data: bytes) -> int | None:
     return None
 
 
-def copy_size_limit(original_bytes: int, media_type: str) -> int:
-    """转正图按字节规则最多多大:JPEG ≤ 原图;PNG ≤ ``max(原图, min(原图 x 1.1, 4,900,000))``。
-    ``_pin`` 用它先估、放不下就不算(审查 N2)。"""
-    if media_type == "image/png":
-        growth = min(math.floor(original_bytes * LOSSLESS_GROWTH), LOSSLESS_MAX_BYTES)
-        return max(original_bytes, growth)
-    return original_bytes
-
-
-def _encode_within(
-    whole: Image.Image, source_format: str, original_bytes: int
-) -> tuple[str, bytes] | None:
-    """按字节规则编码(见 :func:`upright_copy`)。"""
+def _encode_within(whole: Image.Image, original_bytes: int) -> tuple[str, bytes] | None:
+    """按字节规则编码(见 :func:`upright_copy`):不超过原图字节。"""
     from orchestrator.tools.region_zoom import REGION_TARGET_PIXELS  # 延迟导入,见模块说明
 
-    fmt = "JPEG" if source_format == "MPO" else source_format
-    media_type = _MEDIA_TYPES[fmt]
-    limit = copy_size_limit(original_bytes, media_type)
-    qualities: tuple[int | None, ...] = (
-        (_FIRST_QUALITY[fmt], *_FALLBACK_QUALITIES) if fmt in _FIRST_QUALITY else (None,)
-    )
-    for quality in qualities:
-        encoded = _encode(whole, fmt, quality)
-        if len(encoded) <= limit:
-            return media_type, encoded
+    for quality in _QUALITIES:
+        encoded = _encode(whole, quality)
+        if len(encoded) <= original_bytes:
+            return "image/jpeg", encoded
     pixels = whole.width * whole.height
     while pixels > REGION_TARGET_PIXELS:
         pixels = max(REGION_TARGET_PIXELS, math.floor(pixels * _SHRINK_FACTOR))
-        encoded = _encode(_resized(whole, pixels), fmt, qualities[-1])
-        if len(encoded) <= limit:
-            return media_type, encoded
+        encoded = _encode(_resized(whole, pixels), _QUALITIES[-1])
+        if len(encoded) <= original_bytes:
+            return "image/jpeg", encoded
     return None
 
 
@@ -308,24 +287,12 @@ def _resized(image: Image.Image, pixels: int) -> Image.Image:
     return image.resize(size, Image.Resampling.LANCZOS)
 
 
-def _encode(image: Image.Image, fmt: str, quality: int | None) -> bytes:
-    """固定参数编码(同一输入字节每次相同):不带元数据;JPEG 4:2:0、PNG 最高压缩。"""
+def _encode(image: Image.Image, quality: int) -> bytes:
+    """固定参数编码(同一输入字节每次相同):JPEG 4:2:0、不带元数据;CMYK 先转 RGB。"""
     buffer = io.BytesIO()
-    if fmt == "JPEG":
-        rgb = image if image.mode in ("L", "RGB") else _flattened(image)
-        rgb.save(buffer, format="JPEG", quality=quality, subsampling=2)
-    else:
-        image.save(buffer, format="PNG", optimize=True)
+    rgb = image if image.mode in ("L", "RGB") else image.convert("RGB")
+    rgb.save(buffer, format="JPEG", quality=quality, subsampling=2)
     return buffer.getvalue()
-
-
-def _flattened(image: Image.Image) -> Image.Image:
-    """转成 RGB;带透明的铺在白底上。"""
-    if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
-        rgba = image.convert("RGBA")
-        canvas = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-        return Image.alpha_composite(canvas, rgba).convert("RGB")
-    return image.convert("RGB")
 
 
 # ---------------------------------------------------------------------------

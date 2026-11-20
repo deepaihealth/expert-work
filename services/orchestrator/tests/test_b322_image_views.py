@@ -4,18 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import io
-import random
 import time
 import weakref
 from typing import Any
 
 import pytest
 from langchain_core.messages import HumanMessage
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageOps
 
 from orchestrator import image_views
 from orchestrator.image_views import (
-    LOSSLESS_MAX_BYTES,
     ImageView,
     PreparedView,
     UprightViewCache,
@@ -50,6 +48,11 @@ def _encode(image: Image.Image, fmt: str, **kw: Any) -> bytes:
     return buffer.getvalue()
 
 
+def _quad_jpeg() -> bytes:
+    """B-322 只转 JPEG(第六轮):测试图存成 JPEG 100(4:4:4)(转正图按 92 存,不比原图大)。"""
+    return _encode(_quadrants(), "JPEG", quality=100, subsampling=0)
+
+
 def _decode(data: bytes) -> Image.Image:
     image = Image.open(io.BytesIO(data))
     image.load()
@@ -68,26 +71,29 @@ def _fresh_cache() -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _as_copy(image: Image.Image) -> bytes:
+    """转正图的编码参数(JPEG 92、4:2:0、不带元数据)。"""
+    return _encode(image, "JPEG", quality=92, subsampling=2)
+
+
 @pytest.mark.parametrize("degrees", [90, 180, 270])
-def test_png_copy_is_pixel_identical_to_turning_first(degrees: int) -> None:
-    stored = _quadrants()
-    media, data = upright_copy(_encode(stored, "PNG"), degrees) or ("", b"")
-    assert media == "image/png"
-    # 顺时针转 N 度 = PIL 的 rotate(-N)。
-    expected = stored.rotate(-degrees, expand=True)
-    assert _decode(data).convert("RGB").tobytes() == expected.tobytes()
+def test_jpeg_copy_is_the_turned_original(degrees: int) -> None:
+    raw = _quad_jpeg()
+    media, data = upright_copy(raw, degrees) or ("", b"")
+    assert media == "image/jpeg"
+    # 顺时针转 N 度 = PIL 的 rotate(-N);同样的编码参数,字节一样。
+    assert data == _as_copy(_decode(raw).rotate(-degrees, expand=True))
 
 
 @pytest.mark.parametrize("exif", [3, 6, 8])
 def test_exif_orientation_is_applied_before_the_turn(exif: int) -> None:
     """方向标记先转正,再顺时针转 N 度(与 ``crop_upright`` 整张框的结果、与 B-301 候选同一口径)。"""
-    stored = _quadrants()
     tags = Image.Exif()
     tags[0x0112] = exif
-    raw = _encode(stored, "PNG", exif=tags.tobytes())
+    raw = _encode(_quadrants(), "JPEG", quality=100, subsampling=0, exif=tags.tobytes())
     _media, data = upright_copy(raw, 90) or ("", b"")
     expected = ImageOps.exif_transpose(_decode(raw)).rotate(-90, expand=True)
-    assert _decode(data).convert("RGB").tobytes() == expected.convert("RGB").tobytes()
+    assert _decode(data).tobytes() == _decode(_as_copy(expected)).tobytes()
 
 
 def test_same_input_gives_the_same_bytes_every_time() -> None:
@@ -114,26 +120,6 @@ def test_jpeg_copy_never_larger_than_the_original() -> None:
     assert len(data) <= len(raw)
 
 
-def _small_text_png() -> bytes:
-    image = Image.new("RGB", (1800, 1200), (255, 255, 255))
-    draw = ImageDraw.Draw(image)
-    rng = random.Random(3)  # noqa: S311 - 合成测试图,不是密码学用途
-    for row in range(0, 1200, 12):
-        line = "".join(rng.choice("0123456789.-mgdL ") for _ in range(250))
-        draw.text((4, row), line, fill=(0, 0, 0))  # 默认字体约 9-10 像素高
-    return _encode(image, "PNG")
-
-
-def test_png_screenshot_is_not_shrunk_and_stays_within_the_png_allowance() -> None:
-    raw = _small_text_png()
-    found = upright_copy(raw, 90)
-    assert found is not None
-    media, data = found
-    assert media == "image/png"
-    assert _decode(data).size == (1200, 1800)  # 不缩像素
-    assert len(data) <= max(len(raw), min(int(len(raw) * 1.1), LOSSLESS_MAX_BYTES))
-
-
 def test_copy_is_never_downscaled_below_the_originals_size() -> None:
     """设计 §8.1 第 5 条细化(2026-11-20,用户;审查 H1):转正图与原图一样多像素,不缩 —— 原图今天
     就是这么大发给厂商的。4032 x 3024 的手机照片转 90 度是 3024 x 4032,不是 3000 x 4000。"""
@@ -146,7 +132,7 @@ def test_copy_is_never_downscaled_below_the_originals_size() -> None:
 def test_a_copy_that_cannot_fit_gives_up(monkeypatch: pytest.MonkeyPatch) -> None:
     """怎么退都超 → ``None``(调用方按原样发、计 ``copy_too_large``)。"""
     raw = _encode(_photo(1600, 1200), "JPEG", quality=40)
-    monkeypatch.setattr(image_views, "_encode", lambda image, fmt, q: b"x" * (len(raw) + 1))
+    monkeypatch.setattr(image_views, "_encode", lambda image, q: b"x" * (len(raw) + 1))
     assert upright_copy(raw, 90) is None
 
 
@@ -182,7 +168,7 @@ def _count(outcome: str) -> float:
 
 
 async def test_adapter_reads_the_precomputed_copy() -> None:
-    raw = _encode(_quadrants(), "PNG")
+    raw = _quad_jpeg()
     media, copy = upright_copy(raw, 90) or ("", b"")
     key = (image_digest(raw), 90)
     assert image_views.UPRIGHT_VIEWS.try_pin_full([PreparedView(key, media, copy)])
@@ -197,7 +183,7 @@ async def test_adapter_reads_the_precomputed_copy() -> None:
 
 
 async def test_adapter_miss_computes_and_still_succeeds() -> None:
-    raw = _encode(_quadrants(), "PNG")
+    raw = _quad_jpeg()
     before = _count("adapter_miss")
     out = await resolve_message_images([_REF], _resolver(raw), [ImageView(90)])
     assert isinstance(out[0], ResolvedImage)
@@ -206,7 +192,7 @@ async def test_adapter_miss_computes_and_still_succeeds() -> None:
 
 
 async def test_low_variant_is_read_as_low_even_when_full_exists() -> None:
-    raw = _encode(_quadrants(), "PNG")
+    raw = _quad_jpeg()
     key = (image_digest(raw), 90)
     full = upright_copy(raw, 90) or ("", b"")
     low = low_res_copy(raw, 90)
@@ -219,7 +205,7 @@ async def test_low_variant_is_read_as_low_even_when_full_exists() -> None:
 
 
 async def test_block_without_view_is_the_original() -> None:
-    raw = _encode(_quadrants(), "PNG")
+    raw = _quad_jpeg()
     out = await resolve_message_images([_REF], _resolver(raw), split_human_views([_block(None)]))
     assert isinstance(out[0], ResolvedImage)
     assert out[0].data == raw
@@ -227,7 +213,7 @@ async def test_block_without_view_is_the_original() -> None:
 
 @pytest.mark.parametrize("adapter", [openai_adapter, anthropic_adapter])
 async def test_both_adapters_pass_the_view(adapter: Any) -> None:
-    raw = _encode(_quadrants(), "PNG")
+    raw = _quad_jpeg()
     msg = HumanMessage(content=[{"type": "text", "text": "hi"}, _block({"degrees": 180})])
     blocks = await adapter._human_content(msg, _resolver(raw))
     rotated = (upright_copy(raw, 180) or ("", b""))[1]
@@ -341,7 +327,7 @@ async def test_adapter_miss_runs_off_the_event_loop(monkeypatch: pytest.MonkeyPa
     """审查 H1 —— 适配器当场重算走解图名额、在线程里,不占事件循环。"""
     import threading
 
-    raw = _encode(_quadrants(), "PNG")
+    raw = _quad_jpeg()
     seen: list[str] = []
     real = image_views.upright_copy
 
@@ -359,7 +345,7 @@ def test_upright_whole_closes_the_original_once_turned() -> None:
     """审查 H1 —— 转完马上关掉原图(解开的那份像素放掉);不用转时不复制、原样返回。"""
     from orchestrator.tools.region_zoom import upright_whole
 
-    image = Image.open(io.BytesIO(_encode(_quadrants(), "PNG")))
+    image = Image.open(io.BytesIO(_quad_jpeg()))
     turned = upright_whole(image, 90)
     assert turned is not image
     with pytest.raises(ValueError):
@@ -368,7 +354,7 @@ def test_upright_whole_closes_the_original_once_turned() -> None:
 
     tags = Image.Exif()
     tags[0x0112] = 8  # 方向标记 8 再顺时针转 90 度 = 正好不用转
-    plain = Image.open(io.BytesIO(_encode(_quadrants(), "PNG", exif=tags.tobytes())))
+    plain = Image.open(io.BytesIO(_encode(_quadrants(), "JPEG", quality=95, exif=tags.tobytes())))
     assert upright_whole(plain, 90) is plain
 
 
@@ -411,7 +397,7 @@ async def test_cancel_keeps_the_slots_until_the_thread_finishes(runner: str, hel
 
 async def test_a_cancelled_full_copy_still_lands_in_the_cache() -> None:
     """审查 N1 —— 首 token 超时换备用 / 用户取消时,已经开算的全分辨率图算完照样收进缓存。"""
-    raw = _encode(_quadrants(), "PNG")
+    raw = _quad_jpeg()
     digest = image_digest(raw)
     task = asyncio.create_task(image_views.full_copy_in_slots(raw, 90, digest))
     await asyncio.sleep(0)
@@ -425,7 +411,7 @@ async def test_adapter_miss_does_not_wait_long_for_a_slot(monkeypatch: pytest.Mo
     """审查 N3 —— 解图名额被占着时,适配器当场重算最多等 ``ADAPTER_MISS_SLOT_WAIT_S``,等不到就这次
     按原图发(计 ``adapter_busy``),不让首 token 跟着排队。"""
     monkeypatch.setattr(image_views, "ADAPTER_MISS_SLOT_WAIT_S", 0.1)
-    raw = _encode(_quadrants(), "PNG")
+    raw = _quad_jpeg()
     gate = image_views._gate()
     await gate.acquire()
     await gate.acquire()
@@ -481,14 +467,6 @@ def test_a_jpeg_over_the_budget_is_drafted_then_fitted(monkeypatch: pytest.Monke
     assert image.size == (400, 600)  # 600x400 的预算尺寸,转了 90 度
     # 1/4 那一档 600 x 400 = 24 万正好落在 [95% 预算, 预算] 里:按它解码,不再缩。
     assert drafts == [(600, 400)]
-
-
-def test_a_png_over_the_budget_is_reduced_then_fitted() -> None:
-    stored = _quadrants().resize((2400, 1600))
-    found = upright_copy(_encode(stored, "PNG"), 270, max_pixels=240_000)
-    assert found is not None
-    image = _decode(found[1])
-    assert image.size == (400, 600)
 
 
 def test_a_view_carries_the_budget_only_for_full_copies() -> None:
@@ -549,40 +527,37 @@ def test_no_draft_lands_in_the_window_so_none_is_used(monkeypatch: pytest.Monkey
 
 
 def test_the_budget_plan_lands_in_the_window() -> None:
-    """``budget_size`` 是唯一的判定点:解码时缩 / 整数倍缩只在结果落进 [95%, 100%] 预算时才用。"""
+    """``budget_size`` 是唯一的判定点:解码时缩只在结果落进 [95%, 100%] 预算时才用。"""
     from orchestrator.tools.region_zoom import BUDGET_FLOOR, budget_size
 
     qwen = 12_595_200
-    assert budget_size(4032, 3024, qwen, jpeg=True) is None  # 12.2 MP:不超过预算,不缩
-    phone48 = budget_size(8064, 6048, qwen, jpeg=True)
+    assert budget_size(4032, 3024, qwen) is None  # 12.2 MP:不超过预算,不缩
+    phone48 = budget_size(8064, 6048, qwen)
     assert phone48 is not None
-    assert (phone48.draft, phone48.reduce, phone48.resize) == (2, 1, False)  # 按一半读,直接用
-    png48 = budget_size(8064, 6048, qwen, jpeg=False)
-    assert png48 is not None
-    assert (png48.draft, png48.reduce, png48.resize) == (1, 2, False)
-    twenty = budget_size(5184, 3888, qwen, jpeg=True)  # 1/2 只有 504 万(40%):不用 draft
+    assert (phone48.draft, phone48.resize) == (2, False)  # 按一半读,直接用
+    twenty = budget_size(5184, 3888, qwen)  # 1/2 只有 504 万(40%):不用 draft
     assert twenty is not None
-    assert (twenty.draft, twenty.reduce, twenty.resize) == (1, 1, True)
+    assert (twenty.draft, twenty.resize) == (1, True)
     tw, th = twenty.target
     assert qwen * BUDGET_FLOOR <= tw * th <= qwen
 
 
 def test_the_peak_estimate_matches_the_measured_classes() -> None:
     """解码之前的峰值估算:12 MP 照片与按一半读的 48 MP 照片在每张转正图的内存预算以内;20 MP 照片
-    (要整张解开再缩)、48 MP PNG、6000 万像素的 JPEG 超过 —— 它们改用小副本。"""
+    (要整张解开再缩)、按一半读的 48 MP CMYK、6000 万像素的 JPEG 超过 —— 它们改用小副本。"""
     from orchestrator.image_views import FULL_COPY_PEAK_BYTES
     from orchestrator.tools.region_zoom import upright_peak_bytes
 
     qwen, mib = 12_595_200, 1024 * 1024
 
-    def peak(w: int, h: int, *, jpeg: bool = True, mode: str = "RGB", size: int = 4 * mib) -> int:
-        return upright_peak_bytes(w, h, mode, qwen, jpeg=jpeg, encoded_bytes=size)
+    def peak(w: int, h: int, *, mode: str = "RGB", size: int = 4 * mib) -> int:
+        return upright_peak_bytes(w, h, mode, qwen, encoded_bytes=size)
 
     assert peak(4032, 3024) <= FULL_COPY_PEAK_BYTES
     assert peak(4096, 3072, size=10 * mib) <= FULL_COPY_PEAK_BYTES  # 12.58 MP、10 MiB:最贵的不缩图
     assert peak(8064, 6048) <= FULL_COPY_PEAK_BYTES
     assert peak(5184, 3888) > FULL_COPY_PEAK_BYTES
-    assert peak(8064, 6048, jpeg=False) > FULL_COPY_PEAK_BYTES
+    assert peak(8064, 6048, mode="CMYK", size=20 * mib) > FULL_COPY_PEAK_BYTES
     assert peak(9487, 6324) > FULL_COPY_PEAK_BYTES  # 6000 万像素(上传解码上限)
     assert peak(5184, 3888, mode="L") <= FULL_COPY_PEAK_BYTES  # 灰度:每像素 1 字节
 
@@ -591,7 +566,7 @@ async def test_the_adapter_does_not_make_a_full_copy_over_the_peak_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(image_views, "FULL_COPY_PEAK_BYTES", 1000)
-    raw = _encode(_quadrants(), "PNG")
+    raw = _quad_jpeg()
     before = _count("peak_over_budget")
     out = await resolve_message_images([_REF], _resolver(raw), [ImageView(90)])
     assert isinstance(out[0], ResolvedImage)
@@ -606,9 +581,9 @@ def test_small_copies_take_one_or_two_slots_by_their_estimated_peak(
     不超过预算),再大不做。"""
     from orchestrator.tools import region_zoom
 
-    raw = _encode(_quadrants(), "PNG")
+    raw = _quad_jpeg()
     assert image_views.small_copy_slots(raw) == 1
-    peak = region_zoom.crop_peak_bytes(600, 400, "RGB", jpeg=False, encoded_bytes=len(raw))
+    peak = region_zoom.crop_peak_bytes(600, 400, "RGB")
     monkeypatch.setattr(image_views, "FULL_COPY_PEAK_BYTES", peak + 1)
     assert image_views.small_copy_slots(raw) == 2
     monkeypatch.setattr(image_views, "FULL_COPY_PEAK_BYTES", peak - 1)
@@ -639,31 +614,69 @@ def test_lent_candidates_have_their_own_process_wide_cap(monkeypatch: pytest.Mon
     assert cache.lend(("cand", 90), "image/jpeg", b"x" * 60)
 
 
-def test_the_crop_estimate_follows_crop_image_as_on_main() -> None:
-    """候选 / 小副本走的 ``crop_image`` 与 main 逐字节相同;估算按它的实际做法(按审查方法实测:12 MP
-    JPEG 约 41 MiB、20 MP JPEG 约 64 MiB、60 MP JPEG 约 184 MiB —— 请求向上取整、实际按 1/2 解、
-    48.8 MP RGB PNG 约 570 MiB —— 整张解开)。"""
+#: 第六轮实测(审查方法:新进程、读文件、``crop_image`` 整张框转 90 度一次、``ru_maxrss`` 增量;
+#: 本机 macOS 与控制面镜像的 Linux 取大的,MiB)。``test_b322_peak_measured`` 每次现量一遍。
+_MEASURED_CROP_MIB: dict[tuple[int, int, str], float] = {
+    (4032, 3024, "L"): 35.0,
+    (4032, 3024, "RGB"): 41.3,
+    (4032, 3024, "CMYK"): 41.5,
+    (5184, 3888, "L"): 47.3,
+    (5184, 3888, "RGB"): 64.2,
+    (5184, 3888, "CMYK"): 64.2,
+    (8064, 6048, "L"): 35.0,
+    (8064, 6048, "RGB"): 41.3,
+    (8064, 6048, "CMYK"): 41.5,
+    (9487, 6000, "RGB"): 165.3,
+    (3000, 2000, "L"): 10.7,
+}
+
+
+@pytest.mark.parametrize(("size", "measured"), list(_MEASURED_CROP_MIB.items()))
+def test_the_crop_estimate_covers_the_measured_peak(
+    size: tuple[int, int, str], measured: float
+) -> None:
+    """复审第五轮 M1 —— 估算(含 LANCZOS 中间那份、转 RGB 的几份、校准余量,再乘 1.2)不低于实测,
+    也不离谱地高(不到实测的两倍)。"""
+    from orchestrator.tools.region_zoom import PEAK_SAFETY, crop_peak_bytes
+
+    estimate = crop_peak_bytes(*size) / (1024 * 1024)
+    assert estimate / PEAK_SAFETY >= measured  # 校准值本身就不低于实测
+    assert estimate < 2 * measured
+
+
+def test_one_slot_crops_fit_twice_in_the_per_copy_budget() -> None:
+    """复审第五轮 M1 —— 占 1 个名额的候选 / 小副本,两个同时在算也不超过 110 MiB(按估算,估算不低于
+    实测);12 MP 照片占 1 个,20 MP 占 2 个,6000 万像素的不做。"""
+    from orchestrator.image_views import FULL_COPY_PEAK_BYTES, slots_for
     from orchestrator.tools.region_zoom import crop_peak_bytes
 
-    mib = 1024 * 1024
-
-    def estimate(w: int, h: int, *, jpeg: bool = True, mode: str = "RGB") -> float:
-        return crop_peak_bytes(w, h, mode, jpeg=jpeg, encoded_bytes=2 * mib) / mib
-
-    assert 30 <= estimate(4032, 3024) <= 50
-    assert 50 <= estimate(5184, 3888) <= 75
-    assert 160 <= estimate(9487, 6324) <= 200
-    assert 520 <= estimate(8064, 6048, jpeg=False) <= 620
-    assert estimate(4032, 3024, mode="L") < estimate(4032, 3024)
+    for (w, h, mode), measured in _MEASURED_CROP_MIB.items():
+        if slots_for(w, h, mode) == 1:
+            assert 2 * crop_peak_bytes(w, h, mode) <= FULL_COPY_PEAK_BYTES
+            assert 2 * measured * 1024 * 1024 <= FULL_COPY_PEAK_BYTES
+    assert [slots_for(4032, 3024, m) for m in ("L", "RGB", "CMYK")] == [1, 1, 1]
+    assert [slots_for(5184, 3888, m) for m in ("L", "RGB", "CMYK")] == [2, 2, 2]
+    assert [slots_for(8064, 6048, m) for m in ("L", "RGB", "CMYK")] == [1, 1, 1]
+    assert slots_for(9487, 6000, "RGB") is None
 
 
 @pytest.mark.parametrize(
     ("fmt", "mode"),
-    [("WEBP", "RGB"), ("PNG", "P"), ("PNG", "1"), ("PNG", "I;16"), ("GIF", "P")],
+    [
+        ("WEBP", "RGB"),
+        ("PNG", "L"),
+        ("PNG", "LA"),
+        ("PNG", "RGB"),
+        ("PNG", "RGBA"),
+        ("PNG", "P"),
+        ("PNG", "1"),
+        ("PNG", "I;16"),
+        ("GIF", "P"),
+    ],
 )
 def test_unsupported_formats_and_modes_are_skipped_by_header(fmt: str, mode: str) -> None:
-    """第五轮收窄范围 —— 只做 JPEG(L / RGB / CMYK)与 PNG(L / LA / RGB / RGBA);别的按文件头就判定
-    不做(``format_unsupported``),转正图也做不出来。"""
+    """第六轮(用户)—— 只做 JPEG(L / RGB / CMYK);PNG 各种模式、WebP、GIF 按文件头就判定不做
+    (``format_unsupported``),转正图也做不出来。"""
     image = _quadrants().convert(mode) if mode not in ("P",) else _quadrants().convert("P")
     raw = _encode(image, fmt)
     assert image_views.skip_reason(raw) == "format_unsupported"
@@ -678,14 +691,10 @@ def test_unsupported_formats_and_modes_are_skipped_by_header(fmt: str, mode: str
         ("JPEG", "L"),
         ("JPEG", "RGB"),
         ("JPEG", "CMYK"),
-        ("PNG", "L"),
-        ("PNG", "LA"),
-        ("PNG", "RGB"),
-        ("PNG", "RGBA"),
     ],
 )
 def test_supported_formats_and_modes_are_turned(fmt: str, mode: str) -> None:
-    raw = _encode(_quadrants().convert(mode), fmt, **({"quality": 95} if fmt == "JPEG" else {}))
+    raw = _encode(_quadrants().convert(mode), fmt, quality=95)
     assert image_views.skip_reason(raw) is None
     found = upright_copy(raw, 90)
     assert found is not None
