@@ -264,6 +264,10 @@ async def run_child_to_result(
         "turn_document_original_names": dict(ctx.turn_document_original_names),
         "turn_image_refs": list(ctx.turn_image_refs),
     }
+    # B-322 —— 父代对本轮图的方向定论种进子代(孙代照此往下传),子代只问不知道的;
+    # pending / unjudged 不种(``_build_tool_context`` 已滤掉)。
+    if ctx.image_orientations:
+        child_input["image_orientations"] = dict(ctx.image_orientations)
 
     started_at = datetime.now(UTC)
     start_monotonic = time.monotonic()

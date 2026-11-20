@@ -135,6 +135,32 @@ def _merge_figure_documents(left: dict[str, str], right: dict[str, str]) -> dict
     return {**left, **right}
 
 
+def _merge_conversation_images(
+    left: dict[str, dict[str, Any]], right: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """B-322 —— 图编号 → 图的记录,按键并集;同键的值不变,只把新见到的 ref 并进 ``refs``
+    (同一张图的字节被传了两次,两个 ref 都要能认出它)。"""
+    merged = dict(left)
+    for key, value in right.items():
+        old = merged.get(key)
+        if old is None:
+            merged[key] = value
+            continue
+        refs = [
+            *old.get("refs", []),
+            *(r for r in value.get("refs", []) if r not in old.get("refs", [])),
+        ]
+        merged[key] = old if refs == old.get("refs", []) else {**old, "refs": refs}
+    return merged
+
+
+def _merge_image_orientations(
+    left: dict[str, dict[str, Any]], right: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """B-322 —— 方向结论按键并集,同键新值覆盖旧值(待再判 → 定论);不淘汰。"""
+    return {**left, **right}
+
+
 class AgentState(TypedDict):
     """State threaded through every orchestrator LangGraph node.
 
@@ -420,3 +446,16 @@ class AgentState(TypedDict):
     #: B-236 review 10 —— ``seed_skipped_dirs`` 之外还有几个目录没复制(名字只记前
     #: ``MAX_REPORTED_DIRS`` 个)。快照段写成「… and N more」。
     seed_skipped_more: NotRequired[int]
+    #: B-322 —— 主模型自己看图(Path A)时见过的图:图编号(``img_`` + 图哈希前 8 位)→
+    #: ``{"sha": 图哈希前 16 位, "refs": [原图 ref…], "width", "height", "first_turn"}``。只在
+    #: 出现新图时追加,不淘汰(每条约 150 字节)。``graph_builder.image_upright`` 写。
+    conversation_images: NotRequired[
+        Annotated[dict[str, dict[str, Any]], _merge_conversation_images]
+    ]
+    #: B-322 —— 方向结论:``图哈希前 16 位:问法版本`` → 结论、角度、四个方向的回答与应答模型
+    #: (``provider/name``)、尝试过几轮、上一次尝试的那一轮。不淘汰(淘汰会让历史图在对话
+    #: 中途翻回横的)。子代从 ``_child_run`` 种进来父代对本轮图的定论。
+    image_orientations: NotRequired[Annotated[dict[str, dict[str, Any]], _merge_image_orientations]]
+    #: B-322 —— 本步每个图编号发给模型时顺时针转了多少度(整份替换)。调试台据此标「这一步发给
+    #: 模型的是转过的图」;PR ② 的 ``zoom_image`` 只认它。
+    shown_image_angles: NotRequired[dict[str, int]]

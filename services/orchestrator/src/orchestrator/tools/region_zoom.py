@@ -61,6 +61,9 @@ MAX_DECODE_PIXELS: Final = 60_000_000
 LARGE_IMAGE_PIXELS: Final = AUTO_GATE_PIXELS
 #: 裁图存成 JPEG 的质量 —— 与 B-263 上传转码同一档。
 CROP_JPEG_QUALITY: Final = 92
+#: B-322 —— 主模型看的「转正图」原像素转、不缩,超过这么多像素(约 qwen4-max 的单图预算)或长边
+#: 超过 :data:`MAX_SIDE_PIXELS` 才等比缩小。4032 x 3024 的手机照片变成 4000 x 3000。
+UPRIGHT_COPY_MAX_PIXELS: Final = 12_000_000
 
 #: 整页快看一张文档页或大图之后追加的提示。
 REGION_HINT: Final = (
@@ -368,6 +371,20 @@ def _crop_open_image(
         piece.save(buffer, format="JPEG", quality=CROP_JPEG_QUALITY)
         crops.append(CroppedImage(data=buffer.getvalue(), width=piece.width, height=piece.height))
     return crops
+
+
+def upright_whole(image: Image.Image, degrees: int, max_pixels: int) -> Image.Image:
+    """B-322 —— 整张图按方向标记转正、再顺时针转 ``degrees`` 度(不按框裁;方向表与
+    :func:`crop_upright` 同一份,逐像素相同);超过 ``max_pixels`` / 长边上限等比缩小,从不放大。
+
+    解码前先看像素数:超过 :data:`MAX_DECODE_PIXELS` 抛 :class:`RegionImageError`。同步、吃 CPU。"""
+    width, height = image.size
+    if width * height > MAX_DECODE_PIXELS:
+        msg = f"the image is {width}x{height} pixels, over the {MAX_DECODE_PIXELS}-pixel limit"
+        raise RegionImageError(msg)
+    method = _UPRIGHT_METHODS.get(turned_orientation(_orientation(image), degrees))
+    whole = image.copy() if method is None else image.transpose(method)
+    return _cap_pixels(whole, max_pixels)
 
 
 def _orientation(image: Image.Image) -> int:

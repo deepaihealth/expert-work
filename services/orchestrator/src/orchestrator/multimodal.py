@@ -47,6 +47,13 @@ from expert_work.protocol.multimodal import (
     parse_workspace_image_ref,
 )
 from expert_work.runtime.storage.base import ObjectNotFoundError, ObjectStore
+from orchestrator.image_views import (
+    VIEW_KEY,
+    ImageView,
+    image_digest,
+    parse_image_view,
+    view_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +124,24 @@ def split_human_content(content: str | Sequence[object]) -> tuple[str, list[str]
                 if isinstance(text, str):
                     text_parts.append(text)
     return "".join(text_parts), image_refs
+
+
+def split_human_views(content: str | Sequence[object]) -> list[ImageView | None]:
+    """B-322 —— 与 :func:`split_human_content` 的 ref 一一对应的 ``view``(没有就是 ``None``)。
+
+    ``agent_node`` 只在提示词视图里给横 / 倒的图块加 ``view``(检查点里的原件从不带);
+    ``ask_image`` 发出的消息也从不带,所以 Path B 不受影响、不会转两次。"""
+    if isinstance(content, str):
+        return []
+    views: list[ImageView | None] = []
+    for block in content:
+        if (
+            isinstance(block, Mapping)
+            and block.get("type") == IMAGE_REF_BLOCK_TYPE
+            and isinstance(block.get("ref"), str)
+        ):
+            views.append(parse_image_view(block.get(VIEW_KEY)))
+    return views
 
 
 @dataclass(frozen=True)
@@ -646,7 +671,9 @@ def unreadable_workspace_image_text(figure: RenderedFigureRef | None, error: Bas
 
 
 async def resolve_message_images(
-    refs: Sequence[str], resolver: ImageResolver
+    refs: Sequence[str],
+    resolver: ImageResolver,
+    views: Sequence[ImageView | None] = (),
 ) -> list[ResolvedImage | str]:
     """按次序解析一条消息里的图;**工作区** ref 读不出来、上传图的字节已不在时换成一段可见文字。
 
@@ -671,18 +698,25 @@ async def resolve_message_images(
 
     接的是 ``Exception``,不是 ``BaseException``:取消(``asyncio.CancelledError``)
     照常往上走。
+
+    B-322 —— ``views``(与 ``refs`` 一一对应,见 :func:`split_human_views`):带 ``view`` 的上传图
+    先照旧取原图字节(取不到照旧换成提示文字),再按 (图哈希, 角度) 从转正图缓存里**读**
+    (:func:`~orchestrator.image_views.view_bytes`)。
     """
     out: list[ResolvedImage | str] = []
-    for ref in refs:
+    for index, ref in enumerate(refs):
         if not ref.startswith(WORKSPACE_REF_PREFIX):
             try:
-                out.append(await resolver.resolve(ref))
+                resolved = await resolver.resolve(ref)
             except ObjectNotFoundError:
                 upload_images_degraded_total.inc()
                 logger.warning(
                     "multimodal.upload_image_degraded image_id=%s", upload_image_id_for_log(ref)
                 )
                 out.append(UPLOAD_IMAGE_GONE_TEXT)
+                continue
+            view = views[index] if index < len(views) else None
+            out.append(resolved if view is None else _viewed(resolved, view))
             continue
         try:
             out.append(await resolver.resolve(ref))
@@ -697,6 +731,15 @@ async def resolve_message_images(
             )
             out.append(unreadable_workspace_image_text(figure, exc))
     return out
+
+
+def _viewed(resolved: ResolvedImage, view: ImageView) -> ResolvedImage:
+    """B-322 —— 原图换成按 ``view`` 转正的那一份;拿不到(放弃转正)就是原图。"""
+    found = view_bytes(image_digest(resolved.data), view, resolved.data)
+    if found is None:
+        return resolved
+    media_type, data = found
+    return ResolvedImage(media_type=media_type, data=data)
 
 
 @dataclass

@@ -24,7 +24,7 @@ import logging
 import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -81,15 +81,13 @@ from orchestrator.tools.image_orientation import (
     ORIENTATION_MIN_BUDGET_S,
     ORIENTATION_QUESTION,
     ORIENTATION_TIMEOUT_S,
-    TURNS,
     Answer,
     Orientation,
     ask_image_orientation_off_topic_total,
     ask_image_orientation_total,
-    first_conclusion,
     parse_orientation_reply,
-    turned_conclusion,
 )
+from orchestrator.tools.orientation_judge import judge_orientation
 from orchestrator.tools.question_scope import is_count_question, is_whole_image_question
 from orchestrator.tools.read_page import (
     RENDER_DPI,
@@ -226,12 +224,18 @@ _HOST_CROP_GATES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.S
 async def _crop_in_thread(
     data: bytes, boxes: Sequence[Box], degrees: int, max_pixels: int = REGION_TARGET_PIXELS
 ) -> list[CroppedImage]:
+    return await in_host_crop_slot(crop_image, data, boxes, degrees, max_pixels)
+
+
+async def in_host_crop_slot[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    """在宿主解图名额(:data:`HOST_CROP_SLOTS`)里、线程中跑一次解图 / 裁图。B-322 主模型的
+    候选图与转正图也走这里:不新增解图并发,主进程内存峰值的上限不变。"""
     loop = asyncio.get_running_loop()
     gate = _HOST_CROP_GATES.get(loop)
     if gate is None:
         gate = _HOST_CROP_GATES[loop] = asyncio.Semaphore(HOST_CROP_SLOTS)
     async with gate:
-        return await asyncio.to_thread(crop_image, data, boxes, degrees, max_pixels)
+        return await asyncio.to_thread(func, *args, **kwargs)
 
 
 def _tile_slots() -> asyncio.Semaphore:
@@ -1130,62 +1134,26 @@ class AskImageTool:
     async def _ask_orientation(
         self, data: bytes, out_dir: str, *, ctx: ToolContext, orient_until: float | None
     ) -> Orientation:
-        """问方向的两步(设计 §4.1)。没时间、候选副本裁不出来、第 1 步没答成 = 没问成(按今天
-        的样子读);第 1 步答 no 之后没时间问第 2 步也是没问成,不对主模型说什么。
+        """问方向的两步(设计 §4.1,:func:`~orchestrator.tools.orientation_judge.judge_orientation`)。
+        候选副本写进本 run 这张图的裁图目录,按 ref 问快看那条链。没时间、候选副本裁不出来、
+        第 1 步没答成 = 没问成(按今天的样子读);第 1 步答 no 之后没时间问第 2 步也是没问成,
+        不对主模型说什么。
 
         时间每次调用前现算:写副本(线程里裁 + 写 NAS)不设限时 —— 截断它会留下半张 JPEG ——
         但它用掉的时间算数,写完已经过了线就不再问。"""
-        if self._orientation_budget(orient_until) is None:
-            return Orientation("not_asked", reason="deadline")
-        started = time.monotonic()
-        try:
-            zero = await self._write_crops(data, out_dir, [_FULL_FRAME], degrees=0, ctx=ctx)
-        except Exception:
-            logger.warning("ask_image.orientation_candidate_failed", exc_info=True)
-            return Orientation("not_asked", reason="no_copy")
-        copy_s = time.monotonic() - started
-        budget = self._orientation_budget(orient_until)
-        if budget is None:
-            return Orientation("not_asked", reason="deadline")
-        first, first_model = await self._orientation_answer(zero.crops[0].ref, budget, ctx=ctx)
-        answers: dict[str, Answer] = {"0": first}
-        models: dict[str, str | None] = {"0": first_model}
-        conclusion = first_conclusion(first)
-        if conclusion == "not_asked":
-            return Orientation(conclusion, 0, answers, models, "no_answer", extra_calls=1)
-        if conclusion is not None:
-            return Orientation(conclusion, 0, answers, models, extra_calls=1)
-        out_of_time = Orientation("not_asked", 0, answers, models, "deadline", extra_calls=1)
-        turned: list[str] = []
-        for index, turn in enumerate(TURNS):
-            # 写之前先估:剩的时间要够「下限 + 还要写的张数 乘 到目前为止最慢的一张」(第一次估用
-            # 0 度那张),不够就不写了 —— 写到一半才发现,吃掉的是留给读的时间。
-            needed = (len(TURNS) - index) * copy_s
-            if self._orientation_budget(orient_until, extra_s=needed) is None:
-                return out_of_time
-            started = time.monotonic()
-            try:
-                render = await self._write_crops(
-                    data, out_dir, [_FULL_FRAME], degrees=turn, ctx=ctx
-                )
-            except Exception:
-                logger.warning("ask_image.orientation_candidate_failed", exc_info=True)
-                return Orientation("undetermined", 0, answers, models, extra_calls=1)
-            copy_s = max(copy_s, time.monotonic() - started)
-            turned.append(render.crops[0].ref)
-        budget = self._orientation_budget(orient_until)
-        if budget is None:
-            return out_of_time
-        replies = await asyncio.gather(
-            *(self._orientation_answer(ref, budget, ctx=ctx) for ref in turned)
+
+        async def candidate(degrees: int) -> str:
+            render = await self._write_crops(data, out_dir, [_FULL_FRAME], degrees=degrees, ctx=ctx)
+            return render.crops[0].ref
+
+        async def ask(ref: str, budget_s: float) -> tuple[Answer, str | None]:
+            return await self._orientation_answer(ref, budget_s, ctx=ctx)
+
+        return await judge_orientation(
+            candidate=candidate,
+            ask=ask,
+            budget=lambda extra_s: self._orientation_budget(orient_until, extra_s),
         )
-        by_turn: dict[int, Answer] = {}
-        for turn, (reply, model) in zip(TURNS, replies, strict=True):
-            by_turn[turn] = reply
-            answers[str(turn)] = reply
-            models[str(turn)] = model
-        conclusion, degrees = turned_conclusion(by_turn)
-        return Orientation(conclusion, degrees, answers, models, extra_calls=1 + len(TURNS))
 
     async def _orientation_answer(
         self, ref: str, budget_s: float, *, ctx: ToolContext

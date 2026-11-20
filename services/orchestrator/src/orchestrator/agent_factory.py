@@ -73,7 +73,12 @@ from expert_work.protocol import (
     parse_agent_ref,
     parse_skill_ref,
 )
-from expert_work.protocol.model_catalog import ModelEntry, catalog_entry
+from expert_work.protocol.model_catalog import (
+    ModelEntry,
+    catalog_entry,
+    orientation_judge_allowed,
+    orientation_model_label,
+)
 from expert_work.protocol.skill import SkillStatus
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.middleware import MiddlewareChain
@@ -122,6 +127,7 @@ from orchestrator.graph_builder.agent_notes import (
     make_agent_notes_node,
 )
 from orchestrator.graph_builder.conversation_seed import make_conversation_seed_node
+from orchestrator.graph_builder.image_upright import ImageOrienter, OrientationJudge
 from orchestrator.graph_builder.outgoing_reference import (
     OUTGOING_ARGUMENTS_CLAUSE,
     sends_arguments_out,
@@ -863,6 +869,47 @@ async def build_agent(
                 default=(vision_block.model.provider, vision_block.model.name),
                 models=vl_models,
             )
+    # B-322 PR ① —— 主模型自己看图(Path A)时,图进主模型之前先转正。问方向用主模型自己的
+    # 「关思考」路由(与 ask_image 快看同一写法),备用树只留核实且没撤销的节点;主模型本身没核实
+    # 就不建路由(不判新图,已有结论照样显示)。
+    image_orienter: ImageOrienter | None = None
+    if spec.spec.model.supports_vision and env.image_resolver is not None:
+        judge: OrientationJudge | None = None
+        judge_model = orientation_judge_model(spec.spec.model)
+        if judge_model is not None:
+            manifest_dl = spec.spec.stream_deadline_s
+            judge_deadline_s = (
+                float(min(manifest_dl, VL_FIRST_TOKEN_TIMEOUT_S)) if manifest_dl > 0 else None
+            )
+            judge = OrientationJudge(
+                caller=await build_llm_router(
+                    judge_model,
+                    secret_store=secret_store,
+                    # 与主循环同一个盖章层:记账与「只采信核实模型的回答」都要知道实际应答的是谁。
+                    around_llm_chain=step_llm_chain,
+                    image_resolver=env.image_resolver,
+                    first_token_timeout_s=judge_deadline_s,
+                    idle_timeout_s=_chat_idle_timeout_s(spec.spec.idle_timeout_s),
+                    provider_timeout_s=judge_deadline_s,
+                    provider_key_resolver=provider_key_resolver,
+                    ignore_api_key_ref=True,
+                    http_client=http_client,
+                    rate_limiter_factory=rate_limiter_factory,
+                ),
+                meter=conversation_usage.meter(
+                    default=(judge_model.provider, judge_model.name),
+                    models=chain_models(judge_model),
+                ),
+                model=judge_model,
+                stamped=usage_store is not None,
+            )
+        image_orienter = ImageOrienter(
+            image_resolver=env.image_resolver,
+            configured_model=orientation_model_label(
+                spec.spec.model.provider, spec.spec.model.name
+            ),
+            judge=judge,
+        )
     # Stream J.7a (Mini-ADR J-23) — resolve + merge declared skills BEFORE the
     # tool registry so the sandbox tools can be bound with the skill seed-file
     # set (skill-runtime §5.1 auto-mount). ``_load_skills`` is pure-read and does
@@ -1426,6 +1473,8 @@ async def build_agent(
         output_cap_resolver=served_output_cap(spec.spec.model),
         # B-267 第 3 步 —— 每轮轻量探测(开关开、绑了知识库、没关 ``knowledge.probe``)。
         knowledge_probe=_knowledge_probe(spec, env),
+        # B-322 PR ① —— 主模型自己看图时先转正(Path B / 没接图片解析器时为 None)。
+        image_orienter=image_orienter,
         # B-326 —— 与 share_file 同一个条件:开了分享链接、不是动态子智能体。
         share_links_ttl_minutes=(
             spec.spec.share_links.ttl_minutes
@@ -2604,6 +2653,21 @@ def thinking_off_request_fields(provider: str, name: str, *, max_tokens: int) ->
     )
     entry = catalog_entry(provider, name)
     return {**(_thinking_payload(model) or {}), **(_output_cap_payload(model, entry) or {})}
+
+
+def orientation_judge_model(model: ModelSpec) -> ModelSpec | None:
+    """B-322 —— 问方向用的模型树:主模型本身核实且没撤销才有(否则 ``None``,不判新图);备用树
+    里没核实 / 撤销的节点连同它下面的整枝剪掉 —— 保证即使响应上没盖章,答的也只可能是核实模型。
+    再按 :func:`_thinking_off` 关思考(关不掉的落到最低档)。"""
+    pruned = _verified_tree(model)
+    return _thinking_off(pruned) if pruned is not None else None
+
+
+def _verified_tree(model: ModelSpec) -> ModelSpec | None:
+    if not orientation_judge_allowed(model.provider, model.name):
+        return None
+    kept = [tree for tree in (_verified_tree(child) for child in model.fallback) if tree]
+    return model if kept == model.fallback else model.model_copy(update={"fallback": kept})
 
 
 def _thinking_off(model: ModelSpec) -> ModelSpec:

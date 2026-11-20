@@ -475,6 +475,9 @@ class ToolContext:
     #: 根 run 上 = 本图接线时的值;子代上 = 父传下来的值(``SHARE_LINKS_TTL_KEY``)。
     #: ``share_file`` 在子代里只在它有值时才标记交付,并按它(根的有效期)铸链接。
     share_links_ttl_minutes: int | None = None
+    #: B-322 —— 本 run 对 ``turn_image_refs`` 里那几张图已有的**定论**(状态 ``image_orientations``
+    #: 的子集,撤销的除外)。委派时 ``_child_run`` 原样种进子代的初始状态,子代只问不知道的。
+    image_orientations: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def workspace_view(self) -> WorkspaceView:

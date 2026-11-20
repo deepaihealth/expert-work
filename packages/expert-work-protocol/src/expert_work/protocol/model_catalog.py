@@ -341,6 +341,11 @@ class ModelEntry(BaseModel):
     # B-222 —— per-call averages for the ingest estimate. None = the platform's
     # generic averages.
     estimate_caps: EstimateCaps | None = None
+    # B-322 —— 主模型自己看图(Path A)时,能不能由它来判「图里的主要文字是正的吗」并据此把横 /
+    # 倒的图转正。只有跑过 B-322 设计 §6.2 E 组(正放 33 + 无文字 4 + 转过 99,完整两步)、过了
+    # §6.3 的 E 线,才在这里设为 True,并在条目上写体检日期与结果出处。没设的模型(含新加的)不判
+    # 新图;已有结论照样显示。撤销走 :data:`ORIENTATION_REVOKED_MODELS`,不是把它改回 False。
+    orientation_verified: bool = False
 
     @property
     def ocr_only(self) -> bool:
@@ -1102,6 +1107,34 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         ),
     ),
 }
+
+
+#: B-322 —— 明确撤销「能判图片方向」的模型(``provider/name``)。**只增不减**:删掉或改名
+#: 目录条目、把 ``orientation_verified`` 改回 False 都不算撤销,只有进了这里才算 —— 这样它判过的
+#: 结论在显示时一律按「没判过」对待(设计 §4.1.3 / §4.1.9)。
+#: ``tests/test_b322_orientation_catalog.py`` 另记一份,这里少了任何一个名字就红。
+#: 撤销只随完整发布上线;急的话先用紧急开关 ``EXPERT_WORK_MAIN_MODEL_IMAGE_ORIENTATION`` 整体关停。
+ORIENTATION_REVOKED_MODELS: frozenset[str] = frozenset()
+
+
+def orientation_model_label(provider: str, name: str) -> str:
+    """B-322 —— 判方向的结论里记的模型名:``provider/name``,与目录条目的键同形。"""
+    return f"{provider}/{name}"
+
+
+def orientation_revoked(label: str) -> bool:
+    """B-322 —— ``label``(``provider/name``)在不在撤销清单里(调用时现读模块常量)。"""
+    return label in ORIENTATION_REVOKED_MODELS
+
+
+def orientation_judge_allowed(provider: str, name: str) -> bool:
+    """B-322 —— 这个模型能不能判新图的方向:目录里核实过、且没被撤销。目录外的模型一律不能。"""
+    entry = catalog_entry(provider, name)
+    return (
+        entry is not None
+        and entry.orientation_verified
+        and not orientation_revoked(orientation_model_label(provider, name))
+    )
 
 
 def catalog_entry(provider: str, name: str) -> ModelEntry | None:

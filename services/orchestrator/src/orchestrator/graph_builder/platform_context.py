@@ -207,6 +207,29 @@ def with_platform_context(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
     return out
 
 
+#: B-322 —— 提示词视图里带图的那条消息要追加的平台说明(``list[str]``,一行一张图)。只打在视图
+#: 里的副本上(``graph_builder.image_upright``),:func:`with_image_notes` 贴完就剥掉。
+IMAGE_NOTES_MARK = "expert_work_image_notes"
+
+
+def with_image_notes(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
+    """B-322 —— 打了 :data:`IMAGE_NOTES_MARK` 的消息末尾各追加一段 ``<platform-context>``
+    (说的是这条消息里的第几张图)。返回新列表;没有打标的消息原样(identity 不变)。
+
+    必须在 :func:`with_platform_context` **之后**调:那一步已经把用户 / 工具写的同名字样转义了,
+    这里贴的才是唯一一段真的平台说明(防冒充的程度与 B-162 平台段相同)。"""
+    out: list[BaseMessage] = []
+    for msg in messages:
+        notes = (msg.additional_kwargs or {}).get(IMAGE_NOTES_MARK)
+        if not notes:
+            out.append(msg)
+            continue
+        kwargs = {k: v for k, v in msg.additional_kwargs.items() if k != IMAGE_NOTES_MARK}
+        bare = msg.model_copy(update={"additional_kwargs": kwargs})
+        out.append(_with_appended(bare, wrap_platform_context("\n".join(notes))) or bare)
+    return out
+
+
 def with_recovery_advisory_mark(msg: ToolMessage, advisory: str) -> ToolMessage:
     """B-163 —— 给失败的工具结果打上恢复建议的标(副本;已有的 ``additional_kwargs`` 原样保留)。"""
     return msg.model_copy(
