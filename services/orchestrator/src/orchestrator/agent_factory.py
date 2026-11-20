@@ -997,6 +997,8 @@ async def build_agent(
         # B-64 —— read_page 的回执按实际投递路径说;与下面 build_react_graph /
         # BuiltAgent 用的是同一个表达式。
         supports_vision=spec.spec.model.supports_vision,
+        # B-326 —— 开了分享链接才有 share_file。
+        share_links=spec.spec.share_links,
     )
     # Stream J.1 — a ``plan_execute`` manifest front-loads a planner node
     # that decomposes the task before the ReAct loop runs. B-35 — the
@@ -1413,6 +1415,15 @@ async def build_agent(
         output_cap_resolver=served_output_cap(spec.spec.model),
         # B-267 第 3 步 —— 每轮轻量探测(开关开、绑了知识库、没关 ``knowledge.probe``)。
         knowledge_probe=_knowledge_probe(spec, env),
+        # B-326 —— 与 share_file 同一个条件:开了分享链接、不是动态子智能体。
+        share_links_ttl_minutes=(
+            spec.spec.share_links.ttl_minutes
+            if spec.spec.share_links is not None
+            and spec.spec.share_links.enabled
+            and env.share_links is not None
+            and not env.worker_policy
+            else None
+        ),
     )
     compiled = GraphRunner(checkpointer=checkpointer).compile(graph)
     base_prompt = spec.spec.system_prompt.template

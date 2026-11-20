@@ -225,6 +225,7 @@ def _get_session_purge_stores(request: Request) -> SessionPurgeStores:
         object_store=getattr(state, "object_store", None),
         runs=getattr(state, "run_store", None),
         trajectories=trajectory_store_for(state.agent_runtime),
+        share_links=getattr(state, "artifact_share_link_store", None),
     )
 
 

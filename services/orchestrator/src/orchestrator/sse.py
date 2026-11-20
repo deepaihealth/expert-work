@@ -117,7 +117,7 @@ from orchestrator.tools._budget import DELEGATION_GATE_KEY, DelegationGate
 from orchestrator.tools._guards import GUARD_SINK_KEY, TOKEN_BUDGET_KEY, TokenBudget
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
 from orchestrator.tools.agent_file_versions import AgentFileVersionStore, dispatch_observation
-from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder
+from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder, public_entries
 from orchestrator.tools.registry import TURN_ROOT_RUN_KEY
 from orchestrator.tools.spawn_worker import WorkerSpawnBudget
 from orchestrator.trajectory import (
@@ -558,9 +558,7 @@ async def run_agent(
         seeded = getattr(record, "seed_artifacts", None)
         if seeded is None:
             seeded = await run_manager.persisted_artifacts(run_id, tenant_id=record.tenant_id)
-        for e in seeded or []:
-            if isinstance(e, dict) and e.get("name"):
-                artifact_manifest(dict(e))
+        artifact_manifest.seed(seeded)
 
     _manifest_snapshot = artifact_manifest.snapshot
 
@@ -1870,6 +1868,10 @@ async def sse_consumer(
     # 字段(调用方没接线)。装配与口径都在
     # ``control_plane.api._run_usage.make_usage_loader``,这里只认这个形状。
     load_usage: Callable[[], Awaitable[list[dict[str, Any]] | None]] | None = None,
+    # B-326 —— ``end`` 帧的产物清单发出前经过它(控制面按当前配置续分享链接)。``None`` =
+    # 原样(内部的 ``_share`` 一律由 ``end_frame_data`` 去掉)。
+    artifact_view: Callable[[list[dict[str, Any]] | None], Awaitable[list[dict[str, Any]] | None]]
+    | None = None,
 ) -> AsyncIterator[bytes]:
     """Yield SSE wire frames for ``record``'s run.
 
@@ -1938,6 +1940,8 @@ async def sse_consumer(
                 _end_data = entry.data if isinstance(entry.data, dict) else {}
                 status = _end_data.get("status")
                 arts = _end_data.get("artifacts")
+                if artifact_view is not None:
+                    arts = await artifact_view(arts)
                 if converter is not None:
                     # ``channel="final"`` 的改判必须排在 ``end`` 之前 —— 判定要
                     # 向后看一条消息,只有到这里才知道后面没有了。
@@ -2051,7 +2055,8 @@ def end_frame_data(
         "run_id": str(run_id),
     }
     if artifacts is not None:
-        data["artifacts"] = artifacts
+        # B-326 —— 标记交付项的内部元数据(``_share``)只在 run 行里,不出 end 帧。
+        data["artifacts"] = public_entries(artifacts)
     if usage_by_model is not None:
         data["usage_by_model"] = usage_by_model
     if completed is not None:

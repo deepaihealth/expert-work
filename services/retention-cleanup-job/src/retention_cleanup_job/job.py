@@ -110,6 +110,9 @@ from retention_cleanup_job.report import CleanupReport
 from retention_cleanup_job.trajectories import TrajectorySweepTally, sweep_trajectories
 from retention_cleanup_job.uploads import UploadSweep, UploadSweepTally
 
+#: B-326 —— 产物分享链接过期多少天后由本作业删行(只剩审计 / 排障价值,续链不靠它)。
+SHARE_LINK_GRACE_DAYS = 7
+
 logger = logging.getLogger(__name__)
 
 #: 审计行的 actor —— 与 control-plane 的 sweep 同款写法(``actor_type="system"``)。
@@ -306,6 +309,7 @@ class RetentionCleanupJob:
             event_deleted = await self._delete_event_log()
             sandbox_egress_audit_deleted = await self._delete_sandbox_egress_audit()
             memory_writeback_jobs_deleted = await self._delete_finished_memory_writeback_jobs()
+            share_links_deleted = await self._delete_expired_share_links()
             knowledge_tasks_deleted = await self._delete_finished_knowledge_tasks()
             knowledge_revisions_deleted = await self._delete_orphaned_knowledge_revisions()
             retrieval_logs_deleted = await self._delete_expired_knowledge_retrieval_logs()
@@ -396,6 +400,7 @@ class RetentionCleanupJob:
             tenant_users_hard_deleted=tenant_users_hard_deleted,
             sandbox_egress_audit_deleted=sandbox_egress_audit_deleted,
             memory_writeback_jobs_deleted=memory_writeback_jobs_deleted,
+            share_links_deleted=share_links_deleted,
             knowledge_tasks_deleted=knowledge_tasks_deleted,
             knowledge_revisions_deleted=knowledge_revisions_deleted,
             knowledge_retrieval_logs_deleted=retrieval_logs_deleted,
@@ -1199,6 +1204,31 @@ class RetentionCleanupJob:
                     """
                 ),
                 {"days": self._memory_writeback_job_retention_days, "batch": self._batch_size},
+            )
+            await session.commit()
+        return result.rowcount or 0  # type: ignore[attr-defined]
+
+    async def _delete_expired_share_links(self) -> int:
+        """B-326 —— 删掉过期满宽限期的产物分享链接行。
+
+        公开下载从不删行(过期就 404);读产物清单续链接靠 run 行里记着的标记,不靠旧链接行,
+        所以过期行只剩审计 / 排障价值,留 :data:`SHARE_LINK_GRACE_DAYS` 天后删。与
+        :meth:`_delete_finished_memory_writeback_jobs` 同款 ``ctid`` 限批;授权见迁移 0194。
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                text(
+                    """
+                    DELETE FROM artifact_share_links
+                    WHERE ctid IN (
+                        SELECT l.ctid
+                        FROM artifact_share_links l
+                        WHERE l.expires_at < now() - make_interval(days => :days)
+                        LIMIT :batch
+                    )
+                    """
+                ),
+                {"days": SHARE_LINK_GRACE_DAYS, "batch": self._batch_size},
             )
             await session.commit()
         return result.rowcount or 0  # type: ignore[attr-defined]

@@ -49,6 +49,10 @@ FIGURE_RUN_IDS_KEY = "figure_run_ids"
 #: :attr:`ToolContext.turn_root_run_id`);新开一轮 / 孤儿复活同一个 run 时不写。
 TURN_ROOT_RUN_KEY = "turn_root_run_id"
 
+#: B-326 —— 委派树的根智能体开了分享链接时,它的链接有效期(分钟)。只在根开了时才出现在
+#: 子代的 ``configurable`` 里(``_child_config`` 写);根 run 的值由图构建时定。
+SHARE_LINKS_TTL_KEY = "share_links_ttl_minutes"
+
 
 def workspace_view_fields(configurable: Mapping[str, Any]) -> dict[str, Any]:
     """B-236 —— 从 ``config["configurable"]`` 取工作区视图要的四个值(agent 身份、本对话
@@ -467,6 +471,10 @@ class ToolContext:
     #: B-268 —— 这一轮首段的 run id(审批续跑段是新 run_id;``None`` = 本 run 就是首段)。
     #: ``read_page`` 的读取账按它记,续跑段接着上一段的计数。子代不继承(它有自己的 state)。
     turn_root_run_id: UUID | None = None
+    #: B-326 —— 这棵委派树的根智能体的分享链接有效期(分钟);``None`` = 根没开分享链接。
+    #: 根 run 上 = 本图接线时的值;子代上 = 父传下来的值(``SHARE_LINKS_TTL_KEY``)。
+    #: ``share_file`` 在子代里只在它有值时才标记交付,并按它(根的有效期)铸链接。
+    share_links_ttl_minutes: int | None = None
 
     @property
     def workspace_view(self) -> WorkspaceView:

@@ -63,6 +63,7 @@ from control_plane.runtime import AgentRuntime
 from expert_work.persistence.agent_instance.base import AgentInstanceStore
 from expert_work.persistence.approval import ApprovalStore
 from expert_work.persistence.artifact import ArtifactStore
+from expert_work.persistence.artifact_share import ArtifactShareLinkStore
 from expert_work.persistence.curation import CurationCandidateStore, EvalDatasetStore
 from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.image_upload import ImageUploadStore
@@ -169,6 +170,8 @@ class PurgeUserDeps:
     #: B-285 —— where the run path writes trajectory objects
     #: (``runtime.trajectory_recorder``); ``None`` = this deployment writes none.
     trajectories: TrajectoryStore | None = None
+    #: B-326 —— the user's artifact share links; ``None`` = no share links here.
+    share_links: ArtifactShareLinkStore | None = None
 
 
 @dataclass
@@ -606,6 +609,14 @@ async def purge_user(
         deps.artifacts.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
         default=0,
     )
+    if deps.share_links is not None:
+        # B-326 —— 链接行不靠外键挂在产物上,单独删(删了立刻失效,不等过期)。
+        summary.deleted["artifact_share_links"] = await _step(
+            summary,
+            "artifact_share_links",
+            deps.share_links.delete_for_user(tenant_id=tenant_id, user_id=user_id),
+            default=0,
+        )
     # mcp_oauth_connection is keyed by the string subject_id, NOT the surrogate.
     summary.deleted["mcp_oauth_connection"] = await _step(
         summary,

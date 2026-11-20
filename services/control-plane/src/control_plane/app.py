@@ -42,6 +42,7 @@ from fastapi.responses import JSONResponse
 from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from control_plane.access_log import install_access_log_redaction
 from control_plane.advisory_locks import MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api import (
@@ -96,6 +97,7 @@ from control_plane.api import (
     build_platform_recognition_config_router,
     build_platform_skills_router,
     build_platform_tool_budget_config_router,
+    build_public_files_router,
     build_quality_router,
     build_quota_router,
     build_rate_card_router,
@@ -141,6 +143,7 @@ from control_plane.auth import (
 )
 from control_plane.aux_model_adapter import LLMRouterAuxModelAdapter, make_llm_router_aux_model
 from control_plane.catalog_seed import CatalogSeedError, load_catalog_seed, seed_catalog
+from control_plane.client_ip import parse_trusted_proxies
 from control_plane.credential_value_cache import CredentialValueCache
 from control_plane.curation_worker import CurationWorker
 from control_plane.delegation_policy import make_delegation_policy_aux
@@ -335,6 +338,11 @@ from expert_work.persistence.artifact import (
     ArtifactStore,
     InMemoryArtifactStore,
     SqlArtifactStore,
+)
+from expert_work.persistence.artifact_share import (
+    ArtifactShareLinkStore,
+    InMemoryArtifactShareLinkStore,
+    SqlArtifactShareLinkStore,
 )
 from expert_work.persistence.audit_log import AuditLogStore, SqlAuditLogStore
 from expert_work.persistence.auth import (
@@ -609,6 +617,7 @@ from orchestrator.tools import (
 )
 from orchestrator.tools.locks import ProcessKeyedLock
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+from orchestrator.tools.share_file import PUBLIC_FILES_PATH, ShareLinkService
 from orchestrator.trajectory import TrajectoryReader
 from retention_cleanup_job.legacy_originals import release_migrated_originals
 
@@ -683,6 +692,8 @@ def create_app(
         Keycloak; production wiring builds one from ``settings`` (C.1).
     """
     resolved_settings = settings or Settings()
+    # B-326 —— the share-link id is a credential; keep it out of uvicorn's access log.
+    install_access_log_redaction()
     # Stream O (Mini-ADR O-1) — Platform Catalog startup validation.
     # Fail fast at create_app rather than at first LLM call so a
     # mis-configured deployment crashes the pipeline at boot.
@@ -741,6 +752,21 @@ def create_app(
     # shared with the agent tool env.
     resolved_artifact_store: ArtifactStore = artifact_repo or (
         sql_stores.artifact if sql_stores else InMemoryArtifactStore()
+    )
+    # B-326 —— 产物分享链接(``share_file`` 铸、``GET /v1/public/files/{id}`` 读)。分享服务只在
+    # 配了公开地址时才有;没配 = 平台上没有分享链接,开了 ``spec.share_links`` 的智能体构建报错。
+    resolved_artifact_share_links: ArtifactShareLinkStore = (
+        sql_stores.artifact_share_link if sql_stores else InMemoryArtifactShareLinkStore()
+    )
+    resolved_share_link_service: ShareLinkService | None = (
+        ShareLinkService(
+            links=resolved_artifact_share_links,
+            artifacts=resolved_artifact_store,
+            public_base_url=resolved_settings.public_base_url,
+            max_downloads=resolved_settings.share_link_max_downloads,
+        )
+        if resolved_settings.public_base_url
+        else None
     )
     # Stream Playground-Uplift (D4) — read-only per-user workspace registry,
     # backing the playground workspace inspector (verify a user's VM/persistence).
@@ -1919,6 +1945,8 @@ def create_app(
                     # 共用同一个 store 实例,不另造一份。
                     workspace_store=resolved_workspace_store,
                     artifact_snapshots=resolved_artifact_snapshots,
+                    # B-326 —— 产物分享链接(没配公开地址时为 None)。
+                    share_links=resolved_share_link_service,
                     # Stream TE-8 — cross-replica per-workspace write lock for
                     # write_file / bash. A raw (non-RLS) sessionmaker: the
                     # advisory lock touches no tenant tables.
@@ -2903,6 +2931,12 @@ def create_app(
     app.state.feedback_store = resolved_feedback
     app.state.token_usage_store = resolved_token_usage
     app.state.artifact_store = resolved_artifact_store
+    app.state.artifact_share_link_store = resolved_artifact_share_links  # B-326
+    # B-326 —— 读产物清单时给标记交付的项换上有效链接(``api/_share_links``);没配公开地址时为 None。
+    app.state.share_link_service = resolved_share_link_service
+    app.state.share_link_max_downloads = resolved_settings.share_link_max_downloads
+    # B-326 M1 —— whose X-Forwarded-For is believed (public-download audit IP).
+    app.state.trusted_proxies = parse_trusted_proxies(resolved_settings.trusted_proxy_cidrs)
     app.state.user_workspace_store = resolved_user_workspace_store
     # 沙箱迁移波 3 —— None 也照设(与其余部署零行为变化对称;仅 agent_sandbox
     # 后端 + 配了 NAS 根才是非 None,见上面 resolved_workspace_quota 赋值)。
@@ -3073,6 +3107,7 @@ def create_app(
         limiter=resolved_limiter,
         enabled=resolved_settings.rate_limit_enabled,
         hmac_salt=resolved_settings.apikey_rate_limit_hmac_salt,
+        trusted_proxies=parse_trusted_proxies(resolved_settings.trusted_proxy_cidrs),
     )
     app.add_middleware(
         AuditContextMiddleware,
@@ -3121,7 +3156,11 @@ def create_app(
         lifecycle=resolved_lifecycle,
         max_in_flight=resolved_settings.backpressure_max_in_flight,
         retry_after_s=resolved_settings.backpressure_retry_after_s,
-        exempt_path_prefixes=tuple(resolved_settings.auth_exempt_path_prefixes),
+        # B-326 —— 公开的分享链接下载不鉴权,但要读库、整份文件进内存:过载时照样要能挡掉,
+        # 不跟着鉴权豁免一起免掉过载保护。
+        exempt_path_prefixes=tuple(
+            p for p in resolved_settings.auth_exempt_path_prefixes if p != PUBLIC_FILES_PATH
+        ),
     )
     app.add_middleware(ObservabilityMiddleware)
 
@@ -3149,6 +3188,8 @@ def create_app(
     app.include_router(build_external_workspace_router())
     app.include_router(build_external_agent_catalog_router())
     app.include_router(build_external_artifacts_router())
+    # B-326 —— 分享链接下载,不鉴权(``/v1/public`` 在 auth_exempt_path_prefixes 里)。
+    app.include_router(build_public_files_router())
 
     app.include_router(build_agents_router())
     # B-278 —— 恢复 / 彻底删除(三段路径,和上面的两段 {name}/{version} 不冲突)。
@@ -3287,6 +3328,7 @@ class _SqlStores:
     image_upload: ImageUploadStore  # Stream J.6.补强-3 (Mini-ADR J-32)
     user_upload: UserUploadStore  # 对外附件模型统一(spec 2026-08-17)
     artifact: ArtifactStore
+    artifact_share_link: ArtifactShareLinkStore  # B-326
     approval: ApprovalStore  # Stream J.8 (Mini-ADR J-24)
     run: RunStore  # Stream J.8 closeout follow-up (Mini-ADR J-41)
     run_event: RunEventStore  # Stream H.3 PR 3 (Mini-ADR H-7)
@@ -3516,6 +3558,7 @@ def _build_sql_stores(settings: Settings) -> _SqlStores:
         image_upload=SqlImageUploadStore(session_factory),
         user_upload=SqlUserUploadStore(session_factory),
         artifact=SqlArtifactStore(session_factory),
+        artifact_share_link=SqlArtifactShareLinkStore(session_factory),
         approval=SqlApprovalStore(session_factory),
         run=SqlRunStore(session_factory),
         run_event=SqlRunEventStore(session_factory),

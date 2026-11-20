@@ -35,6 +35,7 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.artifact_share import SqlArtifactShareLinkStore
 from expert_work.persistence.feedback_store import DbFeedbackStore, FeedbackRecord
 from expert_work.persistence.image_upload.sql import SqlImageUploadStore
 from expert_work.persistence.memory.dlq import SqlMemoryWritebackDLQ
@@ -82,6 +83,7 @@ def _stores(sf: SF, objects: InMemoryObjectStore) -> SessionPurgeStores:
         user_uploads=SqlUserUploadStore(sf),
         image_uploads=SqlImageUploadStore(sf),
         object_store=objects,
+        share_links=SqlArtifactShareLinkStore(sf),
     )
 
 
@@ -93,6 +95,8 @@ class _Seeded:
     candidate_id: UUID
     object_key: str
     upload_id: UUID
+    user_id: UUID
+    share_version_id: UUID
 
 
 async def _seed(s: SessionPurgeStores, tenant_id: UUID, thread_id: UUID, user: UUID) -> _Seeded:
@@ -157,11 +161,30 @@ async def _seed(s: SessionPurgeStores, tenant_id: UUID, thread_id: UUID, user: U
         mime_type="image/png",
         sha256="x",
     )
-    return _Seeded(tenant_id, thread_id, run_id, candidate_id, object_key, upload_id)
+    assert s.share_links is not None
+    share_version_id = uuid4()
+    await s.share_links.mint_or_reuse(
+        tenant_id=tenant_id,
+        user_id=user,
+        agent_key=_AGENT,
+        artifact_id=uuid4(),
+        artifact_version_id=share_version_id,
+        version=1,
+        thread_id=thread_id,
+        run_id=run_id,
+        file_name="report.pdf",
+        ttl=timedelta(hours=1),
+        now=datetime.now(UTC),
+        max_downloads=20,
+    )
+    return _Seeded(
+        tenant_id, thread_id, run_id, candidate_id, object_key, upload_id, user, share_version_id
+    )
 
 
 async def _remaining(s: SessionPurgeStores, seeded: _Seeded) -> dict[str, int]:
     assert s.object_store is not None
+    assert s.share_links is not None
     t, ids = seeded.tenant_id, [seeded.thread_id]
     upload = await s.user_uploads.get(upload_id=seeded.upload_id, tenant_id=t)
     return {
@@ -176,6 +199,13 @@ async def _remaining(s: SessionPurgeStores, seeded: _Seeded) -> dict[str, int]:
         "user_uploads": int(upload is not None and not is_session_deleted_tombstone(upload)),
         "image_uploads": len(await s.image_uploads.list_for_threads(tenant_id=t, thread_ids=ids)),
         "image_blob": len(await s.object_store.list_prefix(seeded.object_key)),
+        "share_links": len(
+            await s.share_links.newest_for(
+                tenant_id=t,
+                user_id=seeded.user_id,
+                keys=[(seeded.thread_id, seeded.share_version_id)],
+            )
+        ),
     }
 
 
@@ -187,6 +217,7 @@ _ONE = {
     "user_uploads": 1,
     "image_uploads": 1,
     "image_blob": 1,
+    "share_links": 1,
 }
 _ZERO = dict.fromkeys(_ONE, 0)
 
@@ -210,6 +241,7 @@ async def test_only_the_purged_conversations_rows_go(sf: SF) -> None:
         "memory_writeback_dlq": 1,
         "user_uploads": 1,
         "image_uploads": 1,
+        "share_links": 1,
         # B-285 —— no trajectory store wired here (``test_purge_trajectories.py``).
         "trajectories": 0,
     }
@@ -233,6 +265,7 @@ async def test_only_the_purged_conversations_rows_go(sf: SF) -> None:
         ("memory_writeback_dlq", "memory_dlq"),
         ("user_uploads", "user_uploads"),
         ("image_uploads", "image_uploads"),
+        ("share_links", "share_links"),
     ],
 )
 async def test_a_failed_kind_leaves_only_itself_and_a_rerun_finishes(

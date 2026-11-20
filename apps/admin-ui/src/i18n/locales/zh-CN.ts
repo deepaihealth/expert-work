@@ -1703,6 +1703,12 @@ const zhCN: TranslationKeys = {
     tool_ask_for_approval: "请求人工审批",
     tool_ask_for_approval_help:
       "让智能体在运行中主动暂停、提交一张审批单等人裁决，有人在审批列表里批准后从暂停处恢复执行。\n有人在场的对话场景请保持关闭：智能体直接在对话里文字追问即可。适合开启的场景：无人值守的运行（定时任务、API 调用发起）或需要留痕放行的高危动作。",
+    share_links_label: "分享文件链接",
+    share_links_help:
+      "开启后，智能体可以把本次对话里登记的文件标记为「交给用户」：接口返回的这一轮产物清单里，这份文件会带上下载链接（share_url），对接方拿去发给终端用户即可。拿到链接的任何人都能下载这个文件，不需要登录；链接过了有效期就打不开了。链接不会写进智能体的回复。",
+    share_links_ttl_label: "链接有效期（分钟）",
+    share_links_ttl_hint: "5–1440 分钟，留空为默认 {{default}} 分钟",
+    share_links_ttl_invalid: "有效期必须是 {{min}}–{{max}} 之间的整数分钟",
     tools_config_note:
       "文件读写、产物保存这些基础能力默认开启，不在此列出；要调整请到 YAML 视图。网页搜索开箱可用（平台自带免费搜索服务）。",
     section_approval: "人工审批",

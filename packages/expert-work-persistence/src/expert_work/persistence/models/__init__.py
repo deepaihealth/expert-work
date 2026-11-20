@@ -8,6 +8,7 @@ from expert_work.persistence.models.agent_spec import AgentSpecRevisionRow, Agen
 from expert_work.persistence.models.agent_trigger import AgentTriggerRow, TriggerRunRow
 from expert_work.persistence.models.api_key import ApiKeyRow
 from expert_work.persistence.models.artifact import ArtifactRow, ArtifactVersionRow
+from expert_work.persistence.models.artifact_share_link import ArtifactShareLinkRow
 from expert_work.persistence.models.audit_log import AuditLogRow
 from expert_work.persistence.models.backup_record import BackupRecordRow
 from expert_work.persistence.models.credential_proxy import (
@@ -124,6 +125,7 @@ __all__ = [
     "AgentTriggerRow",
     "ApiKeyRow",
     "ArtifactRow",
+    "ArtifactShareLinkRow",
     "ArtifactVersionRow",
     "AuditLogRow",
     "BackupRecordRow",

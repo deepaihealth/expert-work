@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -113,6 +113,7 @@ class _Seeded:
     upload_id: UUID
     image_id: UUID
     object_key: str
+    share_link_id: str
 
 
 async def _seed(app: FastAPI, thread_id: UUID) -> _Seeded:
@@ -177,7 +178,22 @@ async def _seed(app: FastAPI, thread_id: UUID) -> _Seeded:
         mime_type="image/png",
         sha256="x",
     )
-    return _Seeded(run_id, candidate_id, upload_id, image_id, object_key)
+    # B-326 —— a share link minted in this conversation dies with it.
+    link = await state.artifact_share_link_store.mint_or_reuse(
+        tenant_id=_TENANT,
+        user_id=_USER,
+        agent_key=_AGENT,
+        artifact_id=uuid4(),
+        artifact_version_id=uuid4(),
+        version=1,
+        thread_id=thread_id,
+        run_id=run_id,
+        file_name="report.pdf",
+        ttl=timedelta(hours=1),
+        now=datetime.now(UTC),
+        max_downloads=20,
+    )
+    return _Seeded(run_id, candidate_id, upload_id, image_id, object_key, link.id)
 
 
 async def _remaining(app: FastAPI, thread_id: UUID, seeded: _Seeded) -> dict[str, int]:
@@ -206,6 +222,9 @@ async def _remaining(app: FastAPI, thread_id: UUID, seeded: _Seeded) -> dict[str
             await s.image_upload_store.list_for_threads(tenant_id=_TENANT, thread_ids=ids)
         ),
         "image_blob": blob,
+        "share_links": int(
+            await s.artifact_share_link_store.get_public(link_id=seeded.share_link_id) is not None
+        ),
     }
 
 
@@ -217,6 +236,7 @@ _ALL_ONE = {
     "user_uploads": 1,
     "image_uploads": 1,
     "image_blob": 1,
+    "share_links": 1,
 }
 _ALL_ZERO = dict.fromkeys(_ALL_ONE, 0)
 
@@ -241,6 +261,7 @@ async def test_purge_deletes_each_thread_keyed_kind_and_spares_a_sibling(
         "user_uploads",
         "image_uploads",
         "image_blobs_removed",
+        "share_links",
     ):
         assert data[kind] == 1, kind
     assert data["image_blobs_failed"] == 0
@@ -273,6 +294,7 @@ _FAILING = [
     ("memory_writeback_dlq", "memory_writeback_dlq", "delete_for_threads"),
     ("user_uploads", "user_upload_store", "tombstone_for_threads"),
     ("image_uploads", "image_upload_store", "list_for_threads"),
+    ("share_links", "artifact_share_link_store", "delete_for_threads"),
 ]
 
 

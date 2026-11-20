@@ -3068,3 +3068,160 @@ async def test_admin_run_reads_carry_completed_and_exit_reason(runs_client: Asyn
         assert rows[str(unstamped)]["completed"] is None
         assert rows[str(unstamped)]["exit_reason"] is None
         assert rows[str(unstamped)]["unresolved_failures"] is None
+
+
+# ---------------------------------------------------------------------------
+# B-326 M1 —— 跨租户审计看事件流:三条 end 分支都不出分享链接
+# ---------------------------------------------------------------------------
+
+_MARKED = {
+    "name": "r.pdf",
+    "kind": "document",
+    "version": 1,
+    "created_at": "t",
+    "share_url": "https://files.example.test/v1/public/files/AAAAAAAAAAAAAAAA/r.pdf",
+    "share_expires_at": "2099-01-01T00:00:00+00:00",
+    "_share": {"artifact_id": str(uuid4()), "version_id": str(uuid4()), "agent_key": "x"},
+}
+_UNMARKED_VIEW = {"name": "r.pdf", "kind": "document", "version": 1, "created_at": "t"}
+#: What the recording view below hands back: same-tenant console streams go through the
+#: same share-link view as the external ones (round 5 M1).
+_SAME_TENANT_VIEW = {**_UNMARKED_VIEW, "share_url": "renewed", "share_expires_at": "later"}
+
+
+@pytest.fixture
+def renewing_view(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Replace the console's share-link view with one that records what it saw."""
+    from control_plane.api import runs as runs_module
+
+    seen: list[object] = []
+
+    def share_view(_request: object, **_kwargs: object) -> object:
+        async def view(artifacts: object) -> object:
+            seen.append(artifacts)
+            return [dict(_SAME_TENANT_VIEW)]
+
+        return view
+
+    async def thread_share_view(_request: object, **_kwargs: object) -> object:
+        return share_view(_request)
+
+    monkeypatch.setattr(runs_module, "share_view", share_view)
+    monkeypatch.setattr(runs_module, "thread_share_view", thread_share_view)
+    return seen
+
+
+def _end_artifacts(body: str) -> object:
+    [end] = [d for evt, d in _parse_sse(body) if evt == "end"]
+    assert isinstance(end, dict)
+    return end.get("artifacts")
+
+
+async def _events(client: AsyncClient, thread_id: str, run_id: str, *, cross_tenant: bool) -> str:
+    params: dict[str, str] = {}
+    headers: dict[str, str] = {}
+    if cross_tenant:
+        params = {"tenant_id": str(_DEFAULT_TENANT)}
+        headers = await grant_system_admin(client)
+    resp = await client.get(
+        f"/v1/sessions/{thread_id}/runs/{run_id}/events", params=params, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.text
+
+
+async def _set_row(client: AsyncClient, run_id: str, status: RunStatus) -> None:
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    store = app.state.run_store
+    row = await store.get(run_id=UUID(run_id), tenant_id=_DEFAULT_TENANT)
+    assert row is not None
+    await store.set_status(
+        run_id=UUID(run_id),
+        tenant_id=_DEFAULT_TENANT,
+        status=status,
+        updated_at=datetime.now(UTC),
+        artifacts=[dict(_MARKED)],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cross_tenant", [True, False])
+async def test_replayed_end_hides_share_links_from_cross_tenant_audit(
+    runs_client: AsyncClient, cross_tenant: bool, renewing_view: list[object]
+) -> None:
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    await _set_row(runs_client, run_id, RunStatus.SUCCESS)
+    renewing_view.clear()  # the seeding run's own live end went through it too
+    body = await _events(runs_client, thread_id, run_id, cross_tenant=cross_tenant)
+    assert _end_artifacts(body) == ([_UNMARKED_VIEW] if cross_tenant else [_SAME_TENANT_VIEW])
+    assert renewing_view == ([] if cross_tenant else [[_MARKED]])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cross_tenant", [True, False])
+async def test_live_end_hides_share_links_from_cross_tenant_audit(
+    runs_client: AsyncClient, cross_tenant: bool, renewing_view: list[object]
+) -> None:
+    """Live attach: the end comes from the stream bridge, not the row."""
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    await _set_row(runs_client, run_id, RunStatus.RUNNING)
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    bridge = app.state.agent_runtime.stream_bridge
+    await bridge.cleanup(UUID(run_id))  # drop the seeded run's own stream and end
+    await bridge.publish(UUID(run_id), "values", {"x": 1})
+    await bridge.publish_end(UUID(run_id), status="success", artifacts=[dict(_MARKED)])
+    assert bridge.has_live_stream(UUID(run_id))
+    renewing_view.clear()  # the seeding run's own live end went through it too
+    body = await _events(runs_client, thread_id, run_id, cross_tenant=cross_tenant)
+    assert _end_artifacts(body) == ([_UNMARKED_VIEW] if cross_tenant else [_SAME_TENANT_VIEW])
+    assert renewing_view == ([] if cross_tenant else [[_MARKED]])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cross_tenant", [True, False])
+async def test_probed_end_hides_share_links_from_cross_tenant_audit(
+    runs_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    cross_tenant: bool,
+    renewing_view: list[object],
+) -> None:
+    """Live attach on a replica that does not run it: the end comes from the row probe."""
+    import asyncio
+
+    from control_plane.api import _run_event_stream
+
+    monkeypatch.setattr(_run_event_stream, "_STORE_POLL_INTERVAL_S", 0.01)
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    await _set_row(runs_client, run_id, RunStatus.RUNNING)
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.agent_runtime.stream_bridge.cleanup(UUID(run_id))
+    assert not app.state.agent_runtime.stream_bridge.has_live_stream(UUID(run_id))
+
+    async def finish() -> None:
+        await asyncio.sleep(0.05)
+        await _set_row(runs_client, run_id, RunStatus.SUCCESS)
+
+    finisher = asyncio.create_task(finish())
+    renewing_view.clear()  # the seeding run's own live end went through it too
+    body = await _events(runs_client, thread_id, run_id, cross_tenant=cross_tenant)
+    await asyncio.gather(finisher)
+    assert _end_artifacts(body) == ([_UNMARKED_VIEW] if cross_tenant else [_SAME_TENANT_VIEW])
+    assert renewing_view == ([] if cross_tenant else [[_MARKED]])
+
+
+@pytest.mark.asyncio
+async def test_console_approval_resume_end_goes_through_the_share_view(
+    runs_client: AsyncClient, renewing_view: list[object]
+) -> None:
+    """Round 5 M1 —— 控制台审批续跑的直播 ``end`` 也经过分享链接视图。"""
+    thread_id = await _create_session(runs_client)
+    await _seed_completed_run(runs_client, thread_id=thread_id)
+    run_id = await _seed_pending_approval(runs_client, thread_id)
+    await _checkpoint_waits_on_seeded_approval(runs_client, thread_id)
+    renewing_view.clear()
+    resp = await runs_client.post(
+        f"/v1/sessions/{thread_id}/runs/{run_id}/resume", json={"decision": "approve"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert _end_artifacts(resp.text) == [_SAME_TENANT_VIEW]
+    assert len(renewing_view) == 1

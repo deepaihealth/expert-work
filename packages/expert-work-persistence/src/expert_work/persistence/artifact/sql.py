@@ -316,6 +316,65 @@ class SqlArtifactStore(ArtifactStore):
                 return None
             return await self._latest_of(session, artifact)
 
+    async def get_latest_version_under(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, path_prefix: str
+    ) -> ArtifactVersion | None:
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(ArtifactVersionRow)
+                    .join(ArtifactRow, ArtifactRow.id == ArtifactVersionRow.artifact_id)
+                    .where(
+                        ArtifactRow.id == artifact_id,
+                        ArtifactRow.tenant_id == tenant_id,
+                        ArtifactRow.user_id == user_id,
+                        ArtifactRow.deleted_at.is_(None),
+                        # A literal prefix compare (no LIKE wildcards to escape).
+                        func.left(ArtifactVersionRow.path_in_workspace, len(path_prefix))
+                        == path_prefix,
+                    )
+                    .order_by(ArtifactVersionRow.version.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        return _row_to_version(row) if row is not None else None
+
+    async def get_by_id(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID
+    ) -> Artifact | None:
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(ArtifactRow).where(
+                        ArtifactRow.id == artifact_id,
+                        ArtifactRow.tenant_id == tenant_id,
+                        ArtifactRow.user_id == user_id,
+                        ArtifactRow.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+        return _row_to_artifact(row) if row is not None else None
+
+    async def get_live_versions(
+        self, *, tenant_id: UUID, user_id: UUID, version_ids: Sequence[UUID]
+    ) -> dict[UUID, tuple[Artifact, ArtifactVersion]]:
+        if not version_ids:
+            return {}
+        async with self._sf() as session:
+            rows = (
+                await session.execute(
+                    select(ArtifactRow, ArtifactVersionRow)
+                    .join(ArtifactVersionRow, ArtifactVersionRow.artifact_id == ArtifactRow.id)
+                    .where(
+                        ArtifactVersionRow.id.in_(list(set(version_ids))),
+                        ArtifactRow.tenant_id == tenant_id,
+                        ArtifactRow.user_id == user_id,
+                        ArtifactRow.deleted_at.is_(None),
+                    )
+                )
+            ).all()
+        return {v.id: (_row_to_artifact(a), _row_to_version(v)) for a, v in rows}
+
     async def get_version_by_id(
         self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, version: int
     ) -> ArtifactVersion | None:

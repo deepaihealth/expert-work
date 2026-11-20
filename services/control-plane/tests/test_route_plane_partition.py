@@ -56,7 +56,8 @@ from tests.route_audit import MountedRoute, mounted_api_routes
 #: never resolves a principal, so no route under them can carry a plane gate.
 #: Mirrors ``Settings.auth_exempt_path_prefixes``; asserted against it below so
 #: the two cannot drift.
-PUBLIC_PREFIXES = ("/healthz", "/metrics", "/v1/webhooks", "/v1/setup")
+#: B-326 —— ``/v1/public`` = 产物分享链接下载(链接本身就是凭据,终端用户没有身份)。
+PUBLIC_PREFIXES = ("/healthz", "/metrics", "/v1/webhooks", "/v1/setup", "/v1/public/files")
 
 #: Qualname marker → plane. Factory-built dependencies only.
 _PLANE_DEPENDENCIES: tuple[tuple[str, str], ...] = (

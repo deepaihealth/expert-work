@@ -18,7 +18,7 @@ export const CONFIG_GROUPS: readonly ConfigGroup[] = [
   { id: "basic", labelKey: "manifest_editor.group_basic", sections: ["basic"], keywords: ["名称", "版本", "描述", "name", "version", "extends"] },
   { id: "model", labelKey: "manifest_editor.group_model", sections: ["model"], keywords: ["模型", "回退", "路由", "思考", "model", "fallback", "thinking", "vision"] },
   { id: "prompt", labelKey: "manifest_editor.group_prompt", sections: ["prompt"], keywords: ["提示词", "输出", "jinja", "prompt", "schema", "日期", "date", "提醒"] },
-  { id: "capabilities", labelKey: "manifest_editor.group_capabilities", sections: ["tools", "mcp", "knowledge", "skills", "subagents"], keywords: ["工具", "技能", "知识库", "子agent", "worker", "tools", "mcp", "skills"] },
+  { id: "capabilities", labelKey: "manifest_editor.group_capabilities", sections: ["tools", "mcp", "knowledge", "skills", "subagents"], keywords: ["工具", "技能", "知识库", "子agent", "worker", "tools", "mcp", "skills", "分享", "链接", "下载", "share"] },
   { id: "memory", labelKey: "manifest_editor.group_memory", sections: [], keywords: ["记忆", "memory", "recall"] },
   { id: "budget", labelKey: "manifest_editor.group_budget", sections: [], keywords: ["步数", "超时", "预算", "max_iterations", "deadline", "idle", "no_progress", "工作流", "workflow", "plan_execute", "规划", "plan_first", "结构化执行", "委派"] },
   { id: "context", labelKey: "manifest_editor.group_context", sections: [], keywords: ["压缩", "上下文", "compression", "working memory", "prune"] },

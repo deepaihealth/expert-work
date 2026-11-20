@@ -151,6 +151,32 @@ class ArtifactStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def get_latest_version_under(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, path_prefix: str
+    ) -> ArtifactVersion | None:
+        """B-326 —— 这条产物里 ``path_in_workspace`` 以 ``path_prefix`` 开头的版本中最新的一版
+        (``ORDER BY version DESC LIMIT 1``)。``share_file`` 用它挑「本会话登记的最新一版」,
+        不把整条产物的版本全列出来。隐藏规则同 :meth:`get_latest_version_by_id`。
+        """
+
+    @abc.abstractmethod
+    async def get_by_id(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID
+    ) -> Artifact | None:
+        """B-326 —— 按 id 取一条产物(带 ``agent_key`` / ``name``),给公开分享链接的下载端点用。
+
+        隐藏规则同 :meth:`get_latest_version_by_id`:未知 / 已软删 / 跨用户都是 ``None``。
+        """
+
+    @abc.abstractmethod
+    async def get_live_versions(
+        self, *, tenant_id: UUID, user_id: UUID, version_ids: Sequence[UUID]
+    ) -> dict[UUID, tuple[Artifact, ArtifactVersion]]:
+        """B-326 —— 按版本 id 批量取版本行和它的产物(一次查询),给读产物清单时核对分享链接
+        还指着活着的那一版用。隐藏规则同 :meth:`get_by_id`:未知 / 产物已软删 / 跨用户的 id
+        不在结果里。"""
+
+    @abc.abstractmethod
     async def get_version_by_id(
         self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, version: int
     ) -> ArtifactVersion | None:

@@ -197,6 +197,12 @@ class EventStreamPlan:
     next_seq: int | None
 
 
+#: B-326 —— 三条 ``end`` 分支(replay / probe / live)发出产物清单之前都经过它:对外路径按
+#: 当前配置续分享链接,控制台跨租户审计读去掉链接。``None`` = 原样(``_share`` 内部元数据
+#: 一律由 ``end_frame_data`` 去掉)。
+ArtifactView = Callable[[list[dict[str, Any]] | None], Awaitable[list[dict[str, Any]] | None]]
+
+
 async def build_event_producer(
     *,
     run_id: UUID,
@@ -231,6 +237,7 @@ async def build_event_producer(
     hide_events: frozenset[str] = frozenset(),
     strip_state_keys: frozenset[str] = frozenset(),
     stream_format: str = STREAM_FORMAT_LEGACY,
+    artifact_view: ArtifactView | None = None,
 ) -> EventStreamPlan:
     """Return the SSE byte producer for one run, plus the replay cursor.
 
@@ -302,6 +309,9 @@ async def build_event_producer(
                 return await event_store.list(run_id=run_id, since_seq=after, limit=limit)
         return await event_store.list(run_id=run_id, since_seq=after, limit=limit)
 
+    async def _view(artifacts: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        return await artifact_view(artifacts) if artifact_view is not None else artifacts
+
     def _encode(event_name: str, data: Any, *, event_id: str | None) -> list[bytes]:
         """编码一条记录 / 一帧实时事件成 SSE 字节 —— 对外过滤在**这一点且只
         在这一点**发生:``event_name in hide_events`` 时不产出字节,调用方的
@@ -356,7 +366,7 @@ async def build_event_producer(
             end_frame_data(
                 run_id=run_id,
                 status=_RUN_STATUS_END_STATUS.get(run_status),
-                artifacts=run_artifacts,
+                artifacts=await _view(run_artifacts),
                 usage_by_model=(await load_usage()) if load_usage else None,
                 completed=run_completed,
                 exit_reason=run_exit_reason,
@@ -540,7 +550,7 @@ async def build_event_producer(
                             end_frame_data(
                                 run_id=run_id,
                                 status=_RUN_STATUS_END_STATUS.get(status),
-                                artifacts=probed.artifacts,
+                                artifacts=await _view(probed.artifacts),
                                 usage_by_model=(await load_usage()) if load_usage else None,
                                 completed=probed.completed,
                                 exit_reason=probed.exit_reason,
@@ -576,7 +586,7 @@ async def build_event_producer(
                     end_frame_data(
                         run_id=run_id,
                         status=_end_data.get("status"),
-                        artifacts=_end_data.get("artifacts"),
+                        artifacts=await _view(_end_data.get("artifacts")),
                         usage_by_model=(await load_usage()) if load_usage else None,
                         # B-85 ③ —— 与 status / artifacts 同源透传。
                         completed=_end_data.get("completed"),

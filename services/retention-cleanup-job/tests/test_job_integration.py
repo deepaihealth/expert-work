@@ -584,6 +584,66 @@ async def test_memory_writeback_job_retention_deletes_old_finished_rows_only(
 
 
 @pytest.mark.asyncio
+async def test_expired_share_links_go_after_the_grace_window(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-326 H1 —— 公开下载不删行;过期满宽限期(默认 7 天)的行由这里删,宽限期内过期的和
+    还没过期的都留着。只数本用例自造租户的行。"""
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenant = uuid4()
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                insert = text(
+                    "INSERT INTO artifact_share_links "
+                    "(id, tenant_id, user_id, agent_key, artifact_id, artifact_version_id, "
+                    " version, thread_id, created_at, expires_at) "
+                    "VALUES (:id, :t, :u, 'a', :a, :v, 1, :th, now() - interval '30 days', "
+                    " now() + make_interval(days => :expires_in))"
+                )
+                for link_id, expires_in in (
+                    ("gone-8-days-ago", -8),
+                    ("kept-6-days-ago", -6),
+                    ("kept-live-00000", 1),
+                ):
+                    conn.execute(
+                        insert,
+                        {
+                            "id": link_id,
+                            "t": str(tenant),
+                            "u": str(uuid4()),
+                            "a": str(uuid4()),
+                            "v": str(uuid4()),
+                            "th": str(uuid4()),
+                            "expires_in": expires_in,
+                        },
+                    )
+        finally:
+            admin.dispose()
+
+        job = RetentionCleanupJob(
+            db_session_factory=create_async_session_factory(worker_engine), batch_size=10000
+        )
+        report = await job.run_once()
+
+        async with worker_engine.begin() as conn:
+            remaining = sorted(
+                row[0]
+                for row in (
+                    await conn.execute(
+                        text("SELECT id FROM artifact_share_links WHERE tenant_id = :t"),
+                        {"t": str(tenant)},
+                    )
+                ).all()
+            )
+        assert remaining == ["kept-6-days-ago", "kept-live-00000"]
+        assert report.share_links_deleted >= 1
+    finally:
+        await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_run_once_idempotent_on_empty_state(
     db_fixture: tuple[AsyncEngine, AsyncEngine, str],
 ) -> None:

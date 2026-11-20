@@ -140,6 +140,9 @@ export interface AgentManifest {
       [k: string]: unknown;
     };
     routing?: RoutingFields | null;
+    // B-326 — public, time-limited links to registered artifacts (share_file).
+    // Absent = off; the form never writes ``enabled: false`` (see setShareLinksOn).
+    share_links?: { enabled?: boolean; ttl_minutes?: number; [k: string]: unknown } | null;
     // Stream J.6 Path B — VL fallback for a text-only main model (ask_image).
     vision?: {
       model?: ModelFields;
@@ -883,6 +886,76 @@ export function setVisionModel(
   }
   const existing = specOf(m).vision ?? {};
   return patchSpec(m, { vision: { ...existing, model } });
+}
+
+// ---- share links (B-326 — the ``share_links:`` block) ----
+// The backend rule is "absent = off, and the block is omitted from the stored
+// manifest". So switching OFF removes the whole block (same idiom as clearing
+// ``vision``, #2171) instead of writing ``enabled: false``; switching ON writes
+// ``{enabled: true}`` and keeps a ``ttl_minutes`` the user already set.
+// ``ttl_minutes`` absent = the platform default (120 minutes).
+export const SHARE_LINKS_TTL_MIN = 5;
+export const SHARE_LINKS_TTL_MAX = 1440;
+export const SHARE_LINKS_TTL_DEFAULT = 120;
+
+export interface ShareLinksFields {
+  enabled: boolean;
+  ttlMinutes: number | undefined;
+  /** A ``ttl_minutes`` is present but the backend would reject it (out of range,
+   * not a whole number, not a number at all) — whether or not ``enabled`` is on:
+   * the bound applies to the stored block either way. */
+  ttlInvalid: boolean;
+}
+
+export function readShareLinks(m: unknown): ShareLinksFields {
+  const block = specOf(m).share_links;
+  const ttl: unknown = block?.ttl_minutes;
+  const present = block !== null && block !== undefined && ttl !== undefined && ttl !== null;
+  return {
+    enabled: block?.enabled === true,
+    ttlMinutes: typeof ttl === "number" ? ttl : undefined,
+    ttlInvalid: present && !isValidShareLinksTtl(ttl),
+  };
+}
+
+/** Whether ``ttl`` is a value the backend accepts (an integer in 5..1440). */
+export function isValidShareLinksTtl(ttl: unknown): ttl is number {
+  return (
+    typeof ttl === "number" &&
+    Number.isInteger(ttl) &&
+    ttl >= SHARE_LINKS_TTL_MIN &&
+    ttl <= SHARE_LINKS_TTL_MAX
+  );
+}
+
+export function setShareLinksOn(m: unknown, on: boolean): AgentManifest {
+  if (!on) {
+    return patchSpec(m, { share_links: undefined });
+  }
+  const ttl = specOf(m).share_links?.ttl_minutes;
+  return patchSpec(m, {
+    share_links: ttl === undefined ? { enabled: true } : { enabled: true, ttl_minutes: ttl },
+  });
+}
+
+/** Set (or with ``null``/``undefined`` clear back to the default) the link
+ * lifetime. Only while the switch is on; an out-of-range value is not written. */
+export function setShareLinksTtl(
+  m: unknown,
+  ttl: number | null | undefined,
+): AgentManifest {
+  const block = specOf(m).share_links;
+  if (block?.enabled !== true) {
+    return asObj(m);
+  }
+  if (ttl === null || ttl === undefined) {
+    const { ttl_minutes: _dropped, ...rest } = block;
+    return patchSpec(m, { share_links: rest });
+  }
+  if (!isValidShareLinksTtl(ttl)) {
+    return asObj(m);
+  }
+  return patchSpec(m, { share_links: { ...block, ttl_minutes: ttl } });
 }
 
 export function setTool(

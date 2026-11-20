@@ -62,6 +62,7 @@ from orchestrator.tools._worker_events import (
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder
 from orchestrator.tools.registry import (
     FIGURE_RUN_IDS_KEY,
+    SHARE_LINKS_TTL_KEY,
     WORKSPACE_LAYOUT_KEY,
     WORKSPACE_THREAD_ID_KEY,
     ToolContext,
@@ -997,6 +998,10 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
         # (otherwise each delegation leaves an orphan threads/<uuid>/ dir).
         "child_run": True,
     }
+    if ctx.share_links_ttl_minutes is not None:
+        # B-326 —— 根开了分享链接才往下传它的有效期(子代的 ``share_file`` 据此标记交付);
+        # 没开就不写这个键,不进检查点元数据。
+        configurable[SHARE_LINKS_TTL_KEY] = ctx.share_links_ttl_minutes
     if ctx.user_id is not None:
         configurable["user_id"] = str(ctx.user_id)
     # MCP-OAUTH (OA-3b-后续): carry the caller's OAuth subject so the child's

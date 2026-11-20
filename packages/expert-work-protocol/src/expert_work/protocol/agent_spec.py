@@ -1505,6 +1505,34 @@ class SubAgentSpec(BaseModel):
         return self
 
 
+class ShareLinksSpec(BaseModel):
+    """B-326 —— manifest ``share_links:`` block: public, time-limited links to artifacts.
+
+    When ``enabled``, the agent gets the ``share_file`` tool: it marks one of the
+    artifacts it registered (``save_artifact``) for delivery, and the run's artifact
+    list reports a public download URL for it (``share_url`` / ``share_expires_at``;
+    never in model text). Anyone holding the URL can download that exact artifact
+    version — no login, no API key — until ``ttl_minutes`` after the link was
+    created. Absent block = off; the block itself is omitted from the stored
+    manifest when absent (rollback discipline, ``extra="forbid"``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "register the share_file tool; marked files get a share_url in the run's artifact list"
+        ),
+    )
+    ttl_minutes: int = Field(
+        default=120,
+        ge=5,
+        le=1440,
+        description="how long a share link stays valid after it is created (minutes)",
+    )
+
+
 # ---------------------------------------------------------------------------
 # spec body + envelope
 # ---------------------------------------------------------------------------
@@ -1638,6 +1666,13 @@ class AgentSpecBody(BaseModel):
             "table on deploy (source='manifest')."
         ),
     )
+    share_links: ShareLinksSpec | None = Field(
+        default=None,
+        description=(
+            "B-326 — public time-limited download links for registered artifacts "
+            "(the share_file tool). Absent = off."
+        ),
+    )
     workflow: WorkflowSpec = Field(default_factory=WorkflowSpec)
     output_schema: OutputSchemaSpec | None = Field(
         default=None,
@@ -1694,6 +1729,17 @@ class AgentSpecBody(BaseModel):
     code: CodePackageSpec | None = None
     hooks: dict[str, str] = Field(default_factory=dict)
     observability: ObservabilitySpec = Field(default_factory=ObservabilitySpec)
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_share_links(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
+        """B-326 —— 没开分享链接时 ``share_links`` 不落库:存量配置的内容与指纹不变,回滚到
+        没有这个字段的镜像时(``extra="forbid"``)照样能读。"""
+        data = handler(self)
+        if "share_links" in data and data["share_links"] is None:
+            data.pop("share_links")
+        return data
 
     @model_validator(mode="after")
     def _check_arg_bindings(self) -> AgentSpecBody:

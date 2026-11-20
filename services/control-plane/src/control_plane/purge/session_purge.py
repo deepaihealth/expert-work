@@ -34,6 +34,7 @@ from control_plane.purge.trajectories import (
     delete_conversation_trajectories,
     today,
 )
+from expert_work.persistence.artifact_share import ArtifactShareLinkStore
 from expert_work.persistence.curation import CurationCandidateStore
 from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.image_upload import ImageUploadStore
@@ -55,6 +56,7 @@ KINDS: tuple[str, ...] = (
     "memory_writeback_dlq",
     "user_uploads",
     "image_uploads",
+    "share_links",
 )
 
 
@@ -73,6 +75,8 @@ class SessionPurgeStores:
     #: 不写轨迹。
     runs: RunStore | None = None
     trajectories: TrajectoryStore | None = None
+    #: B-326 —— 这段对话里铸的分享链接:对话删了,链接立刻作废(不等过期)。``None`` = 没接。
+    share_links: ArtifactShareLinkStore | None = None
 
 
 @dataclass
@@ -155,6 +159,14 @@ async def _purge_trajectories(
         raise
 
 
+async def _purge_share_links(
+    stores: SessionPurgeStores, *, tenant_id: UUID, thread_ids: list[UUID]
+) -> int:
+    if stores.share_links is None:
+        return 0
+    return await stores.share_links.delete_for_threads(tenant_id=tenant_id, thread_ids=thread_ids)
+
+
 async def purge_thread_children(
     stores: SessionPurgeStores,
     *,
@@ -200,6 +212,10 @@ async def purge_thread_children(
         (
             "image_uploads",
             lambda: _purge_images(stores, result, tenant_id=tenant_id, thread_id=thread_id),
+        ),
+        (
+            "share_links",
+            lambda: _purge_share_links(stores, tenant_id=tenant_id, thread_ids=ids),
         ),
     )
     for kind, step in steps:

@@ -24,7 +24,7 @@ import hmac
 import logging
 import math
 import secrets
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 
 from pydantic import SecretStr
 from redis.exceptions import RedisError
@@ -33,6 +33,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
+from control_plane.client_ip import IPNetwork, client_ip
 from control_plane.ratelimit import RateLimiter
 from expert_work.common.observability import expert_work_counter
 
@@ -81,12 +82,21 @@ def _derive_bucket_id(value: str, hmac_key: bytes) -> str:
     return hmac.new(hmac_key, value.encode("utf-8"), "sha256").hexdigest()[:16]
 
 
-def _resolve_bucket(request: Request, hmac_key: bytes) -> tuple[str, str]:
+#: B-326 —— unauthenticated paths: an ``X-API-Key`` header there is never
+#: verified, so keying the bucket on it would let a caller mint a fresh bucket
+#: per request with a random header. These always use the IP bucket.
+_IP_ONLY_PATH_PREFIX = "/v1/public/files/"
+
+
+def _resolve_bucket(
+    request: Request, hmac_key: bytes, trusted_proxies: Sequence[IPNetwork] = ()
+) -> tuple[str, str]:
     header_value = request.headers.get(API_KEY_HEADER)
-    if header_value:
+    if header_value and not request.url.path.startswith(_IP_ONLY_PATH_PREFIX):
         return "apikey", _derive_bucket_id(header_value, hmac_key)
-    host = request.client.host if request.client else "unknown"
-    return "ip", host
+    # B-326 M1 —— behind a configured trusted proxy the bucket is the real client,
+    # not the proxy's address (see ``control_plane.client_ip``).
+    return "ip", client_ip(request, trusted_proxies)
 
 
 def _retry_after_seconds(retry_after_s: float) -> int:
@@ -106,10 +116,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         limiter: RateLimiter,
         enabled: bool = True,
         hmac_salt: SecretStr | None = None,
+        trusted_proxies: Sequence[IPNetwork] = (),
     ) -> None:
         super().__init__(app)
         self._limiter = limiter
         self._enabled = enabled
+        self._trusted_proxies = tuple(trusted_proxies)
         self._bucket_hmac_key = (
             hashlib.sha256(hmac_salt.get_secret_value().encode("utf-8")).digest()
             if hmac_salt is not None
@@ -124,7 +136,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not self._enabled:
             return await call_next(request)
 
-        dimension, key = _resolve_bucket(request, self._bucket_hmac_key)
+        dimension, key = _resolve_bucket(request, self._bucket_hmac_key, self._trusted_proxies)
         try:
             decision = await self._limiter.acquire(dimension=dimension, key=key)
         except RedisError:

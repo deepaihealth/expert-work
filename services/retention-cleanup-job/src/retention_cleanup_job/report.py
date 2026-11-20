@@ -106,6 +106,8 @@ class CleanupReport:
     knowledge_revisions_deleted: int = 0
     # B-175 P2-PR4 — knowledge retrieval log rows past their window (30 days).
     knowledge_retrieval_logs_deleted: int = 0
+    # B-326 —— 过期满宽限期的产物分享链接行。
+    share_links_deleted: int = 0
     duration_seconds: float = 0.0
     # Per-tenant breakdown of audit deletes (for observability).
     audit_deleted_by_tenant: dict[str, int] = field(default_factory=dict)

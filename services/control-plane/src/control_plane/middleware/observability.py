@@ -97,6 +97,18 @@ def _record_request(request: Request, status_code: int, start: float) -> None:
     _request_duration.labels(**labels).observe(duration)
 
 
+#: B-326 —— the share-link id in ``/v1/public/files/<id>`` is a bearer credential;
+#: spans record the route shape instead.
+_SHARE_LINK_PREFIX = "/v1/public/files/"
+
+
+def _span_target(path: str) -> str:
+    """``http.target`` for the request span, with a share-link id redacted."""
+    if path.startswith(_SHARE_LINK_PREFIX):
+        return _SHARE_LINK_PREFIX + "{link_id}"
+    return path
+
+
 class ObservabilityMiddleware(BaseHTTPMiddleware):
     """Outermost middleware (sees raw request / final response)."""
 
@@ -124,7 +136,7 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
                 "http_request",
                 attributes={
                     "http.method": method,
-                    "http.target": request.url.path,
+                    "http.target": _span_target(request.url.path),
                 },
             ) as span:
                 trace_id_hex = current_trace_id_hex()

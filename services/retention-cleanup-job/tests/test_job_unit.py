@@ -56,6 +56,7 @@ def test_cleanup_report_default_is_all_zero() -> None:
     assert report.knowledge_tasks_deleted == 0
     assert report.knowledge_revisions_deleted == 0
     assert report.knowledge_retrieval_logs_deleted == 0
+    assert report.share_links_deleted == 0
     assert report.duration_seconds == 0.0
     assert report.audit_deleted_by_tenant == {}
 
