@@ -74,27 +74,39 @@ def _looks_account_dead(body: str) -> bool:
 # 的 400 正文常以 ``messages.0.content.1.image…`` 这种路径开头。核过出处的厂商原话(正反例)见
 # ``test_b328_vendor_too_long``。
 _TOO_LONG_RE = re.compile(
+    # ``context (length|window)`` 故意宽:几家都这么说(OpenAI「maximum context length」、代理转出的
+    # 「exceeds the context window」),误中的形状靠下面的就近排除词挡。
     r"context (?:length|window)"
     r"|maximum context"
     r"|prompt (?:is )?too long"
     r"|input.{0,30}(?:too long|length)"
+    r"|input token count.{0,40}exceeds"
     r"|exceeded model token limit"
     r"|上下文.{0,10}(?:长度|超过|超出|超长)"
     r"|输入.{0,10}(?:长度|超过|超出|超长)"
 )
-#: 同一句里说的是限流、额度、输出上限、思考预算或图片 —— 缩输入救不了,不认。
+#: 短语**附近**(前后 60 字内)说的是限流、额度、输出上限、思考预算或图片 —— 缩输入救不了,
+#: 不认。只看附近:正文别处(请求 id、括号里的补充说明)出现这些词不算。``max_tokens`` 不在
+#: 这里:Anthropic「input length and ``max_tokens`` exceed context limit: N + M > W」是真的
+#: 超窗口,按输入 / 输出谁占大头处理(``graph_builder.vendor_too_long``)。
 _NOT_TOO_LONG_RE = re.compile(
-    r"rate limit|rate_limit|per minute|quota|max_tokens|budget_tokens|completion tokens|image"
+    r"rate limit|rate_limit|per minute|quota|budget_tokens|completion tokens|image"
 )
+_EXCLUSION_REACH = 60
 
 
 def looks_context_too_long(body: str) -> bool:
     """B-328 PR R —— 厂商这句话是不是在说「输入太长 / 超过上下文」。
 
     只在 4xx 的通用分支(401 / 402 / 408 / 409 / 429 / 403 都已先分走)和两个流式适配器的
-    错误事件默认分支之前用(流式那里没有状态码,网关的限流事件也会提到 input tokens)。"""
+    错误事件默认分支之前用(流式那里没有状态码,网关的限流事件也会提到 input tokens)。
+    有一处短语附近没有排除词就算。"""
     low = body.lower()
-    return _TOO_LONG_RE.search(low) is not None and _NOT_TOO_LONG_RE.search(low) is None
+    for match in _TOO_LONG_RE.finditer(low):
+        around = low[max(0, match.start() - _EXCLUSION_REACH) : match.end() + _EXCLUSION_REACH]
+        if _NOT_TOO_LONG_RE.search(around) is None:
+            return True
+    return False
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:

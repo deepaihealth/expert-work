@@ -36,6 +36,11 @@ from orchestrator.tools.overflow import TOOL_RESULT_PATH_ARTIFACT_KEY
 
 # ------------------------------------------------------------------ 厂商原话
 
+ANTHROPIC_SPLIT = (
+    "input length and `max_tokens` exceed context limit: {n} + {m} > {w}, "
+    "decrease input length or `max_tokens` and try again"
+)
+
 #: 正例:说的是「输入太长」。
 TOO_LONG = [
     # OpenAI —— 真实 API 回包(400 invalid_request_error, code context_length_exceeded),
@@ -56,6 +61,23 @@ TOO_LONG = [
     # Moonshot / Kimi —— 官方 Kimi Code 错误参考(kimi.com/code/docs/.../error-reference):
     # 「Your request exceeded model token limit」(请求 tokens + max_tokens 超过模型规格)。
     ("kimi", "Your request exceeded model token limit: 262144"),
+    # Anthropic —— 输入 + max_tokens 超窗口(老模型的预检;新模型改为接受后按
+    # model_context_window_exceeded 停)。写法引自 anthropics/claude-code #52 / #408 的报错。
+    # 是真的超窗口:按「输入 / 输出谁占大头」决定缩不缩(见下面 agent_node 用例)。
+    ("anthropic", ANTHROPIC_SPLIT.format(n=188240, m=21333, w=200000)),
+    # Gemini —— Google AI 开发者论坛多帖的真实回包(400 INVALID_ARGUMENT);Vertex AI 错误码
+    # 文档把它归为「超过模型输入 token 上限」。
+    (
+        "gemini",
+        "The input token count (35868) exceeds the maximum number of tokens allowed (32768).",
+    ),
+    # 审查 N2 给的形状:真的「太长」,排除词(image / quota)在正文远处,不该一票否决。
+    (
+        "openai",
+        "This model's maximum context length is 16385 tokens. However, your messages "
+        "resulted in 16648 tokens. Please reduce the length of the messages. "
+        "(note: token counts include image inputs; request id req_quota_0001)",
+    ),
 ]
 
 #: 反例:同样是 4xx,但不是「输入太长」—— 缩提示词救不了,不该重试。
@@ -87,14 +109,8 @@ NOT_TOO_LONG = [
         "Invalid prompt: your prompt was flagged as potentially violating our usage policy. "
         "Please try again with a different prompt.",
     ),
-    # Anthropic —— 输入 + max_tokens 超窗口(老模型的预检;新模型改为接受后按
-    # model_context_window_exceeded 停)。写法引自 anthropics/claude-code #52 / #408 的报错。
-    # 说的是输出上限那一半,按排除词不认(缩输入不一定救得了)。
-    (
-        "anthropic",
-        "input length and `max_tokens` exceed context limit: 188240 + 21333 > 200000, "
-        "decrease input length or `max_tokens` and try again",
-    ),
+    # 审查 N2 给的形状:短语旁边就说的是限流 —— 不认。原文没核到。
+    ("gateway", "Rate limit exceeded: input length of 120000 tokens per minute is allowed."),
     # 以下四条是审查(R1)给的形状:按「输入词 + 长度词」规则会误中。原文没核到,形状照收。
     ("anthropic", "thinking.enabled.budget_tokens: Input should be greater than or equal to 1024"),
     ("openai", "In context=('properties', 'name'), 'maxLength' is not permitted."),
@@ -380,9 +396,9 @@ async def test_rejection_log_carries_no_vendor_text(caplog: pytest.LogCaptureFix
     llm = _Scripted(script=[_too_long(), AIMessage(content="好")])
     with caplog.at_level("WARNING"):
         await _run(llm)
-    lines = [r.getMessage() for r in caplog.records if "vendor_too_long" in r.getMessage()]
-    assert lines
-    assert all("203284" not in line and "chars=" in line for line in lines)
+    # 这条路径上**所有**日志(重试模块、agent_node、路由……)都不许带厂商原话。
+    assert any(r.name == "orchestrator.graph_builder.vendor_too_long" for r in caplog.records)
+    assert all("203284" not in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -405,3 +421,45 @@ async def test_structured_resend_is_shrunk_and_retried_once() -> None:
     assert len(llm.prompts) == 3
     assert _web(llm.prompts[1]) == "w" * 8_000
     assert _web(llm.prompts[2]).startswith("<tool-result-overflow>")
+
+
+def _anthropic_split(n: int, m: int, w: int = 200_000) -> LLMContextTooLongError:
+    return LLMContextTooLongError("anthropic 400: " + ANTHROPIC_SPLIT.format(n=n, m=m, w=w))
+
+
+@pytest.mark.asyncio
+async def test_anthropic_input_heavy_split_is_shrunk_and_retried() -> None:
+    llm = _Scripted(script=[_anthropic_split(188_240, 21_333), AIMessage(content="好")])
+    await _run(llm)
+    assert len(llm.prompts) == 2
+    assert _web(llm.prompts[1]).startswith("<tool-result-overflow>")
+
+
+@pytest.mark.asyncio
+async def test_anthropic_output_heavy_split_is_not_retried() -> None:
+    llm = _Scripted(script=[_anthropic_split(5_000, 199_000), AIMessage(content="不该到这里")])
+    with pytest.raises(ContextOverflowError) as exc_info:
+        await _run(llm)
+    assert len(llm.prompts) == 1
+    assert "(5000 input + 199000 output > 200000)" in str(exc_info.value)
+
+
+class _Zero:
+    def count(self, text: str) -> int:
+        del text
+        return 0
+
+
+@pytest.mark.asyncio
+async def test_structured_resend_failure_uses_the_main_estimator() -> None:
+    from expert_work.protocol import StructuredOutputSpec
+
+    spec = StructuredOutputSpec(
+        schema={"type": "object", "properties": {"score": {"type": "integer"}}},
+        name="verdict",
+    )
+    llm = _Scripted(script=[AIMessage(content="not json"), _too_long(), _too_long()])
+    budget = ContextBudget(window_tokens=10**9, result_tokens=10**9, estimator=_Zero())
+    with pytest.raises(ContextOverflowError) as exc_info:
+        await _run(llm, output_schema=spec, context_budget=budget)
+    assert "platform estimate 0 tokens" in str(exc_info.value)

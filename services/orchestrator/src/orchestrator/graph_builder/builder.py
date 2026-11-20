@@ -1771,6 +1771,8 @@ def build_react_graph(
                 primary_cache_hit=cache_hit_response is not None,
                 cache_bypass=cache_bypass,
                 token_budget=token_budget,
+                estimator=(context_budget.estimator if context_budget is not None else None)
+                or token_estimator,  # B-328 PR R —— 重发被拒时报错里的估算口径同主调用
             )
             response = finalize.response
             structured_prompt = finalize.structured_prompt
@@ -3731,6 +3733,7 @@ async def _finalize_structured_response(
     primary_cache_hit: bool,
     cache_bypass: bool = False,
     token_budget: TokenBudget | None = None,
+    estimator: TokenEstimator | None = None,
 ) -> _StructuredFinalize:
     """RT-ADR-4 two-stage finalization (mechanism: ``agent_node`` comment).
 
@@ -3843,7 +3846,7 @@ async def _finalize_structured_response(
                     call=_resend,
                     before_llm_chain=None,
                     chain_payload={},
-                    estimator=None,
+                    estimator=estimator,
                 )
 
     # B3 — stage 2 spend (finding 2 fix): a resend is a second real billed

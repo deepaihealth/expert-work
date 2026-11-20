@@ -54,22 +54,27 @@ async def _noop(_ctx: MiddlewareContext) -> None:
     return None
 
 
-#: OpenAI 的「输入 + 要求的输出」写法:``maximum context length is W tokens. However, you
-#: requested T tokens (N in the messages, M in the completion)``。
-_SPLIT_RE = re.compile(
-    r"maximum context length is (\d+) tokens.{0,80}?\((\d+) in the messages, "
-    r"(\d+) in the completion\)",
+#: 厂商写明了「输入 + 要求的输出 > 窗口」的两种写法:
+#: OpenAI ``maximum context length is W tokens. However, you requested T tokens (N in the
+#: messages, M in the completion)``;Anthropic ``input length and `max_tokens` exceed context
+#: limit: N + M > W``。
+_OPENAI_SPLIT_RE = re.compile(
+    r"maximum context length is (?P<w>\d+) tokens.{0,80}?\((?P<n>\d+) in the messages, "
+    r"(?P<m>\d+) in the completion\)",
     re.DOTALL,
+)
+_ANTHROPIC_SPLIT_RE = re.compile(
+    r"exceed context limit: (?P<n>\d+) \+ (?P<m>\d+) > (?P<w>\d+)", re.IGNORECASE
 )
 
 
 def _input_output_split(text: str) -> tuple[int, int, int] | None:
     """厂商报了「输入 N + 要求的输出 M > 窗口 W」时的 ``(W, N, M)``,读不出来为 ``None``。"""
-    match = _SPLIT_RE.search(text)
-    if match is None:
-        return None
-    window, messages, completion = (int(g) for g in match.groups())
-    return window, messages, completion
+    for pattern in (_OPENAI_SPLIT_RE, _ANTHROPIC_SPLIT_RE):
+        match = pattern.search(text)
+        if match is not None:
+            return int(match["w"]), int(match["n"]), int(match["m"])
+    return None
 
 
 def _log_rejection(error: LLMContextTooLongError, stage: str) -> None:
