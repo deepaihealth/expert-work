@@ -66,22 +66,28 @@ FULL_COPY_PEAK_BYTES: Final = 110 * 1024 * 1024
 #: 2 秒:一次普通裁图约 0.1~0.3 秒、一张 12 MP 转正图约 0.1~0.2 秒(本机),等两轮还够。
 ADAPTER_MISS_SLOT_WAIT_S: Final = 2.0
 
-#: 有损格式依次用的质量(与上传转码同档:JPEG 92 / WebP 90,超了退 85、75)。
-_FIRST_QUALITY: Final = {"JPEG": 92, "WEBP": 90}
+#: B-322 第五轮(2026-11-20,用户收窄范围)—— 转正只做内存估得准的格式 / 颜色模式;别的(WebP、
+#: GIF、调色板 P、1 位、16 位灰度、其它模式)不判方向、按原样发、不加说明
+#: (计 ``format_unsupported``)。
+#: 只看文件头判断,不解码。
+UPRIGHT_MODES: Final[Mapping[str, frozenset[str]]] = {
+    "JPEG": frozenset({"L", "RGB", "CMYK"}),
+    "MPO": frozenset({"L", "RGB", "CMYK"}),
+    "PNG": frozenset({"L", "LA", "RGB", "RGBA"}),
+}
+#: 问方向时借给适配器的候选图,全进程合计最多这么多字节(复审第四轮):超过就这张图这一步不判(计
+#: ``candidates_over_cap``),下一轮第一步再判。算进控制面主进程的内存常数。
+LENT_CANDIDATES_CAP_BYTES: Final = 16 * 1024 * 1024
+#: JPEG 依次用的质量(与上传转码同档:92,超了退 85、75)。
+_FIRST_QUALITY: Final = {"JPEG": 92}
 _FALLBACK_QUALITIES: Final = (85, 75)
 #: 每次缩像素到上一次的 0.8 倍(像素数),最低到小副本的像素数。
 _SHRINK_FACTOR: Final = 0.8
-#: PNG / GIF 无损,转完字节只因压缩顺序略有出入:允许到 ``min(原图 x 1.1, 4,900,000)``(十进制
+#: PNG 无损,转完字节只因压缩顺序略有出入:允许到 ``min(原图 x 1.1, 4,900,000)``(十进制
 #: 4.9 MB,低于 Anthropic 的 5 MB;5 MiB 会超过它)。
 LOSSLESS_GROWTH: Final = 1.1
 LOSSLESS_MAX_BYTES: Final = 4_900_000
-_MEDIA_TYPES: Final = {
-    "JPEG": "image/jpeg",
-    "MPO": "image/jpeg",
-    "PNG": "image/png",
-    "WEBP": "image/webp",
-    "GIF": "image/gif",
-}
+_MEDIA_TYPES: Final = {"JPEG": "image/jpeg", "MPO": "image/jpeg", "PNG": "image/png"}
 
 ViewOutcome = Literal[
     "hit", "precomputed", "adapter_miss", "adapter_busy", "low_res_copy", "peak_over_budget"
@@ -153,9 +159,10 @@ def upright_copy(
 ) -> tuple[str, bytes] | None:
     """原图按方向标记转正、再顺时针转 ``degrees`` 度的整张图 → ``(媒体类型, 字节)``。
 
-    像素:与原图一样多,**不缩**(原图今天就是这么大发给厂商的;设计 §8.1 第 5 条细化)。格式跟
-    原图走(JPEG 92 / WebP 90 / PNG 最高压缩 / GIF)。字节:有损格式超过原图就按 85、75 再存,仍超
-    就每次缩到 0.8 倍像素再试、最低到小副本的像素数;无损格式不超过
+    只做 :data:`UPRIGHT_MODES` 里的格式 / 颜色模式(别的抛 ``RegionImageError``,调用方之前就不会
+    走到这里)。像素:不超过单图预算就不缩(设计 §8.1 第 5 条)。格式跟原图走(JPEG 92 / PNG 最高
+    压缩)。字节:JPEG 超过原图就按 85、75 再存,仍超就每次缩到 0.8 倍像素再试、最低到小副本的
+    像素数;PNG 不超过
     ``max(原图, min(原图 x 1.1, 4,900,000))`` 就照发,超了才缩。还超(实际上碰不到)→ ``None``:
     放弃转正,调用方按原样发并计 ``copy_too_large``。
 
@@ -174,7 +181,10 @@ def upright_copy(
         msg = f"the image could not be decoded for turning upright ({type(exc).__name__})"
         raise RegionImageError(msg) from exc
     try:
-        source_format = image.format or "PNG"
+        source_format = image.format or ""
+        if image.mode not in UPRIGHT_MODES.get(source_format, frozenset()):
+            msg = f"{source_format} {image.mode} images are not turned upright (B-322)"
+            raise RegionImageError(msg)
         whole = upright_whole(image, degrees, max_pixels)
     except RegionImageError:
         image.close()
@@ -190,15 +200,29 @@ def upright_copy(
 
 
 def _header(data: bytes) -> tuple[int, int, str, bool] | None:
-    """只读文件头:``(宽, 高, 颜色模式, 是不是 JPEG)``;认不出 → ``None``。"""
+    """只读文件头:``(宽, 高, 颜色模式, 是不是 JPEG)``;认不出、或不是 :data:`UPRIGHT_MODES` 里的
+    格式 / 颜色模式 → ``None``。"""
     from orchestrator.tools.region_zoom import OPEN_FORMATS  # 延迟导入,见模块说明
 
     try:
         with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
-            (width, height), mode, fmt = image.size, image.mode, image.format
+            (width, height), mode, fmt = image.size, image.mode, image.format or ""
     except (OSError, ValueError, Image.DecompressionBombError):
         return None
+    if mode not in UPRIGHT_MODES.get(fmt, frozenset()):
+        return None
     return width, height, mode, fmt in ("JPEG", "MPO")
+
+
+def skip_reason(data: bytes) -> str | None:
+    """这张图 B-322 做不做(只读文件头,不解码):格式 / 颜色模式不在 :data:`UPRIGHT_MODES` 里 →
+    ``"format_unsupported"``;问方向的候选都要超过每张的内存预算 → ``"too_large"``;
+    能做 → ``None``。"""
+    if _header(data) is None:
+        return "format_unsupported"
+    if small_copy_slots(data) is None:
+        return "too_large"
+    return None
 
 
 def full_copy_peak(data: bytes, max_pixels: int | None) -> int | None:
@@ -219,8 +243,9 @@ def full_copy_fits_memory(data: bytes, max_pixels: int | None) -> bool:
 
 def small_copy_slots(data: bytes) -> int | None:
     """问方向的候选 / 小副本(:func:`low_res_copy`,整张框的 ``crop_image``)该占几个解图名额(复审
-    H-new):估的峰值不到 :data:`FULL_COPY_PEAK_BYTES` 的一半占 1 个,不到它占 2 个(两个名额加起来
-    永远不超过它);更大的(要整张解开的大 PNG 之类)→ ``None``:不做,这张图不判方向。"""
+    H-new):估的峰值不到 :data:`FULL_COPY_PEAK_BYTES` 的一半占 1 个,不到它占 2 个(B-322 自己的
+    解码在两个名额里加起来不超过它;``ask_image`` 自己的裁图不走这道估算,不受它约束);更大的(要
+    整张解开的大 PNG 之类)、不支持的格式 → ``None``:不做,这张图不判方向。"""
     from orchestrator.tools.region_zoom import crop_peak_bytes  # 延迟导入,见模块说明
 
     header = _header(data)
@@ -236,9 +261,9 @@ def small_copy_slots(data: bytes) -> int | None:
 
 
 def copy_size_limit(original_bytes: int, media_type: str) -> int:
-    """转正图按字节规则最多多大:有损格式 ≤ 原图;PNG / GIF ≤ ``max(原图, min(原图 x 1.1,
-    4,900,000))``。``_pin`` 用它先估、放不下就不算(审查 N2)。"""
-    if media_type in ("image/png", "image/gif"):
+    """转正图按字节规则最多多大:JPEG ≤ 原图;PNG ≤ ``max(原图, min(原图 x 1.1, 4,900,000))``。
+    ``_pin`` 用它先估、放不下就不算(审查 N2)。"""
+    if media_type == "image/png":
         growth = min(math.floor(original_bytes * LOSSLESS_GROWTH), LOSSLESS_MAX_BYTES)
         return max(original_bytes, growth)
     return original_bytes
@@ -251,7 +276,7 @@ def _encode_within(
     from orchestrator.tools.region_zoom import REGION_TARGET_PIXELS  # 延迟导入,见模块说明
 
     fmt = "JPEG" if source_format == "MPO" else source_format
-    media_type = _MEDIA_TYPES.get(fmt, "image/png")
+    media_type = _MEDIA_TYPES[fmt]
     limit = copy_size_limit(original_bytes, media_type)
     qualities: tuple[int | None, ...] = (
         (_FIRST_QUALITY[fmt], *_FALLBACK_QUALITIES) if fmt in _FIRST_QUALITY else (None,)
@@ -284,19 +309,11 @@ def _resized(image: Image.Image, pixels: int) -> Image.Image:
 
 
 def _encode(image: Image.Image, fmt: str, quality: int | None) -> bytes:
-    """固定参数编码(同一输入字节每次相同):不带元数据;JPEG 4:2:0、WebP 默认方法、PNG 最高压缩。"""
+    """固定参数编码(同一输入字节每次相同):不带元数据;JPEG 4:2:0、PNG 最高压缩。"""
     buffer = io.BytesIO()
     if fmt == "JPEG":
         rgb = image if image.mode in ("L", "RGB") else _flattened(image)
         rgb.save(buffer, format="JPEG", quality=quality, subsampling=2)
-    elif fmt == "WEBP":
-        has_alpha = image.mode in ("RGBA", "LA") or "transparency" in image.info
-        mode = "RGBA" if has_alpha else "RGB"
-        # 模式已经对了就不转(convert 会再复制一整张;审查 H1)。
-        ready = image if image.mode == mode else image.convert(mode)
-        ready.save(buffer, format="WEBP", quality=quality)
-    elif fmt == "GIF":
-        image.save(buffer, format="GIF")
     else:
         image.save(buffer, format="PNG", optimize=True)
     return buffer.getvalue()
@@ -398,7 +415,7 @@ class UprightViewCache:
 
     @property
     def lent_bytes(self) -> int:
-        """正借给适配器的问方向候选图(也算在全分辨率区的上限里,审查 L6)。"""
+        """正借给适配器的问方向候选图(有自己的上限 :data:`LENT_CANDIDATES_CAP_BYTES`)。"""
         return sum(len(held[1]) for held in self._lent.values())
 
     def try_pin_full(self, items: Sequence[PreparedView]) -> bool:
@@ -408,7 +425,7 @@ class UprightViewCache:
         wanted = {p.key for p in new}
         needed = sum(len(p.data) for p in new if p.key not in self._full)
         needed += sum(len(e.data) for k, e in self._full.items() if e.pins > 0 or k in wanted)
-        if needed + self.lent_bytes > self.full_cap_bytes:
+        if needed > self.full_cap_bytes:
             return False
         for prepared in new:
             if prepared.key not in self._full:
@@ -424,20 +441,20 @@ class UprightViewCache:
         if prepared.key in self._full:
             return True
         pinned = sum(len(e.data) for e in self._full.values() if e.pins > 0)
-        if pinned + self.lent_bytes + len(prepared.data) > self.full_cap_bytes:
+        if pinned + len(prepared.data) > self.full_cap_bytes:
             return False
         self._full[prepared.key] = _FullEntry(prepared.media_type, prepared.data)
         self._evict_unpinned(keep={prepared.key})
         return True
 
     def fits_full(self, extra_bytes: int) -> bool:
-        """再钉住 ``extra_bytes`` 字节放不放得下(只看已钉住的 + 借出的,没钉住的可以挤)。"""
+        """再钉住 ``extra_bytes`` 字节放不放得下(只看已钉住的,没钉住的可以挤)。"""
         pinned = sum(len(e.data) for e in self._full.values() if e.pins > 0)
-        return pinned + self.lent_bytes + extra_bytes <= self.full_cap_bytes
+        return pinned + extra_bytes <= self.full_cap_bytes
 
     def _evict_unpinned(self, keep: set[ViewKey] | frozenset[ViewKey] = frozenset()) -> None:
-        """挤掉没钉住的旧条目(最久没用的先挤),直到全分辨率区 + 借出的候选不超过上限。"""
-        total = self.full_bytes + self.lent_bytes
+        """挤掉没钉住的旧条目(最久没用的先挤),直到全分辨率区不超过上限。"""
+        total = self.full_bytes
         for key in list(self._full):
             if total <= self.full_cap_bytes:
                 break
@@ -514,15 +531,15 @@ class UprightViewCache:
 
     # -- 问方向的候选图(只借不存)-----------------------------------------
 
-    def lend(self, key: ViewKey, media_type: str, data: bytes) -> None:
-        """候选图在问的那一会儿借给适配器;同一张图被两个对话同时问时按次数借还。借出的字节算在
-        全分辨率区的上限里:先挤掉没钉住的转正图腾地方,之后钉住新图时也把它们算进去。**从不拒借**
-        (问方向不因此失败),所以钉住的 + 借出的**可能略超**上限:候选借出到这张图判完为止
-        (一张图最多 4 张、每张约 0.3~0.6 MB;一步最多判 8 张图 → 一个对话约 13 MB),超出的最多是
-        「同时在判图的对话数 x 约 13 MB」(审查 N4 / 复审 L2)。"""
+    def lend(self, key: ViewKey, media_type: str, data: bytes) -> bool:
+        """候选图在问的那一会儿借给适配器(一直借到这张图判完);同一张图被两个对话同时问时按次数借还。
+        全进程借出的合计不超过 :data:`LENT_CANDIDATES_CAP_BYTES`:放不下就不借、返回 ``False``
+        (调用方让这张图这一步不判)。"""
         held = self._lent.get(key)
+        if held is None and self.lent_bytes + len(data) > LENT_CANDIDATES_CAP_BYTES:
+            return False
         self._lent[key] = (media_type, data, (held[2] if held is not None else 0) + 1)
-        self._evict_unpinned()
+        return True
 
     def give_back(self, key: ViewKey) -> None:
         held = self._lent.get(key)

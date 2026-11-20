@@ -114,14 +114,6 @@ def test_jpeg_copy_never_larger_than_the_original() -> None:
     assert len(data) <= len(raw)
 
 
-def test_webp_copy_never_larger_than_the_original() -> None:
-    raw = _encode(_photo(3000, 2000), "WEBP", quality=30)
-    found = upright_copy(raw, 270)
-    assert found is not None
-    assert found[0] == "image/webp"
-    assert len(found[1]) <= len(raw)
-
-
 def _small_text_png() -> bytes:
     image = Image.new("RGB", (1800, 1200), (255, 255, 255))
     draw = ImageDraw.Draw(image)
@@ -317,18 +309,6 @@ def test_run_modes_expire_for_runs_that_never_reach_sse() -> None:
     cache.set_run_mode("child-run", "b", "raw", time.monotonic() + 60)
     assert ("child-run", "z") not in cache._run_modes  # 写新的时顺手清掉过期的
     assert cache.run_mode("child-run", "b") == "raw"
-
-
-def test_lent_candidates_count_toward_the_full_cap() -> None:
-    """审查 L6 —— 借出的问方向候选图算进全分辨率区的上限:挤掉没钉住的转正图,钉不下就不钉。"""
-    cache = UprightViewCache(full_cap_bytes=100, low_cap_bytes=10)
-    assert cache.try_pin_full([_prepared("a", 60)])
-    cache.unpin_full([("a", 90)])
-    cache.lend(("cand", 0), "image/jpeg", b"x" * 50)
-    assert not cache.has_full(("a", 90))  # 没钉住的被挤掉
-    assert not cache.try_pin_full([_prepared("b", 60)])  # 50 + 60 > 100
-    cache.give_back(("cand", 0))
-    assert cache.try_pin_full([_prepared("b", 60)])
 
 
 async def test_a_full_copy_takes_both_decode_slots() -> None:
@@ -635,21 +615,6 @@ def test_small_copies_take_one_or_two_slots_by_their_estimated_peak(
     assert image_views.small_copy_slots(raw) is None
 
 
-def test_the_crop_estimate_matches_the_measured_classes() -> None:
-    """本机按审查方法实测:12 MP JPEG 约 41 MiB、20 MP JPEG 约 64 MiB、48.8 MP PNG 约 228 MiB。"""
-    from orchestrator.tools.region_zoom import crop_peak_bytes
-
-    mib = 1024 * 1024
-
-    def estimate(w: int, h: int, *, jpeg: bool = True) -> float:
-        return crop_peak_bytes(w, h, "RGB", jpeg=jpeg, encoded_bytes=2 * mib) / mib
-
-    assert 30 <= estimate(4032, 3024) <= 50
-    assert 50 <= estimate(5184, 3888) <= 75
-    assert 30 <= estimate(9487, 6324) <= 60  # 6000 万像素 JPEG:按 1/4 读
-    assert estimate(8064, 6048, jpeg=False) > 200  # 大 PNG 得整张解开
-
-
 def test_the_jpeg_draft_request_picks_the_intended_scale() -> None:
     """复审 —— Pillow 按「原尺寸 // 请求尺寸」选 draft 档:宽高不是倍数时(9487)也要真按 1/4 读。"""
     raw = _encode(Image.new("RGB", (9487, 6324), (40, 80, 120)), "JPEG", quality=50)
@@ -660,20 +625,83 @@ def test_the_jpeg_draft_request_picks_the_intended_scale() -> None:
     assert image.size == (2372, 1581)
 
 
-def test_a_large_png_is_reduced_before_the_full_frame_crop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """复审 —— 不是 JPEG 的图没有解码时缩:整张框的裁图(问方向的候选 / 小副本)先整数倍缩一次,
-    不在原尺寸上裁 / 转(48.8 MP PNG 570 → 228 MiB)。结果尺寸不变(仍缩到约 150 万像素)。"""
-    from orchestrator.tools.region_zoom import crop_image
+def test_lent_candidates_have_their_own_process_wide_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """复审第四轮 —— 借给适配器的候选图全进程合计有上限:到了就不借(调用方让这张图这一步不判);
+    还回去之后又能借。它们不再挤全分辨率区的转正图。"""
+    monkeypatch.setattr(image_views, "LENT_CANDIDATES_CAP_BYTES", 100)
+    cache = UprightViewCache(full_cap_bytes=100, low_cap_bytes=10)
+    assert cache.try_pin_full([_prepared("a", 60)])
+    cache.unpin_full([("a", 90)])
+    assert cache.lend(("cand", 0), "image/jpeg", b"x" * 60)
+    assert cache.has_full(("a", 90))  # 不挤转正图
+    assert not cache.lend(("cand", 90), "image/jpeg", b"x" * 60)  # 60 + 60 > 100
+    cache.give_back(("cand", 0))
+    assert cache.lend(("cand", 90), "image/jpeg", b"x" * 60)
 
-    factors: list[int] = []
-    real = Image.Image.reduce
 
-    def spy(self: Image.Image, factor: Any, box: Any = None) -> Image.Image:
-        factors.append(factor)
-        return real(self, factor, box)
+def test_the_crop_estimate_follows_crop_image_as_on_main() -> None:
+    """候选 / 小副本走的 ``crop_image`` 与 main 逐字节相同;估算按它的实际做法(按审查方法实测:12 MP
+    JPEG 约 41 MiB、20 MP JPEG 约 64 MiB、60 MP JPEG 约 184 MiB —— 请求向上取整、实际按 1/2 解、
+    48.8 MP RGB PNG 约 570 MiB —— 整张解开)。"""
+    from orchestrator.tools.region_zoom import crop_peak_bytes
 
-    monkeypatch.setattr(Image.Image, "reduce", spy)
-    raw = _encode(Image.new("RGB", (4000, 3000), (30, 60, 90)), "PNG")
-    (crop,) = crop_image(raw, [(0, 0, 1000, 1000)], 90)
-    assert factors == [2]
-    assert crop.width * crop.height <= 1_500_000
+    mib = 1024 * 1024
+
+    def estimate(w: int, h: int, *, jpeg: bool = True, mode: str = "RGB") -> float:
+        return crop_peak_bytes(w, h, mode, jpeg=jpeg, encoded_bytes=2 * mib) / mib
+
+    assert 30 <= estimate(4032, 3024) <= 50
+    assert 50 <= estimate(5184, 3888) <= 75
+    assert 160 <= estimate(9487, 6324) <= 200
+    assert 520 <= estimate(8064, 6048, jpeg=False) <= 620
+    assert estimate(4032, 3024, mode="L") < estimate(4032, 3024)
+
+
+@pytest.mark.parametrize(
+    ("fmt", "mode"),
+    [("WEBP", "RGB"), ("PNG", "P"), ("PNG", "1"), ("PNG", "I;16"), ("GIF", "P")],
+)
+def test_unsupported_formats_and_modes_are_skipped_by_header(fmt: str, mode: str) -> None:
+    """第五轮收窄范围 —— 只做 JPEG(L / RGB / CMYK)与 PNG(L / LA / RGB / RGBA);别的按文件头就判定
+    不做(``format_unsupported``),转正图也做不出来。"""
+    image = _quadrants().convert(mode) if mode not in ("P",) else _quadrants().convert("P")
+    raw = _encode(image, fmt)
+    assert image_views.skip_reason(raw) == "format_unsupported"
+    assert image_views.small_copy_slots(raw) is None
+    with pytest.raises(ValueError):
+        upright_copy(raw, 90)
+
+
+@pytest.mark.parametrize(
+    ("fmt", "mode"),
+    [
+        ("JPEG", "L"),
+        ("JPEG", "RGB"),
+        ("JPEG", "CMYK"),
+        ("PNG", "L"),
+        ("PNG", "LA"),
+        ("PNG", "RGB"),
+        ("PNG", "RGBA"),
+    ],
+)
+def test_supported_formats_and_modes_are_turned(fmt: str, mode: str) -> None:
+    raw = _encode(_quadrants().convert(mode), fmt, **({"quality": 95} if fmt == "JPEG" else {}))
+    assert image_views.skip_reason(raw) is None
+    found = upright_copy(raw, 90)
+    assert found is not None
+    assert _decode(found[1]).size == (400, 600)
+
+
+def test_a_12mp_webp_is_skipped_without_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """不支持的格式只读文件头,不解码。"""
+    raw = _encode(Image.new("RGB", (4000, 3000), (10, 20, 30)), "WEBP", quality=50)
+    loads: list[str] = []
+    real = Image.Image.load
+
+    def spy(self: Image.Image) -> Any:
+        loads.append(self.format or "")
+        return real(self)
+
+    monkeypatch.setattr(Image.Image, "load", spy)
+    assert image_views.skip_reason(raw) == "format_unsupported"
+    assert loads == []

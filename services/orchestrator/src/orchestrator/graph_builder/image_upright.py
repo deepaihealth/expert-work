@@ -57,6 +57,7 @@ from orchestrator.image_views import (
     in_host_crop_slots,
     low_res_copy,
     main_model_image_view_cache_total,
+    skip_reason,
     small_copy_slots,
 )
 from orchestrator.multimodal import IMAGE_REF_BLOCK_TYPE, ImageResolver
@@ -104,6 +105,9 @@ MIN_RUN_LEFT_S: Final = SEAM_RELOOK_MIN_RUN_LEFT_S
 MEMO_SIZE: Final = 512
 #: 一步钉住的全分辨率转正图最多占全分辨率区的几分之几(审查 M2):总给别的步骤留地方。
 STEP_PIN_SHARE: Final = 0.5
+#: 「这张图不判」(格式不支持 / 太大)的规则版本:改了 ``image_views.UPRIGHT_MODES`` 或内存预算的
+#: 估法就改它,所有这样记下的图在之后某一轮的第一步重新看一次(复审 L-1)。
+SKIP_RULES_VERSION: Final = "b322-skip-1"
 #: run 在本进程里的降级决定 / 小副本至少留这么久(秒),即使时限已过(收尾那一步,审查 N7)。
 RUN_STATE_FLOOR_S: Final = 60.0
 
@@ -245,6 +249,11 @@ class ImageOrienter:
     def new_step(self) -> UprightStep:
         return UprightStep(views=self.views)
 
+    @property
+    def skip_tag(self) -> str:
+        """「不判」决定的版本:规则版本 + 单图预算。两样任一变了,旧的决定不再算数(复审 L-1)。"""
+        return f"{SKIP_RULES_VERSION}/{self.max_image_pixels}"
+
     # ------------------------------------------------------------------ A 段
 
     async def prepare(
@@ -350,13 +359,7 @@ class ImageOrienter:
             "height": size[1] if size else None,
             "first_turn": run.turn,
         }
-        if small_copy_slots(data) is None:
-            # 连问方向的候选都要整张解开一张很大的图(大 PNG 之类),峰值超过每张的内存预算:不判,
-            # 按原样发(复审 H-new)。
-            entry["too_large"] = True
-            if run.first_step:
-                main_model_image_orientation_skipped_total.labels(reason="too_large").inc()
-        elif not _judgeable(entry) and run.first_step:
+        if not _judgeable(entry) and run.first_step:
             main_model_image_orientation_skipped_total.labels(reason="tiny").inc()
         return image_id, entry
 
@@ -401,7 +404,7 @@ class ImageOrienter:
                 if (
                     record is not None
                     and _judgeable(images[image_id])
-                    and _retry_due(record, run.turn)
+                    and _retry_due(record, run.turn, self.skip_tag)
                 ):
                     again.append(_ToJudge(image_id, key, images[image_id]["refs"][0], record))
         if self.judge is None:
@@ -464,6 +467,13 @@ class ImageOrienter:
         data = await self._bytes(item.ref)
         if data is None:
             return not_asked("no_copy")
+        # 只看文件头:格式 / 颜色模式不支持、或连问方向的候选都要超过每张的内存预算
+        # → 不判、按原样发、
+        # 不加说明(第五轮收窄范围)。记成带版本的 skipped:规则或单图预算变了,下一轮第一步重新看。
+        skip = skip_reason(data)
+        if skip is not None:
+            main_model_image_orientation_skipped_total.labels(reason=skip).inc()
+            return {**not_asked(skip), "conclusion": "skipped", "skip_tag": self.skip_tag}
         digest = image_digest(data)
         lent: list[tuple[str, int]] = []
         first: tuple[Answer, str | None] | None = None
@@ -477,7 +487,12 @@ class ImageOrienter:
         async def candidate(degrees: int) -> dict[str, Any]:
             crop = (await _candidate_crop(data, degrees, slots))[0]
             key = (digest, degrees)
-            self.views.lend(key, "image/jpeg", crop.data)
+            if not self.views.lend(key, "image/jpeg", crop.data):
+                # 全进程借出的候选到了上限:这张图这一步不判(没答成 → 下一轮第一步再判)。
+                main_model_image_orientation_skipped_total.labels(
+                    reason="candidates_over_cap"
+                ).inc()
+                raise _CandidatesOverCapError
             lent.append(key)
             return _view_block(item.ref, ImageView(degrees, "candidate"))
 
@@ -827,11 +842,12 @@ def _judgeable(image: Mapping[str, Any]) -> bool:
     """尺寸认得出、短边不小于 :data:`MIN_SIDE_PIXELS` 的图才问。"""
     width, height = image.get("width"), image.get("height")
     return (
-        image.get("too_large") is not True
-        and isinstance(width, int)
-        and isinstance(height, int)
-        and min(width, height) >= MIN_SIDE_PIXELS
+        isinstance(width, int) and isinstance(height, int) and min(width, height) >= MIN_SIDE_PIXELS
     )
+
+
+class _CandidatesOverCapError(Exception):
+    """借出的候选到了全进程上限:这张图这一步不判。"""
 
 
 async def _candidate_crop(data: bytes, degrees: int, slots: int) -> list[Any]:
@@ -897,10 +913,13 @@ def _effective(record: Mapping[str, Any]) -> str:
     return str(record.get("conclusion"))
 
 
-def _retry_due(record: Mapping[str, Any], turn: str) -> bool:
-    """上一轮的 pending / unjudged 只再判一次;被撤销的定论重判一次(覆盖旧的)。"""
+def _retry_due(record: Mapping[str, Any], turn: str, skip_tag: str) -> bool:
+    """上一轮的 pending / unjudged 只再判一次;被撤销的定论重判一次(覆盖旧的);因为格式 / 内存
+    没判的(skipped)只在规则版本或单图预算变了时重新看(复审 L-1,不是永久的)。"""
     if record.get("last_turn") == turn:
         return False
+    if record.get("conclusion") == "skipped":
+        return record.get("skip_tag") != skip_tag
     effective = _effective(record)
     if effective == "revoked":
         return True

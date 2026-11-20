@@ -1248,6 +1248,7 @@ async def test_new_images_get_full_resolution_and_history_degrades_alone(
     s = _setup({_ref(1): first, _ref(2): second})
     async with _graph(s) as compiled:
         await _turn(compiled, s, _ref(1))
+        image_views.UPRIGHT_VIEWS.clear()  # 换了副本 / 被挤出:历史图的那一份要按估算重新决定
         await _turn(compiled, s, _ref(2), text="又一张横的")
     prompt = s.main.prompts[-1]
     old_block = _last_user(prompt[:1]).content[1]
@@ -1489,16 +1490,75 @@ async def test_an_image_whose_full_copy_would_peak_too_high_gets_the_low_copy(
 async def test_an_image_too_large_even_for_candidates_is_not_judged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """复审 H-new —— 连问方向的候选都要整张解开一张很大的图(大 PNG 之类),估的峰值超过每张的内存
-    预算:这张图不判、按原样发,计 ``too_large``;不解码它。"""
+    """连问方向的候选都要超过每张的内存预算:这张图不判、按原样发、不加说明,计 ``too_large``;
+    记成带版本的 skipped,规则版本或单图预算变了才重新看(复审 L-1)。"""
     monkeypatch.setattr(image_views, "FULL_COPY_PEAK_BYTES", 1000)
     before = _count(main_model_image_orientation_skipped_total, reason="too_large")
     s = _setup({_ref(): _stored(90)})
     async with _graph(s) as compiled:
         config = await _turn(compiled, s, _ref())
-        snapshot = await compiled.aget_state(config)
-    assert s.judge.calls == []
+        (record,) = (await compiled.aget_state(config)).values["image_orientations"].values()
+        assert (record["conclusion"], record["reason"]) == ("skipped", "too_large")
+        assert record["skip_tag"] == s.orienter.skip_tag
+        await _turn(compiled, s, text="下一轮:规则没变,不重新看")
+        assert _count(main_model_image_orientation_skipped_total, reason="too_large") == before + 1
+        # 规则版本变了:下一轮第一步重新看(内存预算放宽了,这次就判)。
+        monkeypatch.setattr(upright_mod, "SKIP_RULES_VERSION", "b322-skip-2")
+        monkeypatch.setattr(image_views, "FULL_COPY_PEAK_BYTES", 110 * 1024 * 1024)
+        config = await _turn(compiled, s, text="规则变了")
+        (record,) = (await compiled.aget_state(config)).values["image_orientations"].values()
+    assert s.judge.calls == [0, 90, 180, 270]
+    assert record["conclusion"] == "rotated"
     assert _last_user(s.main.prompts[0]).content == _user("读一下", _ref()).content
-    (image,) = snapshot.values["conversation_images"].values()
-    assert image["too_large"] is True
-    assert _count(main_model_image_orientation_skipped_total, reason="too_large") == before + 1
+
+
+@pytest.mark.parametrize("shape", ["webp", "png-p", "png-1", "png-i16"])
+async def test_unsupported_shapes_are_not_judged_and_sent_as_stored(shape: str) -> None:
+    """第五轮收窄范围 —— WebP / 调色板 / 1 位 / 16 位灰度的图:不判、原样发、不加说明,每张计一次
+    ``format_unsupported``。"""
+    base = _upright().rotate(90, expand=True)
+    buffer = io.BytesIO()
+    if shape == "webp":
+        base.save(buffer, format="WEBP")
+    else:
+        mode = {"png-p": "P", "png-1": "1", "png-i16": "I;16"}[shape]
+        (base.convert(mode) if mode != "I;16" else base.convert("L").convert("I;16")).save(
+            buffer, format="PNG"
+        )
+    s = _setup({_ref(): buffer.getvalue()})
+    s.main.script = [_tool_call()]
+    registry = ToolRegistry()
+    registry.register(_Noop())
+    before = _count(main_model_image_orientation_skipped_total, reason="format_unsupported")
+    async with _graph(s, registry=registry) as compiled:
+        await _turn(compiled, s, _ref())  # 两步
+        await _turn(compiled, s, text="下一轮")
+    assert s.judge.calls == []
+    for prompt in s.main.prompts:
+        user = prompt[0]
+        assert user.content == _user("读一下", _ref()).content
+    assert _count(main_model_image_orientation_skipped_total, reason="format_unsupported") == (
+        before + 1
+    )
+
+
+async def test_too_many_lent_candidates_leave_the_image_for_later(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全进程借出的候选到了上限:这张图这一步不判(没答成),计 ``candidates_over_cap``,下一轮再判。"""
+    monkeypatch.setattr(image_views, "LENT_CANDIDATES_CAP_BYTES", 10)
+    before = _count(main_model_image_orientation_skipped_total, reason="candidates_over_cap")
+    s = _setup({_ref(): _stored(90)})
+    async with _graph(s) as compiled:
+        config = await _turn(compiled, s, _ref())
+        (record,) = (await compiled.aget_state(config)).values["image_orientations"].values()
+        assert record["conclusion"] == "unjudged"
+        assert s.judge.calls == []
+        assert (
+            _count(main_model_image_orientation_skipped_total, reason="candidates_over_cap")
+            == before + 1
+        )
+        monkeypatch.setattr(image_views, "LENT_CANDIDATES_CAP_BYTES", 16 * 1024 * 1024)
+        await _turn(compiled, s, text="下一轮")
+    assert s.judge.calls == [0, 90, 180, 270]
+    assert s.main.replies[-1] == SECRET
