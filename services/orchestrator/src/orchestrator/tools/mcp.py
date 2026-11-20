@@ -68,6 +68,7 @@ from orchestrator.tools.arg_bindings import (
     strip_bound_params,
     unbindable_params,
 )
+from orchestrator.tools.link_registry import mask_links
 from orchestrator.tools.registry import (
     InvalidFixedValue,
     ToolContext,
@@ -1434,9 +1435,16 @@ class MCPTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        links = ctx.conversation_links
         del ctx
         result = await self.client.call_tool(self.tool_def.name, args)
-        content, truncated = _middle_trim(result.content, self.content_char_cap)
+        # B-330 —— 登记过的原链接遮回编号,**在截断之前**:截断边界落在链接中间也漏不出半条;
+        # 溢出写进工作区的全文与 span 记的结果随之都是遮过的。
+        # 结果可能很长:放到线程里做,不占事件循环。
+        masked = (
+            await asyncio.to_thread(mask_links, result.content, links) if links else result.content
+        )
+        content, truncated = _middle_trim(masked, self.content_char_cap)
         return ToolResult(
             content=content,
             meta={
@@ -1446,7 +1454,7 @@ class MCPTool:
             },
             # Stream CM-5: middle-trimmed MCP output is otherwise
             # unrecoverable — carry the full text for externalization.
-            full_content=result.content if truncated else None,
+            full_content=masked if truncated else None,
             # B-226 ③ — the server's own ``isError`` is a failure. On a tool the server
             # marks read-only (``readOnlyHint``) it is neutral, like a native read-only
             # failure (B-164): a failed lookup is not undone work, nor a success that

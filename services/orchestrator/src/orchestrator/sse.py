@@ -259,6 +259,8 @@ _INTERNAL_STATE_KEYS: frozenset[str] = frozenset(
         "edit_file_streaks",
         "edit_file_history",
         "outcome_repeats",
+        # B-330 —— 本对话的链接登记带着原链接,只给平台用:不进直播帧、run_event、对接方。
+        "conversation_links",
     }
 )
 

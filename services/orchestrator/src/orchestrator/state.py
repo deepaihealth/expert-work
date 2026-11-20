@@ -273,6 +273,11 @@ class AgentState(TypedDict):
     #: 据此带上原名(主 run 的 ``[file attached: …]`` 那一行已经带了)。同样每轮都设。
     turn_document_original_names: NotRequired[dict[str, str]]
     turn_image_refs: NotRequired[list[str]]
+    #: B-330 —— 本对话模板变量收到过的链接登记:每条 ``{id, url, variable, where, ext,
+    #: received_at, run_id, turn_files, turn_images}``(``tools.link_registry``)。只由开头节点
+    #: ``link_registry`` 整份写(默认覆盖 reducer),只增不减;run 的起始输入不写这个键,值随
+    #: 检查点跨轮留着。委派时整份种进子代。**原链接只在这里和真正发出的 MCP 调用里。**
+    conversation_links: NotRequired[list[dict[str, Any]]]
     plan: NotRequired[Plan | None]
     reflections: NotRequired[Annotated[list[Reflection], add]]
     recalled_memories: NotRequired[list[MemoryItem]]

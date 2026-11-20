@@ -29,7 +29,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -94,6 +94,8 @@ class LiteralHit:
     remote: bool
     #: ``kind == "variable"`` 且这个变量绑定在本工具上:绑定的参数名。
     bound_param: str | None = None
+    #: ``kind == "local_path"``:那段本地路径(工作区路径,不是链接;只用来认出是哪个变量的文件)。
+    path: str = ""
 
 
 def _strings(value: Any) -> Iterator[str]:
@@ -162,14 +164,52 @@ def find_literal(
                 bound = (bound_params or {}).get(name) if kind == "variable" else None
                 return LiteralHit(tool, arg, kind, name, remote, bound)
             if remote and check_local and _LOCAL_INPUT_RE.fullmatch(text.strip()):
-                return LiteralHit(tool, arg, "local_path", "", remote)
+                return LiteralHit(tool, arg, "local_path", "", remote, path=text.strip())
     return None
 
 
-def literal_guard_message(hit: LiteralHit) -> str:
-    """回给模型的那句话(设计 §4.5)。只有参数名、变量名、绑定参数名、环境变量名。"""
+_INPUT_DIR_RE = re.compile(rf"(?:/workspace/|\./|/agent/)?inputs/(?:current|{_RUN_ID})/")
+
+
+def _path_variable(path: str, names: Collection[str]) -> str | None:
+    """本地输入路径属于哪个变量:路径的第一段是 ``<变量名>`` / ``<变量名>.<扩展名>`` /
+    ``<变量名>-2…``(``inputs_doc.link_names`` 的几种命名),取最长的那个变量名。"""
+    match = _INPUT_DIR_RE.match(path)
+    if match is None:
+        return None
+    head = path[match.end() :].split("/", 1)[0]
+    owners = [
+        name
+        for name in names
+        if head == name
+        or (head.startswith(name) and head[len(name) : len(name) + 1] in (".", "-"))
+        or path[match.end() :].startswith(f"{name}/")
+    ]
+    return max(owners, key=len) if owners else None
+
+
+def _ids_text(ids: Sequence[str]) -> str:
+    return "、".join(ids)
+
+
+def literal_guard_message(
+    hit: LiteralHit, *, link_ids: Mapping[str, Sequence[str]] | None = None
+) -> str:
+    """回给模型的那句话(设计 §4.5)。只有参数名、变量名、绑定参数名、环境变量名。
+
+    B-330 —— ``link_ids`` 是本对话链接登记里「变量名 → 编号」:命中的变量在登记里有链接时,
+    交给外部服务的本地路径与 ``$变量名`` 两种提示改为给编号(不列链接);没有时原句不变。
+    """
     arg = hit.arg
+    links = link_ids or {}
     if hit.kind == "local_path":
+        owner = _path_variable(hit.path, links)
+        if owner is not None and links.get(owner):
+            return (
+                f"[blocked] 参数 {arg} 是工作区里的本地路径，对方服务读不到沙箱里的文件。"  # noqa: RUF001
+                f"要传 {owner} 收到的链接，请写它的编号：{_ids_text(links[owner])}"  # noqa: RUF001
+                "（平台在发出前换成原链接）。"  # noqa: RUF001
+            )
         return (
             f"[blocked] 参数 {arg} 是工作区里的本地路径，对方服务读不到沙箱里的文件。"  # noqa: RUF001
             "要传文件地址，请用绑定（由平台填）或原始链接。"  # noqa: RUF001
@@ -181,6 +221,12 @@ def literal_guard_message(hit: LiteralHit) -> str:
                 f"[blocked] 参数 {arg} 里的 ${var} 不会被换成值，收到的就是这串字。"  # noqa: RUF001
                 f"{var} 由平台自动填进本工具的 {hit.bound_param} 参数"
                 "（它不在你看到的参数表里），这里不用写，去掉后重新调用。"  # noqa: RUF001
+            )
+        if hit.remote and links.get(var):
+            return (
+                f"[blocked] 参数 {arg} 里的 ${var} 不会被换成值，对方服务收到的就是这串字。"  # noqa: RUF001
+                f"要传 {var} 收到的链接，请写它的编号：{_ids_text(links[var])}"  # noqa: RUF001
+                "（平台在发出前换成原链接）。"  # noqa: RUF001
             )
         if hit.remote:
             return (

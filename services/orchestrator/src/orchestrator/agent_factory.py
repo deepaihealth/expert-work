@@ -128,6 +128,7 @@ from orchestrator.graph_builder.agent_notes import (
 )
 from orchestrator.graph_builder.conversation_seed import make_conversation_seed_node
 from orchestrator.graph_builder.image_upright import ImageOrienter, OrientationJudge
+from orchestrator.graph_builder.link_registry_node import make_link_registry_node
 from orchestrator.graph_builder.outgoing_reference import (
     OUTGOING_ARGUMENTS_CLAUSE,
     sends_arguments_out,
@@ -1359,6 +1360,12 @@ async def build_agent(
             client=env.sandbox_runtime,
             variables=tuple(spec.spec.system_prompt.variables),
         )
+    # B-330 —— 本对话的链接登记。门:agent 声明了变量(不要求接沙箱 —— 只有 MCP 的也要能用)。
+    link_registry_node = (
+        make_link_registry_node(variables=tuple(spec.spec.system_prompt.variables))
+        if spec.spec.system_prompt.variables
+        else None
+    )
     # B-236 —— 对话开场把 agent 根的基础目录复制进本对话的 /workspace。复制按目录 fd 在
     # 宿主侧做,只有 NAS 存储做得到;没接 NAS(本地 supervisor 后端 / 单测)= 不装节点。
     # 节点自己只在对话视图、非委派子代时动手。
@@ -1437,6 +1444,7 @@ async def build_agent(
         workspace_ingest_node=workspace_ingest_node,
         inputs_node=inputs_node,
         conversation_seed_node=conversation_seed_node,
+        link_registry_node=link_registry_node,
         agent_notes_node=agent_notes_node,
         # B-67 §七 —— 手抄守卫的提示只对 trusted 变量写链接名。
         trusted_input_names=frozenset(

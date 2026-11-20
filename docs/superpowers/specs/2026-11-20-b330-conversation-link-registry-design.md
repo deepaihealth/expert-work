@@ -1,6 +1,6 @@
 # B-330 平台记住对话里收到的链接,之后的轮次也能交给外部工具 —— 设计
 
-- **日期**:2026-11-20 · **状态**:设计稿第 3 版(第 2 版按第一轮独立审查 1 高 7 中 9 低修订、能靠收窄范围解决的都收窄了;第 3 版按复审的 1 中 4 低修订,见文末「修订记录」),**§8 已拍板(2026-11-20,全部按推荐,见 §8.1)**;本文不动代码。
+- **日期**:2026-11-20 · **状态**:设计稿第 4 版(第 2 版按第一轮独立审查 1 高 7 中 9 低修订、能靠收窄范围解决的都收窄了;第 3 版按复审的 1 中 4 低修订;第 4 版按实现后两轮代码审查修订,见文末「修订记录」),**§8 已拍板(2026-11-20,全部按推荐,见 §8.1)**;本文不动代码。
 - **读者**:产品负责人(看 §0、§7、§8)、开发工程师(全文)、验收执行人(§6)。
 - **代码事实**:凡写了 `文件:行号` 的,都在 `origin/main` `630dcf9fd` 上打开文件核过(本分支只多文档)。没核过的标「未核实」,汇总在 §10。
 - **事故与测试库事实**:§1.1 的经过、§1.2 第 27 条的测试库查询结果由协调人提供(11-20 测试环境,只看了编号与字段编码);本文作者没有查任何数据库、没有连任何集群、没有发任何付费调用,也没有读任何客户对话内容。
@@ -153,7 +153,7 @@
 | 孤儿复活 | 开头节点再跑一次,按链接原文去重,结果不变 |
 | 重新生成 / 编辑重发 | 不回退(§8 第 9 条):被取代那一轮的链接确实收到过;重放同一份 inputs,去重后编号不变 |
 | 删除 | 彻底清除会话时随检查点删(事实 26) |
-| 子代 / worker | 委派时整份种进子代初始状态(事实 25 同一处);孙代同样 |
+| 子代 / worker | 委派时经 `config["configurable"]` 传给子代(键 `conversation_links`,非标量,LangGraph 不抄进检查点 metadata);孙代沿用。**不种进子代状态**:子代的检查点按子线程 id 持久化,会话 / 用户清除只删根对话的线程,种进去的原链接会留在那里删不掉(第 4 版,代码审查 M3)。子代撞审批是软拒、没有子代续跑,不存在续跑时 config 缺登记的问题 |
 | 压缩 | 登记不在消息里;平台段每步按登记重新生成 |
 | 不会被整份读出去 | 控制面读检查点只取特定键(事实 28) |
 | 回滚到旧版本 | 审查意见指出 LangGraph 会把检查点里代码没声明的通道键原样带着;PR 里用我们自己的检查点保存器写一条单测钉住(T16),不靠推断 |
@@ -162,13 +162,14 @@
 
 ### 4.2 每一轮开头怎么记
 
-**谁来记**:新加一个开头节点 `link_registry`,纯计算、不碰沙箱,挂在 inputs 节点同一位置(`builder.py:2573-2576`)。门:智能体声明了模板变量(不要求接沙箱 —— 只有 MCP 的智能体也要能用,事实 5)。委派子 run 跳过(用种进来的登记)。
+**谁来记**:新加一个开头节点 `link_registry`,纯计算、不碰沙箱,挂在 inputs 节点同一位置(`builder.py:2573-2576`)。门:智能体声明了模板变量(不要求接沙箱 —— 只有 MCP 的智能体也要能用,事实 5)。委派子 run 跳过(用父经 config 传下来的登记)。
 
 **怎么找链接**:**新写一个遍历,不复用** `_walk` / `linked_sites` / `candidates_from_inputs` —— 它们跳过列表里的裸字符串,正是事故形状(事实 6)。只复用两个判定函数:
 
 - 字符串:先按 `parse_json_value` 试着解析(B-314 的对接方客户端把 inputs 当 `Record<string, string>` 传,`attachment_urls` 很可能是 JSON 数组**字符串**,`04-mcp-tools.md:507`);能解析按解析结果走。
 - 列表、对象:逐层往下,有递归上限(超了跳过这个变量)。对象里叫 `local_path` 的键跳过(`inputs_doc.py:422-429` 同一理由)。
-- 叶子:`http_url_in` 拿到的才算。查询串原样保留,不规范化、不解码。
+- 叶子:`http_url_in` 拿到的、且 `urlparse` 的 `netloc` 不为空的才算(第 4 版,代码审查 M1:`https://` 这种空壳登记进来,结果里所有链接的开头都会被遮成编号)。查询串原样保留,不规范化、不解码。
+- 顺序号取已有登记里最大的顺序号 + 1,不取条数 + 1(第 4 版:读检查点时清洗掉的坏条目会让条数变少,条数 + 1 会和一条还在的编号撞上)。
 
 **每条记什么**:
 
@@ -223,7 +224,7 @@ MCP 工具的参数值整段是下面某个编号时，平台在发出前把它�
 **怎么换**(纯函数:参数 + 登记 → 新参数、换了哪几个编号、错误):
 
 1. 复制参数,不改 AIMessage 身上那份(`arg_bindings.py:302-306` 同一规矩)。
-2. 走遍所有字符串叶子,不管字段名和深度:
+2. 走遍所有字符串叶子(**字典的键也算**,第 4 版),不管字段名和深度:
    - 去掉首尾空白后整段等于一个编号形态 `expert_work://link/…`:在本对话登记里 → 换成原链接;不在 → 错误。
    - 以 `[` / `{` 开头、能解析成 JSON 的字符串:在解析结果里同样找,换完再序列化回去(`ensure_ascii=False`),只往里走这一层。
    - 字符串里**含有**编号但不是整段相等(「附件见 …」、`"…-1;…-2"`):错误 ——「一个值只能是一个编号」。
@@ -250,15 +251,23 @@ MCP 工具的参数值整段是下面某个编号时，平台在发出前把它�
 
 ### 4.6 工具结果里的原链接:换回编号(审查 M5)
 
-**在哪**:`McpTool.call` 里,拿到服务端结果后、`_middle_trim` 截断**之前**(`tools/mcp.py:1438-1439`),对完整内容做。截断之前做,半条链接就不会因为截断边界漏出去;`full_content`(溢出写进工作区的那份)和 span 记的结果也随之是遮过的。登记通过 `ToolContext.conversation_links` 传进来(子代种子本来也要这个字段)。
+**在哪**:`McpTool.call` 里,拿到服务端结果后、`_middle_trim` 截断**之前**(`tools/mcp.py:1438-1439`),对完整内容做。截断之前做,半条链接就不会因为截断边界漏出去;`full_content`(溢出写进工作区的那份)和 span 记的结果也随之是遮过的。登记通过 `ToolContext.conversation_links` 传进来(委派往下传也读这个字段)。
 
-**认哪几种写法**:每条登记链接按下面几种形态各找一遍,按长度从长到短替换(一条是另一条的前缀时不会换错):
+**认哪几种写法**(第 4 版补齐):原样与「服务端把百分号解码后回显」的那份,各自再按下面几种变换(可以叠加):
 
-1. 原样;
-2. JSON 转义:`json.dumps(url)[1:-1]`,`ensure_ascii` 真假两种(中文路径会变成 `\uXXXX`);
+1. JSON 转义:`json.dumps(url)[1:-1]`,`ensure_ascii` 真假两种(中文路径会变成 `\uXXXX`);
+2. `&` 写成 `\u0026`(Go `encoding/json` 的默认)或 `&amp;`(HTML 片段,复审 N4);
 3. 斜杠转义 `\/`(一些 JSON 序列化器默认这样写);
-4. 百分号编码:`urllib.parse.quote(url, safe="")` 与 `quote(url)` 两种;
-5. HTML 实体:`&` 写成 `&amp;`(返回 HTML 片段的服务会这样写,复审 N4)。
+4. 百分号编码:`quote(url, safe="")`、`quote(url)`,以及 `encodeURIComponent` 的写法(`!'()*~` 不转义);
+5. 百分号编码的十六进制位大小写不限(文字和写法都先归一成小写,长度不变)。
+
+**怎么找**(第 4 版,代码审查 M2:原来把所有写法拼成一个大正则,200 条链接编译 3 秒、峰值上百 MB,还常驻在 `re` 的全局缓存里):先按主机名做子串预筛(主机名在原样、JSON 转义、`\/`、`quote(safe="")` 里都原样保留);只给命中的链接生成写法(按链接缓存,有上限),用 `str.find` 找。MCP 结果放到 `asyncio.to_thread` 里遮,不占事件循环。新模块 `tools/link_masking.py`。
+
+**结尾边界**(第 4 版,代码审查 M1):找到的位置后面紧跟的还是链接的一部分(字母数字、`-_~/?#%=&+`,`.` 后接字母数字,`\/`、`\u0026`)就不算 —— `…/a.pdf` 不会把 `…/a.pdf.bak` 的开头遮掉,`https://shenhu.com` 不会把 `https://shenhu.com/docs/b.pdf` 遮坏;句末的 `.` `)` `,` 不挡。重叠的命中取长的。代价:一条更长的、以登记链接开头的链接整条不遮(它本来就不是同一个地址)。
+
+**边界按写法分开判**(第 4 版复审):完全百分号编码的写法(`quote(safe="")`、`encodeURIComponent`、`quote(url)`)里不会有原样的 `& # = ? +`,它们出现就是外层的分隔符(`?src=<编码链接>&page=2`、`…#p2`),所以这几种写法只把字母数字和 `-_.~%` 当「还在链接里」(`encodeURIComponent` 另加 `!'()*`,`quote(url)` 另加 `/`);原样和 JSON 转义这类写法用上面那条规则。同一串字出现在几种写法里时按原样那种算。
+
+**已知认不出的写法**(原样交给模型,对外文档里也写了):JSON 套两层转义、`ensure_ascii` 的非 ASCII 再套一层、HTML 数字实体(`&#38;`)、服务端只回显半截链接。另外两种因为和「更长的另一条链接」分不开,有意不遮:原样写法的链接后面紧跟 `&`(`?src=https://…/a.pdf?sig=x&page=2`),以及百分号编码的链接后面紧跟同样编码过的分隔符(`%26`、`%22`)。
 
 只对 MCP 结果做;纯子串替换,没有模式匹配。
 
@@ -271,7 +280,10 @@ MCP 工具的参数值整段是下面某个编号时，平台在发出前把它�
 | 被调用的 MCP 服务 | 有(这就是目的) |
 | 对话检查点 `conversation_links` | 有(只给平台用;控制面只读特定键,事实 28) |
 | 本轮 `system_prompt` 帧、排队模式的 `enqueued_input` | 有(今天就有,不是本功能新增) |
-| 模型看到的平台段、工具结果 | 没有 |
+| 模型看到的平台段、**MCP** 工具结果 | 没有 |
+| 沙箱里的 `inputs/<run>/inputs.json` | 有(今天就有,不是本功能新增):接了沙箱的智能体用 `read_file` / `bash` / `exec_python` 读得到。所以「工具结果里没有原链接」只对 MCP 结果成立(第 4 版补) |
+| SSE `updates` 帧、`run_event`、调试台原始视图、对接方事件流 | 没有:`conversation_links` 在 `sse._INTERNAL_STATE_KEYS` 里,发帧前剥掉(第 4 版,代码审查 C1:开头节点的写入原来会整份进 `updates` 帧) |
+| 子代 / 孙代的检查点 | 没有(登记走 config,不进子代状态,见 §4.1;第 4 版,代码审查 M3) |
 | 检查点里的 AIMessage 参数、SSE 工具调用帧 | 没有(是编号) |
 | 审批单 `proposed_args`、审批帧、动作筛查判官 | 没有(换回在审批门之后) |
 | 轨迹 span | 没有(记编号版参数、遮过的结果) |
@@ -355,7 +367,7 @@ MCP 工具的参数值整段是下面某个编号时，平台在发出前把它�
 | T7a | 审批:被审批的 MCP 工具;审批单 `proposed_args` 和审批帧里是编号、没有链接;批准后假 MCP 收到真链接;RT-6 摘要校验通过 | 换回挪到审批门之前 → 审批单里出现链接 |
 | T7b | 审批「修改」:人把参数改成另一个本对话的编号 → 派发时换成那条;改成不存在的编号 → 拒绝,并计入「批准后被拦」 | 续跑路径不检查 |
 | T7c | **同一批两个要审批的 MCP 调用**(复审 N1):[0] 带不存在的编号,[1] 编号正确。断言这一步**没有挂审批**,[0] 得到编号错误、[1] 得到「没有执行」;下一步模型只重发 [1] → 审批挂在它上面,批准后续跑摘要校验通过、假 MCP 收到真链接 | 检测时跳过坏调用去挂 [1] → 续跑选中 [0],摘要漂移被否决 |
-| T8 | 子代:父有两条,委派后子代写父的第 2 条 → 换回;子代平台段有这两行;孙代同样 | 不种登记 / 子代用自己的 run id 当前缀 |
+| T8 | 子代:父有两条,委派后子代写父的第 2 条 → 换回;子代平台段有这两行;孙代同样;子代、孙代的检查点里没有原链接 | 不传登记 / 子代用自己的 run id 当前缀 / 登记种进子代状态 |
 | T9 | 去重与稳定:第 1、3 轮同一链接 → 同一编号;重新生成 → 编号不变;孤儿复活重跑开头节点 → 登记不变 | 去重键错 / 重新生成回退 |
 | T10 | 平台段:同一份登记两次生成逐字节相同;登记为空或没有 MCP 工具不出现;超过 10 条只列最新 10 条加一行汇总;untrusted 不写扩展名 | — |
 | T11 | 拼在长串里(含「;」拼两个编号)→ 拒绝 `embedded`,错误文字提示用数组 | 去掉 |
@@ -430,15 +442,17 @@ MCP 工具的参数值整段是下面某个编号时，平台在发出前把它�
 
 | 文件 | 改什么 |
 |---|---|
-| `services/orchestrator/src/orchestrator/tools/link_registry.py`(新) | 登记条目;**新写的**遍历(不复用 `_walk` / `linked_sites` / `candidates_from_inputs`,只用 `http_url_in` / `parse_json_value`);编号(对话前缀 + 序号)、去重、上限;平台段文字;检查 + 换回纯函数(对照表入参,§4.10);结果遮回(四种写法);从登记构造 `find_retyped_url` 的候选(只计数) |
+| `services/orchestrator/src/orchestrator/tools/link_registry.py`(新) | 登记条目;**新写的**遍历(不复用 `_walk` / `linked_sites` / `candidates_from_inputs`,只用 `http_url_in` / `parse_json_value`);编号(对话前缀 + 序号)、去重、上限;平台段文字;检查 + 换回纯函数(对照表入参,§4.10);结果遮回(写法见 §4.6,做法在新模块 `tools/link_masking.py`);从登记构造 `find_retyped_url` 的候选(只计数) |
 | `services/orchestrator/src/orchestrator/graph_builder/link_registry_node.py`(新) | 开头节点:读 `PROMPT_INPUTS_KEY`、`turn_documents`、`turn_image_refs`,写 `conversation_links`;编号前缀取根对话 id(`workspace_thread_id or thread_id`,不用子 run 的 id);永不让 run 失败 |
 | `services/orchestrator/src/orchestrator/state.py` | `conversation_links` 通道 |
 | `services/orchestrator/src/orchestrator/agent_factory.py` | 声明了变量就装节点(不要求沙箱) |
 | `services/orchestrator/src/orchestrator/graph_builder/builder.py` | 挂节点(`:2573` 一带);`agent_node` 加平台段(`:1290-1338` 一带);检测路径在审批门之前做编号检查,本批有编号错误时这一步不挂审批(坏的得错误结果、其它得「没有执行」,不改 `find_approval_target`);MCP 的出错路径(`_invoke_tool` 里 `_format_error(exc)`,`:5150-5170`)先遮回再写结果和 span 状态;续跑路径再查一次并计「批准后被拦」;拒绝并进 `file_events` / `ran_calls` 的排除条件(`:2365-2374`);派发前换回;`_dispatch_tool` 多收「记录用参数」给 `_record_tool_io`(`:4106`);审计 `rewritten_links`;最终回复里出现编号计数;三个计数器 |
-| `services/orchestrator/src/orchestrator/tools/mcp.py` | `call` 里在 `_middle_trim` 之前遮回(`:1438-1439`) |
+| `services/orchestrator/src/orchestrator/tools/mcp.py` | `call` 里在 `_middle_trim` 之前遮回(`:1438-1439`),放在 `asyncio.to_thread` 里 |
+| `services/orchestrator/src/orchestrator/tools/link_masking.py`(新,第 4 版) | 结果遮回:主机名预筛 + 按链接生成写法 + 结尾边界(§4.6) |
+| `services/orchestrator/src/orchestrator/sse.py`(第 4 版) | `_INTERNAL_STATE_KEYS` 加 `conversation_links`(§4.7) |
 | `services/orchestrator/src/orchestrator/graph_builder/input_literal_guard.py` | `:172-189` 两句提示:变量在登记里有链接时改为给编号 |
 | `services/orchestrator/src/orchestrator/tools/registry.py` | `ToolContext.conversation_links` |
-| `services/orchestrator/src/orchestrator/tools/_child_run.py` | `child_input` 加 `conversation_links`(`:253-266`) |
+| `services/orchestrator/src/orchestrator/tools/_child_run.py` | `_child_config` 把登记放进子代的 `configurable`(第 4 版;原来写的是 `child_input` 种进子代状态,见 §4.1) |
 | `apps/admin-ui/docs-site/guide/chat.md` | 一段说明(§7) |
 | `services/orchestrator/tests/test_b330_*.py`(新) | T1~T18 |
 
@@ -461,6 +475,18 @@ MCP 工具的参数值整段是下面某个编号时，平台在发出前把它�
 ---
 
 ## 修订记录
+
+**第 4 版(11-20,实现后按两轮代码审查修订;实现在 `feat/b330-conversation-link-registry`)**
+
+| 审查项 | 处理 |
+|---|---|
+| C1 开头节点的写入整份进 SSE `updates` 帧 | `conversation_links` 加进 `sse._INTERNAL_STATE_KEYS`;§4.7 加一行,§9 加 `sse.py` |
+| M1 遮回没有边界,空壳 / 前缀链接把别的链接遮坏 | 只登记有主机名的链接(§4.2);遮回加结尾边界(§4.6) |
+| M2 大正则编译慢、占内存、常驻 `re` 缓存 | 主机名预筛 + 按链接生成写法 + `str.find`,放到线程里(§4.6,新模块 `link_masking.py`) |
+| M3 子代检查点留着原链接,清除删不到 | 登记改走子代的 `configurable`,不种进子代状态(§4.1、§4.7、§9、T8) |
+| 认不出的写法 | 补 `\u0026`、解码后回显、大小写混用的百分号、`encodeURIComponent`;认不出的列进 §4.6 与对外文档 |
+| 字典键、顺序号、检查出错时的提示 | 键也算叶子(§4.4);顺序号取最大 + 1(§4.2);检查出错时提示不写空参数名 |
+| 沙箱 `inputs.json` | §4.7 写明:「工具结果里没有原链接」只对 MCP 结果成立 |
 
 **第 3 版(11-20,按复审修订:第一轮 17 条里 16 条已关、L4 部分;新 1 中 4 低)**
 
