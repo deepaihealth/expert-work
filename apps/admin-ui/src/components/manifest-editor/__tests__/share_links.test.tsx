@@ -1,4 +1,4 @@
-// B-326 — the "分享文件链接" switch in the agent config form.
+// B-326 — the "分享文件链接" checkbox in the agent config form.
 //
 // Backend rule: ``share_links`` absent = off, and the block is omitted from the
 // stored manifest. So the form writes ``{enabled: true}`` when on and REMOVES
@@ -142,7 +142,11 @@ describe("ShareLinksToggle", () => {
     const user = userEvent.setup();
     const { onChange } = renderToggle(SEED);
     expect(screen.queryByTestId("af-share-links-ttl")).not.toBeInTheDocument();
-    await user.click(screen.getByTestId("af-share-links-switch"));
+    // The label is the checkbox's own accessible name (no separate aria-label).
+    expect(screen.getByRole("checkbox", { name: /分享文件链接|Share file links/ })).toBe(
+      screen.getByTestId("af-share-links-checkbox"),
+    );
+    await user.click(screen.getByTestId("af-share-links-checkbox"));
     const next = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
     expect(next.spec?.share_links).toEqual({ enabled: true });
   });
@@ -150,7 +154,7 @@ describe("ShareLinksToggle", () => {
   it("turning off removes the block", async () => {
     const user = userEvent.setup();
     const { onChange } = renderToggle(withBlock({ enabled: true, ttl_minutes: 30 }));
-    await user.click(screen.getByTestId("af-share-links-switch"));
+    await user.click(screen.getByTestId("af-share-links-checkbox"));
     const next = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
     expect(next.spec?.share_links).toBeUndefined();
   });
@@ -198,9 +202,9 @@ describe("ShareLinksToggle", () => {
     }
     let latest: AgentManifest = SEED;
     render(<Stateful />);
-    await user.click(screen.getByTestId("af-share-links-switch"));
+    await user.click(screen.getByTestId("af-share-links-checkbox"));
     expect(latest.spec?.share_links).toBeUndefined();
-    await user.click(screen.getByTestId("af-share-links-switch"));
+    await user.click(screen.getByTestId("af-share-links-checkbox"));
     expect(latest.spec?.share_links).toEqual({ enabled: true, ttl_minutes: 45 });
     expect(screen.getByTestId("af-share-links-ttl")).toHaveValue("45");
   });

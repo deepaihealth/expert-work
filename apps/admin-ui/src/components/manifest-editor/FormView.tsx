@@ -485,9 +485,9 @@ export function FormView({
               />
             </span>
           ))}
+          {/* B-326 — public, time-limited links to registered artifacts. */}
+          <ShareLinksToggle formData={formData} onChange={onChange} />
         </div>
-        {/* B-326 — public, time-limited links to registered artifacts. */}
-        <ShareLinksToggle formData={formData} onChange={onChange} />
         <Text
           type="secondary"
           data-testid="af-tools-config-note"
