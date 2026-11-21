@@ -110,8 +110,9 @@ data:
   # image work for vision main models (110 MiB decode budget; in-pod 12 MP
   # measured +94 MiB), its caches (32 + 4 MiB) and lent orientation candidates
   # (16 MiB), and the pod keeps >= 50 MiB headroom: 1,528 + (2,280 - 650) +
-  # (1,536 - 654) = 4,040 of 4,096 MiB. The largest photo described at 2280 is
-  # not measured yet (runbook §127.6). Paired with the memory limit in
+  # (1,536 - 654) = 4,040 of 4,096 MiB. Measured 2026-11-21 in the test pod:
+  # photos up to 59.8 MP were described at 2280 (peak 1,275 MiB); the limit is
+  # the 60 MP decode cap (MAX_DECODE_PIXELS), not memory (runbook §127.6). Paired with the memory limit in
   # control-plane/deployment.yaml — change them together;
   # tools/deploy/test_parse_worker_memory_budget.py checks them.
   EXPERT_WORK_KNOWLEDGE_PARSE_WORKERS: "1"

@@ -2889,6 +2889,8 @@ PY
 - [ ] **126.4 委派**:子智能体用 `inputs/current/` 读到父智能体那一轮的文件。
 - [ ] **126.5 审批挂起后续跑**:同一轮里审批挂起后再续跑,续跑段的 `inputs/current/` 仍是首段的文件。
 
+> **11-21 测试 `0ec0181d2` 发版与验收记录(§127~§131)**:smoke、金丝雀过,镜像与 overlay 一致;迁移到 `0196`;`qwen3.8-max` 价目行 12000000 / 36000000 / 0 / 1500000;解析子进程上限 2280。付费验收合计约 ¥6.4(批准上限 ¥28)。**遗留测试数据**:`acc128-*` / `acc130-*` / `acc131-*` / `b322-accept` 这几个用户的对话还在,待控制台清除;`b322-accept` 用户的健管师记忆也要查一下有没有写进去。
+
 ## §127 主模型自己看图时先把横着的图转正(B-322 PR ①;紧急开关 `EXPERT_WORK_MAIN_MODEL_IMAGE_ORIENTATION`,默认开)
 
 **背景**:主模型自己能看图(`supports_vision: true`)的智能体,以前横着 / 倒着的照片原样进模型,qwen4-max 直接看 54 次读对 33 次、错的全是笃定的错。PR ① 在 `agent_node` 组装提示词时先用主模型自己的「关思考」路由按 B-301 的问法问方向,横的只在发给模型的那一份里换成转正的图,并在那条消息末尾加一句平台说明。用户的原图、聊天记录、检查点都不动,转正的图只在内存里。设计见 `docs/superpowers/specs/2026-11-19-b322-pathA-vision-parity-design.md` §4.1。
@@ -2897,26 +2899,30 @@ PY
 
 **怎么进**:用测试环境 API key(服务账号)对健管师 `agent_health_manager`(qwen4-max、`supports_vision: true`)发带图的消息;看轨迹 / 状态要控制台登录(租户管理员)。要花模型费:每张新图多 1 次调用(横的多 4 次),qwen4-max 约 ¥0.016 一次;跑前按评测要算钱的规矩报价。真实横图用用户授权的仪表照片(仓库外),或 `tools/eval/b301_images.py` 写出来的合成图。
 
-- [ ] **127.1 横图转正**:发一张横着拍的血压计 / 血糖仪照片问读数。判据:回答读数正确;这一步的轨迹里有 `image_orientation` span(asked ≥ 1、rotated = 1)和 4 次 `图片方向判断` 调用、各落一行 `token_usage`;会话状态 `shown_image_angles` 里这张图是 90 / 180 / 270;对话页里用户消息的图仍是原图(横的)。**没修好时**:没有问方向的调用,读数错。
-- [ ] **127.2 正放的图不被转**:发一张正放拍的报告照片(JPEG;PNG 截图不判方向,见 127.5)。判据:只有 1 次 `图片方向判断` 调用;`shown_image_angles` 为 0;消息里没有平台说明。**没修好时**:正放的图被转、或多了「已转」那句。
-- [ ] **127.3 之后不再问**:接 127.1 在同一会话再问一个问题(不带图)。判据:这一轮没有 `图片方向判断` 调用;图仍按转正后的样子发给模型(回答仍对)。**没修好时**:每轮都重新问,或下一轮图又横回去。
-- [ ] **127.4 紧急开关**:测试环境控制面设 `EXPERT_WORK_MAIN_MODEL_IMAGE_ORIENTATION=0` 重启后重复 127.1。判据:没有问方向的调用,图原样发(与上线前一样);改回 / 去掉后恢复。**没修好时**:关了还在问或还在转。
-- [ ] **127.5 首 token 与内存**:看带横图那一步的首 token 时间(开关开 / 关对比),以及控制面 pod 的内存曲线。判据:没有因为转正触发路由的首 token 超时(没有切到备用模型);内存峰值记下来(pod 实测 2026-11-20:4032×3024 全分辨率 +94 MiB;8064×6048 按一半读 +93 MiB;8160×6120 按一半读 +96 MiB。20 MP JPEG 走小副本;只转 JPEG(第六轮,用户):60 MP JPEG 不判(`too_large`),PNG(各种模式,含截图)、WebP、GIF 一律不判、原样发(`format_unsupported`)—— 各发一张核对轨迹里是对应原因、没有问方向的调用、消息里没有平台说明。候选图 / 小副本的估算已乘 1.2(实测见设计修订记录 5.6)。B-322 自己的解码上限 110 MiB,解析子进程上限已从 2,400 降到 2,280 MiB:进控制面 pod 看解析子进程 `grep "Max address space" /proc/<pid>/limits` 为 `2390753280`(2280 MiB)。见设计 §4.1.5 与修订记录 5.5 / 5.6),若常驻有增量就改 `tools/deploy/test_parse_worker_memory_budget.py` 的主进程常数。**没修好时**:带横图的那一步首 token 超时切备用,或 pod OOM。
-- [ ] **127.6 解析子进程降到 2,280 MiB 后知识库还能描述多大的照片**(复审第五轮 L1):2,400 MiB 时定的「约 48 MP 的照片能描述、更大的跳过」在 2,280 MiB 下没量过。进测试环境控制面 pod,往测试知识库上传一份内嵌一张照片的 Word,照片依次用 24 / 36 / 48 MP 的 JPEG(合成图即可),看每次是「描述了」还是「跳过」、解析子进程有没有因地址空间上限失败(`grep "Max address space" /proc/<pid>/limits` 先确认是 `2390753280`)。判据:记下能描述的最大一张(MP),写回 `infra/k8s/base/configmap.yaml` 那段注释与设计 §4.1.5;比 48 MP 小就在设计 §10 记一条、告诉用户。**没修好时**:注释里写的数没人量过。
+- [x] **127.1 横图转正**:发一张横着拍的血压计 / 血糖仪照片问读数。判据:回答读数正确;这一步的轨迹里有 `image_orientation` span(asked ≥ 1、rotated = 1)和 4 次 `图片方向判断` 调用、各落一行 `token_usage`;会话状态 `shown_image_angles` 里这张图是 90 / 180 / 270;对话页里用户消息的图仍是原图(横的)。**没修好时**:没有问方向的调用,读数错。 **2026-11-21 测试 `0ec0181d2` 过**(agent_health_manager / qwen4-max):run `09bf7942`,4 次方向调用(各约 1245 入 / 2 出),90 度横图,`shown_image_angles` 为 90,读数 164 / 96 / 63 正确,原图 `image_ref` 不变。
+- [x] **127.2 正放的图不被转**:发一张正放拍的报告照片(JPEG;PNG 截图不判方向,见 127.5)。判据:只有 1 次 `图片方向判断` 调用;`shown_image_angles` 为 0;消息里没有平台说明。**没修好时**:正放的图被转、或多了「已转」那句。 **2026-11-21 测试 `0ec0181d2` 过**:run `e997b95e`,1 次方向调用,角度 0,图保持正放,读数正确。
+- [x] **127.3 之后不再问**:接 127.1 在同一会话再问一个问题(不带图)。判据:这一轮没有 `图片方向判断` 调用;图仍按转正后的样子发给模型(回答仍对)。**没修好时**:每轮都重新问,或下一轮图又横回去。 **2026-11-21 测试 `0ec0181d2` 过**:run `ec11ed7f`,没有方向调用,角度仍是 90,读数正确。
+- [x] **127.4 紧急开关**:测试环境控制面设 `EXPERT_WORK_MAIN_MODEL_IMAGE_ORIENTATION=0` 重启后重复 127.1。判据:没有问方向的调用,图原样发(与上线前一样);改回 / 去掉后恢复。**没修好时**:关了还在问或还在转。 **2026-11-21 测试 `0ec0181d2` 过**:run `f9f2d590`,`EXPERT_WORK_MAIN_MODEL_IMAGE_ORIENTATION=0`,没有方向调用,没写 `image_orientations` / `shown_image_angles`。模型这次恰好也读对了,所以「读数对」不是这一步的判据。开关已改回,集群与 overlay 一致。
+- [ ] **127.5 首 token 与内存**:看带横图那一步的首 token 时间(开关开 / 关对比),以及控制面 pod 的内存曲线。判据:没有因为转正触发路由的首 token 超时(没有切到备用模型);内存峰值记下来(pod 实测 2026-11-20:4032×3024 全分辨率 +94 MiB;8064×6048 按一半读 +93 MiB;8160×6120 按一半读 +96 MiB。20 MP JPEG 走小副本;只转 JPEG(第六轮,用户):60 MP JPEG 不判(`too_large`),PNG(各种模式,含截图)、WebP、GIF 一律不判、原样发(`format_unsupported`)—— 各发一张核对轨迹里是对应原因、没有问方向的调用、消息里没有平台说明。候选图 / 小副本的估算已乘 1.2(实测见设计修订记录 5.6)。B-322 自己的解码上限 110 MiB,解析子进程上限已从 2,400 降到 2,280 MiB:进控制面 pod 看解析子进程 `grep "Max address space" /proc/<pid>/limits` 为 `2390753280`(2280 MiB)。见设计 §4.1.5 与修订记录 5.5 / 5.6),若常驻有增量就改 `tools/deploy/test_parse_worker_memory_budget.py` 的主进程常数。**没修好时**:带横图的那一步首 token 超时切备用,或 pod OOM。 **2026-11-21 测试 `0ec0181d2` 格式部分过**:run `caaf1ed4`,PNG 得 `format_unsupported`、0 次方向调用;模型随后自己用 `exec_python` 读了这个文件(4 次大调用,约 ¥0.86)。首 token 对比与内存峰值**本轮没记**,未勾。
+- [x] **127.6 解析子进程降到 2,280 MiB 后知识库还能描述多大的照片**(复审第五轮 L1):2,400 MiB 时定的「约 48 MP 的照片能描述、更大的跳过」在 2,280 MiB 下没量过。进测试环境控制面 pod,往测试知识库上传一份内嵌一张照片的 Word,照片依次用 24 / 36 / 48 MP 的 JPEG(合成图即可),看每次是「描述了」还是「跳过」、解析子进程有没有因地址空间上限失败(`grep "Max address space" /proc/<pid>/limits` 先确认是 `2390753280`)。判据:记下能描述的最大一张(MP),写回 `infra/k8s/base/configmap.yaml` 那段注释与设计 §4.1.5;比 48 MP 小就在设计 §10 记一条、告诉用户。**没修好时**:注释里写的数没人量过。 **2026-11-21 测试 `0ec0181d2` 过(pod 内等效测量)**:控制台知识库上传要 OIDC 登录,改在 pod 内用同一份解析代码、同一上限(`2390753280` 字节)跑:24 / 36 / 48 / 54 / 59.8 MP 全部抽出并留待描述,没有 `MemoryError`;峰值 654 / 869 / 1067 / 1185 / 1275 MiB。实际封顶的是 `MAX_DECODE_PIXELS` = 60 MP,不是内存。已写回 `infra/k8s/base/configmap.yaml` 注释与设计 §4.1.5 / §10 第 17 条。真实控制台上传仍可补做,非必需。
+
+**11-21 观察(开放问题)**:agent_health_manager 上每一轮都多 1 次很小的调用(约 300 入 / 7 出,不带图),来源不明,待查。
 
 ## §128 一条大工具结果不再把对话卡死(B-328 PR A+B,没有开关)
 
 **背景**:11-20 测试环境一个智能体把压缩门槛配成 6 万(窗口 100 万),`read_document` 一次返回约 4.5 万 token 落在「最后 6 条永不总结」里,第 2、3 轮都以 `ContextOverflowError`(`60301` / `60379`)失败。修复后:压缩器压不到门槛以下就照发(只有超过主模型整个窗口才失败);能分段重读的大结果(`read_document`、有工作区副本的)在发给模型的那份里截到单条预算 R = 门槛 / 5(下限 4,000 token),说明里写怎么接着读;`read_document` 一次只返回 R 那么多正文、全文存进 `.tool_results/`、由 footer 给路径;`read_file` 每页也不超过 R。检查点、对话页不变。设计见 `docs/superpowers/specs/2026-11-20-b328-oversized-tool-result-stuck-design.md` §4.1 / §4.3 / §6.3。
 
-**怎么进**:用平台自己的测试智能体(**不碰深护的智能体和对话**),配成与事故相同的门槛:`context_compression.absolute_cap_tokens: 60000`、`tail_keep: 6`,`tool_result_prune` 与 `working_memory` 的 `absolute_cap_tokens: 40000`(R = 12,000)。用测试环境 API key(服务账号)跑;看轨迹、计费要控制台登录(租户管理员)。要花模型费,qwen4-max 约 ¥4~5,跑前按评测要算钱的规矩报价。上传一份约 5 万字的平台自造中文文档,另备一个约 1 万字的中文技能。
+**怎么进**:用平台自己的测试智能体(**不碰深护的智能体和对话**),配成与事故相同的门槛:测试智能体必须设 `persistent_workspace: true`,否则没有工作区、不会出现 footer(11-21 第一个临时智能体漏了这项,白跑一轮)。`context_compression.absolute_cap_tokens: 60000`、`tail_keep: 6`,`tool_result_prune` 与 `working_memory` 的 `absolute_cap_tokens: 40000`(R = 12,000)。用测试环境 API key(服务账号)跑;看轨迹、计费要控制台登录(租户管理员)。要花模型费,qwen4-max 约 ¥4~5,跑前按评测要算钱的规矩报价。上传一份约 5 万字的平台自造中文文档,另备一个约 1 万字的中文技能。
 
-- [ ] **128.1 读大文档那一轮成功**:第 2 轮让它读文档并做一步计算(`exec_python`)。判据:run `success`;`read_document` 结果正文约 1.3 万字以内、末尾有 `<tool-result-overflow>` footer 指向 `.tool_results/<run>/…-read_document.txt`,工作区里有这份全文;这一步之后没有 `RUN_FAILED`。**没修好时**:报 `context overflow: estimated … > threshold 60000`。
-- [ ] **128.2 下一轮普通追问**:第 3 轮问一句与文档有关的话。判据:`success`;这一轮厂商计费的输入 token < 4 万(修前约 6 万)。**没修好时**:同样的 `ContextOverflowError`。
-- [ ] **128.3 重新生成**:对第 3 轮点「重新生成」。判据:`success`,输入 token 与 128.2 同一量级。**没修好时**:每次重新生成都失败(视图不变,永久卡住)。
-- [ ] **128.4 翻页接着读**:追问文档后半部分的内容。判据:模型用 `read_file` 按 footer 给的路径带 offset / limit 翻页,每页不超过约 1.3 万字;回答对得上原文。**没修好时**:模型看不到后半部分、或一页就把上下文塞满。
-- [ ] **128.5 技能不截**:让它读那个中文技能。判据:发给模型的那份里 `skill_view` 结果没有 B-328 的截短说明(「only the first … are shown here to keep each result within this agent's per-result budget」)。注:超过 1.2 万字的工具结果在工具返回时本来就外置成「开头 + 结尾预览 + footer」(B-328 之前就如此,`skill_view` 不在免外置名单里),所以约 2 万字的技能看到的是那份预览,不算本节失败;要看「完整」就用 1.2 万字以内的技能。**没修好时**:技能正文后面跟着 B-328 的截短说明。
-- [ ] **128.6 默认配置不受影响**:任一默认配置(压缩门槛 20 万)的智能体读一份几千字的文档。判据:结果与上线前一样,没有截断说明、没有 footer。
-- [ ] **128.7 跑代码打印的大段输出也截到 R**:同一个测试智能体(门槛 6 万,R = 12,000)让它用 `exec_python` 打印约 2 万字中文。判据:工具返回时照旧落盘(footer 指向 `.tool_results/<run>/…-exec_python.txt`);发给模型的那份里这条结果约 1.3 万字以内、关围栏之后有「only the first … are shown … The full text is saved at … page through it with read_file」;再追问输出后半段,模型用 `read_file` 按那个路径带 offset / limit 翻页读到。同样适用于 bash、http / MCP / `web_search` 这类带工作区副本的结果,以及本步刚返回的那条。**没修好时**:这条结果原样约 1.8 万 token 留在提示词里。
+- [x] **128.1 读大文档那一轮成功**:第 2 轮让它读文档并做一步计算(`exec_python`)。判据:run `success`;`read_document` 结果正文不超过 R(R = 12,000 **token**;重复文本或中文每 token 对应的字数不固定,按 token 判,别按字数)、末尾有 `<tool-result-overflow>` footer 指向 `.tool_results/<run>/…-read_document.txt`,工作区里有这份全文;这一步之后没有 `RUN_FAILED`。**没修好时**:报 `context overflow: estimated … > threshold 60000`。 **2026-11-21 测试 `0ec0181d2` 过**(临时智能体 / qwen4-max):run `fad83611`,`read_document` 返回 15,190 / 51,151 字并带 footer,全文在 `.tool_results/`。
+- [x] **128.2 下一轮普通追问**:第 3 轮问一句与文档有关的话。判据:`success`;这一轮厂商计费的输入 token < 4 万(修前约 6 万)。**没修好时**:同样的 `ContextOverflowError`。 **2026-11-21 测试 `0ec0181d2` 过**:run `ac50fc24`,厂商输入 15,679。
+- [x] **128.3 重新生成**:对第 3 轮点「重新生成」。判据:`success`,输入 token 与 128.2 同一量级。**没修好时**:每次重新生成都失败(视图不变,永久卡住)。 **2026-11-21 测试 `0ec0181d2` 过**:run `d02fdc0d`,输入 15,679。
+- [x] **128.4 翻页接着读**:追问文档后半部分的内容。判据:模型用 `read_file` 按 footer 给的路径带 offset / limit 翻页,每页不超过 R(12,000 token);回答对得上原文。**没修好时**:模型看不到后半部分、或一页就把上下文塞满。 **2026-11-21 测试 `0ec0181d2` 过**:run `eabfe454`,`read_file` 带 offset / limit 翻页,回答对得上原文。
+- [ ] **128.5 技能不截**:让它读那个中文技能。判据:发给模型的那份里 `skill_view` 结果没有 B-328 的截短说明(「only the first … are shown here to keep each result within this agent's per-result budget」)。注:超过 1.2 万字的工具结果在工具返回时本来就外置成「开头 + 结尾预览 + footer」(B-328 之前就如此,`skill_view` 不在免外置名单里),所以约 2 万字的技能看到的是那份预览,不算本节失败;要看「完整」就用 1.2 万字以内的技能。**没修好时**:技能正文后面跟着 B-328 的截短说明。 **2026-11-21 测试 `0ec0181d2` 未跑**:手边没有 1.2 万字以内的技能。
+- [x] **128.6 默认配置不受影响**:任一默认配置(压缩门槛 20 万)的智能体读一份几千字的文档。判据:结果与上线前一样,没有截断说明、没有 footer。 **2026-11-21 测试 `0ec0181d2` 过**:run `d8c0b385`,3,046 字,没有 footer。
+- [x] **128.7 跑代码打印的大段输出也截到 R**:同一个测试智能体(门槛 6 万,R = 12,000)让它用 `exec_python` 打印一段**不到 12,000 字、但 token 估算超过 R** 的输出(打印约 2 万字会先撞到通用的「超过 1.2 万字外置」,不是本条要测的路径)。判据:工具返回时照旧落盘(footer 指向 `.tool_results/<run>/…-exec_python.txt`);发给模型的那份里这条结果不超过 R(12,000 token)、关围栏之后有「only the first … are shown … The full text is saved at … page through it with read_file」;再追问输出后半段,模型用 `read_file` 按那个路径带 offset / limit 翻页读到。同样适用于 bash、http / MCP / `web_search` 这类带工作区副本的结果,以及本步刚返回的那条。**没修好时**:这条结果原样约 1.8 万 token 留在提示词里。 **2026-11-21 测试 `0ec0181d2` 间接证据过**:run `d47b1d6a`(输出 11,774 字约 2 万 token,模型输入只增约 1.1 万,即已截到 R)与 run `22428b8a`(`read_file` 翻页)。
+
+**2026-11-21 测试 `0ec0181d2` 汇总**:临时智能体 / qwen4-max,合计约 ¥3.9(含第一次配错的那轮)。`/metrics` 的 `expert_work_llm_vendor_too_long_total` 无样本。**开放问题**:智能体 `acc128-bigp` 的 run 里有两次 qwen4-max 调用在 `token_usage` 记成 0 入 / 0 出,同样的调用别处数字正常;另有调查在跑,未结。
 
 **注意**:A②(单条预算截短)和 A③(发送前超窗口才狠缩 / 失败)与压缩开关无关 —— `context_compression.enabled: false` 的智能体也有,R 按它策略里的门槛数算。
 
@@ -2928,9 +2934,9 @@ PY
 
 **怎么进(只在测试环境)**:同 §121 —— release canary 租户里用存储层建临时智能体(主模型分别改 `doubao / doubao-seed-2-1-turbo-260628`、`doubao / doubao-seed-2-1-lite-260915`,不配备用),用 Secret `canary-credentials` 的 key 从 control-plane pod 内走对外平面发 run(key 走 stdin 首行),做完先标删除再彻底删除。价目表查询走只读连接。
 
-- [ ] **129.1 价目表 0196**:判据:`model_rate_card` 平台行(`tenant_id IS NULL`)turbo 为 3 000 000 / 15 000 000 / 0 / 600 000,lite 为 800 000 / 2 700 000 / 0 / 160 000;`doubao-seed-2-1-pro-260915` 仍是 6 000 000 / 30 000 000 / 0 / 1 200 000。**没修好时**:没有这两行,用量记成「未定价」、成本 0。
+- [x] **129.1 价目表 0196**:判据:`model_rate_card` 平台行(`tenant_id IS NULL`)turbo 为 3 000 000 / 15 000 000 / 0 / 600 000,lite 为 800 000 / 2 700 000 / 0 / 160 000;`doubao-seed-2-1-pro-260915` 仍是 6 000 000 / 30 000 000 / 0 / 1 200 000。**没修好时**:没有这两行,用量记成「未定价」、成本 0。 **2026-11-21 测试 `0ec0181d2` 过**:库里行已核(11-21):turbo 3000000 / 15000000 / 0 / 600000,lite 800000 / 2700000 / 0 / 160000。
 - [ ] **129.2 下拉里能选**(要控制台登录):智能体编辑页选 doubao → 模型下拉。判据:顺序 pro 260915、turbo、lite;选中后「能看图」可勾、思考开关默认开、输出上限输入框提示上限 262144,填 300000 保存时报「超过厂商上限 262144」。**没修好时**:下拉里没有它们,或保存时报模型不在目录里。
-- [ ] **129.3 平台上一轮真调 + 记上了钱**:两个临时智能体各发一轮「用一句话回答:1+1 等于几?」。判据:`end` 为 `success`;`token_usage` 有对应 `model` 的行;用 §121.3 那条只读 SQL(`provider` 改 `'doubao'`)算出的金额大于 0。**没修好时**:`priced=false`,或 run 失败(模型名厂商不认)。
+- [x] **129.3 平台上一轮真调 + 记上了钱**:两个临时智能体各发一轮「用一句话回答:1+1 等于几?」。判据:`end` 为 `success`;`token_usage` 有对应 `model` 的行;用 §121.3 那条只读 SQL(`provider` 改 `'doubao'`)算出的金额大于 0。**没修好时**:`priced=false`,或 run 失败(模型名厂商不认)。 **2026-11-21 测试 `0ec0181d2` 过**:turbo run `a50fc5c1`(6,769 入 / 36 出,¥0.0208,已定价);lite run `aa85470e`(6,857 入 / 117 出,¥0.0058)。
 - **花费**:两轮平台 run(约 1~2 万输入、1~3 千输出)turbo ≈ ¥0.1、lite ≈ ¥0.03,合计约 ¥0.15,止损 ¥1。
 
 ## §130 对话记住模板变量里的链接,之后的轮次也能交给 MCP 工具(B-330,没有开关)
@@ -2939,24 +2945,27 @@ PY
 
 **怎么进**:用平台自己的测试智能体,不碰任何客户对话:声明 `attachment_urls`(可选)与 `note_url`(可选,untrusted),接一个只把收到的参数原样记下的回显 MCP 服务,工具名与 schema 照 B-314 的 `form_save_customer_values`(`fields[]` 对象数组)。测试环境没有回显服务就在测试命名空间起一个最小的,用完删。先跑不配 `attachments` 绑定的一遍,再跑配了绑定的一遍看重复。**要花模型费**:7 个用例约 20 轮、约 60 次模型调用,deepseek-flash 级别粗估 ¥1~3;开跑前单独报价、批了再跑。看轨迹要控制台登录(租户管理员)。
 
-- [ ] **130.1 事故形状两轮**:第 1 轮 `attachment_urls` = 含 1 条带签名参数链接的 JSON 数组字符串,并上传一个 PDF;第 2 轮不传变量,用户说「是我的,存进去」。判据:回显服务收到的 `fields[].value` 与第 1 轮传的链接逐字相同(签名参数也一样)。**没修好时**:收到 `expert_work://link/…` 这串字,或附件栏为空。
-- [ ] **130.2 同一轮直接写**:带链接的那一轮就让智能体写表单。判据:回显服务收到原链接。
-- [ ] **130.3 更早的链接**:第 3 轮再写第 1 轮那条。判据:编号与第 1 轮相同,回显服务收到原链接。
-- [ ] **130.4 审批**:把表单工具设为要审批,走一次。判据:审批卡和审批单 `proposed_args` 里是编号、没有链接;批准后回显服务收到原链接,没有「完整性否决」。
-- [ ] **130.5 委派**:让智能体委派一个子智能体去写表单。判据:子代写父对话的编号,回显服务收到原链接。
-- [ ] **130.6 别的对话的编号**:在用户消息里写一个别的对话的编号让它存。判据:工具结果是「不是本对话收到的链接编号」,回显服务没收到这次调用,模型改口。
-- [ ] **130.7 反向回归**:有链接登记之后,隔几轮报一次血压(「今天血压 125/80」),连续 3 次无关上报。判据:回显服务收到的 `fields[]` 里**没有**任何链接。
-- [ ] **130.8 看不到原链接**:在调试台原始请求、运行轨迹(Langfuse 工具调用的输入 / 输出)、orchestrator 日志里搜第 1 轮那条链接的域名与签名串。判据:都搜不到;轨迹里工具输入是编号。计数 `expert_work_link_use_total{event="rewritten"}` 增加,`expert_work_link_refused_total{reason="foreign"}` 只在 130.6 增加。
-- [ ] **130.9 跑完回归 B-314 绑定**:主动重跑 B-314 绑定相关的现有用例。判据:与发布前一致。
+- [x] **130.1 事故形状两轮**:第 1 轮 `attachment_urls` = 含 1 条带签名参数链接的 JSON 数组字符串,并上传一个 PDF;第 2 轮不传变量,用户说「是我的,存进去」。判据:回显服务收到的 `fields[].value` 与第 1 轮传的链接逐字相同(签名参数也一样)。**没修好时**:收到 `expert_work://link/…` 这串字,或附件栏为空。 **2026-11-21 测试 `0ec0181d2` 过**(临时 deepseek-flash 智能体 + 临时回显 MCP,用完已撤):run `dcc7f631`,回显收到原链接逐字相同,含 `Signature=y%2Bz`。
+- [x] **130.2 同一轮直接写**:带链接的那一轮就让智能体写表单。判据:回显服务收到原链接。 **2026-11-21 测试 `0ec0181d2` 过**:run `ee45c1e8`。
+- [x] **130.3 更早的链接**:第 3 轮再写第 1 轮那条。判据:编号与第 1 轮相同,回显服务收到原链接。 **2026-11-21 测试 `0ec0181d2` 过**:run `d9f2233a`;另核:后面又登记了第二条链接,模型仍正确选了 -1。
+- [x] **130.4 审批**:把表单工具设为要审批,走一次。判据:审批卡和审批单 `proposed_args` 里是编号、没有链接;批准后回显服务收到原链接,没有「完整性否决」。 **2026-11-21 测试 `0ec0181d2` 过**:挂起 `8b9efe17` → 续跑 `48c389f8`,`proposed_args` 里只有编号,没有完整性否决。
+- [x] **130.5 委派**:让智能体委派一个子智能体去写表单。判据:子代写父对话的编号,回显服务收到原链接。 **2026-11-21 测试 `0ec0181d2` 用静态子智能体过**:run `0e509920`。动态 `spawn_worker` 对 MCP 没有写权限(B-122:worker 只给只读 MCP 工具),模型也没去委派,这条路径要另设计用例。
+- [x] **130.6 别的对话的编号**:在用户消息里写一个别的对话的编号让它存。判据:工具结果是「不是本对话收到的链接编号」,回显服务没收到这次调用,模型改口。 **2026-11-21 测试 `0ec0181d2` 过**:run `90d8350a`,别的对话的编号被拦。只在用户坚持时才触发,模型通常自己改口。
+- [x] **130.7 反向回归**:有链接登记之后,隔几轮报一次血压(「今天血压 125/80」),连续 3 次无关上报。判据:回显服务收到的 `fields[]` 里**没有**任何链接。 **2026-11-21 测试 `0ec0181d2` 过**:连报 3 次血压,`fields[]` 里没有链接。
+- [x] **130.8 看不到原链接**:在调试台原始请求、运行轨迹(Langfuse 工具调用的输入 / 输出)、orchestrator 日志里搜第 1 轮那条链接的域名与签名串。判据:都搜不到;轨迹里工具输入是编号。计数 `expert_work_link_use_total{event="rewritten"}` 增加,`expert_work_link_refused_total{reason="foreign"}` 只在 130.6 增加。 **2026-11-21 测试 `0ec0181d2` 过**:21 个 run 的 Langfuse 轨迹与 40 分钟控制面日志里没有伪链接;唯一命中是早期一个 run 里模型读了沙箱 `inputs.json`,属设计 §4.7 的已知通道。计数:registered 9、rewritten 7、result_masked 7、id_in_reply 5、verbatim 1(未解释,待查)、foreign 1。
+- [ ] **130.9 跑完回归 B-314 绑定**:主动重跑 B-314 绑定相关的现有用例。判据:与发布前一致。 **2026-11-21 测试 `0ec0181d2` 跳过**:要深护的智能体,不碰。
+
+**2026-11-21 测试 `0ec0181d2` 绑定对照**:配 `attachments ← attachment_urls` 绑定时,同一轮把链接写了两遍(附件栏 + 字段);两轮用例正常。这支持设计 §8 第 14 条(去掉该绑定),待用户与深护定。总花费约 ¥0.17。
 
 ## §131 对外用量 `input_tokens` 对 Claude 也含缓存(B-331,没有开关)
 
 **背景**:文档承诺 `usage_by_model[].input_tokens` 已包含 `cache_read_tokens` 与 `cache_creation_tokens`,但 Anthropic 库里存的是厂商原值(不含缓存),对接方照文档减会少算甚至为负。修复:对外那一个装配口(`end` 帧四个分支 + `GET /v1/agents/{code}/runs/{run_id}/usage`)读时给 anthropic 的桶补上缓存;库里的行不动,所以历史 run 取回也是新口径;其它厂商一字不变;内部计费(月度滚动)仍按原值,金额不变。对外平面的 worker `end` 帧(`usage_by_model` 与顶层 `usage`)在出口处同样补缓存(显式 `external_plane` 开关,控制台流不经过,落库的帧不动)。**不覆盖**:`updates` 里逐步 `usage_metadata`(没有厂商标记)仍是厂商原值。
 
-- [ ] **131.1 历史 run 读时补**:取测试环境一条已有的 Claude 对话 run(`token_usage` 里该 trace `provider='anthropic'` 且缓存列非 0),调 `GET …/runs/{run_id}/usage`。判据:该桶 `input_tokens` = 库里 `input_tokens + cache_read_tokens + cache_creation_tokens`(只读 SQL 对照),`cache_*` 两项与库里相同。
-- [ ] **131.2 非 Claude 不变**:同样取一条 glm / deepseek / qwen / doubao 的 run。判据:`input_tokens` 与库里逐字相同(对照发布前记下的值)。
-- [ ] **131.3 月度计费不变**:发布前后各跑一次同一月的 billing-rollup(或对照已有 `usage_rollup` 行)。判据:anthropic 的 `billed_cost_micros` 与发布前相同。
-- [ ] **131.4(真跑,需先报价再跑)一轮小 Claude run 对账**:用测试智能体(主模型 anthropic,开提示词缓存)连发两轮简短问题,让第二轮命中缓存。判据:`end` 帧 `usage_by_model` 的 anthropic 桶 `input_tokens` = 厂商控制台 / 响应里的 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`;`input_tokens − cache_read_tokens − cache_creation_tokens` ≥ 0 且等于厂商原 `input_tokens`;同一 run 的 `GET …/usage` 与 `end` 帧逐字相同。**没修好时**:`input_tokens` 等于厂商原值(缓存列非 0 时小于两者之和)。
-- [ ] **131.5 worker 帧(对外 / 控制台 / 回放)**:用 131.4 的测试智能体,让主智能体委派一个 Claude 子任务(`spawn_worker`),流式跑完。判据:对外流里 worker `end` 帧 anthropic 桶 `input_tokens` = 库里原值 + `cache_read` + `cache_creation`,帧顶层 `usage.input_tokens` = 各桶之和;同一个 run 在控制台流 / 对话页看到的同一个 worker 帧仍是原值;对外 `GET …/runs/{run_id}/events` 回放与对外实时流一致。**没修好时**:对外 worker 帧与库里原值相同(缓存列非 0 时偏小),或控制台那帧被补了(控制台计价会重复算缓存)。
-- [ ] **131.6 历史 NULL 厂商的 Claude 行**:只读 SQL 数数(只打印数字):`SELECT count(*) FROM token_usage WHERE provider IS NULL AND model LIKE 'claude-%' AND (cache_read_tokens > 0 OR cache_creation_tokens > 0)`。判据:数是 0 就写「不适用」;非 0 则取一条这样的 run 调 `GET …/usage`,桶 `provider` 仍是 `null`、`input_tokens` 已含缓存(按模型名认出 Claude)。
+- [ ] **131.1 历史 run 读时补**:取测试环境一条已有的 Claude 对话 run(`token_usage` 里该 trace `provider='anthropic'` 且缓存列非 0),调 `GET …/runs/{run_id}/usage`。判据:该桶 `input_tokens` = 库里 `input_tokens + cache_read_tokens + cache_creation_tokens`(只读 SQL 对照),`cache_*` 两项与库里相同。 **2026-11-21 测试 `0ec0181d2` 未直接做**:测试环境够得着的历史对外 anthropic run 没有(都是控制台用户),由 131.4 覆盖。
+- [x] **131.2 非 Claude 不变**:同样取一条 glm / deepseek / qwen / doubao 的 run。判据:`input_tokens` 与库里逐字相同(对照发布前记下的值)。 **2026-11-21 测试 `0ec0181d2` 过**:glm / deepseek / qwen / doubao / kimi 共 20 个 run,逐字相同。
+- [ ] **131.3 月度计费不变**:发布前后各跑一次同一月的 billing-rollup(或对照已有 `usage_rollup` 行)。判据:anthropic 的 `billed_cost_micros` 与发布前相同。 **2026-11-21 测试 `0ec0181d2` 无法直接比**:`tenant_billing_ledger` 里 anthropic 行为 0。间接确认:月度滚动读原值,库里存的原值没变。
+- [x] **131.4(真跑,需先报价再跑)一轮小 Claude run 对账**:用测试智能体(主模型 anthropic,开提示词缓存)连发两轮简短问题,让第二轮命中缓存。判据:`end` 帧 `usage_by_model` 的 anthropic 桶 `input_tokens` = 厂商控制台 / 响应里的 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`;`input_tokens − cache_read_tokens − cache_creation_tokens` ≥ 0 且等于厂商原 `input_tokens`;同一 run 的 `GET …/usage` 与 `end` 帧逐字相同。**没修好时**:`input_tokens` 等于厂商原值(缓存列非 0 时小于两者之和)。 **2026-11-21 测试 `0ec0181d2` 过**(临时 claude-haiku-5-5 智能体,约 ¥0.04):run `7e62bde1` 输入 22809 = 4 + 0 + 22805;run `a9b0e630` 输入 22827 = 4 + 22805 + 18,缓存确实命中。`GET /usage` 与 `end` 帧一致。
+- [x] **131.5 worker 帧(对外 / 控制台 / 回放)**:用 131.4 的测试智能体,让主智能体委派一个 Claude 子任务(`spawn_worker`),流式跑完。判据:对外流里 worker `end` 帧 anthropic 桶 `input_tokens` = 库里原值 + `cache_read` + `cache_creation`,帧顶层 `usage.input_tokens` = 各桶之和;同一个 run 在控制台流 / 对话页看到的同一个 worker 帧仍是原值;对外 `GET …/runs/{run_id}/events` 回放与对外实时流一致。**没修好时**:对外 worker 帧与库里原值相同(缓存列非 0 时偏小),或控制台那帧被补了(控制台计价会重复算缓存)。 **2026-11-21 测试 `0ec0181d2` 过**:run `fdc873db`,对外 worker 帧 8947 = 4 + 8841 + 102(顶层 `usage` 同口径);落库的帧是原值(4);回放与实时一致。控制台流没实时跑(要登录),改核了落库的帧。
+- [x] **131.6 历史 NULL 厂商的 Claude 行**:只读 SQL 数数(只打印数字):`SELECT count(*) FROM token_usage WHERE provider IS NULL AND model LIKE 'claude-%' AND (cache_read_tokens > 0 OR cache_creation_tokens > 0)`。判据:数是 0 就写「不适用」;非 0 则取一条这样的 run 调 `GET …/usage`,桶 `provider` 仍是 `null`、`input_tokens` 已含缓存(按模型名认出 Claude)。 **2026-11-21 测试 `0ec0181d2` 不适用**:0 行。
+- **2026-11-21 测试 `0ec0181d2` 备注**:worker 的 `total_tokens` 也被一并补(设计如此)。worker run `49637cf6` 用量全 0,多半是自定义 base_url 的上游回了缓存响应,已记在 ROADMAP B-325 行。
 - **花费**:131.4 两轮 Claude 小对话,预计不到 ¥1;**开跑前先给用户报价并等确认**,131.1~131.3 不花钱。
