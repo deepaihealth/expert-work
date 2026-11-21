@@ -92,7 +92,7 @@ _CHANGED_BY_B332 = {
     "_flatten_resized": "52f23caf31e900c0",
     "_flatten_region": "ca73c80ed80f8174",
     "_upright_rect": "396c3a89034f7b10",
-    "_undrafted_peak_bytes": "17c90a7b2d53f3c9",
+    "_undrafted_peak_bytes": "cad9ca5557771e63",
 }
 
 

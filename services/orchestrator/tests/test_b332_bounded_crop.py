@@ -795,3 +795,17 @@ async def test_explicit_region_on_an_uncroppable_image_raises_the_refusal(tmp_pa
         await up.tool.call(
             {"image_ref": up.ref, "question": "?", "region": [0, 0, 500, 500]}, ctx=up.ctx
         )
+
+
+@pytest.mark.anyio
+async def test_write_crops_passes_its_purpose_to_the_refusal_count(tmp_path: Path) -> None:
+    """问方向的候选副本经 ``_write_crops``:拒绝按 ``purpose="orientation"`` 计,不混进局部。"""
+    data = _fake_png(8000, 6000)
+    up, _vl = _large_upload(tmp_path, data)
+    out_dir = up.tool._crop_dir(data, ctx=up.ctx)
+    before = _refused("orientation"), _refused("region")
+    with pytest.raises(ExpectedRefusalError):
+        await up.tool._write_crops(
+            data, out_dir, [_WHOLE], degrees=0, ctx=up.ctx, purpose="orientation"
+        )
+    assert (_refused("orientation"), _refused("region")) == (before[0] + 1, before[1])

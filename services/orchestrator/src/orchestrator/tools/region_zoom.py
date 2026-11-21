@@ -621,8 +621,6 @@ WEBP_DECODE_BYTES_PER_PIXEL: Final = 13.0
 UNDRAFTED_COEFFICIENT_BYTES: Final = 72
 #: 分条转 RGB(带透明)时每条里每个像素同时存在的字节数(审查量到约 4 份 RGBA 拷贝)。
 UNDRAFTED_STRIP_BYTES_PER_PIXEL: Final = 20
-#: 不用缩的框,转 RGB / 转方向时同时存在的整块拷贝份数(RGB 字节算:转 RGB 一份、转方向一份)。
-UNDRAFTED_BOX_COPIES: Final = 2
 
 
 def _undrafted_peak_bytes(
@@ -664,9 +662,8 @@ def _undrafted_peak_bytes(
         # 分条转 RGB 的每一条:一条至少一整行(宽 > 条的像素数时一行就是一条)。
         strip = max(width, _FLATTEN_STRIP_PIXELS) * UNDRAFTED_STRIP_BYTES_PER_PIXEL
         phases = [phase + strip for phase in phases]
-    # 不用缩的框(``bands`` 最多 ``max_pixels`` 像素):整张在,再加框那一块转 RGB / 转方向的几份。
-    box_pixels = min(pixels, max_pixels)
-    phases.append(decoded + UNDRAFTED_BOX_COPIES * box_pixels * 4)
+    # 不用缩的框(``bands`` 最多 ``max_pixels`` 像素):框那一块分条转 RGB、再转方向,至多两份框大小的
+    # RGB,小于上面「整张要缩」那一档的中间图,不单独估。
     # Pillow 缩小时的滤波系数表:横向约 宽 x 48 字节、纵向约 高 x 48 字节(实测 72 盖得住),与输出
     # 尺寸无关 —— 又细又长的图(10,000,000 x 1)主要贵在这里。
     coefficients = UNDRAFTED_COEFFICIENT_BYTES * (width + height)
