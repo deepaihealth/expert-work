@@ -2006,6 +2006,7 @@ def build_agents_router() -> APIRouter:
                 # 系统提示词全文)是控制台调试专用帧,第三方 API key 不可见。
                 hide_events=EXTERNAL_HIDDEN_EVENTS,
                 strip_state_keys=EXTERNAL_STRIPPED_STATE_KEYS,
+                external_plane=True,
                 stream_format=payload.stream_format,
                 # 断线在对外场景是意外而不是「我不要了」,取消会把一次网络
                 # 抖动放大成整轮工作作废;控制台那边关页面才是明确意图,所以

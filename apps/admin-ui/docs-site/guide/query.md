@@ -1362,7 +1362,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/usage?user_id=u
 ### 其它规则
 
 - **已经包含子任务**。子任务与主 Agent 共用同一次 run 的计量，各项相加就是整次 run 的总量。不要再去累加 `worker` 事件里的 `usage`，那会重复计算。
-- **`input_tokens` 已经包含 `cache_read_tokens` 与 `cache_creation_tokens`**，不是与它们并列的第三项。未命中缓存的输入量是 `input_tokens - cache_read_tokens - cache_creation_tokens`。直接用 `input_tokens` 乘普通输入单价，会把已经享受缓存折扣的部分按全价计算一遍。
+- **`input_tokens` 已经包含 `cache_read_tokens` 与 `cache_creation_tokens`**，不是与它们并列的第三项，对所有厂商都成立，包括 Anthropic（此前 Anthropic 的这一项不含缓存，历史 run 取回时也按新口径，见 [更新记录](./changelog)）。未命中缓存的输入量是 `input_tokens - cache_read_tokens - cache_creation_tokens`。直接用 `input_tokens` 乘普通输入单价，会把已经享受缓存折扣的部分按全价计算一遍。
 - **run 没有结束也可以查**，返回的是到目前为止的量。`run_status` 还不是最终状态时，这个数还会继续增长，不要据此落账。
 - **`usage_by_model` 缺席不等于零**。缺席表示没有记录：平台升级前的历史 run、还没开始执行的 run、或者平台取数失败。确实没有消耗时返回的是空数组。
 - **各项全为 `0` 的元素表示这次调用由平台的回答缓存直接给出**，没有调用模型，也就没有消耗。温度很低的 Agent 在短时间内收到完全相同的对话时会出现这种情况；[重新生成](./chat#_2-10-重新生成与编辑重发)不走缓存，一定会重新调用模型。

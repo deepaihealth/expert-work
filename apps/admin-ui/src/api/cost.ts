@@ -49,8 +49,9 @@ interface Tokens {
 /** Providers whose ``input_tokens`` EXCLUDE the prompt-cache counters (B-279).
  *  Anthropic reports cache reads / writes beside ``input_tokens``; every other
  *  (OpenAI-compatible) adapter reports ``prompt_tokens``, which already
- *  contains them. Same set as billing-rollup-job ``_INPUT_EXCLUDES_CACHE_PROVIDERS``
- *  (B-185) and runtime ``token_usage._prompt_tokens`` (B-142). */
+ *  contains them. Same set as persistence ``token_usage_store``
+ *  ``INPUT_EXCLUDES_CACHE_PROVIDERS`` (billing-rollup-job B-185, runtime
+ *  ``token_usage._prompt_tokens`` B-142). */
 const INPUT_EXCLUDES_CACHE_PROVIDERS: ReadonlySet<string> = new Set(["anthropic"]);
 
 /** Whether ``provider``'s input count leaves the cache reads / writes out

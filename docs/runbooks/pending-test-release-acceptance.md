@@ -2948,3 +2948,15 @@ PY
 - [ ] **130.7 反向回归**:有链接登记之后,隔几轮报一次血压(「今天血压 125/80」),连续 3 次无关上报。判据:回显服务收到的 `fields[]` 里**没有**任何链接。
 - [ ] **130.8 看不到原链接**:在调试台原始请求、运行轨迹(Langfuse 工具调用的输入 / 输出)、orchestrator 日志里搜第 1 轮那条链接的域名与签名串。判据:都搜不到;轨迹里工具输入是编号。计数 `expert_work_link_use_total{event="rewritten"}` 增加,`expert_work_link_refused_total{reason="foreign"}` 只在 130.6 增加。
 - [ ] **130.9 跑完回归 B-314 绑定**:主动重跑 B-314 绑定相关的现有用例。判据:与发布前一致。
+
+## §131 对外用量 `input_tokens` 对 Claude 也含缓存(B-331,没有开关)
+
+**背景**:文档承诺 `usage_by_model[].input_tokens` 已包含 `cache_read_tokens` 与 `cache_creation_tokens`,但 Anthropic 库里存的是厂商原值(不含缓存),对接方照文档减会少算甚至为负。修复:对外那一个装配口(`end` 帧四个分支 + `GET /v1/agents/{code}/runs/{run_id}/usage`)读时给 anthropic 的桶补上缓存;库里的行不动,所以历史 run 取回也是新口径;其它厂商一字不变;内部计费(月度滚动)仍按原值,金额不变。对外平面的 worker `end` 帧(`usage_by_model` 与顶层 `usage`)在出口处同样补缓存(显式 `external_plane` 开关,控制台流不经过,落库的帧不动)。**不覆盖**:`updates` 里逐步 `usage_metadata`(没有厂商标记)仍是厂商原值。
+
+- [ ] **131.1 历史 run 读时补**:取测试环境一条已有的 Claude 对话 run(`token_usage` 里该 trace `provider='anthropic'` 且缓存列非 0),调 `GET …/runs/{run_id}/usage`。判据:该桶 `input_tokens` = 库里 `input_tokens + cache_read_tokens + cache_creation_tokens`(只读 SQL 对照),`cache_*` 两项与库里相同。
+- [ ] **131.2 非 Claude 不变**:同样取一条 glm / deepseek / qwen / doubao 的 run。判据:`input_tokens` 与库里逐字相同(对照发布前记下的值)。
+- [ ] **131.3 月度计费不变**:发布前后各跑一次同一月的 billing-rollup(或对照已有 `usage_rollup` 行)。判据:anthropic 的 `billed_cost_micros` 与发布前相同。
+- [ ] **131.4(真跑,需先报价再跑)一轮小 Claude run 对账**:用测试智能体(主模型 anthropic,开提示词缓存)连发两轮简短问题,让第二轮命中缓存。判据:`end` 帧 `usage_by_model` 的 anthropic 桶 `input_tokens` = 厂商控制台 / 响应里的 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`;`input_tokens − cache_read_tokens − cache_creation_tokens` ≥ 0 且等于厂商原 `input_tokens`;同一 run 的 `GET …/usage` 与 `end` 帧逐字相同。**没修好时**:`input_tokens` 等于厂商原值(缓存列非 0 时小于两者之和)。
+- [ ] **131.5 worker 帧(对外 / 控制台 / 回放)**:用 131.4 的测试智能体,让主智能体委派一个 Claude 子任务(`spawn_worker`),流式跑完。判据:对外流里 worker `end` 帧 anthropic 桶 `input_tokens` = 库里原值 + `cache_read` + `cache_creation`,帧顶层 `usage.input_tokens` = 各桶之和;同一个 run 在控制台流 / 对话页看到的同一个 worker 帧仍是原值;对外 `GET …/runs/{run_id}/events` 回放与对外实时流一致。**没修好时**:对外 worker 帧与库里原值相同(缓存列非 0 时偏小),或控制台那帧被补了(控制台计价会重复算缓存)。
+- [ ] **131.6 历史 NULL 厂商的 Claude 行**:只读 SQL 数数(只打印数字):`SELECT count(*) FROM token_usage WHERE provider IS NULL AND model LIKE 'claude-%' AND (cache_read_tokens > 0 OR cache_creation_tokens > 0)`。判据:数是 0 就写「不适用」;非 0 则取一条这样的 run 调 `GET …/usage`,桶 `provider` 仍是 `null`、`input_tokens` 已含缓存(按模型名认出 Claude)。
+- **花费**:131.4 两轮 Claude 小对话,预计不到 ¥1;**开跑前先给用户报价并等确认**,131.1~131.3 不花钱。

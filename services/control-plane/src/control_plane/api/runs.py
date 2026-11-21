@@ -1278,6 +1278,7 @@ async def spawn_run(
     envelope: bool = False,
     hide_events: frozenset[str] = frozenset(),
     strip_state_keys: frozenset[str] = frozenset(),
+    external_plane: bool = False,
     stream_format: str = STREAM_FORMAT_LEGACY,
     on_disconnect: DisconnectMode = DisconnectMode.CANCEL,
     supersede: SupersedeRequest | None = None,
@@ -1640,6 +1641,7 @@ async def spawn_run(
             last_event_id=request.headers.get("Last-Event-ID"),
             hide_events=hide_events,
             strip_state_keys=strip_state_keys,
+            external_plane=external_plane,
             stream_format=stream_format,
             # B-52 —— end 帧带本 run 的用量;装配与口径在 ``_run_usage``。
             load_usage=make_usage_loader(

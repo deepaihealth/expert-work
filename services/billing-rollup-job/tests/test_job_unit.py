@@ -570,3 +570,11 @@ async def test_anthropic_shape_input_excludes_cache_so_nothing_is_subtracted(
     rows = await ledger.list_for_tenant(tenant_id=tenant, month=MONTH)
     # 2,062 * 3 + 10,240 * 0.3 + 1,000 * 3.75 = 6,186 + 3,072 + 3,750 = 13,008
     assert rows[0].base_cost_micros == 13_008
+
+
+def test_b331_billing_still_bills_anthropic_raw_input() -> None:
+    """B-331 只在对外读时补缓存;计费入口仍把 anthropic 的库内 input 当作不含缓存。"""
+    from billing_rollup_job.job import _uncached_input_tokens
+
+    assert _uncached_input_tokens("anthropic", 100, 50, 700) == 100
+    assert _uncached_input_tokens("glm", 1000, 0, 800) == 200

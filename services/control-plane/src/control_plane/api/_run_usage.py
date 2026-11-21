@@ -23,7 +23,11 @@ from contextlib import AbstractAsyncContextManager
 from typing import Any
 from uuid import UUID
 
-from expert_work.persistence.token_usage_store import ModelTokenTotals, TokenUsageStore
+from expert_work.persistence.token_usage_store import (
+    ModelTokenTotals,
+    TokenUsageStore,
+    contract_input_tokens,
+)
 from expert_work.runtime.runs import RunStore
 
 logger = logging.getLogger(__name__)
@@ -37,9 +41,11 @@ def usage_buckets_to_wire(buckets: Sequence[ModelTokenTotals]) -> list[dict[str,
     """把聚合桶转成对外形状。
 
     四档 token **恒全给** —— 计价口径是调用方的事,我方只负责计量完整准确。
-    (一条告知义务:``input_tokens`` 已经**包含** ``cache_read_tokens``,这是
-    LangChain ``usage_metadata`` 的约定 —— ``input_tokens`` 是所有输入类型之和,
-    ``input_token_details`` 是它的细分。)
+    ``input_tokens`` **包含** ``cache_read_tokens`` 与 ``cache_creation_tokens``
+    (LangChain ``usage_metadata`` 的约定:所有输入类型之和,缓存是它的细分),
+    对所有厂商成立。库里存的是厂商原值 —— OpenAI 兼容厂商本来就含缓存;Anthropic
+    的原值**不含**,所以这里读时补上(B-331,``contract_input_tokens``;库里的行不动,
+    新老 run 同一口径)。内部计费走另一条路,仍按原值。
 
     ``llm_calls`` **不对外**:那是我方内部的 LLM 调用次数,调用方不需要。
     """
@@ -47,7 +53,13 @@ def usage_buckets_to_wire(buckets: Sequence[ModelTokenTotals]) -> list[dict[str,
         {
             "provider": b.provider,
             "model": b.model,
-            "input_tokens": b.input_tokens,
+            "input_tokens": contract_input_tokens(
+                b.provider,
+                b.input_tokens,
+                b.cache_read_tokens,
+                b.cache_creation_tokens,
+                model=b.model,
+            ),
             "output_tokens": b.output_tokens,
             "cache_read_tokens": b.cache_read_tokens,
             "cache_creation_tokens": b.cache_creation_tokens,

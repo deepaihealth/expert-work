@@ -334,6 +334,7 @@ def build_external_approvals_router() -> APIRouter:
                 # 同样是第三方 API key 直接消费,system_prompt 不可见。
                 hide_events=EXTERNAL_HIDDEN_EVENTS,
                 strip_state_keys=EXTERNAL_STRIPPED_STATE_KEYS,
+                external_plane=True,
                 stream_format=payload.stream_format,
                 load_usage=make_usage_loader(
                     usage=request.app.state.token_usage_store,

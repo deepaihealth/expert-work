@@ -236,6 +236,7 @@ async def build_event_producer(
     scope: Callable[[], AbstractAsyncContextManager[None]] | None,
     hide_events: frozenset[str] = frozenset(),
     strip_state_keys: frozenset[str] = frozenset(),
+    external_plane: bool = False,
     stream_format: str = STREAM_FORMAT_LEGACY,
     artifact_view: ArtifactView | None = None,
 ) -> EventStreamPlan:
@@ -326,7 +327,9 @@ async def build_event_producer(
         一帧时完全同款,调用方的游标照旧按真实记录推进。"""
         if event_name in hide_events:
             return []
-        data = strip_frame_state_keys(event_name, data, strip_state_keys)
+        data = strip_frame_state_keys(
+            event_name, data, strip_state_keys, external_plane=external_plane
+        )
         if converter is None:
             return [format_sse(event_name, data, event_id=event_id)]
         frames = converter.convert(event_name, data, event_id=event_id)

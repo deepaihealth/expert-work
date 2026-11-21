@@ -776,7 +776,9 @@ class _WorkerUsageLedger:
     记」),所以 end 帧与这个 worker 的 ``token_usage`` 行对得上。只排除
     ``NON_BILLABLE_USAGE_KINDS``(平台开销:安全评审 / 重排序),其余 kind 都收。对话构建
     里剩下的全是 ``conversation``,于是与 run 级对外 ``usage_by_model``(只取
-    ``conversation``)一致;非对话构建(如 ``skill_evolution`` 回放)的帧收的是该构建的
+    ``conversation``)的**范围**一致;数值口径不同:这里是厂商原值,对外那份在读时给 anthropic
+    补缓存(B-331),对外 SSE 的 worker 帧也在出口处补(``sse.contract_worker_usage``);
+    非对话构建(如 ``skill_evolution`` 回放)的帧收的是该构建的
     kind,与 run 级对外视图不可比 —— 那类回放没有帧消费者。缓存命中的全 0 行没有
     ``usage_metadata``,也不收(与按消息求和时一样)。
     """

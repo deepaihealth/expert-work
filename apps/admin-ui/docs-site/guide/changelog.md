@@ -22,6 +22,15 @@
 
 ## 12.2 变更记录
 
+### Claude 模型的 `input_tokens` 改为包含缓存
+
+| 项目 | 内容 |
+|---|---|
+| 日期 | 待发布 |
+| 摘要 | 文档一直写明 `input_tokens` 已经包含 `cache_read_tokens` 与 `cache_creation_tokens`，但 Claude（`provider` 为 `anthropic`）的这一项此前不含缓存，与文档不符。发布后 Claude 与其它厂商一致：`input_tokens` 含缓存。涉及 `end` 事件与 [run 用量接口](./query#_5-9-run-用量) 的 `usage_by_model`，以及 `worker` 结束事件里的 `usage` / `usage_by_model` |
+| 影响范围 | 只影响 `provider` 为 `anthropic` 的项（`provider` 为 `null` 的历史记录按模型名认出 Claude 时同样变化）；其它厂商的数值不变。平台升级前的历史 run 取回时也按新口径，所以同一个 run 发布前后读到的 `input_tokens` 会不同。`cache_read_tokens`、`cache_creation_tokens`、`output_tokens` 不变。`updates` 事件里逐步的 `usage_metadata` 不在这次变化内，对 Claude 仍是厂商原值 |
+| 调用方的改动 | 如果你为 Claude 自己把缓存加回了 `input_tokens`，发布后请去掉这一步，否则会重复计算；按文档公式 `input_tokens - cache_read_tokens - cache_creation_tokens` 算未命中缓存输入的，不需要改 |
+
 ### 产物清单可以带分享链接
 
 | 项目 | 内容 |
