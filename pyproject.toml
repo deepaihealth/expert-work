@@ -25,6 +25,13 @@ dependencies = [
 
 [tool.uv]
 package = false
+# CVE-2026-132276 (wcmatch 10.2.1, fixed in 11.2; flagged by pip-audit 2026-11-21).
+# wcmatch comes in only via e2b==2.24.0, which caps it at <11 and is pinned on
+# purpose (2.25+ rejects ACS sandbox keys; upgrade tracked as ROADMAP X-13).
+# e2b uses wcmatch solely in e2b/template/utils.py (globbing local files when
+# building an E2B template), an API expert-work never calls. Override the cap so
+# the vulnerable version never ships; drop this once e2b allows wcmatch>=11.2.
+override-dependencies = ["wcmatch>=11.2,<12"]
 
 [dependency-groups]
 dev = [
