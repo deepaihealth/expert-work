@@ -281,14 +281,28 @@ def slots_for(
     return None
 
 
+def _may_rotate(image: Image.Image, data: bytes, degrees: int) -> bool:
+    """这次裁图会不会转方向(转一份整张的拷贝,估算要加):文件头里的方向标记与 B-301 的 ``degrees``
+    合成不是 1 就算;PNG 文件头里没有 ``exif``、但文件里有 ``eXIf`` 块(只能在末尾,要解码才读得到值)
+    —— 保守算会转。不解码。"""
+    from orchestrator.tools.region_zoom import (  # 延迟导入,见模块说明
+        header_orientation,
+        turned_orientation,
+    )
+
+    if turned_orientation(header_orientation(image), degrees) != 1:
+        return True
+    return image.format == "PNG" and "exif" not in image.info and b"eXIf" in data
+
+
 def crop_slots(data: bytes, degrees: int, max_pixels: int) -> int | None:
     """B-332 —— ``ask_image`` 在宿主裁这张图该占几个解图名额;``None`` = 解码之后峰值内存会超过
     :data:`FULL_COPY_PEAK_BYTES`,不裁(调用方如实告诉模型)。只读文件头,不解码。
 
     JPEG 按缩小解码裁,峰值不随框变,老样子占 1 个。别的格式(PNG / WebP / GIF)不能缩小解码,
     整张都要解开,按 :func:`slots_for` 的 ``draftable=False`` 估。认不出、或超过像素上限的图占 1 个,
-    由 ``crop_image`` 自己报错(那条在解码之前就抛)。转方向(``degrees`` 不为 0,或文件头里带
-    EXIF)多一份整张的拷贝,估算里算上。"""
+    由 ``crop_image`` 自己报错(那条在解码之前就抛)。转方向(文件头方向标记与 ``degrees`` 合成
+    不是 1,或 PNG 末尾带 ``eXIf`` 块,见 :func:`_may_rotate`)多一份整张的拷贝,估算里算上。"""
     from orchestrator.tools.region_zoom import (  # 延迟导入,见模块说明
         MAX_DECODE_PIXELS,
         OPEN_FORMATS,
@@ -298,7 +312,7 @@ def crop_slots(data: bytes, degrees: int, max_pixels: int) -> int | None:
     try:
         with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
             (width, height), mode, fmt = image.size, image.mode, image.format or ""
-            rotated = degrees != 0 or "exif" in image.info
+            rotated = _may_rotate(image, data, degrees)
     except (OSError, ValueError, Image.DecompressionBombError):
         return 1
     if fmt in ("JPEG", "MPO") or width * height > MAX_DECODE_PIXELS:

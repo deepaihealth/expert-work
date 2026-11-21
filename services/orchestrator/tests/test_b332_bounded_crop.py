@@ -22,6 +22,7 @@ import sys
 import zlib
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 from PIL import Image, ImageChops, ImageDraw, ImageStat
@@ -29,7 +30,10 @@ from PIL import Image, ImageChops, ImageDraw, ImageStat
 from orchestrator import image_views
 from orchestrator.image_views import FULL_COPY_PEAK_BYTES, crop_slots, slots_for
 from orchestrator.tools import region_zoom, vision
-from orchestrator.tools.error_classifier import GuidedToolError
+from orchestrator.tools.error_classifier import (
+    ExpectedRefusalError,
+    classify_tool_error,
+)
 from orchestrator.tools.region_zoom import (
     MAX_BAND_PIXELS,
     PEAK_SAFETY,
@@ -223,7 +227,7 @@ def test_jpeg_estimate_and_slots_are_unchanged_from_main(mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["RGB", "L"])
-@pytest.mark.parametrize("orientation", [1, 3, 6, 8])
+@pytest.mark.parametrize("orientation", range(1, 9))
 def test_partial_downscale_keeps_geometry_with_bounded_pixel_difference(
     mode: str, orientation: int
 ) -> None:
@@ -247,8 +251,9 @@ def test_seam_band_union_box_matches_main_within_bound() -> None:
     union = (0, bands[1].box[1], 1000, bands[2].box[3])
     ours = crop_image(data, [union], 0, MAX_BAND_PIXELS)[0]
     theirs = main.crop_image(data, [union], 0, MAX_BAND_PIXELS)[0]
-    full = _unscaled(data, union, 0)
-    assert (theirs.width, theirs.height) != full or full[0] * full[1] <= MAX_BAND_PIXELS
+    # 并集约 1.67 MP,在横条上限(300 万)以内,不用缩:与 main 逐字节相同。
+    assert (ours.width, ours.height) == _unscaled(data, union, 0)
+    assert _plain([ours]) == _plain([theirs])
     assert (ours.width, ours.height) == (theirs.width, theirs.height)
     mean, worst = _diff(ours.data, theirs.data)
     assert mean < 0.5
@@ -366,7 +371,7 @@ async def test_over_budget_png_is_refused_before_decoding(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(vision, "crop_image", must_not_run)
     before = _refused()
-    with pytest.raises(GuidedToolError) as raised:
+    with pytest.raises(ExpectedRefusalError) as raised:
         await vision._crop_in_thread(_fake_png(8000, 6000), [_WHOLE], 0)
     assert "too large to crop at its original resolution" in str(raised.value)
     assert "Nothing was cropped" in str(raised.value)
@@ -374,8 +379,10 @@ async def test_over_budget_png_is_refused_before_decoding(monkeypatch: pytest.Mo
     assert _refused() == before + 1
 
 
-def _refused() -> float:
-    return vision.ask_image_crop_refused_total.labels(reason="peak_over_budget")._value.get()
+def _refused(purpose: str = "region") -> float:
+    return vision.ask_image_crop_refused_total.labels(
+        reason="peak_over_budget", purpose=purpose
+    )._value.get()
 
 
 @pytest.mark.anyio
@@ -516,3 +523,275 @@ def test_measured_webp_peak_stays_within_the_estimate(tmp_path: Path) -> None:
         decoder_bytes_per_pixel=region_zoom.WEBP_DECODE_BYTES_PER_PIXEL,
     )
     assert real <= estimate / PEAK_SAFETY, (real, estimate)
+
+
+# ---------------------------------------------------------------------------
+# 独立审查(2026-11-21)返工
+# ---------------------------------------------------------------------------
+
+_BANDS = 3_000_000
+
+
+@pytest.mark.parametrize("mode", ["RGBA", "LA", "PT", "P", "1", "I;16"])
+def test_multi_strip_flatten_is_byte_identical_to_main(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """条宽压到 7 行(最后一条不满):分条转 RGB、分条横向缩拼起来,与 main 逐字节相同。"""
+    monkeypatch.setattr(region_zoom, "_FLATTEN_STRIP_PIXELS", _W * 7)
+    for orientation in (1, 6):
+        data = _png(_make(mode), orientation) if mode not in ("LA", "I;16") else _png(_make(mode))
+        for degrees in (0, 90):
+            for box in [_WHOLE, *_PARTIAL]:
+                for cap in (_SMALL_CAP, region_zoom.REGION_TARGET_PIXELS):
+                    ours = crop_image(data, [box], degrees, cap)
+                    theirs = main.crop_image(data, [box], degrees, cap)
+                    assert _plain(ours) == _plain(theirs), (mode, orientation, degrees, box, cap)
+
+
+def test_header_only_helpers_never_decode_a_png() -> None:
+    """``Image.getexif()`` 对没有 ``exif`` 头的 PNG 会整张解码;``image_size`` / ``exif_orientation``
+    只读文件头:对只有文件头的假 PNG(解码就会失败)照样答得出。"""
+    fake = _fake_png(8000, 6000, 6)
+    assert region_zoom.image_size(fake) == (8000, 6000)
+    assert region_zoom.image_size(fake, 90) == (6000, 8000)
+    assert region_zoom.exif_orientation(fake) == 1
+    with pytest.raises(OSError):  # 前提:真解码这张假图会失败
+        Image.open(io.BytesIO(fake)).load()
+
+
+def test_png_with_a_header_exif_still_reports_its_orientation() -> None:
+    tagged = _png(Image.new("RGB", (40, 20)), orientation=6)
+    assert region_zoom.exif_orientation(tagged) == 6
+    assert region_zoom.image_size(tagged) == (20, 40)
+
+
+def _trailing_exif_png(size: tuple[int, int], orientation: int) -> bytes:
+    """``eXIf`` 块在 IDAT 之后(文件头里看不到方向)的 PNG。"""
+    raw = _png(Image.new("RGB", size, (200, 200, 200)))
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    body = exif.tobytes()[6:]
+    crc = zlib.crc32(b"eXIf" + body) & 0xFFFFFFFF
+    chunk = struct.pack(">I", len(body)) + b"eXIf" + body + struct.pack(">I", crc)
+    at = raw.rindex(b"IEND") - 4
+    return raw[:at] + chunk + raw[at:]
+
+
+def test_trailing_exif_png_is_estimated_as_rotated() -> None:
+    cap = region_zoom.REGION_TARGET_PIXELS
+    trailing = _trailing_exif_png((4000, 3000), 6)
+    assert crop_slots(_png(Image.new("RGB", (4000, 3000))), 0, cap) == 2
+    assert crop_slots(trailing, 0, cap) is None
+    # 真裁时照它转(整张已解开):输出是竖的。
+    piece = crop_image(_trailing_exif_png((600, 400), 6), [_WHOLE], 0, _SMALL_CAP)[0]
+    assert piece.width < piece.height
+
+
+def test_harmless_header_exif_does_not_count_as_rotated() -> None:
+    cap = region_zoom.REGION_TARGET_PIXELS
+    flat = Image.new("RGB", (4000, 3000), (200, 200, 200))
+    assert crop_slots(_png(flat, orientation=1), 0, cap) == 2
+    one = io.BytesIO()
+    exif = Image.Exif()
+    exif[0x0112] = 1
+    flat.save(one, format="PNG", exif=exif)
+    assert crop_slots(one.getvalue(), 0, cap) == 2
+    # 方向 6 再转 270 度合成回 1:不转;不再转就是转了。
+    assert crop_slots(_png(flat, orientation=6), 270, cap) == 2
+    assert crop_slots(_png(flat, orientation=6), 0, cap) is None
+
+
+@pytest.mark.parametrize(
+    ("size", "color_type"),
+    [((10_000_000, 1), 3), ((40_000_000, 1), 3), ((10_000_000, 1), 2), ((1, 10_000_000), 2)],
+)
+def test_extreme_aspect_png_is_refused_before_decoding(
+    size: tuple[int, int], color_type: int
+) -> None:
+    assert crop_slots(_fake_png(*size, color_type), 0, region_zoom.REGION_TARGET_PIXELS) is None
+
+
+_EXTREME = {
+    "P+tRNS 2Mx3": ((2_000_000, 3), "PT"),
+    "RGB 3Mx1": ((3_000_000, 1), "RGB"),
+    "RGB 1x3M": ((1, 3_000_000), "RGB"),
+    "P+tRNS 3Mx1": ((3_000_000, 1), "PT"),
+}
+
+
+def _extreme_png(size: tuple[int, int], mode: str) -> bytes:
+    if mode == "RGB":
+        return _png(Image.new("RGB", size, (10, 200, 30)))
+    image = Image.new("P", size, 5)
+    image.putpalette([i % 256 for i in range(768)])
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", transparency=3)
+    return buffer.getvalue()
+
+
+_MEASURE_BOX = """
+import gc, json, resource, sys
+path, box, cap = sys.argv[1], json.loads(sys.argv[2]), int(sys.argv[3])
+data = open(path, "rb").read()
+from orchestrator.tools.region_zoom import crop_image
+crop_image(open(sys.argv[4], "rb").read(), [(0, 0, 1000, 1000)], 0)
+gc.collect()
+base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+crop_image(data, [tuple(box)], 0, cap)
+grown = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - base
+print(json.dumps(grown * (1 if sys.platform == "darwin" else 1024)))
+"""
+
+
+def _measure_box(path: Path, warm: Path, box: tuple[int, int, int, int], cap: int) -> int:
+    out = subprocess.run(  # noqa: S603 - 固定的解释器与脚本
+        [sys.executable, "-c", _MEASURE_BOX, str(path), json.dumps(box), str(cap), str(warm)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    return int(json.loads(out.stdout.strip().splitlines()[-1]))
+
+
+@pytest.mark.parametrize("name", list(_EXTREME))
+def test_measured_extreme_aspect_peak_stays_within_the_estimate(tmp_path: Path, name: str) -> None:
+    """一像素高 / 宽的 PNG:滤波系数表与分条的整行临时空间,按像素数估会差一个数量级。"""
+    size, mode = _EXTREME[name]
+    path = tmp_path / "extreme.png"
+    path.write_bytes(_extreme_png(size, mode))
+    warm = tmp_path / "warm.png"
+    warm.write_bytes(_extreme_png((64, 48), mode))
+    real = _measure_box(path, warm, _WHOLE, region_zoom.REGION_TARGET_PIXELS)
+    estimate = crop_peak_bytes(*size, "P" if mode == "PT" else mode, draftable=False)
+    assert real <= estimate / PEAK_SAFETY, (real / 2**20, estimate / 2**20)
+
+
+@pytest.mark.parametrize("mode", ["RGBA", "PT"])
+@pytest.mark.parametrize("size", [(3600, 2700), (4000, 2700)])
+def test_measured_band_crop_without_downscale_stays_within_the_estimate(
+    tmp_path: Path, mode: str, size: tuple[int, int]
+) -> None:
+    """B-301 横条(上限 300 万像素)里不用缩的框:带透明的图在老路上同时有约 5 份拷贝。"""
+    if mode == "RGBA":
+        data = _png(Image.new("RGBA", size, (10, 200, 30, 120)))
+        warm_bytes = _png(Image.new("RGBA", (64, 48), (1, 2, 3, 4)))
+    else:
+        data = _extreme_png(size, "PT")
+        warm_bytes = _extreme_png((64, 48), "PT")
+    path, warm = tmp_path / "band.png", tmp_path / "warm.png"
+    path.write_bytes(data)
+    warm.write_bytes(warm_bytes)
+    real = _measure_box(path, warm, (0, 0, 1000, 277), _BANDS)
+    estimate = crop_peak_bytes(*size, "P" if mode == "PT" else mode, _BANDS, draftable=False)
+    assert real <= estimate / PEAK_SAFETY, (real / 2**20, estimate / 2**20)
+
+
+# ---------------------------------------------------------------------------
+# 预期之内的拒绝:不是 run 的失败;提示不再把模型引回必被拒的裁图
+# ---------------------------------------------------------------------------
+
+
+def _ledger(error: BaseException) -> tuple[str, list[object]]:
+    """这个异常经 tools 节点的同一串记账函数之后,run 级失败账本里剩什么。"""
+    from langchain_core.messages import ToolMessage
+
+    from orchestrator.graph_builder import builder as builder_mod
+
+    classified = classify_tool_error(tool_name="ask_image", error=error)
+    call = {"name": "ask_image", "args": {}, "id": "c1", "type": "tool_call"}
+    message = ToolMessage(content="x", tool_call_id="c1", status="error", name="ask_image")
+    failure = builder_mod._classify_tool_failure(call, message, classified)
+    ledger_failure = builder_mod._ledger_failure(failure, classified)
+    key = builder_mod._ledger_key(call, message, failure)
+    return classified.error_class, list(
+        builder_mod._apply_failure_ledger([], [(key, ledger_failure)])
+    )
+
+
+def test_refusal_is_a_neutral_class_that_keeps_out_of_the_failure_ledger() -> None:
+    error_class, ledger = _ledger(ExpectedRefusalError("too large", advice="read it whole"))
+    assert error_class == "transient"
+    assert ledger == []
+    classified = classify_tool_error(
+        tool_name="ask_image", error=ExpectedRefusalError("x", advice="read it whole")
+    )
+    assert (classified.retryable, classified.advice) == (False, "read it whole")
+
+
+def test_a_genuine_crop_error_still_enters_the_failure_ledger() -> None:
+    error_class, ledger = _ledger(region_zoom.RegionImageError("could not be decoded"))
+    assert error_class != "transient"
+    assert len(ledger) == 1
+
+
+@pytest.mark.anyio
+async def test_orientation_candidate_refusal_is_counted_apart_and_logs_no_stack(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from orchestrator.tools.orientation_judge import judge_orientation
+
+    async def candidate(_degrees: int) -> str:
+        await vision._crop_in_thread(_fake_png(8000, 6000), [_WHOLE], 0, purpose="orientation")
+        return "never"
+
+    async def ask(_item: str, _budget: float) -> tuple[object, str | None]:
+        raise AssertionError("no candidate, nothing to ask")
+
+    before_region, before_orientation = _refused("region"), _refused("orientation")
+    with caplog.at_level("INFO"):
+        outcome = await judge_orientation(
+            candidate=candidate,
+            ask=ask,  # type: ignore[arg-type]
+            budget=lambda _extra: 5.0,
+        )
+    assert (outcome.conclusion, outcome.reason) == ("not_asked", "no_copy")
+    assert _refused("orientation") == before_orientation + 1
+    assert _refused("region") == before_region
+    assert not any(record.exc_info for record in caplog.records)
+
+
+def _large_upload(tmp_path: Path, header_png: bytes) -> tuple[Any, Any]:
+    from orchestrator.multimodal import ResolvedImage
+
+    from .test_b266_region_zoom import _VL, _upload
+
+    vl = _VL(answer=lambda _ref: "a lab report")
+    up = _upload(tmp_path, vl, size=(64, 64))
+    images = up.tool.image_resolver.uploads.images
+    images[up.ref] = ResolvedImage(media_type="image/png", data=header_png)
+    return up, vl
+
+
+@pytest.mark.anyio
+async def test_no_region_hint_for_an_image_the_host_cannot_crop(tmp_path: Path) -> None:
+    up, _vl = _large_upload(tmp_path, _fake_png(8000, 6000))
+    result = await up.tool.call({"image_ref": up.ref, "question": "?"}, ctx=up.ctx)
+    assert region_zoom.REGION_HINT not in result.content
+    assert result.content.startswith("a lab report")
+    # 对照:裁得动的 12 MP 仍然提示。
+    up, _vl = _large_upload(tmp_path, _fake_png(4000, 3000))
+    result = await up.tool.call({"image_ref": up.ref, "question": "?"}, ctx=up.ctx)
+    assert region_zoom.REGION_HINT in result.content
+
+
+@pytest.mark.anyio
+async def test_region_auto_on_an_uncroppable_image_reads_whole_and_does_not_say_reask(
+    tmp_path: Path,
+) -> None:
+    up, vl = _large_upload(tmp_path, _fake_png(8000, 6000))
+    result = await up.tool.call(
+        {"image_ref": up.ref, "question": "?", "region": "auto"}, ctx=up.ctx
+    )
+    assert "too large to zoom into" in result.content
+    assert "Re-ask with an explicit region" not in result.content
+    assert len(vl.calls) == 1  # 只整张读了一次
+
+
+@pytest.mark.anyio
+async def test_explicit_region_on_an_uncroppable_image_raises_the_refusal(tmp_path: Path) -> None:
+    up, _vl = _large_upload(tmp_path, _fake_png(8000, 6000))
+    with pytest.raises(ExpectedRefusalError):
+        await up.tool.call(
+            {"image_ref": up.ref, "question": "?", "region": [0, 0, 500, 500]}, ctx=up.ctx
+        )

@@ -291,7 +291,7 @@ def image_size(data: bytes, degrees: int = 0) -> tuple[int, int] | None:
     try:
         with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
             width, height = image.size
-            if turned_orientation(_orientation(image), degrees) in _SWAPPED_ORIENTATIONS:
+            if turned_orientation(header_orientation(image), degrees) in _SWAPPED_ORIENTATIONS:
                 return height, width
             return width, height
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
@@ -302,9 +302,19 @@ def exif_orientation(data: bytes) -> int:
     """B-301 —— 图片自带的方向标记(只读文件头);没有、认不出来都是 1(不用转)。"""
     try:
         with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
-            return _orientation(image)
+            return header_orientation(image)
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
         return 1
+
+
+def header_orientation(image: Image.Image) -> int:
+    """B-332 —— 只看文件头的方向标记,**绝不解码**。Pillow 的 PNG ``getexif()`` 在文件头里没有
+    ``exif`` 时,会把整张图解开去找文件末尾的 ``eXIf`` 块(48 MP 的 RGBA 多 +184 MiB,发生在事件
+    循环上、不占解图名额),所以 PNG 头里没有就当 1。文件末尾才有的 ``eXIf`` 在这里看不到(罕见;
+    真正裁图时整张已解开,仍照它转)。"""
+    if image.format == "PNG" and "exif" not in image.info:
+        return 1
+    return _orientation(image)
 
 
 @dataclass(frozen=True)
@@ -382,7 +392,8 @@ def _render_box(image: Image.Image, box: Box, orientation: int, max_pixels: int)
     """B-332 —— 裁出 ``box`` 那一块、转 RGB、必要时缩到 ``max_pixels`` 以内。结果与「裁 → 转 →
     转 RGB → 缩」逐字节相同,只有一种例外(见下),内存却不再叠整张图的几份拷贝:
 
-    * 不用缩的框:裁下来的就是小块,原样走老路;
+    * 不用缩的框:RGB / 灰度原样走老路(裁下来的就是小块);别的颜色模式分条转 RGB(一块带透明的
+      图在老路上同时有约 5 份拷贝);
     * 整张框、要缩:不复制整张图 —— RGB / 灰度直接缩(灰度缩完再转 RGB),别的颜色模式分条转 RGB;
     * **局部框、要缩、RGB / 灰度:** 一步 ``resize(box=)``(在原图坐标上,缩完再转方向),不先裁一份
       局部再缩。比「先裁再缩」多读框外一圈像素做滤波,像素有极小差别(用户 2026-11-21 同意),
@@ -390,9 +401,13 @@ def _render_box(image: Image.Image, box: Box, orientation: int, max_pixels: int)
     * 局部框、要缩、别的颜色模式:分条转 RGB 之后缩(与老路逐字节相同)。"""
     (left, top, right, bottom), rect = _upright_rect(image.size, box, orientation)
     target = _capped(right - left, bottom - top, max_pixels)
-    if target == (right - left, bottom - top):
-        return _flatten(crop_upright(image, box, orientation))
     method = _UPRIGHT_METHODS.get(orientation)
+    if target == (right - left, bottom - top):
+        if image.mode in _RESIZE_FIRST_MODES:
+            return _flatten(crop_upright(image, box, orientation))
+        # 不用缩、非 RGB / 灰度:分条转(与「裁 → 转方向 → 转 RGB」逐字节相同,但不叠 ~5 份拷贝)。
+        flat = _flatten_region(image, rect)
+        return flat if method is None else _replaced(flat, flat.transpose(method))
     whole = rect == (0, 0, *image.size)
     if image.mode in _RESIZE_FIRST_MODES:
         if not whole:
@@ -602,6 +617,12 @@ UNDRAFTED_FIXED_BYTES: Final = 6 * 1024 * 1024
 #: B-332 实测:Pillow 解 WebP 时解码器自己还另占约 3 份整图(6 / 12 / 24 MP 的有损、无损、带透明都是
 #: 每像素 11.7~12.2 字节,多于 PNG),估算里按这个另加(取 13)。PNG / GIF 不需要。
 WEBP_DECODE_BYTES_PER_PIXEL: Final = 13.0
+#: B-332 独立审查补的两项(实测见设计 §4):Pillow LANCZOS 的滤波系数表,每条边每像素的字节数。
+UNDRAFTED_COEFFICIENT_BYTES: Final = 72
+#: 分条转 RGB(带透明)时每条里每个像素同时存在的字节数(审查量到约 4 份 RGBA 拷贝)。
+UNDRAFTED_STRIP_BYTES_PER_PIXEL: Final = 20
+#: 不用缩的框,转 RGB / 转方向时同时存在的整块拷贝份数(RGB 字节算:转 RGB 一份、转方向一份)。
+UNDRAFTED_BOX_COPIES: Final = 2
 
 
 def _undrafted_peak_bytes(
@@ -639,8 +660,18 @@ def _undrafted_peak_bytes(
         phases = [decoded + out_w * middle_rows * 4 + out]
         if rotated:
             phases = [decoded + 2 * flat, decoded + flat + out_w * middle_rows * 4 + out]
+    if mode not in _RESIZE_FIRST_MODES:
+        # 分条转 RGB 的每一条:一条至少一整行(宽 > 条的像素数时一行就是一条)。
+        strip = max(width, _FLATTEN_STRIP_PIXELS) * UNDRAFTED_STRIP_BYTES_PER_PIXEL
+        phases = [phase + strip for phase in phases]
+    # 不用缩的框(``bands`` 最多 ``max_pixels`` 像素):整张在,再加框那一块转 RGB / 转方向的几份。
+    box_pixels = min(pixels, max_pixels)
+    phases.append(decoded + UNDRAFTED_BOX_COPIES * box_pixels * 4)
+    # Pillow 缩小时的滤波系数表:横向约 宽 x 48 字节、纵向约 高 x 48 字节(实测 72 盖得住),与输出
+    # 尺寸无关 —— 又细又长的图(10,000,000 x 1)主要贵在这里。
+    coefficients = UNDRAFTED_COEFFICIENT_BYTES * (width + height)
     extra = (UNDRAFTED_OVERHEAD_PER_PIXEL + decoder_bytes_per_pixel) * pixels
-    calibrated = max(phases) + extra + UNDRAFTED_FIXED_BYTES
+    calibrated = max(phases) + coefficients + extra + UNDRAFTED_FIXED_BYTES
     return math.ceil(calibrated * PEAK_SAFETY)
 
 

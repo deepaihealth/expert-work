@@ -70,8 +70,6 @@ _MAIN_SOURCE = {
     "band_dpi": "388f6f7a5180588b",
     "crop_image": "b3d2c386111798eb",
     "crop_output_size": "6dcf4c503df1250b",
-    "exif_orientation": "7a866bac16212033",
-    "image_size": "90137013344e9b3f",
     "parse_box": "93143366d333cec3",
     "parse_region": "9f13d60f2ef0f8c9",
     "pixel_box": "c341073439a5103c",
@@ -80,12 +78,21 @@ _MAIN_SOURCE = {
     "turned_orientation": "61dc9c775a2116d7",
 }
 
-#: B-332(2026-11-21)有意改了的定义:裁图不再为整张图叠几份拷贝(行为见
+#: B-332(2026-11-21)有意改了、或新增的定义:裁图不再为整张图叠几份拷贝,方向只读文件头(行为见
 #: ``test_b332_bounded_crop.py``,它把整张框与不用缩的框逐字节钉在 origin/main 上)。``_cap_pixels``
-#: 被它取代、已删。以后再改这两项,改这里的哈希。
+#: 被它取代、已删。以后再改这些,改这里的哈希(常数 ``UNDRAFTED_*`` 是校准值,由实测测试把关,
+#: 不在此钉)。
 _CHANGED_BY_B332 = {
     "_crop_open_image": "68a43d1d837d4dfa",
     "crop_upright": "2e964df0e4783dca",
+    "image_size": "a6b9b4cdaac25c08",
+    "exif_orientation": "7343239bf2c622e3",
+    "header_orientation": "880da44e6a61cd3b",
+    "_render_box": "a4e0f58d52b52b79",
+    "_flatten_resized": "52f23caf31e900c0",
+    "_flatten_region": "ca73c80ed80f8174",
+    "_upright_rect": "396c3a89034f7b10",
+    "_undrafted_peak_bytes": "17c90a7b2d53f3c9",
 }
 
 
