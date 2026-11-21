@@ -216,8 +216,9 @@ def test_jpeg_candidate_path_is_byte_identical_to_main(mode: str, orientation: i
 
 @pytest.mark.parametrize("mode", ["L", "RGB", "CMYK"])
 def test_jpeg_estimate_and_slots_are_unchanged_from_main(mode: str) -> None:
-    # 含宽高不是 8 的倍数的常见尺寸:JPEG ``draft`` 按「原尺寸 // 请求尺寸」选档,不整除时档位变小,
-    # 估算(B-322 既有,B-332 没动)随之不单调 —— 钉在 main 上,不许这一轮顺手改。
+    # JPEG ``draft`` 按「原尺寸 // 请求尺寸」选档:宽、高不能被想要的档(2 / 4 / 8)整除就退一档
+    # (如 5163x3873 想要 2、宽不能被 2 整除;9000x6700 想要 4、两边都能被 4 整除所以不跳),估算
+    # (B-322 既有,B-332 没动)随之不单调 —— 钉在 main 上,不许这一轮顺手改。
     sizes = [
         (640, 480),
         (4032, 3024),
@@ -736,7 +737,9 @@ def _tools_node_view(error: BaseException) -> tuple[str, bool, list[object]]:
     if not builder_mod._is_read_only_failure(spec, ledger_failure):
         outcomes.append((builder_mod._ledger_key(call, message, failure), ledger_failure))
     ledger = list(builder_mod._apply_failure_ledger([], outcomes))
-    # tools 节点:有建议的失败进 ``tool_failures``,其中非 transient 的触发深想升档。
+    # 照抄生产的升档判断(没有抽成函数):``graph_builder/builder.py`` 里 ``tool_failures``
+    # 只收有建议的失败(约 2562 行),``error_signal = any(f.error_class != "transient" ...)``
+    # (约 1483 行)触发深想升档。
     escalates = failure is not None and bool(failure.advice) and failure.error_class != "transient"
     return classified.error_class, escalates, ledger
 
@@ -862,7 +865,7 @@ def test_measured_extreme_aspect_rotated_peak_stays_within_the_estimate(
 
 
 def test_rotated_estimate_of_a_one_pixel_high_image_is_not_absurd() -> None:
-    """900000x1 的 P 转 90 度实际约 67 MiB;估算不能是几个 GB(中间图按转后的形状算)。"""
+    """900000x1 的 P 转 90 度实际约 52~57 MiB(Linux / macOS);估算不能是几个 GB。"""
     estimate = crop_peak_bytes(900_000, 1, "P", draftable=False, rotated=True)
     assert estimate < 400 * 2**20
 
@@ -879,8 +882,8 @@ def test_reads_a_copy_when_a_png_may_carry_a_trailing_orientation() -> None:
 
 @pytest.mark.parametrize("mode", ["RGB", "RGBA", "L", "P"])
 def test_png_estimate_is_monotone_in_size_with_no_multiple_of_eight_jumps(mode: str) -> None:
-    """不能 ``draft`` 的格式没有 JPEG 那种「整除才缩」的档位:估算随尺寸单调,宽高不是 8 的倍数的
-    常见尺寸与相邻的 8 的倍数估得差不多(JPEG 的估算有跳变,见设计 §10,B-322 既有)。"""
+    """不能 ``draft`` 的格式没有 JPEG 那种「整除才不退档」的档位:估算随尺寸单调,宽高不能被 2 / 4 / 8
+    整除的常见尺寸与相邻尺寸估得差不多(JPEG 的估算有跳变,见设计 §10,B-322 既有)。"""
     previous = 0
     for width in range(1000, 9000, 37):
         estimate = crop_peak_bytes(width, width * 3 // 4, mode, draftable=False)
