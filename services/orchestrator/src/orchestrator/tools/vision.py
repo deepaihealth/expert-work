@@ -19,6 +19,7 @@ See ``docs/streams/STREAM-J-DESIGN.md`` § 13.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import logging
 import time
@@ -57,6 +58,7 @@ from expert_work.runtime.storage.base import ObjectNotFoundError
 # B-266 review round 2 g —— 宿主解图名额(``region_zoom.HOST_CROP_SLOTS``)的闸;B-322 起放在叶子模块
 # ``orchestrator.image_views`` 里,适配器那一侧当场重算转正图也走同一道闸。
 from orchestrator.image_views import _HOST_CROP_GATES as _HOST_CROP_GATES
+from orchestrator.image_views import crop_slots, in_host_crop_slots
 from orchestrator.image_views import in_host_crop_slot as in_host_crop_slot
 from orchestrator.llm.truncation import (
     ServedOutputCap,
@@ -218,10 +220,39 @@ _TILE_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaph
 )
 
 
+#: B-332 —— 宿主裁图被拒(解码之后峰值内存会超过预算,解码之前按文件头估的)的次数。
+ask_image_crop_refused_total = expert_work_counter(
+    "expert_work_ask_image_crop_refused_total",
+    "ask_image host crops refused before decoding because the estimated peak memory exceeds "
+    "FULL_COPY_PEAK_BYTES (B-332), by reason (peak_over_budget).",
+    ("reason",),
+)
+_CROP_TOO_LARGE_ADVICE = (
+    "Do not retry with a different region: the whole file has to be decoded for any region, so "
+    "it would be refused again. Read the image without region (it is looked at whole, at lower "
+    "detail), or tell the user the file is too large to zoom into and ask for a smaller export "
+    "or a screenshot of just the part they need."
+)
+
+
 async def _crop_in_thread(
     data: bytes, boxes: Sequence[Box], degrees: int, max_pixels: int = REGION_TARGET_PIXELS
 ) -> list[CroppedImage]:
-    return await in_host_crop_slot(crop_image, data, boxes, degrees, max_pixels)
+    slots = crop_slots(data, degrees, max_pixels)
+    if slots is None:
+        ask_image_crop_refused_total.labels(reason="peak_over_budget").inc()
+        # 不在这里读尺寸:带 EXIF 的 PNG 读方向会把整张解开,而这里正是要在解码之前拒掉。
+        msg = (
+            "This image is too large to crop at its original resolution on the server: "
+            "decoding it would use more memory than a single crop is allowed. "
+            "Nothing was cropped."
+        )
+        raise GuidedToolError(msg, advice=_CROP_TOO_LARGE_ADVICE)
+    if slots == 1:
+        return await in_host_crop_slot(crop_image, data, boxes, degrees, max_pixels)
+    return await in_host_crop_slots(
+        slots, functools.partial(crop_image, data, boxes, degrees, max_pixels)
+    )
 
 
 def _tile_slots() -> asyncio.Semaphore:

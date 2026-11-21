@@ -58,10 +58,8 @@ _MAIN_SOURCE = {
     "_band_aspect": "4a3c61df47354646",
     "_band_spans": "8fa87b25c715c245",
     "_box_size_at": "0b71bfd9023f82e9",
-    "_cap_pixels": "98f857cc7496343c",
     "_capped": "533a8434fcab82e3",
     "_capped_dpi": "1dcdb2fd0f5f2626",
-    "_crop_open_image": "af2aec21148b1a84",
     "_draft_scale": "8ec9d84183001ac3",
     "_flatten": "3403d05dd82cab95",
     "_orientation": "0e34a7b79925ebfb",
@@ -72,7 +70,6 @@ _MAIN_SOURCE = {
     "band_dpi": "388f6f7a5180588b",
     "crop_image": "b3d2c386111798eb",
     "crop_output_size": "6dcf4c503df1250b",
-    "crop_upright": "2ac7064594000c6b",
     "exif_orientation": "7a866bac16212033",
     "image_size": "90137013344e9b3f",
     "parse_box": "93143366d333cec3",
@@ -81,6 +78,14 @@ _MAIN_SOURCE = {
     "plan_bands": "94d71ebf12d3c284",
     "region_dpi": "b79c641f5e272c5d",
     "turned_orientation": "61dc9c775a2116d7",
+}
+
+#: B-332(2026-11-21)有意改了的定义:裁图不再为整张图叠几份拷贝(行为见
+#: ``test_b332_bounded_crop.py``,它把整张框与不用缩的框逐字节钉在 origin/main 上)。``_cap_pixels``
+#: 被它取代、已删。以后再改这两项,改这里的哈希。
+_CHANGED_BY_B332 = {
+    "_crop_open_image": "68a43d1d837d4dfa",
+    "crop_upright": "2e964df0e4783dca",
 }
 
 
@@ -113,3 +118,8 @@ def test_region_zoom_definition_is_unchanged_from_origin_main(name: str) -> None
     assert current[name] == _MAIN_SOURCE[name], (
         f"{name} 的源码与 origin/main 不同(Path B 的裁图被改了)"
     )
+
+
+@pytest.mark.parametrize("name", sorted(_CHANGED_BY_B332))
+def test_region_zoom_definition_changed_by_b332_is_pinned(name: str) -> None:
+    assert _current()[name] == _CHANGED_BY_B332[name]
