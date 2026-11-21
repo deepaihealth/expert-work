@@ -338,6 +338,18 @@ def test_rotation_and_exif_raise_the_png_estimate() -> None:
 def test_jpeg_crop_keeps_one_slot_whatever_the_size() -> None:
     data = _jpeg("RGB")
     assert crop_slots(data, 0, region_zoom.REGION_TARGET_PIXELS) == 1
+    # 同样 24 MP 的 PNG 会被拒;JPEG 按缩小解码裁,老样子占 1 个。
+    big = _solid((6000, 4000), "JPEG")
+    assert crop_slots(big, 0, region_zoom.REGION_TARGET_PIXELS) == 1
+    assert crop_slots(_solid((6000, 4000), "PNG"), 0, region_zoom.REGION_TARGET_PIXELS) is None
+
+
+def test_png_exif_orientation_in_the_header_counts_as_rotated() -> None:
+    cap = region_zoom.REGION_TARGET_PIXELS
+    plain = _png(Image.new("RGB", (4000, 3000), (200, 200, 200)))
+    tagged = _png(Image.new("RGB", (4000, 3000), (200, 200, 200)), orientation=6)
+    assert crop_slots(plain, 0, cap) == 2
+    assert crop_slots(tagged, 0, cap) is None
     assert crop_slots(b"not an image", 0, region_zoom.REGION_TARGET_PIXELS) == 1
 
 
@@ -368,14 +380,14 @@ def _refused() -> float:
 
 @pytest.mark.anyio
 async def test_crop_takes_the_slots_the_estimate_says(monkeypatch: pytest.MonkeyPatch) -> None:
-    taken: list[int] = []
+    taken: list[int | str] = []
 
     async def fake_slots(slots: int, call: object) -> list[object]:
         taken.append(slots)
         return []
 
     async def fake_slot(*_args: object, **_kwargs: object) -> list[object]:
-        taken.append(1)
+        taken.append("single")
         return []
 
     monkeypatch.setattr(vision, "in_host_crop_slots", fake_slots)
@@ -383,7 +395,7 @@ async def test_crop_takes_the_slots_the_estimate_says(monkeypatch: pytest.Monkey
     await vision._crop_in_thread(_fake_png(2000, 1500), [_WHOLE], 0)
     await vision._crop_in_thread(_fake_png(4000, 3000), [_WHOLE], 0)
     await vision._crop_in_thread(_jpeg("RGB"), [_WHOLE], 0)
-    assert taken == [1, 2, 1]
+    assert taken == ["single", 2, "single"]
 
 
 @pytest.mark.anyio
@@ -411,7 +423,12 @@ grown = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - base
 print(json.dumps(grown * (1 if sys.platform == "darwin" else 1024)))
 """
 
-_MP_SIZES = {"6MP": (3000, 2000), "12MP": (4000, 3000), "24MP": (6000, 4000)}
+_MP_SIZES = {
+    "6MP": (3000, 2000),
+    "12MP": (4000, 3000),
+    "24MP": (6000, 4000),
+    "pano12MP": (12000, 1000),
+}
 
 
 def _flat_png(size: tuple[int, int], mode: str) -> bytes:
@@ -426,11 +443,13 @@ def _flat_png(size: tuple[int, int], mode: str) -> bytes:
         image = image.convert("L")
     elif mode == "P":
         image = image.convert("P", palette=Image.Palette.ADAPTIVE)
+    elif mode == "I;16":
+        image = Image.frombytes("I;16", size, b"\x00\x80" * (size[0] * size[1]))
     return _png(image)
 
 
 @pytest.mark.parametrize("degrees", [0, 90])
-@pytest.mark.parametrize("mode", ["RGB", "RGBA", "L", "P"])
+@pytest.mark.parametrize("mode", ["RGB", "RGBA", "L", "P", "I;16"])
 @pytest.mark.parametrize("name", list(_MP_SIZES))
 def test_measured_png_peak_stays_within_the_estimate(
     tmp_path: Path, name: str, mode: str, degrees: int

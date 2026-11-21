@@ -2969,3 +2969,17 @@ PY
 - [x] **131.6 历史 NULL 厂商的 Claude 行**:只读 SQL 数数(只打印数字):`SELECT count(*) FROM token_usage WHERE provider IS NULL AND model LIKE 'claude-%' AND (cache_read_tokens > 0 OR cache_creation_tokens > 0)`。判据:数是 0 就写「不适用」;非 0 则取一条这样的 run 调 `GET …/usage`,桶 `provider` 仍是 `null`、`input_tokens` 已含缓存(按模型名认出 Claude)。 **2026-11-21 测试 `0ec0181d2` 不适用**:0 行。
 - **2026-11-21 测试 `0ec0181d2` 备注**:worker 的 `total_tokens` 也被一并补(设计如此)。worker run `49637cf6` 用量全 0,是平台回答缓存命中(与前几个 run 的调用逐字相同),不是厂商 / 转发层的问题。
 - **花费**:131.4 两轮 Claude 小对话,预计不到 ¥1;**开跑前先给用户报价并等确认**,131.1~131.3 不花钱。
+
+## §132 `ask_image` 宿主裁图内存有界:大 PNG 能裁的裁、装不下的如实拒(B-332,没有开关)
+
+**背景**:PNG 不能缩小解码,main 上一张 12 MP 的 RGB PNG 裁一次就要约 144 MiB(RGBA 282 MiB、48 MP RGBA 1.1 GiB),控制面 pod 只剩约 56 MiB 余量。修复后:裁图不再叠整张图的拷贝(12 MP 实测约 73 MiB),解码前按文件头估峰值,超过每份 110 MiB 的拒绝并如实告诉模型,不静默降级。设计与实测:`docs/superpowers/specs/2026-11-21-b332-bounded-png-crop.md`。
+
+**怎么进**:用测试环境平台自己的看图智能体(能看图、`ask_image` 开着),上传下面的图,让它用 `region` 看一块;不碰客户对话。合成图:白底 + 几行字的 PNG(`PIL` 一行生成,纯色底压得很小)。
+
+- [ ] **132.1 12 MP PNG 截图能裁**:上传 4000x3000 的 RGB PNG(文字行在右下角),问「右下角那行字写的什么」,让它给 `region=[600,600,1000,1000]`。判据:返回读出了那行字;工具 meta 里 `crop.pixels` 是缩过的尺寸(约 150 万像素以内);没有「too large to crop」。**没修好时**:被拒(估算过紧),或 pod 内存涨过 110 MiB。
+- [ ] **132.2 12 MP RGBA(带透明)PNG**:同上换 RGBA,透明区域在裁出来的图里是白底(不是黑)。判据:读得出字、背景白。
+- [ ] **132.3 48 MP PNG 如实拒**:上传 8000x6000 的 PNG,同样要局部。判据:工具失败,文字是「This image is too large to crop at its original resolution on the server … Nothing was cropped.」,建议里让它不带 `region` 整张看或请用户给更小的图;模型据此如实告诉用户、**没有**换个 `region` 再试一遍;orchestrator 日志没有该图的解码痕迹;计数 `expert_work_ask_image_crop_refused_total{reason="peak_over_budget"}` +1。**没修好时**:pod 重启 / OOMKilled,或静默给了一张糊图。
+- [ ] **132.4 不带 region 整张看不受影响**:同一张 48 MP PNG 不带 `region` 问整图内容。判据:照常回答(整张看走原来的转码路径,不走本票的裁图)。
+- [ ] **132.5 JPEG 不受影响**:一张 12 MP 手机照片 JPEG 带 `region` 与问方向。判据:照常;候选图 / 小副本与发布前一致。
+- [ ] **132.6 pod 内存峰值**:在 132.1 / 132.2 / 132.3 跑的时候看控制面 / orchestrator pod 的内存(`kubectl top` 间隔取样或监控面板的 working set 峰值),与跑之前的基线比。判据:132.1、132.2 的峰值涨幅不超过 110 MiB(设计实测约 73 MiB);132.3 几乎不涨(解码前就拒了)。同时并发发 3 张 12 MP 的看图:峰值涨幅仍不超过两个名额的量(同时在裁的最多两个名额)。
+- **花费**:每个看图问题约 1 万输入 token 的快看,共约 ¥0.1;**开跑前先给用户报价并等确认**。
