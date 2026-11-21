@@ -4,7 +4,7 @@
 # resolved by pip from manylinux wheels — no compiler in the image. Keep
 # this list narrow: every library here is import-available to office agents
 # and is part of the sandbox's trusted surface.
-pandas==3.1.0          # tabular data / xlsx+csv analysis
+pandas==3.1.1          # tabular data / xlsx+csv analysis
 openpyxl==3.1.5        # .xlsx read/write
 python-docx==1.2.0     # .docx read/write
 python-pptx==1.0.2     # .pptx read/write
@@ -15,7 +15,7 @@ pdfplumber==0.11.10    # PDF text + table extraction
 # the baked noto-cjk fonts (needs the libpango/cairo apt libs added in the
 # Dockerfile). This closes the gap that made md→PDF tasks thrash on the missing
 # installer.
-markdown==3.11.2         # Markdown → HTML
+markdown==3.11.3         # Markdown → HTML
 weasyprint==70.0       # HTML+CSS → PDF (report generation)
 # weasyprint 与 pydyf 必须**成对**升级,不能各升各的:weasyprint 声明的
 # ``pydyf>=…`` 没有上界,而 pydyf 的 Stream API 在 0.12.x 重做过——weasyprint
@@ -30,7 +30,7 @@ Pillow==13.0.0         # image read/write/convert
 matplotlib==3.11.2     # charts (CJK rendering via fonts-noto-cjk)
 # route ① §5.4 — Python bridges to the new apt binaries (soffice/poppler/ffmpeg).
 pdf2image==1.17.0      # PDF→image; wraps the poppler-utils binaries
-imageio==2.38.1        # gif/video frames (slack-gif-creator)
+imageio==2.38.2        # gif/video frames (slack-gif-creator)
 imageio-ffmpeg==0.8.1  # imageio's ffmpeg bridge (binary from apt ffmpeg)
 defusedxml==0.7.1      # office unpack/clean scripts import it directly
 # 2026-10-16 —— 测试环境 90 天、2663 个 run 里模型真撞过的缺包,加上两个公开测评集
