@@ -216,7 +216,21 @@ def test_jpeg_candidate_path_is_byte_identical_to_main(mode: str, orientation: i
 
 @pytest.mark.parametrize("mode", ["L", "RGB", "CMYK"])
 def test_jpeg_estimate_and_slots_are_unchanged_from_main(mode: str) -> None:
-    sizes = [(640, 480), (4032, 3024), (5184, 3888), (8064, 6048), (9487, 6000), (7001, 5003)]
+    # 含宽高不是 8 的倍数的常见尺寸:JPEG ``draft`` 按「原尺寸 // 请求尺寸」选档,不整除时档位变小,
+    # 估算(B-322 既有,B-332 没动)随之不单调 —— 钉在 main 上,不许这一轮顺手改。
+    sizes = [
+        (640, 480),
+        (4032, 3024),
+        (5184, 3888),
+        (8064, 6048),
+        (9487, 6000),
+        (7001, 5003),
+        (5163, 3873),
+        (5656, 4243),
+        (9018, 6764),
+        (6000, 4000),
+        (8160, 6120),
+    ]
     for width, height in sizes:
         assert crop_peak_bytes(width, height, mode) == main.crop_peak_bytes(width, height, mode)
 
@@ -861,3 +875,18 @@ def test_reads_a_copy_when_a_png_may_carry_a_trailing_orientation() -> None:
     assert vision._reads_a_copy(upright, plain) is False
     assert vision._reads_a_copy(upright, _trailing_exif_png((40, 20), 6)) is True
     assert vision._reads_a_copy(Orientation("not_asked"), _trailing_exif_png((40, 20), 6)) is False
+
+
+@pytest.mark.parametrize("mode", ["RGB", "RGBA", "L", "P"])
+def test_png_estimate_is_monotone_in_size_with_no_multiple_of_eight_jumps(mode: str) -> None:
+    """不能 ``draft`` 的格式没有 JPEG 那种「整除才缩」的档位:估算随尺寸单调,宽高不是 8 的倍数的
+    常见尺寸与相邻的 8 的倍数估得差不多(JPEG 的估算有跳变,见设计 §10,B-322 既有)。"""
+    previous = 0
+    for width in range(1000, 9000, 37):
+        estimate = crop_peak_bytes(width, width * 3 // 4, mode, draftable=False)
+        assert estimate >= previous, (width, estimate, previous)
+        previous = estimate
+    for odd, nearby in [((5163, 3873), (5160, 3872)), ((5656, 4243), (5656, 4240))]:
+        a = crop_peak_bytes(*odd, mode, draftable=False)
+        b = crop_peak_bytes(*nearby, mode, draftable=False)
+        assert abs(a - b) / b < 0.02, (odd, nearby, a, b)
