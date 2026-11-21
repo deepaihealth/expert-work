@@ -632,20 +632,32 @@ def _extreme_png(size: tuple[int, int], mode: str) -> bytes:
 _MEASURE_BOX = """
 import gc, json, resource, sys
 path, box, cap = sys.argv[1], json.loads(sys.argv[2]), int(sys.argv[3])
+degrees = int(sys.argv[5])
 data = open(path, "rb").read()
 from orchestrator.tools.region_zoom import crop_image
 crop_image(open(sys.argv[4], "rb").read(), [(0, 0, 1000, 1000)], 0)
 gc.collect()
 base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-crop_image(data, [tuple(box)], 0, cap)
+crop_image(data, [tuple(box)], degrees, cap)
 grown = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - base
 print(json.dumps(grown * (1 if sys.platform == "darwin" else 1024)))
 """
 
 
-def _measure_box(path: Path, warm: Path, box: tuple[int, int, int, int], cap: int) -> int:
+def _measure_box(
+    path: Path, warm: Path, box: tuple[int, int, int, int], cap: int, degrees: int = 0
+) -> int:
     out = subprocess.run(  # noqa: S603 - 固定的解释器与脚本
-        [sys.executable, "-c", _MEASURE_BOX, str(path), json.dumps(box), str(cap), str(warm)],
+        [
+            sys.executable,
+            "-c",
+            _MEASURE_BOX,
+            str(path),
+            json.dumps(box),
+            str(cap),
+            str(warm),
+            str(degrees),
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -692,37 +704,47 @@ def test_measured_band_crop_without_downscale_stays_within_the_estimate(
 # ---------------------------------------------------------------------------
 
 
-def _ledger(error: BaseException) -> tuple[str, list[object]]:
-    """这个异常经 tools 节点的同一串记账函数之后,run 级失败账本里剩什么。"""
+def _tools_node_view(error: BaseException) -> tuple[str, bool, list[object]]:
+    """这个异常在 tools 节点里的真实去向(与生产同一串函数、同一份 ``ask_image`` 工具规格):
+    ``(错误类, 会不会触发深想升档, run 级失败账本里剩什么)``。``ask_image`` 是只读工具,B-164 的
+    ``_is_read_only_failure`` 让它所有非瞬态失败本来就不进账本。"""
     from langchain_core.messages import ToolMessage
 
     from orchestrator.graph_builder import builder as builder_mod
 
-    classified = classify_tool_error(tool_name="ask_image", error=error)
+    spec = vision._spec_with_short_form()
+    classified = classify_tool_error(tool_name="ask_image", error=error, spec=spec)
     call = {"name": "ask_image", "args": {}, "id": "c1", "type": "tool_call"}
     message = ToolMessage(content="x", tool_call_id="c1", status="error", name="ask_image")
     failure = builder_mod._classify_tool_failure(call, message, classified)
     ledger_failure = builder_mod._ledger_failure(failure, classified)
-    key = builder_mod._ledger_key(call, message, failure)
-    return classified.error_class, list(
-        builder_mod._apply_failure_ledger([], [(key, ledger_failure)])
+    outcomes = []
+    if not builder_mod._is_read_only_failure(spec, ledger_failure):
+        outcomes.append((builder_mod._ledger_key(call, message, failure), ledger_failure))
+    ledger = list(builder_mod._apply_failure_ledger([], outcomes))
+    # tools 节点:有建议的失败进 ``tool_failures``,其中非 transient 的触发深想升档。
+    escalates = failure is not None and bool(failure.advice) and failure.error_class != "transient"
+    return classified.error_class, escalates, ledger
+
+
+def test_refusal_is_transient_without_escalation_and_outside_the_ledger() -> None:
+    error_class, escalates, ledger = _tools_node_view(
+        ExpectedRefusalError("too large", advice="read it whole")
     )
-
-
-def test_refusal_is_a_neutral_class_that_keeps_out_of_the_failure_ledger() -> None:
-    error_class, ledger = _ledger(ExpectedRefusalError("too large", advice="read it whole"))
-    assert error_class == "transient"
-    assert ledger == []
+    assert (error_class, escalates, ledger) == ("transient", False, [])
     classified = classify_tool_error(
         tool_name="ask_image", error=ExpectedRefusalError("x", advice="read it whole")
     )
     assert (classified.retryable, classified.advice) == (False, "read it whole")
 
 
-def test_a_genuine_crop_error_still_enters_the_failure_ledger() -> None:
-    error_class, ledger = _ledger(region_zoom.RegionImageError("could not be decoded"))
-    assert error_class != "transient"
-    assert len(ledger) == 1
+def test_a_genuine_crop_error_is_not_transient_and_escalates_but_stays_out_of_the_ledger() -> None:
+    """``ask_image`` 只读:B-164 本来就不让它的失败进账本(与拒绝一样);区别是真错误不是 transient ——
+    计 ``cm_tool_error_total{error_class="unknown"}``、会触发深想升档。"""
+    error_class, escalates, ledger = _tools_node_view(
+        region_zoom.RegionImageError("the image could not be decoded for cropping")
+    )
+    assert (error_class, escalates, ledger) == ("unknown", True, [])
 
 
 @pytest.mark.anyio
@@ -809,3 +831,33 @@ async def test_write_crops_passes_its_purpose_to_the_refusal_count(tmp_path: Pat
             data, out_dir, [_WHOLE], degrees=0, ctx=up.ctx, purpose="orientation"
         )
     assert (_refused("orientation"), _refused("region")) == (before[0] + 1, before[1])
+
+
+@pytest.mark.parametrize("name", ["P+tRNS 2Mx3", "RGB 3Mx1", "RGB 1x3M", "P+tRNS 3Mx1"])
+def test_measured_extreme_aspect_rotated_peak_stays_within_the_estimate(
+    tmp_path: Path, name: str
+) -> None:
+    """转 90 度:缩的横向那一遍作用在转过的图上,中间图是 输出宽(对调) x 原宽。"""
+    size, mode = _EXTREME[name]
+    path, warm = tmp_path / "rot.png", tmp_path / "warm.png"
+    path.write_bytes(_extreme_png(size, mode))
+    warm.write_bytes(_extreme_png((64, 48), mode))
+    real = _measure_box(path, warm, _WHOLE, region_zoom.REGION_TARGET_PIXELS, 90)
+    estimate = crop_peak_bytes(*size, "P" if mode == "PT" else mode, draftable=False, rotated=True)
+    assert real <= estimate / PEAK_SAFETY, (real / 2**20, estimate / 2**20)
+
+
+def test_rotated_estimate_of_a_one_pixel_high_image_is_not_absurd() -> None:
+    """900000x1 的 P 转 90 度实际约 67 MiB;估算不能是几个 GB(中间图按转后的形状算)。"""
+    estimate = crop_peak_bytes(900_000, 1, "P", draftable=False, rotated=True)
+    assert estimate < 400 * 2**20
+
+
+def test_reads_a_copy_when_a_png_may_carry_a_trailing_orientation() -> None:
+    from orchestrator.tools.image_orientation import Orientation
+
+    upright = Orientation("upright")
+    plain = _png(Image.new("RGB", (40, 20)))
+    assert vision._reads_a_copy(upright, plain) is False
+    assert vision._reads_a_copy(upright, _trailing_exif_png((40, 20), 6)) is True
+    assert vision._reads_a_copy(Orientation("not_asked"), _trailing_exif_png((40, 20), 6)) is False

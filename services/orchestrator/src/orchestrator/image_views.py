@@ -287,12 +287,13 @@ def _may_rotate(image: Image.Image, data: bytes, degrees: int) -> bool:
     —— 保守算会转。不解码。"""
     from orchestrator.tools.region_zoom import (  # 延迟导入,见模块说明
         header_orientation,
+        may_have_trailing_exif,
         turned_orientation,
     )
 
     if turned_orientation(header_orientation(image), degrees) != 1:
         return True
-    return image.format == "PNG" and "exif" not in image.info and b"eXIf" in data
+    return may_have_trailing_exif(image, data)
 
 
 def crop_slots(data: bytes, degrees: int, max_pixels: int) -> int | None:

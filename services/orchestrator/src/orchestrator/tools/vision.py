@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import io
 import logging
 import time
 import weakref
@@ -32,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from uuid import UUID
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from PIL import Image
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.common.observability.metrics import expert_work_counter
@@ -114,6 +116,7 @@ from orchestrator.tools.region_zoom import (
     DOCUMENT_ZOOM_DPI,
     LARGE_IMAGE_PIXELS,
     MAX_BAND_PIXELS,
+    OPEN_FORMATS,
     REGION_HINT,
     REGION_TARGET_PIXELS,
     Box,
@@ -125,6 +128,7 @@ from orchestrator.tools.region_zoom import (
     crop_output_size,
     exif_orientation,
     image_size,
+    may_have_trailing_exif,
     parse_region,
     plan_bands,
 )
@@ -1915,7 +1919,17 @@ def _reads_a_copy(orientation: Orientation, data: bytes) -> bool:
     用副本的这几种结论,问方向时那张副本都已经写好了。"""
     if orientation.conclusion == "not_asked":
         return False
-    return orientation.degrees != 0 or exif_orientation(data) != 1
+    return orientation.degrees != 0 or exif_orientation(data) != 1 or _png_trailing_exif(data)
+
+
+def _png_trailing_exif(data: bytes) -> bool:
+    """B-332 —— PNG 的方向标记若在文件末尾(``exif_orientation`` 只读文件头、看不到),与估算同一条
+    保守规则:当作可能带方向,读副本(副本是真正解码、照末尾标记转正的那张)。"""
+    try:
+        with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
+            return may_have_trailing_exif(image, data)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return False
 
 
 def _with_orientation_note(content: str, located: _Located) -> str:

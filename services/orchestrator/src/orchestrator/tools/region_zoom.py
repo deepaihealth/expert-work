@@ -317,6 +317,12 @@ def header_orientation(image: Image.Image) -> int:
     return _orientation(image)
 
 
+def may_have_trailing_exif(image: Image.Image, data: bytes) -> bool:
+    """B-332 —— PNG 文件头里没有 ``exif``、但文件里有 ``eXIf`` 字样:方向标记在文件末尾,要解码
+    才读得到值,保守当作「可能要转」(估算按转算,问方向后的整张看也读副本)。不解码。"""
+    return image.format == "PNG" and "exif" not in image.info and b"eXIf" in data
+
+
 @dataclass(frozen=True)
 class CroppedImage:
     data: bytes
@@ -645,19 +651,20 @@ def _undrafted_peak_bytes(
     pixels = width * height
     decoded = pixels * _DECODED_BYTES_PER_PIXEL.get(mode, 4)
     out_w, out_h = _capped(width, height, max_pixels)
-    # 转 90 / 270 度时宽高对调:中间图取两种里大的。
-    middle_rows = max(width, height) if rotated else height
+    # 缩的横向那一遍的中间图(输出宽 x 被缩那张图的行数)。转 90 / 270 度时宽高对调,输出宽也对调:
+    # 取两种里大的(与 JPEG 的估算同一个形状)。
+    middle = max(out_w * height, out_h * width) if rotated else out_w * height
     out = out_w * out_h * 4
     if mode in _RESIZE_FIRST_MODES:
         channels = 4 if mode == "RGB" else 1
-        phases = [decoded + out_w * middle_rows * channels + out + out_w * out_h * (4 - channels)]
+        phases = [decoded + middle * channels + out + out_w * out_h * (4 - channels)]
         if rotated:
             phases[0] += decoded
     else:
         flat = pixels * 4
-        phases = [decoded + out_w * middle_rows * 4 + out]
+        phases = [decoded + middle * 4 + out]
         if rotated:
-            phases = [decoded + 2 * flat, decoded + flat + out_w * middle_rows * 4 + out]
+            phases = [decoded + 2 * flat, decoded + flat + middle * 4 + out]
     if mode not in _RESIZE_FIRST_MODES:
         # 分条转 RGB 的每一条:一条至少一整行(宽 > 条的像素数时一行就是一条)。
         strip = max(width, _FLATTEN_STRIP_PIXELS) * UNDRAFTED_STRIP_BYTES_PER_PIXEL

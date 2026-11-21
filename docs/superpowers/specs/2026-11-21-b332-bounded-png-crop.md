@@ -61,18 +61,18 @@
 
 **横条里不用缩的框**(`bands=True`,上限 300 万像素,框 `[0,0,1000,277]`):4000x2700 RGBA 实测 57 MiB(原路 99),估算 115(拒绝,按整张要缩的最贵框估,比实测宽);3600x2700 RGBA 实测 52,估算 108(占 2 个名额)。**末尾带 `eXIf`(方向 6)的 4000x3200 RGB**:实测 125,估算 172(拒绝;审查原先的估算 107 会放行)。
 
-校准的判据:**乘安全系数之前**的估算在每一个量过的组合(RGB / RGBA / L / P x 6 / 12 / 24 / 48 MP x 0 / 90 度 x 整张 / 局部,Linux 与 macOS 各 48 个)上都不小于实测,最紧的一格 1.07 倍(RGBA 转 90 度)。极端长宽比、横条、WebP 另有测试在新进程里重量。
+校准的判据:**乘安全系数之前**的估算在每一个量过的组合(RGB / RGBA / L / P x 6 / 12 / 24 / 48 MP x 0 / 90 度 x 整张 / 局部,Linux 与 macOS 各 48 个)上都不小于实测,最紧的一格 1.07 倍(RGBA 转 90 度)。转 90 度的中间图按转后的形状算(`max(输出宽 x 原高, 输出高 x 原宽)`,与 JPEG 的估算同一个形状;原先的 `输出宽 x max(宽, 高)` 对一像素高的图高估到 GB 级);转 90 度的极端形状另量:900000x1 P 实测 57 / 52、估算 112;12000x1000 P 实测 108 / 103、估 152;12000x1000 RGBA 实测 150 / 141、估 193;3000000x1 RGB 实测 201 / 200、估 299(macOS / Linux,估算都已含 1.2)。极端长宽比、横条、WebP 另有测试在新进程里重量。
 
 ## 5. 现在装得下什么(4:3 画幅,估算 ≤ 110 MiB;由代码按上面的估算算出)
 
 | 格式 / 模式 | 1 个名额(≤ 55 MiB) | 能裁(≤ 110 MiB) | 转 90 度:1 个名额 / 能裁 |
 |---|---|---|---|
-| PNG RGB | 约 4.9 MP | 约 13 MP(4000x3000 估算 102.7、4032x3024 估算 104.0,都装得下) | 约 2.7 / 7.3 MP |
-| PNG RGBA | 约 4.0 MP | 约 12 MP(4000x3000 估算 108.7 装得下) | 约 2.2 / 6.4 MP |
-| PNG 灰度 L | 约 13 MP | 约 35 MP | 约 8.6 / 23 MP |
-| PNG 调色板 P / GIF | 约 8 MP | 约 26 MP | 约 3.1 / 8.4 MP |
-| PNG 16 位灰度 | 约 6 MP | 约 19 MP | 约 2.7 / 7.6 MP |
-| WebP | 约 1.6 MP | 约 4 MP | 约 1.3 / 3.2 MP |
+| PNG RGB | 约 4.9 MP | 约 13 MP(4000x3000 估算 102.7、4032x3024 估算 104.0,都装得下) | 约 3.0 / 7.7 MP |
+| PNG RGBA | 约 4.0 MP | 约 12 MP(4000x3000 估算 108.7 装得下) | 约 2.5 / 6.4 MP |
+| PNG 灰度 L | 约 13 MP | 约 35 MP | 约 9.0 / 24 MP |
+| PNG 调色板 P / GIF | 约 8 MP | 约 26 MP | 约 3.5 / 8.4 MP |
+| PNG 16 位灰度 | 约 6 MP | 约 19 MP | 约 3.0 / 7.6 MP |
+| WebP | 约 1.6 MP | 约 4 MP | 约 1.3 / 3.3 MP |
 | 48 MP 任何 RGB / RGBA;极端长宽比(单边几百万像素以上) | — | 拒绝 | 拒绝 |
 
 比立项时预计的「RGB ≤ 18 MP、RGBA ≤ 10 MP」:RGB 低(估算含 1.2 安全系数,12 MP RGB 实测才 73 MiB),RGBA 高(分条后不再有整张的 RGBA 拷贝)。
@@ -81,18 +81,26 @@
 
 ## 6. 验证
 
-`services/orchestrator/tests/test_b332_bounded_crop.py`:整张框 x 8 种 EXIF 方向 x 4 个度数 x 8 种颜色模式,与 main 的 `crop_image`(`_b332_main_region_zoom.py`,main 该文件的原样拷贝,进程内比对,不依赖平台的 JPEG 字节哈希)逐字节相同;分条拼接(条宽压到 7 行、最后一条不满)与 main 逐字节相同;局部框(非 RGB / 灰度)同样逐字节相同;RGB / 灰度的局部缩小(含贴左上角的框,8 种方向)尺寸相同、像素差有界(均值 < 0.5、最大 ≤ 32,截图类合成图);B-301 接缝横条并集框;RGBA / LA / 带透明 P 铺白底;B-322 JPEG 候选(L / RGB / CMYK x 8 方向 x 4 度数)逐字节不变、JPEG 估算与 main 相同;估算 ≥ 实测(新进程:6 / 12 / 24 MP 与全景、5 种模式、0 / 90 度,极端长宽比,横条不用缩的框,WebP);只读文件头的 `image_size` / `exif_orientation` 对只有文件头的假 PNG(解码就会失败)照样答得出;末尾 `eXIf`、无害的头部 `eXIf`;超预算在解码前拒绝、占名额数、指标分 `purpose`;拒绝不进失败账本而真正的裁图错误仍进;`region='auto'` 与整张看遇到裁不了的图不再提示 / 建议 region。`test_b322_crop_image_unchanged.py`:`_cap_pixels` 被取代已删;改过 / 新增的定义钉新哈希,其余 main 上的定义仍逐字不变。
+`services/orchestrator/tests/test_b332_bounded_crop.py`:整张框 x 8 种 EXIF 方向 x 4 个度数 x 8 种颜色模式,与 main 的 `crop_image`(`_b332_main_region_zoom.py`,main 该文件的原样拷贝,进程内比对,不依赖平台的 JPEG 字节哈希)逐字节相同;分条拼接(条宽压到 7 行、最后一条不满)与 main 逐字节相同;局部框(非 RGB / 灰度)同样逐字节相同;RGB / 灰度的局部缩小(含贴左上角的框,8 种方向)尺寸相同、像素差有界(均值 < 0.5、最大 ≤ 32,截图类合成图);B-301 接缝横条并集框;RGBA / LA / 带透明 P 铺白底;B-322 JPEG 候选(L / RGB / CMYK x 8 方向 x 4 度数)逐字节不变、JPEG 估算与 main 相同;估算 ≥ 实测(新进程:6 / 12 / 24 MP 与全景、5 种模式、0 / 90 度,极端长宽比,横条不用缩的框,WebP);只读文件头的 `image_size` / `exif_orientation` 对只有文件头的假 PNG(解码就会失败)照样答得出;末尾 `eXIf`、无害的头部 `eXIf`;超预算在解码前拒绝、占名额数、指标分 `purpose`;拒绝是 transient、不升档,真正的裁图错误不是 transient、升档,两者在 `ask_image` 只读规格下都不进失败账本;`region='auto'` 与整张看遇到裁不了的图不再提示 / 建议 region。`test_b322_crop_image_unchanged.py`:`_cap_pixels` 被取代已删;改过 / 新增的定义钉新哈希,其余 main 上的定义仍逐字不变。
 
 ## 7. 预期之内的拒绝与失败账本(用户 11-21 定)
 
-B-164 / B-226 的失败账本(`unresolved_failures`)对工具的失败分类:`ask_image` 是只读工具,按 B-164 它的非瞬态失败本来就不进账本;但「图太大」的拒绝仍会被分成 `unknown`、计入 `expert_work_cm_tool_error_total`、触发深想升档(`error_signal`),且账本规则对别的配置不一定成立。最窄的做法是沿用既有的 `GuidedTimeoutError` 先例:新增 `ExpectedRefusalError`(`tools/error_classifier.py`),分类为 `transient`(账本两个方向都不是证据:既不记入也不抵消、不触发升档)、`retryable=False`、带工具给的建议。模型仍读到一条错误(调用没发生)。真正的裁图错误(解不开等)照旧是 `unknown`、照旧进账本(两边都有测试)。
+`ask_image` 是**只读**工具:B-164 的 `_is_read_only_failure`(`graph_builder/builder.py`)让它所有非瞬态失败本来就不进失败账本(`unresolved_failures`),所以 B-226 的「没做完」判定与账本行为**不因本票改变**(拒绝和真正的裁图错误都不进账本)。「图太大」的拒绝在没有 `ExpectedRefusalError` 时会被分成 `unknown`,从而:计入 `expert_work_cm_tool_error_total{error_class="unknown"}`、触发深想升档(`error_signal` 取「非 transient 的失败」)、给模型的建议标签是 `unknown` 那一套。最窄的做法是沿用既有的 `GuidedTimeoutError` 先例:新增 `ExpectedRefusalError`(`tools/error_classifier.py`),分类为 `transient`、`retryable=False`、带工具给的建议。它实际改变的只有三件事:
+
+1. 不触发深想升档;
+2. 建议的标签是 `[transient]`;
+3. 指标的错误类是 `transient`(不混进 `unknown` 的真错误)。
+
+真正的裁图错误(解不开等)照旧是 `unknown`(会升档、计 `unknown`),也照旧因只读而不进账本。测试用 `vision._spec_with_short_form()` 的真实规格走 `_is_read_only_failure` 这一步断言以上行为。
+
+已知现象:`region='auto'` 的横条在约 11~13 MP 的 RGBA PNG 上会被拒(估算按整张要缩的最贵框算),拒绝按 `purpose="region"` 计,与接缝重看(`bands=True`)的拒绝没有分开;没有单独的 `purpose` 标签,不影响行为。
 
 ## 8. 与立项决定不一致的地方(已按实际处理)
 
 1. 「告诉模型缩小区域」不成立:PNG 不论框多大都要整张解开,估算与框无关,缩小区域会反复被拒。提示改成「不带 region 整张看 / 请用户给更小的图」。
 2. JPEG 的局部框(要缩、RGB / 灰度)也走 `resize(box=)`,有同一档极小差别;整张框(B-322 候选)逐字节不变。
 3. 只估 JPEG 以外的格式;JPEG 的 `ask_image` 局部裁图仍占 1 个名额、估算不随框变(没有动)。JPEG 局部框若不够 `draft` 的门槛会整张解开,这是 B-322 之前就有的口径,不在本票。
-4. 末尾才有 `eXIf` 的 PNG:`image_size` / `exif_orientation` 这类只读头的函数看不到它的方向(返回 1),真正裁图时照它转;两边只对这种罕见文件不一致(复用已裁好的图时报的尺寸可能是转之前的)。
+4. 末尾才有 `eXIf` 的 PNG:`image_size` / `exif_orientation` 这类只读头的函数看不到它的方向(返回 1),真正裁图时照它转;两边只对这种罕见文件不一致(复用已裁好的图时报的尺寸可能是转之前的)。整张看要不要读候选副本(`_reads_a_copy`)对这种文件用与估算相同的保守规则(`may_have_trailing_exif`):读副本,副本是真正解码、照末尾标记转正的那张。
 
 ## 9. 业界做法(调研)
 
