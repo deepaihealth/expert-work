@@ -19,7 +19,9 @@ See ``docs/streams/STREAM-J-DESIGN.md`` § 13.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
+import io
 import logging
 import time
 import weakref
@@ -31,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from uuid import UUID
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from PIL import Image
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.common.observability.metrics import expert_work_counter
@@ -57,6 +60,7 @@ from expert_work.runtime.storage.base import ObjectNotFoundError
 # B-266 review round 2 g —— 宿主解图名额(``region_zoom.HOST_CROP_SLOTS``)的闸;B-322 起放在叶子模块
 # ``orchestrator.image_views`` 里,适配器那一侧当场重算转正图也走同一道闸。
 from orchestrator.image_views import _HOST_CROP_GATES as _HOST_CROP_GATES
+from orchestrator.image_views import crop_slots, in_host_crop_slots
 from orchestrator.image_views import in_host_crop_slot as in_host_crop_slot
 from orchestrator.llm.truncation import (
     ServedOutputCap,
@@ -74,7 +78,11 @@ from orchestrator.multimodal import (
     upload_image_id_for_log,
 )
 from orchestrator.tools._guards import usage_total
-from orchestrator.tools.error_classifier import GuidedTimeoutError, GuidedToolError
+from orchestrator.tools.error_classifier import (
+    ExpectedRefusalError,
+    GuidedTimeoutError,
+    GuidedToolError,
+)
 from orchestrator.tools.figure_lookup import (
     FigureNotRenderedError,
     _ScopeLister,
@@ -108,6 +116,7 @@ from orchestrator.tools.region_zoom import (
     DOCUMENT_ZOOM_DPI,
     LARGE_IMAGE_PIXELS,
     MAX_BAND_PIXELS,
+    OPEN_FORMATS,
     REGION_HINT,
     REGION_TARGET_PIXELS,
     Box,
@@ -119,6 +128,7 @@ from orchestrator.tools.region_zoom import (
     crop_output_size,
     exif_orientation,
     image_size,
+    may_have_trailing_exif,
     parse_region,
     plan_bands,
 )
@@ -218,10 +228,46 @@ _TILE_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaph
 )
 
 
+#: B-332 —— 宿主裁图被拒(解码之后峰值内存会超过预算,解码之前按文件头估的)的次数。
+ask_image_crop_refused_total = expert_work_counter(
+    "expert_work_ask_image_crop_refused_total",
+    "ask_image host crops refused before decoding because the estimated peak memory exceeds "
+    "FULL_COPY_PEAK_BYTES (B-332), by reason (peak_over_budget) and purpose (region: a region "
+    "crop the model asked for; orientation: a candidate copy of the orientation check).",
+    ("reason", "purpose"),
+)
+_CROP_TOO_LARGE_ADVICE = (
+    "Do not retry with a different region: the whole file has to be decoded for any region, so "
+    "it would be refused again. Read the image without region (it is looked at whole, at lower "
+    "detail), or tell the user the file is too large to zoom into and ask for a smaller export "
+    "or a screenshot of just the part they need."
+)
+
+
 async def _crop_in_thread(
-    data: bytes, boxes: Sequence[Box], degrees: int, max_pixels: int = REGION_TARGET_PIXELS
+    data: bytes,
+    boxes: Sequence[Box],
+    degrees: int,
+    max_pixels: int = REGION_TARGET_PIXELS,
+    *,
+    purpose: str = "region",
 ) -> list[CroppedImage]:
-    return await in_host_crop_slot(crop_image, data, boxes, degrees, max_pixels)
+    slots = crop_slots(data, degrees, max_pixels)
+    if slots is None:
+        ask_image_crop_refused_total.labels(reason="peak_over_budget", purpose=purpose).inc()
+        # 不在这里读尺寸:这里正是要在解码之前拒掉。
+        msg = (
+            "This image is too large to crop at its original resolution on the server: "
+            "decoding it would use more memory than a single crop is allowed. "
+            "Nothing was cropped."
+        )
+        # 预期之内的拒绝,不是这次 run 的失败:不进失败账本(见 ExpectedRefusalError)。
+        raise ExpectedRefusalError(msg, advice=_CROP_TOO_LARGE_ADVICE)
+    if slots == 1:
+        return await in_host_crop_slot(crop_image, data, boxes, degrees, max_pixels)
+    return await in_host_crop_slots(
+        slots, functools.partial(crop_image, data, boxes, degrees, max_pixels)
+    )
 
 
 def _tile_slots() -> asyncio.Semaphore:
@@ -810,22 +856,35 @@ class AskImageTool:
             look = await self._look(located.look_ref, question, depth="quick", ctx=ctx)
         except Exception as full_error:
             raise full_error from error
-        ask_image_region_auto_total.labels(path="full_fallback", reason="bands_unavailable").inc()
+        refused = isinstance(error, ExpectedRefusalError)
+        reason_label = "crop_too_large" if refused else "bands_unavailable"
+        ask_image_region_auto_total.labels(path="full_fallback", reason=reason_label).inc()
         # 异常的文字可能带 NAS 路径之类:给模型与 meta 的只有类型和一句固定的话,细节只进日志。
-        logger.warning(
-            "ask_image.auto_bands_unavailable err=%s", type(error).__name__, exc_info=error
+        logger.log(
+            logging.INFO if refused else logging.WARNING,
+            "ask_image.auto_bands_unavailable err=%s",
+            type(error).__name__,
+            exc_info=None if refused else error,
         )
         reason = f"{type(error).__name__}: the region render failed"
         meta.update(
             {
                 "auto": "full_fallback",
-                "auto_reason": "bands_unavailable",
+                "auto_reason": reason_label,
                 "bands_error": type(error).__name__,
                 "vl_calls": 1,
             }
         )
         if look.usage:
             meta["vl_usage"] = look.usage
+        if refused:
+            content = (
+                f"{look.answer}\n\n(region='auto': this image is too large to zoom into on the "
+                "server, so it was read whole; small print may be unreliable. Do not retry with a "
+                "region - it would be refused again. Say the value is uncertain, or ask the user "
+                "for a smaller export or a screenshot of just the part they need.)"
+            )
+            return content, meta
         content = (
             f"{look.answer}\n\n(region='auto': whole-image reading; small print may be unreliable "
             f"- the bands could not be prepared ({reason}). Re-ask with an explicit region, or say "
@@ -989,6 +1048,7 @@ class AskImageTool:
         degrees: int,
         ctx: ToolContext,
         bands: bool = False,
+        purpose: str = "region",
     ) -> RegionRender:
         """裁 ``boxes`` 写进 ``out_dir``(0 度)或 ``out_dir/r<degrees>``;已有的同名文件直接用。
         ``bands=True`` 按横条分辨率裁、文件名带 ``-b``(见 :meth:`_crop_image`)。
@@ -1008,7 +1068,13 @@ class AskImageTool:
         reusable = {n for n in names if n in existing and not existing[n].is_dir}
         todo = [box for box in boxes if region_crop_stem(box, band=bands) + ".jpg" not in reusable]
         pieces = (
-            dict(zip(todo, await _crop_in_thread(data, todo, degrees, max_pixels), strict=True))
+            dict(
+                zip(
+                    todo,
+                    await _crop_in_thread(data, todo, degrees, max_pixels, purpose=purpose),
+                    strict=True,
+                )
+            )
             if todo
             else {}
         )
@@ -1129,7 +1195,9 @@ class AskImageTool:
         但它用掉的时间算数,写完已经过了线就不再问。"""
 
         async def candidate(degrees: int) -> str:
-            render = await self._write_crops(data, out_dir, [_FULL_FRAME], degrees=degrees, ctx=ctx)
+            render = await self._write_crops(
+                data, out_dir, [_FULL_FRAME], degrees=degrees, ctx=ctx, purpose="orientation"
+            )
             return render.crops[0].ref
 
         async def ask(ref: str, budget_s: float) -> tuple[Answer, str | None]:
@@ -1249,8 +1317,21 @@ class AskImageTool:
         figure = parse_rendered_figure_ref(located.ref)
         if figure is not None and figure.region is not None:
             return False
-        pixels, _size, _document = await self._zoom_pixels(located)
-        return pixels is not None and pixels >= LARGE_IMAGE_PIXELS
+        pixels, _size, document = await self._zoom_pixels(located)
+        if pixels is None or pixels < LARGE_IMAGE_PIXELS:
+            return False
+        # B-332 —— 宿主裁不了的图(估算超预算)不提示 region:提示了只会换来一次必被拒的重试。
+        if not document and await self._crop_refused(located):
+            return False
+        return True
+
+    async def _crop_refused(self, located: _Located) -> bool:
+        """宿主裁这张图会不会被拒(只读文件头;读不出来按「不拒」,让真正裁的时候报错)。"""
+        try:
+            data = (await self.image_resolver.resolve(located.ref)).data
+            return crop_slots(data, located.degrees, REGION_TARGET_PIXELS) is None
+        except Exception:
+            return False
 
     async def _ask(
         self,
@@ -1838,7 +1919,17 @@ def _reads_a_copy(orientation: Orientation, data: bytes) -> bool:
     用副本的这几种结论,问方向时那张副本都已经写好了。"""
     if orientation.conclusion == "not_asked":
         return False
-    return orientation.degrees != 0 or exif_orientation(data) != 1
+    return orientation.degrees != 0 or exif_orientation(data) != 1 or _png_trailing_exif(data)
+
+
+def _png_trailing_exif(data: bytes) -> bool:
+    """B-332 —— PNG 的方向标记若在文件末尾(``exif_orientation`` 只读文件头、看不到),与估算同一条
+    保守规则:当作可能带方向,读副本(副本是真正解码、照末尾标记转正的那张)。"""
+    try:
+        with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
+            return may_have_trailing_exif(image, data)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return False
 
 
 def _with_orientation_note(content: str, located: _Located) -> str:

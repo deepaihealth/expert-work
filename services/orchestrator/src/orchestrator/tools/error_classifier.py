@@ -120,6 +120,21 @@ class GuidedToolError(RuntimeError):
         self.advice = advice
 
 
+class ExpectedRefusalError(RuntimeError):
+    """A tool declining a call it knows it cannot do safely — not a failure of the run.
+
+    B-332 —— ``ask_image`` refuses a host crop whose estimated peak memory is over budget,
+    before decoding anything. The model still reads an error (the call did not happen, and the
+    tool supplies advice), but the run's failure ledger treats it like jitter: classed
+    ``transient`` (neither recorded nor clears an entry, no deeper-thinking escalation), same
+    as :class:`GuidedTimeoutError`. A retry does not help, so ``retryable`` is False.
+    """
+
+    def __init__(self, message: str, *, advice: str) -> None:
+        super().__init__(message)
+        self.advice = advice
+
+
 class KindClassifiedError(RuntimeError):
     """A failure whose class the raising tool states from the failure's kind.
 
@@ -158,6 +173,14 @@ def classify_tool_error(
     if isinstance(error, ToolNotFoundError):
         return _make("unknown_tool", tool_name, summary, spec)
     if isinstance(error, GuidedTimeoutError):
+        return ClassifiedToolError(
+            tool_name=tool_name,
+            error_class="transient",
+            summary=summary,
+            retryable=False,
+            advice=error.advice,
+        )
+    if isinstance(error, ExpectedRefusalError):
         return ClassifiedToolError(
             tool_name=tool_name,
             error_class="transient",

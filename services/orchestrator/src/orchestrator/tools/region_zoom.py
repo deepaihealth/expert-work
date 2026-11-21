@@ -291,7 +291,7 @@ def image_size(data: bytes, degrees: int = 0) -> tuple[int, int] | None:
     try:
         with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
             width, height = image.size
-            if turned_orientation(_orientation(image), degrees) in _SWAPPED_ORIENTATIONS:
+            if turned_orientation(header_orientation(image), degrees) in _SWAPPED_ORIENTATIONS:
                 return height, width
             return width, height
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
@@ -302,9 +302,25 @@ def exif_orientation(data: bytes) -> int:
     """B-301 —— 图片自带的方向标记(只读文件头);没有、认不出来都是 1(不用转)。"""
     try:
         with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
-            return _orientation(image)
+            return header_orientation(image)
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
         return 1
+
+
+def header_orientation(image: Image.Image) -> int:
+    """B-332 —— 只看文件头的方向标记,**绝不解码**。Pillow 的 PNG ``getexif()`` 在文件头里没有
+    ``exif`` 时,会把整张图解开去找文件末尾的 ``eXIf`` 块(48 MP 的 RGBA 多 +184 MiB,发生在事件
+    循环上、不占解图名额),所以 PNG 头里没有就当 1。文件末尾才有的 ``eXIf`` 在这里看不到(罕见;
+    真正裁图时整张已解开,仍照它转)。"""
+    if image.format == "PNG" and "exif" not in image.info:
+        return 1
+    return _orientation(image)
+
+
+def may_have_trailing_exif(image: Image.Image, data: bytes) -> bool:
+    """B-332 —— PNG 文件头里没有 ``exif``、但文件里有 ``eXIf`` 字样:方向标记在文件末尾,要解码
+    才读得到值,保守当作「可能要转」(估算按转算,问方向后的整张看也读副本)。不解码。"""
+    return image.format == "PNG" and "exif" not in image.info and b"eXIf" in data
 
 
 @dataclass(frozen=True)
@@ -362,12 +378,91 @@ def _crop_open_image(
             image.draft(image.mode, (-(-width // scale), -(-height // scale)))
     crops: list[CroppedImage] = []
     for box in boxes:
-        piece = _flatten(crop_upright(image, box, orientation))
-        piece = _cap_pixels(piece, max_pixels)
+        piece = _render_box(image, box, orientation, max_pixels)
         buffer = io.BytesIO()
         piece.save(buffer, format="JPEG", quality=CROP_JPEG_QUALITY)
         crops.append(CroppedImage(data=buffer.getvalue(), width=piece.width, height=piece.height))
+        piece.close()
     return crops
+
+
+#: B-332 —— 缩小这一步可以直接在原模式上做的颜色模式(RGB 本来就是;灰度缩完再转 RGB 与先转再缩逐像素
+#: 相同,而灰度每像素只占 1 字节)。别的模式(带透明、调色板、16 位、CMYK……)要先转 RGB / 铺白底再缩:
+#: 调色板与 1 位图缩的时候 Pillow 用最近邻、带透明的要按透明度加权,先缩再转结果不同。
+_RESIZE_FIRST_MODES: Final = frozenset({"RGB", "L"})
+#: B-332 —— 转 RGB / 铺白底一次处理的像素数(分条处理,不整张再复制一份)。
+_FLATTEN_STRIP_PIXELS: Final = 1 << 18
+
+
+def _render_box(image: Image.Image, box: Box, orientation: int, max_pixels: int) -> Image.Image:
+    """B-332 —— 裁出 ``box`` 那一块、转 RGB、必要时缩到 ``max_pixels`` 以内。结果与「裁 → 转 →
+    转 RGB → 缩」逐字节相同,只有一种例外(见下),内存却不再叠整张图的几份拷贝:
+
+    * 不用缩的框:RGB / 灰度原样走老路(裁下来的就是小块);别的颜色模式分条转 RGB(一块带透明的
+      图在老路上同时有约 5 份拷贝);
+    * 整张框、要缩:不复制整张图 —— RGB / 灰度直接缩(灰度缩完再转 RGB),别的颜色模式分条转 RGB;
+    * **局部框、要缩、RGB / 灰度:** 一步 ``resize(box=)``(在原图坐标上,缩完再转方向),不先裁一份
+      局部再缩。比「先裁再缩」多读框外一圈像素做滤波,像素有极小差别(用户 2026-11-21 同意),
+      尺寸与方向不变;
+    * 局部框、要缩、别的颜色模式:分条转 RGB 之后缩(与老路逐字节相同)。"""
+    (left, top, right, bottom), rect = _upright_rect(image.size, box, orientation)
+    target = _capped(right - left, bottom - top, max_pixels)
+    method = _UPRIGHT_METHODS.get(orientation)
+    if target == (right - left, bottom - top):
+        if image.mode in _RESIZE_FIRST_MODES:
+            return _flatten(crop_upright(image, box, orientation))
+        # 不用缩、非 RGB / 灰度:分条转(与「裁 → 转方向 → 转 RGB」逐字节相同,但不叠 ~5 份拷贝)。
+        flat = _flatten_region(image, rect)
+        return flat if method is None else _replaced(flat, flat.transpose(method))
+    whole = rect == (0, 0, *image.size)
+    if image.mode in _RESIZE_FIRST_MODES:
+        if not whole:
+            source_size = (target[1], target[0]) if orientation in _SWAPPED_ORIENTATIONS else target
+            piece = image.resize(source_size, Image.Resampling.LANCZOS, box=rect)
+            return _flatten(piece if method is None else _replaced(piece, piece.transpose(method)))
+        upright = image if method is None else image.transpose(method)
+        piece = upright.resize(target, Image.Resampling.LANCZOS)
+        if upright is not image:
+            upright.close()
+        return _flatten(piece)
+    if method is None:
+        return _flatten_resized(image, rect, target)
+    flat = _flatten_region(image, rect)
+    flat = _replaced(flat, flat.transpose(method))
+    return _replaced(flat, flat.resize(target, Image.Resampling.LANCZOS))
+
+
+def _flatten_resized(image: Image.Image, rect: Box, target: tuple[int, int]) -> Image.Image:
+    """B-332 —— ``rect``(原图坐标,不转方向)转 RGB 再 LANCZOS 缩到 ``target``,与
+    ``_flatten(image.crop(rect)).resize(target, LANCZOS)`` 逐字节相同,但整块 RGB 从不整份存在:Pillow
+    缩小分两遍(先横向、再纵向,中间是 8 位),横向那一遍每一行独立,所以分条转 RGB、分条横向缩,拼成
+    ``目标宽 x 原高`` 的中间图,再做纵向那一遍。"""
+    left, top, right, bottom = rect
+    width = right - left
+    rows = max(1, _FLATTEN_STRIP_PIXELS // width)
+    wide = Image.new("RGB", (target[0], bottom - top))
+    for y in range(top, bottom, rows):
+        strip = image.crop((left, y, right, min(bottom, y + rows)))
+        flat = _flatten(strip)
+        narrow = flat.resize((target[0], flat.height), Image.Resampling.LANCZOS)
+        wide.paste(narrow, (0, y - top))
+        for part in (strip, flat, narrow):
+            part.close()
+    return _replaced(wide, wide.resize(target, Image.Resampling.LANCZOS))
+
+
+def _flatten_region(image: Image.Image, rect: Box) -> Image.Image:
+    """B-332 —— ``rect``(原图坐标)那一块转成 RGB(带透明的铺白底),与 ``_flatten(image.crop(rect))``
+    逐字节相同,但分条转:不先复制一份整块、也不在转的过程里同时有好几份整块的拷贝。"""
+    left, top, right, bottom = rect
+    width = right - left
+    rows = max(1, _FLATTEN_STRIP_PIXELS // width)
+    out = Image.new("RGB", (width, bottom - top))
+    for y in range(top, bottom, rows):
+        strip = image.crop((left, y, right, min(bottom, y + rows)))
+        out.paste(_flatten(strip), (0, y - top))
+        strip.close()
+    return out
 
 
 def upright_whole(image: Image.Image, degrees: int, max_pixels: int | None = None) -> Image.Image:
@@ -474,7 +569,14 @@ FULL_COPY_OVERHEAD_PER_PIXEL: Final = 0.25
 
 
 def crop_peak_bytes(
-    width: int, height: int, mode: str, max_pixels: int = REGION_TARGET_PIXELS
+    width: int,
+    height: int,
+    mode: str,
+    max_pixels: int = REGION_TARGET_PIXELS,
+    *,
+    draftable: bool = True,
+    rotated: bool = False,
+    decoder_bytes_per_pixel: float = 0.0,
 ) -> int:
     """B-322 —— 解码之前估 :func:`crop_image` 对一张 JPEG 整张框(问方向的候选 / 小副本)的峰值内存,
     按它现在(与 main 逐字节相同)的做法:按 ``draft`` 缩小解码 —— 请求尺寸向上取整,Pillow 按
@@ -488,6 +590,10 @@ def crop_peak_bytes(
     取三段里最大的,加上每个解码像素 :data:`CROP_OVERHEAD_PER_PIXEL` 字节,再乘
     :data:`PEAK_SAFETY`。实测(第六轮,设计 §4.1.5):12 MP RGB 实 41.3 MiB、估 53.3;20 MP RGB
     实 64.2、估 83.6;12 MP 灰度实 35.0、估 42.8。"""
+    if not draftable:
+        return _undrafted_peak_bytes(
+            width, height, mode, max_pixels, rotated, decoder_bytes_per_pixel
+        )
     bpp = _BYTES_PER_PIXEL[mode]
     scale = 1
     wanted = _draft_scale((width, height), [(0, 0, REGION_SCALE, REGION_SCALE)], max_pixels)
@@ -504,6 +610,72 @@ def crop_peak_bytes(
         middle = max(ow * sh, oh * sw) * 4
         phases.append(source + rgb + middle + ow * oh * 4)
     calibrated = max(phases) + CROP_OVERHEAD_PER_PIXEL * pixels
+    return math.ceil(calibrated * PEAK_SAFETY)
+
+
+#: B-332 —— 解开之后每个像素在内存里占几个字节(Pillow 的存法;没列的按 4 字节算)。
+_DECODED_BYTES_PER_PIXEL: Final = {"1": 1, "L": 1, "P": 1, "I;16": 2}
+#: B-332 校准(新进程、读文件、调一次 ``crop_image``、``ru_maxrss`` 的增量,见设计
+#: ``2026-11-21-b332-bounded-png-crop.md``):解码器的缓冲与分配器没还回去的,每像素约这么多字节。
+UNDRAFTED_OVERHEAD_PER_PIXEL: Final = 1.0
+#: 小图上占的固定部分(JPEG 编码缓冲、Pillow 的临时对象;6 MP 实测比按像素算的多约 4 MiB)。
+UNDRAFTED_FIXED_BYTES: Final = 6 * 1024 * 1024
+#: B-332 实测:Pillow 解 WebP 时解码器自己还另占约 3 份整图(6 / 12 / 24 MP 的有损、无损、带透明都是
+#: 每像素 11.7~12.2 字节,多于 PNG),估算里按这个另加(取 13)。PNG / GIF 不需要。
+WEBP_DECODE_BYTES_PER_PIXEL: Final = 13.0
+#: B-332 独立审查补的两项(实测见设计 §4):Pillow LANCZOS 的滤波系数表,每条边每像素的字节数。
+UNDRAFTED_COEFFICIENT_BYTES: Final = 72
+#: 分条转 RGB(带透明)时每条里每个像素同时存在的字节数(审查量到约 4 份 RGBA 拷贝)。
+UNDRAFTED_STRIP_BYTES_PER_PIXEL: Final = 20
+
+
+def _undrafted_peak_bytes(
+    width: int,
+    height: int,
+    mode: str,
+    max_pixels: int,
+    rotated: bool,
+    decoder_bytes_per_pixel: float,
+) -> int:
+    """B-332 —— 不能 ``draft`` 缩小解码的格式(PNG / WebP / GIF)解码**之前**估 :func:`crop_image`
+    对一个框的峰值内存(按最贵的框:整张,要缩)。整张解开的那份(``D``)一直在,再看
+    :func:`_render_box` 的做法:
+
+    * RGB / 灰度:直接缩 —— ``D`` + 缩的横向那一遍的中间图 + 输出;转方向(``rotated``)时整张转一份
+      (``D`` 再来一份)再缩;
+    * 别的颜色模式(带透明、调色板、16 位……):分条转 RGB、分条横向缩 —— ``D`` + 中间图
+      (``输出宽 x 原高``,RGB)+ 输出;转方向时先整张转 RGB(``R``)再转一份,再缩。
+
+    再加每个解码像素 :data:`UNDRAFTED_OVERHEAD_PER_PIXEL` 字节与固定的
+    :data:`UNDRAFTED_FIXED_BYTES`,乘 :data:`PEAK_SAFETY`。"""
+    pixels = width * height
+    decoded = pixels * _DECODED_BYTES_PER_PIXEL.get(mode, 4)
+    out_w, out_h = _capped(width, height, max_pixels)
+    # 缩的横向那一遍的中间图(输出宽 x 被缩那张图的行数)。转 90 / 270 度时宽高对调,输出宽也对调:
+    # 取两种里大的(与 JPEG 的估算同一个形状)。
+    middle = max(out_w * height, out_h * width) if rotated else out_w * height
+    out = out_w * out_h * 4
+    if mode in _RESIZE_FIRST_MODES:
+        channels = 4 if mode == "RGB" else 1
+        phases = [decoded + middle * channels + out + out_w * out_h * (4 - channels)]
+        if rotated:
+            phases[0] += decoded
+    else:
+        flat = pixels * 4
+        phases = [decoded + middle * 4 + out]
+        if rotated:
+            phases = [decoded + 2 * flat, decoded + flat + middle * 4 + out]
+    if mode not in _RESIZE_FIRST_MODES:
+        # 分条转 RGB 的每一条:一条至少一整行(宽 > 条的像素数时一行就是一条)。
+        strip = max(width, _FLATTEN_STRIP_PIXELS) * UNDRAFTED_STRIP_BYTES_PER_PIXEL
+        phases = [phase + strip for phase in phases]
+    # 不用缩的框(``bands`` 最多 ``max_pixels`` 像素):框那一块分条转 RGB、再转方向,至多两份框大小的
+    # RGB,小于上面「整张要缩」那一档的中间图,不单独估。
+    # Pillow 缩小时的滤波系数表:横向约 宽 x 48 字节、纵向约 高 x 48 字节(实测 72 盖得住),与输出
+    # 尺寸无关 —— 又细又长的图(10,000,000 x 1)主要贵在这里。
+    coefficients = UNDRAFTED_COEFFICIENT_BYTES * (width + height)
+    extra = (UNDRAFTED_OVERHEAD_PER_PIXEL + decoder_bytes_per_pixel) * pixels
+    calibrated = max(phases) + coefficients + extra + UNDRAFTED_FIXED_BYTES
     return math.ceil(calibrated * PEAK_SAFETY)
 
 
@@ -568,17 +740,23 @@ def crop_upright(image: Image.Image, box: Box, orientation: int) -> Image.Image:
 
     与 ``ImageOps.exif_transpose(image).crop(pixel_box(box, 转正后尺寸))`` 逐像素相同
     (测试对 8 种方向钉住)。"""
-    width, height = image.size
+    piece = image.crop(_upright_rect(image.size, box, orientation)[1])
+    method = _UPRIGHT_METHODS.get(orientation)
+    return piece if method is None else piece.transpose(method)
+
+
+def _upright_rect(size: tuple[int, int], box: Box, orientation: int) -> tuple[Box, Box]:
+    """转正之后的 ``box`` 换成像素:``(转正图上的 (left, top, right, bottom),原图上对应的矩形)``。"""
+    width, height = size
     swapped = orientation in _SWAPPED_ORIENTATIONS
     upright_size = (height, width) if swapped else (width, height)
-    left, top, right, bottom = pixel_box(box, upright_size)
+    upright = pixel_box(box, upright_size)
+    left, top, right, bottom = upright
     corners = [
         _raw_point(x, y, orientation, (width, height)) for x, y in ((left, top), (right, bottom))
     ]
     xs, ys = sorted(c[0] for c in corners), sorted(c[1] for c in corners)
-    piece = image.crop((xs[0], ys[0], xs[1], ys[1]))
-    method = _UPRIGHT_METHODS.get(orientation)
-    return piece if method is None else piece.transpose(method)
+    return upright, (xs[0], ys[0], xs[1], ys[1])
 
 
 def _raw_point(x: int, y: int, orientation: int, raw: tuple[int, int]) -> tuple[int, int]:
@@ -608,11 +786,6 @@ def _capped(width: int, height: int, max_pixels: int = REGION_TARGET_PIXELS) -> 
     if factor >= 1.0:
         return width, height
     return max(1, math.floor(width * factor)), max(1, math.floor(height * factor))
-
-
-def _cap_pixels(piece: Image.Image, max_pixels: int) -> Image.Image:
-    size = _capped(piece.width, piece.height, max_pixels)
-    return piece if size == piece.size else piece.resize(size, Image.Resampling.LANCZOS)
 
 
 def crop_output_size(

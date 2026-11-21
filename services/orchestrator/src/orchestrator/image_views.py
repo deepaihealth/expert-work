@@ -245,19 +245,88 @@ def small_copy_slots(data: bytes) -> int | None:
     return None if header is None else slots_for(*header)
 
 
-def slots_for(width: int, height: int, mode: str) -> int | None:
+def slots_for(
+    width: int,
+    height: int,
+    mode: str,
+    max_pixels: int | None = None,
+    *,
+    draftable: bool = True,
+    rotated: bool = False,
+    decoder_bytes_per_pixel: float = 0.0,
+) -> int | None:
     """按解码之前估的峰值(:func:`~orchestrator.tools.region_zoom.crop_peak_bytes`,已乘安全系数)
     定占几个解图名额(复审 H-new / 第五轮 M1):不到 :data:`FULL_COPY_PEAK_BYTES` 的一半占 1 个 ——
     两个这样的同时在算,加起来也不超过它;不到它占 2 个(单独在算);更大的 → ``None``:不做,这张图
-    不判方向(``too_large``)。``ask_image`` 自己的裁图不走这道估算,不受它约束。"""
-    from orchestrator.tools.region_zoom import crop_peak_bytes  # 延迟导入,见模块说明
+    不判方向(``too_large``)。B-332 起 ``ask_image`` 自己的裁图也走这条:JPEG 之外的格式
+    (``draftable=False``)按 :func:`crop_slots` 估。"""
+    from orchestrator.tools.region_zoom import (  # 延迟导入,见模块说明
+        REGION_TARGET_PIXELS,
+        crop_peak_bytes,
+    )
 
-    peak = crop_peak_bytes(width, height, mode)
+    peak = crop_peak_bytes(
+        width,
+        height,
+        mode,
+        REGION_TARGET_PIXELS if max_pixels is None else max_pixels,
+        draftable=draftable,
+        rotated=rotated,
+        decoder_bytes_per_pixel=decoder_bytes_per_pixel,
+    )
     if peak <= FULL_COPY_PEAK_BYTES // 2:
         return 1
     if peak <= FULL_COPY_PEAK_BYTES:
         return 2
     return None
+
+
+def _may_rotate(image: Image.Image, data: bytes, degrees: int) -> bool:
+    """这次裁图会不会转方向(转一份整张的拷贝,估算要加):文件头里的方向标记与 B-301 的 ``degrees``
+    合成不是 1 就算;PNG 文件头里没有 ``exif``、但文件里有 ``eXIf`` 块(只能在末尾,要解码才读得到值)
+    —— 保守算会转。不解码。"""
+    from orchestrator.tools.region_zoom import (  # 延迟导入,见模块说明
+        header_orientation,
+        may_have_trailing_exif,
+        turned_orientation,
+    )
+
+    if turned_orientation(header_orientation(image), degrees) != 1:
+        return True
+    return may_have_trailing_exif(image, data)
+
+
+def crop_slots(data: bytes, degrees: int, max_pixels: int) -> int | None:
+    """B-332 —— ``ask_image`` 在宿主裁这张图该占几个解图名额;``None`` = 解码之后峰值内存会超过
+    :data:`FULL_COPY_PEAK_BYTES`,不裁(调用方如实告诉模型)。只读文件头,不解码。
+
+    JPEG 按缩小解码裁,峰值不随框变,老样子占 1 个。别的格式(PNG / WebP / GIF)不能缩小解码,
+    整张都要解开,按 :func:`slots_for` 的 ``draftable=False`` 估。认不出、或超过像素上限的图占 1 个,
+    由 ``crop_image`` 自己报错(那条在解码之前就抛)。转方向(文件头方向标记与 ``degrees`` 合成
+    不是 1,或 PNG 末尾带 ``eXIf`` 块,见 :func:`_may_rotate`)多一份整张的拷贝,估算里算上。"""
+    from orchestrator.tools.region_zoom import (  # 延迟导入,见模块说明
+        MAX_DECODE_PIXELS,
+        OPEN_FORMATS,
+        WEBP_DECODE_BYTES_PER_PIXEL,
+    )
+
+    try:
+        with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
+            (width, height), mode, fmt = image.size, image.mode, image.format or ""
+            rotated = _may_rotate(image, data, degrees)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return 1
+    if fmt in ("JPEG", "MPO") or width * height > MAX_DECODE_PIXELS:
+        return 1
+    return slots_for(
+        width,
+        height,
+        mode,
+        max_pixels,
+        draftable=False,
+        rotated=rotated,
+        decoder_bytes_per_pixel=WEBP_DECODE_BYTES_PER_PIXEL if fmt == "WEBP" else 0.0,
+    )
 
 
 def _encode_within(whole: Image.Image, original_bytes: int) -> tuple[str, bytes] | None:

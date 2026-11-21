@@ -19,6 +19,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 
+from orchestrator.tools.error_classifier import ExpectedRefusalError
 from orchestrator.tools.image_orientation import (
     TURNS,
     Answer,
@@ -66,6 +67,10 @@ async def judge_orientation[C](
             zero = await candidate(0)
         except CandidateDeferredError:
             raise
+        except ExpectedRefusalError:
+            # B-332 —— 图太大、宿主不裁:预期之内,不是异常,不打堆栈。
+            logger.info("%s.orientation_candidate_refused", log_prefix)
+            return Orientation("not_asked", reason="no_copy")
         except Exception:
             logger.warning("%s.orientation_candidate_failed", log_prefix, exc_info=True)
             return Orientation("not_asked", reason="no_copy")
@@ -95,6 +100,9 @@ async def judge_orientation[C](
             turned.append(await candidate(turn))
         except CandidateDeferredError:
             raise
+        except ExpectedRefusalError:
+            logger.info("%s.orientation_candidate_refused", log_prefix)
+            return Orientation("undetermined", 0, answers, models, extra_calls=1)
         except Exception:
             logger.warning("%s.orientation_candidate_failed", log_prefix, exc_info=True)
             return Orientation("undetermined", 0, answers, models, extra_calls=1)
