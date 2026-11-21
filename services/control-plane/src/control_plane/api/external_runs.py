@@ -356,6 +356,7 @@ async def _supersede_and_run(
             envelope=True,
             hide_events=EXTERNAL_HIDDEN_EVENTS,
             strip_state_keys=EXTERNAL_STRIPPED_STATE_KEYS,
+            external_plane=True,
             stream_format=stream_format,
             on_disconnect=DisconnectMode.CONTINUE,
             supersede=SupersedeRequest(target_run_id=target.run_id, replay=(op == "regenerate")),

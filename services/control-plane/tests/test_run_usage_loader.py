@@ -173,3 +173,85 @@ async def test_loader_swallows_store_failure_instead_of_raising() -> None:
         await make_usage_loader(usage=_Exploding(), runs=runs, run_id=run_id, tenant_id=tenant)()
         is None
     )
+
+
+# --- B-331: input_tokens follows the documented contract for every vendor --------------
+
+
+def _bucket(provider: str | None, inp: int, read: int, create: int) -> ModelTokenTotals:
+    return ModelTokenTotals(
+        provider=provider,
+        model="m",
+        input_tokens=inp,
+        output_tokens=5,
+        cache_read_tokens=read,
+        cache_creation_tokens=create,
+        llm_calls=1,
+    )
+
+
+def test_anthropic_input_includes_cache_on_the_wire() -> None:
+    """库里是厂商原值(不含缓存),对外要含:100 + 700 + 50 = 850。"""
+    wire = usage_buckets_to_wire([_bucket("anthropic", 100, 700, 50)])
+    assert wire[0]["input_tokens"] == 850
+    assert wire[0]["cache_read_tokens"] == 700
+    assert wire[0]["cache_creation_tokens"] == 50
+    # 对方按文档算「未命中缓存的输入」得回厂商原值,不为负
+    assert wire[0]["input_tokens"] - 700 - 50 == 100
+
+
+@pytest.mark.parametrize("provider", ["glm", "qwen", "deepseek", "doubao", "openai", None])
+def test_other_providers_are_untouched(provider: str | None) -> None:
+    """OpenAI 兼容厂商库里本来就含缓存;NULL 厂商(历史行)同规则,绝不再加一遍。"""
+    wire = usage_buckets_to_wire([_bucket(provider, 1000, 800, 0)])
+    assert wire[0]["input_tokens"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_loader_normalizes_historical_anthropic_rows_at_read_time() -> None:
+    """老 run 的库里行是原值;读时补,新老同口径。库里的行不被改写。"""
+    tenant = uuid4()
+    runs, usage = InMemoryRunStore(), InMemoryTokenUsageStore()
+    run_id = await _seed_run(runs, tenant_id=tenant, trace_id=_TRACE)
+    await usage.insert(
+        TokenUsageRecord(
+            tenant_id=tenant,
+            agent_name="bot",
+            agent_version="1.0.0",
+            model="claude-opus-4-8",
+            provider="anthropic",
+            trace_id=_TRACE,
+            input_tokens=100,
+            output_tokens=1,
+            cache_read_tokens=700,
+            cache_creation_tokens=50,
+            usage_kind="conversation",
+        )
+    )
+
+    buckets = await make_usage_loader(usage=usage, runs=runs, run_id=run_id, tenant_id=tenant)()
+
+    assert buckets is not None and buckets[0]["input_tokens"] == 850
+    stored = await usage.totals_by_trace_ids([_TRACE], usage_kinds=EXTERNAL_USAGE_KINDS)
+    assert stored[_TRACE].by_model[0].input_tokens == 100
+
+
+def test_null_provider_claude_row_is_recognised_by_model_name() -> None:
+    """历史行 provider 为空:与计费滚动同一条规则 ``provider or provider_for_model(model)``。
+    对外 ``provider`` 字段仍是 ``None``,不被改写。"""
+    bucket = ModelTokenTotals(
+        provider=None,
+        model="claude-opus-4-8",
+        input_tokens=100,
+        output_tokens=5,
+        cache_read_tokens=700,
+        cache_creation_tokens=50,
+    )
+    wire = usage_buckets_to_wire([bucket])
+    assert wire[0]["input_tokens"] == 850
+    assert wire[0]["provider"] is None
+
+
+def test_null_provider_unknown_model_stays_raw() -> None:
+    wire = usage_buckets_to_wire([_bucket(None, 1000, 800, 0)])
+    assert wire[0]["input_tokens"] == 1000

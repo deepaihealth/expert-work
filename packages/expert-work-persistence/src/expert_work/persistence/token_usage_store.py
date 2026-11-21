@@ -29,6 +29,7 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models.token_usage import TokenUsageRow
+from expert_work.protocol import provider_for_model
 
 # Cross-tenant usage read (W4) must ``SET LOCAL ROLE`` to a BYPASSRLS role:
 # ``token_usage`` is FORCE ROW LEVEL SECURITY (migration 0036) and the
@@ -39,6 +40,42 @@ from expert_work.persistence.models.token_usage import TokenUsageRow
 # read cross tenants — same precedent as the ledger / tenant_member readers.
 # ``SET LOCAL`` is transaction-scoped, so it lifts on commit/rollback.
 _SET_AUDIT_READER_ROLE = text("SET LOCAL ROLE audit_reader")
+
+
+#: Providers whose stored ``input_tokens`` EXCLUDE the prompt-cache counters.
+#: Anthropic reports ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
+#: beside ``input_tokens`` and the adapter stores all three verbatim; every other
+#: (OpenAI-compatible) adapter stores ``prompt_tokens``, which already contains the
+#: cache hits. One source for the billing rollup (B-185) and the external usage
+#: contract (B-331).
+INPUT_EXCLUDES_CACHE_PROVIDERS: frozenset[str] = frozenset({"anthropic"})
+
+
+def input_excludes_cache(provider: str | None, model: str | None = None) -> bool:
+    """Whether stored ``input_tokens`` leaves the cache counters out. A NULL
+    ``provider`` (legacy rows) falls back to the model-name reverse lookup, exactly
+    like the billing rollup (``provider or provider_for_model(model)``); still
+    unknown = the OpenAI-compatible rule (already inclusive)."""
+    resolved = provider or (provider_for_model(model) if model else None)
+    return resolved in INPUT_EXCLUDES_CACHE_PROVIDERS
+
+
+def contract_input_tokens(
+    provider: str | None,
+    input_tokens: int,
+    cache_read_tokens: int,
+    cache_creation_tokens: int,
+    *,
+    model: str | None = None,
+) -> int:
+    """B-331 — ``input_tokens`` as the integrator contract documents it: the sum of
+    all input kinds, cache reads / writes INCLUDED (the LangChain ``usage_metadata``
+    convention). Stored rows stay vendor-raw; this is applied at read time, so old
+    and new rows look the same. Pass ``model`` so a legacy NULL-provider row is
+    still recognised (see :func:`input_excludes_cache`)."""
+    if input_excludes_cache(provider, model):
+        return input_tokens + cache_read_tokens + cache_creation_tokens
+    return input_tokens
 
 
 @dataclass(frozen=True)

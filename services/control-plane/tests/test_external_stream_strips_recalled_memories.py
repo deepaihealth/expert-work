@@ -23,6 +23,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from copy import deepcopy
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -49,6 +50,7 @@ from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunEventStore,
     InMemoryRunStore,
+    RunEventRecord,
     RunManager,
     RunStatus,
 )
@@ -418,3 +420,88 @@ def test_projection_touches_only_updates_frames_and_never_mutates() -> None:
     # 其它帧原样放行;空集合(控制台)原样放行。
     assert strip_frame_state_keys("plan", frame, EXTERNAL_STRIPPED_STATE_KEYS) is frame
     assert strip_frame_state_keys("updates", frame, frozenset()) is frame
+
+
+# --- B-331: 对外 worker end 帧补缓存;落库的帧与控制台回放保持原值 ----------------
+
+
+def _worker_end_frames(body: str) -> list[dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
+    for block in body.split("\n\n"):
+        lines = block.splitlines()
+        if "event: worker" not in lines:
+            continue
+        data = next(line for line in lines if line.startswith("data: "))
+        frame = json.loads(data[len("data: ") :])
+        if frame.get("kind") == "end":
+            frames.append(frame)
+    return frames
+
+
+def _anthropic_worker_end() -> dict[str, Any]:
+    bucket = {
+        "provider": "anthropic",
+        "model": "claude-opus-4-8",
+        "input_tokens": 100,
+        "output_tokens": 9,
+        "total_tokens": 109,
+        "input_token_details": {"cache_read": 700, "cache_creation": 50},
+        "output_token_details": {"reasoning": 0},
+    }
+    return {
+        "worker_id": "wk-1",
+        "kind": "end",
+        "wseq": 2,
+        "data": {"outcome": "success", "usage": dict(bucket), "usage_by_model": [bucket]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_worker_end_frame_is_normalized_externally_and_raw_for_console(ctx: _Ctx) -> None:
+    _, run_id = await _stream_turn(ctx)
+    last = (await ctx.run_event_store.list(run_id=run_id))[-1].seq
+    now = datetime.now(UTC)
+    await ctx.run_event_store.append(
+        RunEventRecord(
+            run_id=run_id,
+            seq=last + 1,
+            event_name="worker",
+            data=_anthropic_worker_end(),
+            created_at_ms=int(now.timestamp() * 1000),
+            created_at=now,
+        )
+    )
+
+    # 对外回放:桶 100 + 700 + 50 = 850,顶层 usage = 桶之和
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/runs/{run_id}/events", params={"user_id": "cust-77"}
+    )
+    assert resp.status_code == 200, resp.text
+    [frame] = _worker_end_frames(resp.text)
+    assert frame["data"]["usage_by_model"][0]["input_tokens"] == 850
+    assert frame["data"]["usage"]["input_tokens"] == 850
+    assert frame["data"]["usage_by_model"][0]["provider"] == "anthropic"
+
+    # 落库行不动
+    rows = [r for r in await ctx.run_event_store.list(run_id=run_id) if r.event_name == "worker"]
+    assert rows[0].data["data"]["usage_by_model"][0]["input_tokens"] == 100
+
+    # 控制台回放(不传对外参数)仍是原值
+    plan = await build_event_producer(
+        run_id=run_id,
+        run_status=RunStatus.SUCCESS,
+        event_store=ctx.run_event_store,
+        stream_bridge=InMemoryStreamBridge(),
+        since_seq=None,
+        scope=None,
+    )
+    console = b"".join([c async for c in plan.producer]).decode()
+    [raw] = _worker_end_frames(console)
+    assert raw["data"]["usage_by_model"][0]["input_tokens"] == 100
+    assert raw["data"]["usage"]["input_tokens"] == 100
+
+
+def test_external_stripped_state_keys_is_non_empty() -> None:
+    """对外平面由显式 ``external_plane`` 决定,不再由这个集合推断;但集合清空仍是
+    危险信号 —— ``recalled_memories`` 的外泄防线就靠它,所以留一条哨兵。"""
+    assert EXTERNAL_STRIPPED_STATE_KEYS

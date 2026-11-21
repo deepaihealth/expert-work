@@ -719,7 +719,7 @@ function onPlan(data) {
 | `iteration_used` | integer | 实际用掉的步数，非负整数 |
 | `llm_call_count` | integer | `usage` 所计入的模型调用次数，非负整数。平台没有记录到这个子任务的用量时，是模型回复的条数 |
 | `wall_clock_ms` | integer | 这个子任务从开始到结束的墙钟耗时，单位毫秒，非负整数 |
-| `usage` | object | 这个子任务全部模型调用消耗的 token，所含调用见表后说明。字段与 `updates` 事件里模型消息的 `usage_metadata` 相同：`input_tokens` / `output_tokens` / `total_tokens`，以及 `input_token_details`（含 `cache_read`、`cache_creation`）与 `output_token_details`（含 `reasoning`）；没有上报用量时不出现 |
+| `usage` | object | 这个子任务全部模型调用消耗的 token，所含调用见表后说明。字段名与 `updates` 事件里模型消息的 `usage_metadata` 相同（对 Claude，`input_tokens` 的含义不同，以本表为准，见 [`end` 事件](#end)）：`input_tokens` / `output_tokens` / `total_tokens`，以及 `input_token_details`（含 `cache_read`、`cache_creation`）与 `output_token_details`（含 `reasoning`）；没有上报用量时不出现 |
 | `usage_by_model` | array | `usage` 按实际回答的模型拆开的明细，每一项是 `{provider, model}` 加上与 `usage` 相同的字段，各项相加等于 `usage`。可能有多项，见表后说明；平台没有记录到这个子任务的模型调用时，这个字段不出现 |
 
 `usage` 计入这个子任务代用户发起的每一次模型调用：
@@ -1193,12 +1193,14 @@ Agent 产生的文件分两种去向：一种直接写进这个终端用户的**
 |---|---|---|
 | `provider` | string \| null | 模型厂商标识，折算费用时与 `model` 一起作为单价的查找键。`null` 只出现在平台升级前的历史记录上 |
 | `model` | string | 实际回答这些调用的模型，取平台上配置的模型名（不是厂商返回的名称）。所配模型失败、由备用模型回答的调用记在备用模型名下 |
-| `input_tokens` | number | 输入 token 总数。**已经包含 `cache_read_tokens` 与 `cache_creation_tokens`**，不是与它们并列的第三项 |
+| `input_tokens` | number | 输入 token 总数。**已经包含 `cache_read_tokens` 与 `cache_creation_tokens`**，不是与它们并列的第三项。对所有厂商都成立，包括 Anthropic（此前 Anthropic 的这一项不含缓存，见 [更新记录](./changelog)） |
 | `output_tokens` | number | 输出 token 数 |
 | `cache_read_tokens` | number | `input_tokens` 之中命中提示词缓存的部分。多数厂商对这部分按低于普通输入的价格计费 |
 | `cache_creation_tokens` | number | `input_tokens` 之中写入提示词缓存的部分。目前只有部分厂商上报这一项，其余厂商恒为 `0` |
 
 折算费用时，未命中缓存的输入量是 `input_tokens - cache_read_tokens - cache_creation_tokens`。直接用 `input_tokens` 乘普通输入单价会把已经享受缓存折扣的部分按全价计算一遍。
+
+注意：`updates` 事件里每条模型消息的 `usage_metadata`，对 Anthropic 模型仍是厂商原值（`input_tokens` 不含缓存）；计费请以 run 级的 `usage_by_model` 为准。`worker` 结束事件的 `usage` / `usage_by_model` 与 `end` 事件口径一致（含缓存）。
 
 一次 run 跨多个模型是常见情况：主 Agent 与它派出的子任务可以用不同模型，所以要逐项按各自的 `provider` 与 `model` 查单价再相加，不能整次 run 按主 Agent 的单价折算。
 

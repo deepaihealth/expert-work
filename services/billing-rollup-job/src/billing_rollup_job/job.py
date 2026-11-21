@@ -52,6 +52,7 @@ from expert_work.persistence.rls import (
     current_user_id_var,
 )
 from expert_work.persistence.token_usage_store import (
+    INPUT_EXCLUDES_CACHE_PROVIDERS,
     NON_BILLABLE_USAGE_KINDS,
     TokenUsageStore,
 )
@@ -121,27 +122,18 @@ def _tenant_scope(tenant_id: UUID) -> Iterator[None]:
 # ---------------------------------------------------------------------------
 
 
-#: Providers whose ``input_tokens`` EXCLUDE the prompt-cache counters. Anthropic
-#: reports ``cache_read_input_tokens`` / ``cache_creation_input_tokens`` beside
-#: ``input_tokens`` and the platform adapter stores all three verbatim. Every other
-#: (OpenAI-compatible) adapter stores ``prompt_tokens`` — which already contains
-#: ``prompt_tokens_details.cached_tokens`` — as ``input_tokens`` (those adapters
-#: record no cache writes today; any they did would sit inside ``prompt_tokens``
-#: too). Same split as ``expert_work.runtime.middleware.token_usage._prompt_tokens``
-#: (B-142), which takes a non-Anthropic call's whole prompt to be ``input_tokens``.
-_INPUT_EXCLUDES_CACHE_PROVIDERS = frozenset({"anthropic"})
-
-
 def _uncached_input_tokens(
     provider: str, input_tokens: int, cache_creation_tokens: int, cache_read_tokens: int
 ) -> int:
     """B-185 — the input tokens to bill at the full input price.
 
+    Providers whose stored ``input_tokens`` exclude the cache counters are listed in
+    ``INPUT_EXCLUDES_CACHE_PROVIDERS`` (``token_usage_store``, shared with B-331).
     Cache hits / writes are billed at their own prices, so for providers whose
     ``input_tokens`` already contains them they are taken out first (clamped at 0,
     like the console's ``cost.ts``) — otherwise they would be billed twice.
     """
-    if provider in _INPUT_EXCLUDES_CACHE_PROVIDERS:
+    if provider in INPUT_EXCLUDES_CACHE_PROVIDERS:
         return input_tokens
     return max(0, input_tokens - cache_read_tokens - cache_creation_tokens)
 

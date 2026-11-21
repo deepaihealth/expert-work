@@ -56,6 +56,7 @@ from expert_work.common.observability.metrics import expert_work_counter
 from expert_work.persistence.token_usage_store import (
     TokenUsageRecord,
     TokenUsageStore,
+    contract_input_tokens,
 )
 from expert_work.runtime.middleware.base import CallNext, MiddlewareContext
 from expert_work.runtime.tokens import TokenEstimator, estimate_messages
@@ -100,9 +101,7 @@ def _prompt_tokens(
     明细),总量就是 ``input_tokens``。``provider`` 未知时按 OpenAI 口径(除 Anthropic
     外的适配器都是这一口径)。
     """
-    if provider == "anthropic":
-        return input_t + cache_creation_t + cache_read_t
-    return input_t
+    return contract_input_tokens(provider, input_t, cache_read_t, cache_creation_t)
 
 
 #: Stream HX-1 (Mini-ADR HX-A6) — estimated prompt tokens, accumulated

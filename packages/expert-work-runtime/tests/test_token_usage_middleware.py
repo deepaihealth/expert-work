@@ -580,3 +580,13 @@ async def test_drift_denominator_does_not_double_count_cached_tokens() -> None:
     tenant_id = uuid4()
     await mw(_cached_ctx(tenant_id, {"cache_read": 80}, input_tokens=100), _noop)
     assert _actual_sample(str(tenant_id), "b142-drift", "glm-5.3") == 100
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "glm", "qwen", "deepseek", "doubao", None])
+def test_b331_prompt_tokens_matches_the_shared_contract_rule(provider: str | None) -> None:
+    """B-142 的 ``_prompt_tokens`` 与对外口径共用 ``contract_input_tokens``,行为不变:
+    anthropic = 三者相加,其余 = ``input_tokens``。"""
+    from expert_work.runtime.middleware.token_usage import _prompt_tokens
+
+    expected = 100 + 50 + 700 if provider == "anthropic" else 100
+    assert _prompt_tokens(provider, 100, 50, 700) == expected

@@ -144,6 +144,7 @@ async def build_events_response(
         artifact_view=artifact_view,
         # 召回的长期记忆等内部数据:帧照发、值里删键(落库行不动,控制台照看全量)。
         strip_state_keys=EXTERNAL_STRIPPED_STATE_KEYS,
+        external_plane=True,
         stream_format=stream_format,
     )
     headers = {

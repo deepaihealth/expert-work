@@ -359,3 +359,38 @@ async def test_run_without_usage_omits_the_field_rather_than_returning_zero(
     ).json()
     assert "usage_by_model" not in body
     assert body["run_status"]  # 终局状态照给 —— 查不到用量不影响这一条
+
+
+@pytest.mark.asyncio
+async def test_anthropic_input_includes_cache_over_http(ctx: _Ctx) -> None:
+    """B-331 —— 库里是厂商原值(100,不含缓存);对外 = 100 + 700 + 50 = 850。"""
+    await ctx.seed_agent()
+    run_id = await ctx.start_run(user_id="cust-77")
+    await ctx.bind_trace(run_id)
+    await ctx.usage_store.insert(
+        TokenUsageRecord(
+            tenant_id=ctx.tenant_id,
+            agent_name="support-bot",
+            agent_version="1.0.0",
+            model="claude-sonnet-4-5",
+            provider="anthropic",
+            trace_id=_TRACE,
+            input_tokens=100,
+            output_tokens=9,
+            cache_read_tokens=700,
+            cache_creation_tokens=50,
+            usage_kind="conversation",
+        )
+    )
+
+    body = (
+        await ctx.client.get(
+            f"/v1/agents/support-bot/runs/{run_id}/usage",
+            params={"user_id": "cust-77"},
+            headers=ctx.headers,
+        )
+    ).json()
+    bucket = body["usage_by_model"][0]
+    assert bucket["input_tokens"] == 850
+    assert bucket["cache_read_tokens"] == 700
+    assert bucket["cache_creation_tokens"] == 50

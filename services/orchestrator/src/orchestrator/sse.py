@@ -61,6 +61,7 @@ from expert_work.common.observability import (
 )
 from expert_work.common.skill_run_usage import SkillRunUsageRecorder
 from expert_work.persistence import ApprovalStore
+from expert_work.persistence.token_usage_store import input_excludes_cache
 from expert_work.protocol import (
     ApprovalRecord,
     ApprovalRequest,
@@ -289,7 +290,9 @@ def _strip_internal_state_keys(chunk: Any) -> Any:
     return _strip_state_keys(chunk, _INTERNAL_STATE_KEYS)
 
 
-def strip_frame_state_keys(event_name: str, data: Any, keys: frozenset[str]) -> Any:
+def strip_frame_state_keys(
+    event_name: str, data: Any, keys: frozenset[str], *, external_plane: bool = False
+) -> Any:
     """The external plane's read-side projection of one stored / live frame.
 
     Unlike :data:`_INTERNAL_STATE_KEYS` (stripped before the frame is published
@@ -298,10 +301,81 @@ def strip_frame_state_keys(event_name: str, data: Any, keys: frozenset[str]) -> 
     removed only on the way out to a third party. Only ``updates`` frames carry
     ``{node: writes}``; every other frame passes through untouched, as does
     everything when ``keys`` is empty (the console callers). Never mutates
-    ``data``: the live frame object is shared by every subscriber."""
+    ``data``: the live frame object is shared by every subscriber.
+
+    B-331 —— ``external_plane`` (explicit, not inferred from ``keys``) marks the
+    external plane, so the same hook also projects ``worker`` end frames to the
+    documented usage contract (:func:`contract_worker_usage`); the console passes
+    nothing and sees the raw frame."""
+    if external_plane and event_name == "worker":
+        return contract_worker_usage(data)
     if not keys or event_name != DEFAULT_STREAM_MODE:
         return data
     return _strip_state_keys(data, keys)
+
+
+def contract_worker_usage(frame: Any) -> Any:
+    """B-331 —— 对外平面的 worker ``end`` 帧:给 anthropic 桶的 ``input_tokens`` 补上缓存。
+
+    库里 / 帧里存的是厂商原值(Anthropic 不含缓存);对外文档承诺「``input_tokens``
+    含 ``cache_read`` / ``cache_creation``」,所以只在出口处补(控制台与计费读的是存下来的
+    原帧,不经这里)。每个桶按 ``provider or provider_for_model(model)`` 判厂商(与对外
+    run 用量同一条规则);``total_tokens`` 同步加上,桶里的 ``provider`` 字段原样不动。
+    顶层 ``usage`` = 各桶之和,所以按桶的增量整体补 —— 不补的话它是「原值的 Claude + 含缓存
+    的其它厂商」混加,没有意义。没有 ``usage_by_model`` 的帧(不知道谁应答)原样放行。
+    只返回新对象,不改原帧(实时帧被所有订阅者共用)。非 worker end 帧一律原样。"""
+    if not isinstance(frame, dict) or frame.get("kind") != "end":
+        return frame
+    inner = frame.get("data")
+    buckets = inner.get("usage_by_model") if isinstance(inner, dict) else None
+    if not isinstance(inner, dict) or not isinstance(buckets, list):
+        return frame
+    delta_total = 0
+    new_buckets: list[Any] = []
+    for bucket in buckets:
+        added = _bucket_cache_tokens(bucket)
+        if added == 0:
+            new_buckets.append(bucket)
+            continue
+        delta_total += added
+        new_buckets.append(
+            {
+                **bucket,
+                "input_tokens": _int_of(bucket.get("input_tokens")) + added,
+                "total_tokens": _int_of(bucket.get("total_tokens")) + added,
+            }
+        )
+    if delta_total == 0:
+        return frame
+    new_inner: dict[str, Any] = {**inner, "usage_by_model": new_buckets}
+    usage = inner.get("usage")
+    if isinstance(usage, dict):
+        new_inner["usage"] = {
+            **usage,
+            "input_tokens": _int_of(usage.get("input_tokens")) + delta_total,
+            "total_tokens": _int_of(usage.get("total_tokens")) + delta_total,
+        }
+    return {**frame, "data": new_inner}
+
+
+def _int_of(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _bucket_cache_tokens(bucket: Any) -> int:
+    """cache_read + cache_creation of an anthropic bucket; 0 for every other bucket."""
+    if not isinstance(bucket, dict):
+        return 0
+    provider = bucket.get("provider")
+    model = bucket.get("model")
+    if not input_excludes_cache(
+        provider if isinstance(provider, str) else None, model if isinstance(model, str) else None
+    ):
+        return 0
+    details = bucket.get("input_token_details")
+    if not isinstance(details, dict):
+        return 0
+    return _int_of(details.get("cache_read")) + _int_of(details.get("cache_creation"))
 
 
 def _system_prompt_of(graph_input: Any) -> str | None:
@@ -1869,6 +1943,7 @@ async def sse_consumer(
     heartbeat_interval: float = 15.0,
     hide_events: frozenset[str] = frozenset(),
     strip_state_keys: frozenset[str] = frozenset(),
+    external_plane: bool = False,
     stream_format: str = STREAM_FORMAT_LEGACY,
     # B-52 —— 取本 run 的用量,只在 ``end`` 帧之前调一次。``None`` = 不带这个
     # 字段(调用方没接线)。装配与口径都在
@@ -1974,7 +2049,9 @@ async def sse_consumer(
                     yield tick
                 continue
 
-            data = strip_frame_state_keys(entry.event, entry.data, strip_state_keys)
+            data = strip_frame_state_keys(
+                entry.event, entry.data, strip_state_keys, external_plane=external_plane
+            )
             if converter is None:
                 yield format_sse(entry.event, data, event_id=entry.id or None)
                 beat.wrote()
